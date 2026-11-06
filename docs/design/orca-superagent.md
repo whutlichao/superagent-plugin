@@ -1993,3 +1993,35 @@ manifest + types + tsconfig + boot + lock + sqlite(trigger/thread/ticket/decisio
 `node -e 'const{DatabaseSync}=require("node:sqlite")'` 验证 SQLite 侧；
 宿主限制由 `orca plugin inspect` 的 grants 与上表出处逐条核对（`/Applications/Orca.app` 内的
 `app.asar` 中 `PU` 类与 `plugin-host-api-storage-schemas.js`）。
+
+### S6 实测记录（#7，2026-11-07）
+
+**测什么**：插件 worker 重启（保存文件触发的进程退出/新进程启动）时 HTTP 端口的回收时序；
+Orca 应用重启后端口文件是否过期。**影响**：§N.1 的端口选择与附录 C 的 S6 回落。
+
+实测环境：arm64 macOS 27.0.1，Node 25.0.0（`node:http` 的 `Server.close()` + `closeAllConnections()`）。
+
+| 情形 | 样本 | 中位 | p95 | 最大 | 说明 |
+| --- | --- | --- | --- | --- | --- |
+| 同进程 `close()` 后立刻重绑同一端口 | 50 | 0.025 ms | 0.073 ms | 1.74 ms | 无 `EADDRINUSE`；`SO_REUSEADDR` 生效 |
+| 子进程退出后父进程立刻重绑同一端口 | 20 | 0.093 ms | 0.189 ms | 0.189 ms | 一次成功；内核随进程退出释放监听 |
+| 有 live keep-alive 客户端时 `close()` 的耗时 | 1 | 0.109 ms | — | — | `closeAllConnections()` 先断开连接，`close()` 不等待超时 |
+
+**结论**：
+
+1. **端口回收不是风险**：同一端口在 `close()` 之后立即可重绑（最大 1.74 ms 的抖动来自一次
+   调度，不是 `TIME_WAIT`）。因此 worker 保存文件重启后，新进程按端口文件重绑**同一端口**
+   是可行的——面板与 CLI 手里的旧端口号大概率仍然有效。
+2. **Orca 应用重启后端口文件会过期**：旧 worker 随应用退出，端口无人监听，但**文件还在**。
+   纯数字形态的端口文件无法自证新鲜度，读者会连一个没人听的端口。
+3. **回落即设计（已落地）**：端口文件写成 `{port, pid, startedAt}`（0600）；读者 `readPortRecord()`
+   在 `pid` 进程已不存在（`kill(pid, 0)` → `ESRCH`）时**返回 `null`**，于是回退默认端口并让
+   boot 重新探测；写入方 `close()` 删除自己那一份记录（只删 pid+port+startedAt 全同的文件）。
+   同时**兼容** §D.5 的纯数字形态（读作 `{pid: null}`，不做过期判定）——CLI 与面板可能先于
+   本实现存在。
+4. **可测的边界**：`http.test.ts` 断言「pid 已死的端口文件读作缺失」「close 删除自己的记录」
+   「占用的端口 +1」「+20 全占满后落临时端口」——都是上表结论的回归面，不含 sleep。
+
+复现方式（本票脚本未入库，等价代码）：起 `createServer` → `listen(0,'127.0.0.1')` → 记端口 →
+`closeAllConnections(); close()` → 立刻在**同一端口**再 `listen`，`hrtime` 记耗时取分位；
+跨进程用 `spawn(node, ['-e', …])` 让子进程绑定并退出后由父进程重绑。

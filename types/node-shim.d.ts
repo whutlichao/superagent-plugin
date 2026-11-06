@@ -4,9 +4,10 @@
 //
 // 当前用到：`node:fs`（store/lock/migration 与 tests/support/repo.ts）、`node:path`、
 // `node:os`（临时状态目录）、`node:sqlite`（§D.2 的唯一真源）、`node:crypto` 的
-// createHash（`core/ids.ts`，§C.2 规则 1 允许的唯一内置模块）、`node:test` /
-// `node:assert/strict`（纯领域测试不 import `orca/testing`，§P.6）、`import.meta.dirname`、
-// `process.env|pid` 与 `AbortSignal`（运行缝签名）。
+// createHash（`core/ids.ts`，§C.2 规则 1 允许的唯一内置模块）与 randomBytes/timingSafeEqual
+// （`infra/tokens.ts` 的 token 签发与常数时间比较）、`node:http`（§G.3 的 loopback API）、
+// `node:test` / `node:assert/strict`（纯领域测试不 import `orca/testing`，§P.6）、
+// `import.meta.dirname`、`process.env|pid|hrtime` 与 `AbortSignal`（运行缝签名）。
 
 /** `node:path` 的 `join` / `dirname` / `resolve`，只声明本仓库用到的签名。 */
 declare module 'node:path' {
@@ -25,11 +26,12 @@ declare module 'node:fs' {
   export interface Stats {
     readonly size: number
     readonly mtimeMs: number
+    readonly mode: number
     isFile(): boolean
     isDirectory(): boolean
   }
   export function readFileSync(path: string, encoding: 'utf8'): string
-  export function writeFileSync(path: string, data: string, encoding: 'utf8'): void
+  export function writeFileSync(path: string, data: string, encoding?: 'utf8'): void
   export function appendFileSync(path: string, data: string, encoding: 'utf8'): void
   export function readdirSync(
     path: string,
@@ -64,6 +66,107 @@ declare module 'node:crypto' {
     digest(encoding: 'hex'): string
   }
   export function createHash(algorithm: 'sha256'): Hash
+  /** 32 字节随机数（token 的熵源，§D.6）。 */
+  export function randomBytes(size: number): { toString(encoding: 'base64url'): string }
+  /** 常数时间比较：token 校验不做早退（§O 鉴权）。 */
+  export function timingSafeEqual(a: Uint8Array, b: Uint8Array): boolean
+}
+
+/** `node:http` 的 loopback 服务端子集（§G.3）。只声明本仓库用到的成员：
+ *  `createServer` 的处理器、`listen`/`close`/`closeAllConnections`/`address`，
+ *  以及测试用的客户端 `request`。 */
+declare module 'node:http' {
+  /** 请求头（小写键；值是字符串或字符串数组）。 */
+  export interface IncomingHttpHeaders {
+    readonly host?: string
+    readonly origin?: string
+    readonly authorization?: string
+    readonly cookie?: string
+    readonly 'content-type'?: string
+    readonly 'content-length'?: string
+    readonly 'retry-after'?: string
+    readonly 'x-superagent-request'?: string
+    readonly [name: string]: string | readonly string[] | undefined
+  }
+
+  export interface IncomingMessage {
+    readonly method?: string
+    readonly url?: string
+    readonly headers: IncomingHttpHeaders
+    setEncoding(encoding: 'utf8'): void
+    /** 排空剩余数据（拒绝大 body 时用，避免对端 EPIPE）。 */
+    resume(): void
+    on(event: 'data', listener: (chunk: string) => void): void
+    on(event: 'end', listener: () => void): void
+    on(event: 'error', listener: (error: Error) => void): void
+  }
+
+  export interface ServerResponse {
+    readonly statusCode: number
+    writeHead(status: number, headers?: Readonly<Record<string, string>>): void
+    end(chunk?: string): void
+  }
+
+  /** 监听地址（`address()` 的返回；Unix socket 不在本仓库的用法里）。 */
+  export interface AddressInfo {
+    readonly address: string
+    readonly family: string
+    readonly port: number
+  }
+
+  export interface Server {
+    listen(port: number, host: string, callback?: () => void): void
+    close(callback?: () => void): void
+    closeAllConnections(): void
+    address(): AddressInfo | string | null
+    on(event: 'error', listener: (error: Error) => void): void
+    once(event: 'error', listener: (error: Error) => void): void
+    once(event: 'listening', listener: () => void): void
+    removeListener(event: 'error', listener: (error: Error) => void): void
+    removeListener(event: 'listening', listener: () => void): void
+    unref(): void
+  }
+
+  export type RequestListener = (request: IncomingMessage, response: ServerResponse) => void
+
+  export function createServer(listener: RequestListener): Server
+
+  /** 测试客户端的响应：状态码 + 头 + 正文分块。 */
+  export interface ClientResponse {
+    readonly statusCode?: number
+    readonly statusMessage?: string
+    readonly headers: IncomingHttpHeaders
+    setEncoding(encoding: 'utf8'): void
+    on(event: 'data', listener: (chunk: string) => void): void
+    on(event: 'end', listener: () => void): void
+    on(event: 'error', listener: (error: Error) => void): void
+  }
+
+  /** 测试客户端：只有它能发送任意的 `Host`（`fetch` 会覆写成目标地址）。 */
+  export interface ClientRequest {
+    on(event: 'error', listener: (error: Error) => void): void
+    end(chunk?: string): void
+  }
+
+  export function request(
+    options: {
+      readonly host: string
+      readonly port: number
+      readonly path: string
+      readonly method: string
+      readonly headers?: Readonly<Record<string, string>>
+    },
+    callback: (response: ClientResponse) => void
+  ): ClientRequest
+}
+
+/** `node:net`：端口探测（S6 的重复绑定与占用判定）。 */
+declare module 'node:net' {
+  export interface Socket {
+    destroy(): void
+    on(event: 'error', listener: (error: Error) => void): void
+  }
+  export function connect(options: { readonly host: string; readonly port: number }, callback?: () => void): Socket
 }
 
 /**
@@ -145,11 +248,14 @@ interface ImportMeta {
   readonly url: string
 }
 
-/** 进程面：本仓库只读环境变量与 pid（§D.5 的 stateDir 解析、锁文件内容）。 */
+/** 进程面：本仓库只读环境变量与 pid（§D.5 的 stateDir 解析、锁文件内容），
+ *  `kill(pid, 0)` 做存活探测（§N.1 / S6 的端口文件校验），`hrtime` 量请求耗时。 */
 declare const process: {
   readonly env: Record<string, string | undefined>
   readonly pid: number
   readonly platform: string
+  kill(pid: number, signal: 0): true
+  hrtime: { bigint(): bigint }
 }
 
 /** 定时器：心跳（§N.1 每 5 s 触碰锁）与保留策略的节流用。 */

@@ -17,6 +17,8 @@ export const KV_KEY_LITERALS = {
   routerWorkspace: 'router-workspace',
   routerToken: 'router-token',
   routerRestarts: 'router-restarts',
+  tokenHashPrefix: 'token-hash:',
+  requestIdPrefix: 'request-id:',
   githubCursorPrefix: 'github-cursor:',
   githubCiPrefix: 'github-ci:',
   feishuCursorPrefix: 'feishu-cursor:',
@@ -49,6 +51,18 @@ export const ROUTER_TERMINAL_KEY = KV_KEY_LITERALS.routerTerminal
 export const ROUTER_WORKSPACE_KEY = KV_KEY_LITERALS.routerWorkspace
 export const ROUTER_TOKEN_KEY = KV_KEY_LITERALS.routerToken
 export const ROUTER_RESTARTS_KEY = KV_KEY_LITERALS.routerRestarts
+
+/**
+ * token 与幂等的族（本票新增，§D.6、§G.1 幂等行）：
+ * - `token-hash:<sha256(token)>` → `{role, ticketId?, assignmentId?, expiresAt}`：库里只存哈希；
+ * - `request-id:<tokenHash>:<requestId>` → 首次结果：同 id 一小时内重试返回首次结果。
+ */
+export const tokenHashKey = (hash: string): string => `${KV_KEY_LITERALS.tokenHashPrefix}${hash}`
+export const requestIdKey = (tokenHash: string, requestId: string): string =>
+  `${KV_KEY_LITERALS.requestIdPrefix}${tokenHash}:${requestId}`
+
+/** 幂等族的前缀（保留策略与键扫描用；字面量同样只活在这里）。 */
+export const REQUEST_ID_PREFIX = KV_KEY_LITERALS.requestIdPrefix
 
 /** Source 状态族（§D.3「Source 状态」行）。 */
 export const githubCursorKey = (notificationId: string): string =>

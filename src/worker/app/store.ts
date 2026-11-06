@@ -12,9 +12,11 @@ import type { LogLine, LogSink } from '../infra/log-line'
 import { migrate, readSchemaVersion } from './migration'
 import { SCHEMA_VERSION } from './schema'
 import {
+  readAssignmentCounts,
   readTimeline,
   readWorkingSet,
   workingSetPlan,
+  type AssignmentCounts,
   type TimelineOptions,
   type WorkingSetName
 } from './store-read'
@@ -171,6 +173,11 @@ export interface Store {
   transaction<T>(work: () => T): T
   /** 工作集：pass 只扫这四组活行。 */
   workingSet(): WorkingSet
+  /**
+   * Executor 负载的计数（§E.6）：未结束 Ticket 里最新 Assignment 是 running 与 pending
+   * 的数量。`GET state` 的 `load` 用它，口径与领域侧 `latestAssignment()` 一致。
+   */
+  assignmentCounts(): AssignmentCounts
   /** 工作集查询的 `EXPLAIN QUERY PLAN` detail 行（断言只走部分索引）。 */
   workingSetPlan(): Readonly<Record<WorkingSetName, readonly string[]>>
   /**
@@ -281,6 +288,9 @@ export function openStore(options: StoreOptions): Store {
     },
     workingSet(): WorkingSet {
       return readWorkingSet(sql.reader)
+    },
+    assignmentCounts(): AssignmentCounts {
+      return readAssignmentCounts(sql.reader)
     },
     workingSetPlan() {
       return workingSetPlan(sql.reader)
