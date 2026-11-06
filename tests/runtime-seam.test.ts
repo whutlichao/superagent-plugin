@@ -82,26 +82,30 @@ test('the scanners actually catch the shapes they forbid', () => {
   assert.deepEqual(findViolations(" * from 'orca' is forbidden here", ORCA_BARE_IMPORT_PATTERN), [])
 })
 
-test('the seam directory stays interface-only in this ticket', () => {
-  // §B: 本票只建立接口与错误类型；实现（host-runtime/cli/fake-runtime）由后续票补齐。
-  // `worker-api.ts` 是同一目录下的纯类型再导出（不含实现、不 host.call、不 spawn），
-  // 让 `src/worker/main.ts` 只从 runtime 拿 `OrcaWorkerApi`。
-  const runtimeFiles = listFiles('src/worker/runtime', '.ts').map((file) =>
-    file.slice(file.lastIndexOf('/') + 1)
-  )
-  assert.deepEqual(runtimeFiles, ['host-methods.ts', 'orca-runtime.ts', 'worker-api.ts'])
+test('the seam stays interface-only in this ticket', () => {
+  // §B / 票面：本票只建立接口与错误类型，不实现 HostOrcaRuntime；实现由后续票补齐。
+  // 断言「还没有任何 OrcaRuntime 实现」，而不是枚举文件名——后续票新增实现时，这条
+  // 会连同它的说明一起被有意改掉，而不是无声漂移。
+  const implementations = listFiles('src/worker/runtime', '.ts')
+    .map((file) => ({ file, source: readRepoFile(file) }))
+    .filter(({ source }) => /implements\s+OrcaRuntime\b/.test(source))
+    .map(({ file }) => file)
+  assert.deepEqual(implementations, [], 'this ticket ships the seam interface only')
+})
 
+test('worker-api.ts is a pure type re-export the entry may import', () => {
+  // coordinator 裁决 2026-11-07：该文件不含实现、不 host.call、不 spawn；
+  // `src/worker/main.ts` 只从它拿类型，runtime 仍是唯一 Orca 接触点。
   const workerApi = readRepoFile('src/worker/runtime/worker-api.ts')
   assert.equal(/\bhost\s*\.\s*call\s*\(/.test(workerApi), false, 'no host.call in worker-api.ts')
   assert.equal(/\bspawn\s*\(/.test(workerApi), false, 'no spawn in worker-api.ts')
-  // 纯类型：每一行导出都是 `export type { … }` 形式。
-  const nonCommentLines = workerApi
-    .split('\n')
-    .filter((line) => !/^\s*(?:\/\/|$)/.test(line))
-  for (const line of nonCommentLines) {
-    assert.ok(
-      /^(?:export type \{|  [A-Za-z]|  [A-Za-z]+,|  [A-Za-z]+$|\} from)/.test(line),
-      `worker-api.ts stays type-only: ${line}`
-    )
-  }
+  assert.equal(/^\s*(?:export\s+)?(?:function|const|class)\s/m.test(workerApi), false, 'no values')
+
+  const main = readRepoFile('src/worker/main.ts')
+  assert.ok(main.includes("from './runtime/worker-api'"), 'the entry imports the seam re-export')
+  assert.equal(
+    /from\s*['"]orca(?:\/[a-z-]+)?['"]/.test(main),
+    false,
+    'the entry never imports orca directly'
+  )
 })
