@@ -224,3 +224,51 @@ test('a migrated old database still reads through the store', () => {
     reopened.close()
   }
 })
+
+test('each step commits on its own: a later failing step leaves the earlier level applied', () => {
+  const stateDir = tempStateDir()
+  const db = new DatabaseSync(join(stateDir, 'superagent.sqlite'))
+  try {
+    const steps: readonly MigrationStep[] = [
+      {
+        from: 0,
+        to: 1,
+        run(target): void {
+          target.exec('CREATE TABLE level_one (id TEXT PRIMARY KEY)')
+        }
+      },
+      {
+        from: 1,
+        to: 2,
+        run(target): void {
+          target.exec('CREATE TABLE level_two (id TEXT PRIMARY KEY)')
+          throw new Error('second level fails')
+        }
+      }
+    ]
+    let caught: unknown
+    try {
+      migrate(db, {
+        databasePath: join(stateDir, 'superagent.sqlite'),
+        backupDir: join(stateDir, 'backups'),
+        keepBackups: 5,
+        targetVersion: 2,
+        steps,
+        now: () => new Date(AT)
+      })
+    } catch (error) {
+      caught = error
+    }
+    assert.ok(caught instanceof MigrationError)
+    assert.equal(caught.code, 'migration_failed')
+    // 第一级已经提交（版本停在 1），第二级整级回滚（没有 level_two）。
+    assert.equal(readSchemaVersion(db), 1, 'the committed level is the one before the failure')
+    const tables = (db.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all() as {
+      name: string
+    }[]).map((row) => row.name)
+    assert.ok(tables.includes('level_one'), 'level one committed')
+    assert.equal(tables.includes('level_two'), false, 'the failing level rolled back as a unit')
+  } finally {
+    db.close()
+  }
+})
