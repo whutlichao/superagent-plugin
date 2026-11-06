@@ -40,6 +40,40 @@ export const WORKING_SET_INDEX: Readonly<Record<WorkingSetName, string>> = {
   pendingOutbox: 'outbox_waiting'
 }
 
+/**
+ * Executor 负载的计数口径（§E.6、§M.2 的 Overview「Executor load」）：
+ * `running` = 未结束 Ticket 里**最新** Assignment 状态为 `running` 的数量；
+ * `queued`   = 未结束 Ticket 里还没有 Assignment、或最新一个仍是 `pending` 的数量。
+ *
+ * 「最新」取 `ticket.body.assignments` 的最后一项（SQLite 的 `[#-1]` JSON 路径），
+ * 与领域侧 `latestAssignment()`（`core/model.ts`）同义。生成列 `open = 1` 走
+ * `ticket_open` 部分索引，不扫已结束的 Ticket。
+ */
+export const ASSIGNMENT_COUNT_SQL =
+  `SELECT COALESCE(json_extract(body, '$.assignments[#-1].state'), '') AS last, COUNT(*) AS n
+     FROM ticket
+    WHERE open = 1
+    GROUP BY last`
+
+/** 一份负载计数（未结束 Ticket 的最新 Assignment 状态汇总）。 */
+export interface AssignmentCounts {
+  readonly running: number
+  readonly queued: number
+}
+
+/** 读出负载计数。 */
+export function readAssignmentCounts(reader: SqlReader): AssignmentCounts {
+  let running = 0
+  let queued = 0
+  for (const row of reader.all(ASSIGNMENT_COUNT_SQL)) {
+    const last = String(field(row, 'last'))
+    const count = Number(field(row, 'n'))
+    if (last === 'running') running += count
+    else if (last === '' || last === 'pending') queued += count
+  }
+  return { running, queued }
+}
+
 /** 读取全部工作集；每个查询只返回活行。 */
 export function readWorkingSet(reader: SqlReader): WorkingSet {
   return {
