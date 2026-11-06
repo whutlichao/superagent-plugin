@@ -9,11 +9,44 @@
 // `node:test` / `node:assert/strict`（纯领域测试不 import `orca/testing`，§P.6）、
 // `import.meta.dirname`、`process.env|pid|hrtime` 与 `AbortSignal`（运行缝签名）。
 
-/** `node:path` 的 `join` / `dirname` / `resolve`，只声明本仓库用到的签名。 */
+/** `node:path` 的 `join` / `dirname` / `resolve` / `basename` / `isAbsolute`，只声明本仓库用到的签名。 */
 declare module 'node:path' {
   export function join(...parts: string[]): string
   export function dirname(path: string): string
   export function resolve(...parts: string[]): string
+  export function basename(path: string): string
+  export function isAbsolute(path: string): boolean
+}
+
+/**
+ * `node:child_process` 的 `execFile`：`sources/commands.ts` 是唯一允许起子进程的地方（§I.4）。
+ * 只声明本仓库用到的成员：参数是 argv 数组、选项里有 `shell`（本仓库永远传 `false`）。
+ */
+declare module 'node:child_process' {
+  export interface ExecFileOptions {
+    cwd?: string
+    env?: Record<string, string | undefined>
+    signal?: AbortSignal
+    timeout?: number
+    maxBuffer?: number
+    encoding?: 'utf8'
+    /** 本仓库永远传 `false`：argv 数组直达 exec，不经 shell（§O 命令注入）。 */
+    shell?: boolean
+  }
+  /** `execFile` 的失败形态：退出码/信号/是否被杀，以及标准错误（可能含 CLI 的诊断文本）。 */
+  export interface ExecFileError extends Error {
+    code?: number | string
+    killed?: boolean
+    signal?: string | null
+    stderr?: string
+    stdout?: string
+  }
+  export function execFile(
+    file: string,
+    args: readonly string[],
+    options: ExecFileOptions,
+    callback: (error: ExecFileError | null, stdout: string, stderr: string) => void
+  ): unknown
 }
 
 /** `node:fs` 的同步子集（避免测试里出现异步竞态）。 */
@@ -282,9 +315,21 @@ interface TimerHandle {
   unref(): void
 }
 
-/** 取消信号：运行缝的接口参数用它，具体实现由后续票提供。 */
+/** 取消信号：运行缝的接口参数与命令端口用它（§I.4 的「可取消」）。 */
 interface AbortSignal {
   readonly aborted: boolean
-  addEventListener(type: 'abort', listener: () => void): void
+  /** 监听取消；`{ once: true }` 让监听在触发后自行移除（`mergeSignals` 用）。 */
+  addEventListener(type: 'abort', listener: () => void, options?: { readonly once?: boolean }): void
   removeEventListener(type: 'abort', listener: () => void): void
 }
+
+/**
+ * 取消的发起端：命令端口与评估窗口用它造信号，测试用它模拟「窗口取消」。
+ */
+declare class AbortController {
+  readonly signal: AbortSignal
+  abort(): void
+}
+
+
+
