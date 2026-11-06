@@ -71,7 +71,7 @@ test('the item keeps the manifest id', () => {
 /** 一台假时钟 + 假定时器：手动推进，不 sleep。 */
 function fakeTimers(): {
   readonly now: () => number
-  readonly schedule: (fn: () => void, ms: number) => unknown
+  readonly schedule: (fn: () => void, ms: number) => { readonly id: number }
   readonly cancel: (handle: unknown) => void
   readonly advance: (ms: number) => void
   readonly pending: () => number
@@ -84,10 +84,10 @@ function fakeTimers(): {
     schedule: (fn, ms) => {
       next += 1
       timers.set(next, { at: clock + ms, fn })
-      return next
+      return { id: next }
     },
     cancel: (handle) => {
-      timers.delete(handle as number)
+      timers.delete((handle as { readonly id: number }).id)
     },
     advance: (ms) => {
       clock += ms

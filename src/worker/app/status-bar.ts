@@ -36,6 +36,9 @@ export function statusBarView(state: PanelState): StatusBarView {
   return { text: 'Superagent', tone: 'success', tooltip }
 }
 
+/** 注入的定时器句柄：测试给数字，生产给 Node 的 `Timeout`；发布器只负责原样交回 `cancel`。 */
+export type TimerHandleLike = unknown
+
 /** 状态栏更新：节流器与发送端都是注入的。 */
 export interface StatusBarPublisher {
   /** 交给它一份新取值；它在允许的时机（且值确实变了）调用 `send`。 */
@@ -48,8 +51,9 @@ export interface StatusBarPublisher {
 export interface StatusBarPublisherOptions {
   readonly send: (update: StatusBarUpdate) => void
   readonly now: () => number
-  readonly schedule: (run: () => void, milliseconds: number) => unknown
-  readonly cancel: (handle: unknown) => void
+  readonly schedule: (run: () => void, milliseconds: number) => TimerHandleLike
+  /** 句柄原样交回；发布器不解释它，因此注入方可以给任意形状。 */
+  readonly cancel: (handle: TimerHandleLike) => void
   /** 两次发送之间的最小间隔；缺省 2 s（§N.7）。 */
   readonly intervalMs?: number
 }
@@ -68,7 +72,7 @@ export function createStatusBarPublisher(options: StatusBarPublisherOptions): St
   let lastSent: StatusBarView | undefined
   let lastSentAt = Number.NEGATIVE_INFINITY
   let pending: StatusBarView | undefined
-  let timer: unknown = null
+  let timer: TimerHandleLike | null = null
 
   const flush = (): void => {
     timer = null

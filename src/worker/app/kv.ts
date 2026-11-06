@@ -1,0 +1,72 @@
+// KV 键的单一命名处（§D.3）。**键字面量只允许出现在本文件与 `migration.ts`**，
+// 由 `tests/store.test.ts` 的源码扫描守住（§D.2 要点 3「上线约束」）。
+//
+// 结构：`KV_KEY_LITERALS` 是字面量的唯一列表（精确键与族前缀都在这里写一次），
+// 下面的常量与构造函数全部由它派生。扫描测试读 `KV_KEY_LITERALS`，因此新增键只改一处。
+
+/** 键字面量（精确键与族前缀）。前缀以 `:` 结尾，构造函数在其后接参数。 */
+export const KV_KEY_LITERALS = {
+  schemaVersion: 'schema-version',
+  settingsRevision: 'settings-revision',
+  settingsVersionPrefix: 'settings-version:',
+  settingsBlockRevisionPrefix: 'settings-block-revision:',
+  promptRevision: 'prompt-revision',
+  promptBuiltinBase: 'prompt-builtin-base',
+  promptVersionPrefix: 'prompt-version:',
+  routerTerminal: 'router-terminal',
+  routerWorkspace: 'router-workspace',
+  routerToken: 'router-token',
+  routerRestarts: 'router-restarts',
+  githubCursorPrefix: 'github-cursor:',
+  githubCiPrefix: 'github-ci:',
+  feishuCursorPrefix: 'feishu-cursor:',
+  threadSeenPrefix: 'thread-seen:',
+  sourceLabelsPrefix: 'source-labels:',
+  lockPid: 'lock-pid',
+  lastPrune: 'last-prune',
+  apiPort: 'api-port',
+  backupIndex: 'backup-index'
+} as const
+
+/** schema 版本（唯一版本源，§D.2 要点 3）。 */
+export const SCHEMA_VERSION_KEY = KV_KEY_LITERALS.schemaVersion
+
+/** 设置版本族（§D.3「设置版本」行）。 */
+export const SETTINGS_REVISION_KEY = KV_KEY_LITERALS.settingsRevision
+export const settingsVersionKey = (revision: number): string =>
+  `${KV_KEY_LITERALS.settingsVersionPrefix}${revision}`
+export const settingsBlockRevisionKey = (block: string): string =>
+  `${KV_KEY_LITERALS.settingsBlockRevisionPrefix}${block}`
+
+/** Prompt 版本族（§D.3「Prompt 版本」行、§L.4）。 */
+export const PROMPT_REVISION_KEY = KV_KEY_LITERALS.promptRevision
+export const PROMPT_BUILTIN_BASE_KEY = KV_KEY_LITERALS.promptBuiltinBase
+export const promptVersionKey = (revision: number): string =>
+  `${KV_KEY_LITERALS.promptVersionPrefix}${revision}`
+
+/** Router 快照族（§D.3「Router」行、§D.4 写者表）。 */
+export const ROUTER_TERMINAL_KEY = KV_KEY_LITERALS.routerTerminal
+export const ROUTER_WORKSPACE_KEY = KV_KEY_LITERALS.routerWorkspace
+export const ROUTER_TOKEN_KEY = KV_KEY_LITERALS.routerToken
+export const ROUTER_RESTARTS_KEY = KV_KEY_LITERALS.routerRestarts
+
+/** Source 状态族（§D.3「Source 状态」行）。 */
+export const githubCursorKey = (notificationId: string): string =>
+  `${KV_KEY_LITERALS.githubCursorPrefix}${notificationId}`
+export const githubCiKey = (pull: string, headSha: string): string =>
+  `${KV_KEY_LITERALS.githubCiPrefix}${pull}#${headSha}`
+export const feishuCursorKey = (chat: string): string => `${KV_KEY_LITERALS.feishuCursorPrefix}${chat}`
+export const threadSeenKey = (threadKey: string): string => `${KV_KEY_LITERALS.threadSeenPrefix}${threadKey}`
+export const sourceLabelsKey = (kind: string): string => `${KV_KEY_LITERALS.sourceLabelsPrefix}${kind}`
+
+/** 维护族（§D.3「维护」行）。 */
+export const LOCK_PID_KEY = KV_KEY_LITERALS.lockPid
+export const LAST_PRUNE_KEY = KV_KEY_LITERALS.lastPrune
+export const API_PORT_KEY = KV_KEY_LITERALS.apiPort
+export const BACKUP_INDEX_KEY = KV_KEY_LITERALS.backupIndex
+
+/** 保留策略要扫的两个版本族（§D.2 要点 5：删「非当前」的旧快照）。 */
+export const VERSION_SNAPSHOT_PREFIXES = {
+  settings: KV_KEY_LITERALS.settingsVersionPrefix,
+  prompt: KV_KEY_LITERALS.promptVersionPrefix
+} as const

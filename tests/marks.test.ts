@@ -55,7 +55,6 @@ const marks: readonly Mark[] = [
   sourceMark('off'),
   sourceMark('missing'),
   decisionMark('accept'),
-  decisionMark('reopen'),
   decisionMark('stop'),
   decisionMark('ignore'),
   decisionMark('unavailable'),
@@ -84,20 +83,22 @@ test('a Ticket waits for the person who must act, or reports how it ended', () =
     [
       ['stage.answer', 'warning', 'info'],
       ['stage.review', 'warning', 'check'],
-      ['stage.blocked', 'warning', 'warning'],
-      ['stage.failed', 'danger', 'error'],
+      ['stage.blockedFailed', 'warning', 'warning'],
+      ['stage.blockedFailed', 'danger', 'error'],
       ['stage.delivery', 'warning', 'download'],
       ['stage.queued', 'neutral', 'layers'],
       ['stage.working', 'accent', 'play'],
       ['stage.idle', 'neutral', 'bell'],
-      ['stage.ended', 'neutral', 'stop']
+      ['outcome.completed', 'neutral', 'stop']
     ]
   )
 })
 
-test('an ended Ticket carries the outcome in its label, not just "ended"', () => {
-  assert.equal(ticketMark({ stage: 'ended', outcome: 'merged' }).labelKey, 'stage.ended')
+test('an ended Ticket says how it ended, not just "ended"', () => {
+  assert.equal(ticketMark({ stage: 'ended', outcome: 'merged' }).labelKey, 'outcome.merged')
   assert.equal(ticketMark({ stage: 'ended', outcome: 'merged' }).detail, 'merged')
+  // 没有结局的已结束工单退回「无需处理」，而不是印一个空标签。
+  assert.equal(ticketMark({ stage: 'ended' }).labelKey, 'report.dropped')
 })
 
 test('a Thread names the stage the person sees, and a queued one counts what waits', () => {
@@ -139,17 +140,16 @@ test('a Source state reads as what the person can do about it', () => {
 
 test('a Decision mark tells accept from stop, and an observe-only acceptance apart', () => {
   assert.deepEqual(
-    (['accept', 'reopen', 'stop', 'ignore', 'unavailable', 'wouldAccept'] as const).map((kind) => {
+    (['accept', 'stop', 'ignore', 'unavailable', 'wouldAccept'] as const).map((kind) => {
       const mark = decisionMark(kind)
       return [mark.labelKey, mark.tone, mark.icon]
     }),
     [
-      ['kind.accept', 'success', 'check'],
-      ['kind.reopen', 'success', 'refresh'],
-      ['kind.stop', 'danger', 'stop'],
-      ['kind.ignore', 'neutral', 'close'],
-      ['kind.unavailable', 'warning', 'warning'],
-      ['kind.wouldAccept', 'warning', 'close']
+      ['decision.accept', 'success', 'check'],
+      ['decision.stop', 'danger', 'stop'],
+      ['decision.ignore', 'neutral', 'close'],
+      ['decision.unavailable', 'warning', 'warning'],
+      ['decision.ignore', 'warning', 'close']
     ]
   )
 })
@@ -188,5 +188,5 @@ test('every mark label exists in both languages', () => {
 test('labels render in the active locale through the one copy table', () => {
   assert.equal(markLabel('zh-CN', ticketMark({ stage: 'person', action: 'answer' })), '待回答')
   assert.equal(markLabel('en', ticketMark({ stage: 'person', action: 'answer' })), 'Awaiting answer')
-  assert.equal(translate('en', 'stage.ended'), 'Ended')
+  assert.equal(translate('en', 'outcome.merged'), 'Pull request merged')
 })

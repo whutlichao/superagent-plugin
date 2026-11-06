@@ -42,8 +42,8 @@ export default function activate(orca: OrcaWorkerApi): void {
     send: (update) => host.setStatusBar(update),
     // worker 侧可以读时钟：它是常驻进程，且状态栏的节流本来就以真实时间为准。
     now: () => Date.now(),
-    schedule: (run, milliseconds) => setTimeout(run, milliseconds),
-    cancel: (handle) => clearTimeout(handle)
+    schedule: (run, milliseconds) => Number(setTimeout(run, milliseconds)),
+    cancel: (handle) => clearTimeout(Number(handle))
   })
 
   // 每次状态变化：推给面板（带单调修订号），并把新值交给节流的状态栏。

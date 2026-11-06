@@ -51,8 +51,8 @@ export type ThreadStage =
 /** Source 实例的状态。 */
 export type SourceState = 'ready' | 'starting' | 'paused' | 'error' | 'setup' | 'off' | 'missing'
 
-/** Decision 的类型（含 observe 模式下「本可接单」的忽略）。 */
-export type DecisionKind = 'accept' | 'reopen' | 'stop' | 'ignore' | 'unavailable' | 'wouldAccept'
+/** Decision 的类型（`core/model.ts` 的 `DECISION_KINDS`，外加 observe 模式下「本可接单」的忽略）。 */
+export type DecisionKind = 'accept' | 'stop' | 'ignore' | 'unavailable' | 'wouldAccept'
 
 /** Report 的状态。 */
 export type ReportState = 'progress' | 'waiting' | 'ready' | 'blocked' | 'failed' | 'dropped'
@@ -64,16 +64,21 @@ export function ticketMark(ticket: {
   readonly outcome?: TicketOutcome
 }): Mark {
   if (ticket.stage === 'ended') {
-    return { labelKey: 'stage.ended', tone: 'neutral', icon: 'stop', ...(ticket.outcome ? { detail: ticket.outcome } : {}) }
+    return {
+      labelKey: ticket.outcome ? (`outcome.${ticket.outcome}` as CopyKey) : 'report.dropped',
+      tone: 'neutral',
+      icon: 'stop',
+      ...(ticket.outcome ? { detail: ticket.outcome } : {})
+    }
   }
   if (ticket.stage === 'person') {
     switch (ticket.action) {
       case 'review':
         return { labelKey: 'stage.review', tone: 'warning', icon: 'check' }
       case 'blocked':
-        return { labelKey: 'stage.blocked', tone: 'warning', icon: 'warning' }
+        return { labelKey: 'stage.blockedFailed', tone: 'warning', icon: 'warning' }
       case 'failed':
-        return { labelKey: 'stage.failed', tone: 'danger', icon: 'error' }
+        return { labelKey: 'stage.blockedFailed', tone: 'danger', icon: 'error' }
       case 'delivery':
         return { labelKey: 'stage.delivery', tone: 'warning', icon: 'download' }
       default:
@@ -130,17 +135,16 @@ export function sourceMark(state: SourceState): Mark {
 export function decisionMark(kind: DecisionKind): Mark {
   switch (kind) {
     case 'accept':
-      return { labelKey: 'kind.accept', tone: 'success', icon: 'check' }
-    case 'reopen':
-      return { labelKey: 'kind.reopen', tone: 'success', icon: 'refresh' }
+      return { labelKey: 'decision.accept', tone: 'success', icon: 'check' }
     case 'stop':
-      return { labelKey: 'kind.stop', tone: 'danger', icon: 'stop' }
+      return { labelKey: 'decision.stop', tone: 'danger', icon: 'stop' }
     case 'unavailable':
-      return { labelKey: 'kind.unavailable', tone: 'warning', icon: 'warning' }
+      return { labelKey: 'decision.unavailable', tone: 'warning', icon: 'warning' }
     case 'wouldAccept':
-      return { labelKey: 'kind.wouldAccept', tone: 'warning', icon: 'close' }
+      // observe 模式下的「本可接单」没有独立码；它按忽略措辞，语气提醒。
+      return { labelKey: 'decision.ignore', tone: 'warning', icon: 'close', detail: 'wouldAccept' }
     default:
-      return { labelKey: 'kind.ignore', tone: 'neutral', icon: 'close' }
+      return { labelKey: 'decision.ignore', tone: 'neutral', icon: 'close' }
   }
 }
 

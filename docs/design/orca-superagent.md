@@ -1953,3 +1953,43 @@ manifest + types + tsconfig + boot + lock + sqlite(trigger/thread/ticket/decisio
 | S8 | `orca.storage` 的容量与写入频率（状态栏/面板镜像） | §D.5 为什么大库在 SQLite | 若很便宜，也仍保持 SQLite 为唯一真源（设计不变） |
 | S9 | `agents.list` 在 `state: blocked` 时是否总是伴随可见的终端提示 | §E.7 Attention 质量 | 摘要取最后 20 行；若为空则 Attention 里写明「terminal shows no prompt」 |
 
+### S8 实测记录（#5，2026-11-07）
+
+**宿主实现（实测，Orca 1.4.251 的应用包）**：`orca.storage` 每个插件一个 `storage.json` 文件，
+每次 `storage.set` 都**重写整个文件**（`JSON.stringify(read(), null, 2)` 后整文件写入）。
+限制是硬编码在宿主里的：
+
+| 项 | 实测值 | 出处 |
+| --- | --- | --- |
+| 单值上限 | 262 144 字节（256 KiB） | 宿主 `PU.set`：`value exceeds ${He.E} bytes` |
+| 整库上限 | 5 242 880 字节（5 MiB） | 宿主 `PU.set`：`storage exceeds ${He.T} bytes` |
+| 键数量上限 | 1 024 | 宿主 `PU.set`：`storage exceeds the ${He.w}-key limit` |
+| 键名长度 / 保留字 | ≤ 256 字符；`__proto__` / `prototype` / `constructor` 被拒 | `plugin-host-api-storage-schemas.js` |
+| 读损坏文件 | 文件存在但读不出 → 拒绝覆盖（`storage file exists but could not be read`） | 宿主 `bfn` 常量 |
+| 无原子写/无事务 | 是（整文件覆盖，无 journal/WAL） | 同上 |
+
+**写入成本（本机实测，arm64 macOS 27.0.1，Node 25.0.0，`writeFileSync` 整文件重写 60 次取中位数）**：
+
+| 负载 | 文件大小 | 中位耗时 | 95 分位 | 0.5 Hz 下的开销 |
+| --- | --- | --- | --- | --- |
+| 状态栏 + 面板页镜像（真实体量） | 143 B | 0.042 ms | 0.055 ms | 0.02 ms/s |
+| 单值打满 256 KiB | 256 KiB | 0.11 ms | 0.42 ms | 0.2 ms/s |
+| 整库打满 5 MiB | 5 MiB | 2.06 ms | 2.80 ms | 4.1 ms/s |
+
+对照：同一台机器上 SQLite 的 `kv` upsert（92 B）中位 0.003 ms，且不随全库体积增长。
+
+**结论**：
+
+1. **容量足以放镜像，但不足以放真源**：5 MiB 的上限比整个 SQLite 库小两三个数量级；
+   而且每次写都重写全文件，库越大写越慢——这正是 §D.5 把大库留在 SQLite 的理由。
+2. **写入频率按 §N.7 的节流**：状态栏最多每 2 s 一次、值未变不发；面板镜像只在换页时写。
+   以 0.5 Hz 计，镜像写在两种规模下都远低于 5 ms/s，性能不是问题。
+3. **没有事务与原子写**：整文件覆盖意味着并发写与崩溃可能留下半截文件（宿主只会拒绝覆盖
+   读不出的文件，不保证内容一致）。因此**任何需要「先存后做」的状态都不进 `orca.storage`**。
+4. **回落即设计**：即使实测「很便宜」，SQLite 仍是唯一真源，设计不变。`orca.storage` 只放
+   §D.5 允许的两类小镜像：状态栏文本、面板最后停留页。
+
+复现方式（本票实测脚本未入库，命令等价）：
+`node -e 'const{DatabaseSync}=require("node:sqlite")'` 验证 SQLite 侧；
+宿主限制由 `orca plugin inspect` 的 grants 与上表出处逐条核对（`/Applications/Orca.app` 内的
+`app.asar` 中 `PU` 类与 `plugin-host-api-storage-schemas.js`）。

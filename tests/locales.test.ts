@@ -1,7 +1,7 @@
 // 双语文案表（§M.5）：`copy.ts` 是唯一文案表，两种语言的键集合相等且都非空；
 // 领域术语沿用设计里的中文译名，术语表是页头覆盖层的内容（不是第八个导航项）。
 import { assert, test } from 'orca/testing'
-import { COPY, GLOSSARY_GROUPS, TERMS, translate, type CopyKey } from '../src/panel/copy'
+import { COPY, GLOSSARY_GROUPS, GLOSSARY_TERMS, translate, type CopyKey } from '../src/panel/copy'
 import { listFiles, readRepoFile } from './support/repo'
 
 /** 每条文案的两种语言。 */
@@ -47,12 +47,12 @@ test('leaves an unknown placeholder alone rather than printing undefined', () =>
 
 test('the glossary groups cover every domain term once, and each has a meaning', () => {
   const grouped = GLOSSARY_GROUPS.flatMap((group) => group.terms)
-  assert.deepEqual([...grouped].sort(), [...TERMS].sort())
+  assert.deepEqual([...grouped].sort(), [...GLOSSARY_TERMS].sort())
   assert.equal(new Set(grouped).size, grouped.length, 'no term appears in two groups')
   for (const group of GLOSSARY_GROUPS) {
     assert.ok(group.label.trim() !== '', `group ${group.key} has a label key`)
   }
-  const missingMeaning = TERMS.filter((term) => !(`glossary.meaning.${term}` in COPY))
+  const missingMeaning = GLOSSARY_TERMS.filter((term) => !(`glossary.meaning.${term}` in COPY))
   assert.deepEqual(missingMeaning, [])
 })
 
