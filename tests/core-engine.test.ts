@@ -669,7 +669,8 @@ describe('worker reports', () => {
     const h = harness()
     const ticketId = accepted(h).ticketId!
     const blocked = h.engine.report(ticketId, { state: 'blocked', summary: 'need permission' })
-    assert.deepEqual(ticketStage(blocked), { stage: 'person', action: 'blocked' })
+    // §E.8 要求 agentState ∈ {blocked, done}；这里显式给出 agent 已停在提示上这一维。
+    assert.deepEqual(ticketStage(blocked, 'blocked'), { stage: 'person', action: 'blocked' })
     // 人 follow-up 的报告之后到达（时刻必须严格更晚）。
     h.tick(1)
     h.engine.receive(trigger('2', { actor: guest }))
