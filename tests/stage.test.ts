@@ -1,7 +1,8 @@
 // Ticket stage 表逐行（§E.8）：上游七行 + Orca 新增的 agent 状态维度。第一行命中即止。
 //
 // 表的三列来自设计文档 §E.8 的「Orca 条件」与「面板标签」两列；本文件按行断言 stage
-// 与标签，另有一组断言「agent 状态这一维只在它被写进条件的那两行起作用」。
+// 与标签。agent 状态这一维只在它被写进条件的那两行（person/blocked·failed 与 idle）
+// 起作用，且按 §E.8 的集合成员严格判定：`null`/未观察到不满足条件，落到下一行。
 import { describe, test } from 'node:test'
 import assert from 'node:assert/strict'
 import { stageLabel, ticketStage } from '../src/worker/core/index.ts'
@@ -64,11 +65,11 @@ const ended = {
   outcome: 'completed' as const
 }
 
-/** 表的一行：名字、Ticket、可选的 agent 状态、期望的 stage、期望的面板标签。 */
+/** 表的一行：名字、Ticket、可选的 agent 状态（`null` = 尚未观察到）、期望的 stage 与面板标签。 */
 interface Row {
   name: string
   ticket: Ticket
-  agentState?: AgentState
+  agentState?: AgentState | null
   stage: ReturnType<typeof ticketStage>
   label: ReturnType<typeof stageLabel>
 }
@@ -127,18 +128,20 @@ const ROWS: readonly Row[] = [
     stage: { stage: 'person', action: 'review' },
     label: 'review'
   },
-  // --- person / blocked・failed：报告已停且 agent 已停 ---
+  // --- person / blocked・failed：报告已停且 agentState ∈ {blocked, done} ---
   {
-    name: 'a blocked Report',
+    name: 'a blocked Report with a null agent state',
     ticket: ticket({ assignments: [reported('blocked')] }),
-    stage: { stage: 'person', action: 'blocked' },
-    label: 'blockedFailed'
+    agentState: null,
+    stage: { stage: 'working' },
+    label: 'working'
   },
   {
-    name: 'a failed Report',
+    name: 'a failed Report with a null agent state',
     ticket: ticket({ assignments: [reported('failed')] }),
-    stage: { stage: 'person', action: 'failed' },
-    label: 'blockedFailed'
+    agentState: null,
+    stage: { stage: 'working' },
+    label: 'working'
   },
   {
     name: 'a blocked Report while the agent is blocked',
@@ -196,18 +199,20 @@ const ROWS: readonly Row[] = [
     stage: { stage: 'working', action: 'queued' },
     label: 'queued'
   },
-  // --- idle：Report 是 waiting 或 Assignment 已结束，且 agent 空闲 ---
+  // --- idle：Report 是 waiting 或 Assignment 已结束，且 agentState ∈ {waiting, done} ---
   {
-    name: 'a waiting Report',
+    name: 'a waiting Report with a null agent state',
     ticket: ticket({ assignments: [reported('waiting')] }),
-    stage: { stage: 'idle' },
-    label: 'idle'
+    agentState: null,
+    stage: { stage: 'working' },
+    label: 'working'
   },
   {
-    name: 'an ended Assignment',
+    name: 'an ended Assignment with a null agent state',
     ticket: ticket({ assignments: [assignment({ state: 'ended' })] }),
-    stage: { stage: 'idle' },
-    label: 'idle'
+    agentState: null,
+    stage: { stage: 'working' },
+    label: 'working'
   },
   {
     name: 'a waiting Report while the agent waits',
@@ -289,14 +294,14 @@ describe('ticketStage', () => {
     ])
   })
 
-  test('an unknown agent state leaves the report and assignment rows in charge', () => {
-    // 编排侧还没观察到 agent 状态时不做这一维的过滤：否则 blocked 的报告会伪装成「工作中」。
-    assert.deepEqual(ticketStage(ticket({ assignments: [reported('blocked')] }), undefined), {
-      stage: 'person',
-      action: 'blocked'
-    })
-    assert.deepEqual(ticketStage(ticket({ assignments: [reported('waiting')] }), undefined), {
-      stage: 'idle'
-    })
+  test('an unobserved agent state never satisfies either set-membership condition', () => {
+    // §E.8 写的是 `agentState ∈ {…}`：未观察到（省略或 null）不在集合里，那两行都不命中，
+    // 按表落到 working——与 `working` 状态的走法一致。
+    const blocked = ticket({ assignments: [reported('blocked')] })
+    const waiting = ticket({ assignments: [reported('waiting')] })
+    for (const state of [undefined, null] as const) {
+      assert.deepEqual(ticketStage(blocked, state), { stage: 'working' })
+      assert.deepEqual(ticketStage(waiting, state), { stage: 'working' })
+    }
   })
 })

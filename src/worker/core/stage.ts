@@ -30,18 +30,19 @@ export const STAGE_LABELS = [
 export type StageLabel = (typeof STAGE_LABELS)[number]
 
 /**
- * agent 状态是否让「报告已停」的判定成立。没有 agent 状态（编排侧还没观察到，或该
- * Ticket 没有活着的终端）时不做这一维的过滤，按上游的报告与 Assignment 判定——否则
- * worker 报 blocked 却因为还没收到事件而显示「工作中」，那是不诚实的。
+ * agent 状态是否让「报告已停」的判定成立：§E.8 写的是 `agentState ∈ {blocked, done}`，
+ * 是集合成员而不是「未知不过滤」。没有观察到状态（`null`/`undefined`）就不满足条件，
+ * 落到下一行。
  */
-const settledAgent = (state: AgentState | undefined): boolean =>
-  state === undefined || state === 'blocked' || state === 'done'
-/** agent 状态是否让「等待下一轮」的判定成立；同上，未知不做过滤。 */
-const idleAgent = (state: AgentState | undefined): boolean =>
-  state === undefined || state === 'waiting' || state === 'done'
+const settledAgent = (state: AgentState | null | undefined): boolean =>
+  state === 'blocked' || state === 'done'
+/** agent 状态是否让「等待下一轮」的判定成立：§E.8 的 `agentState ∈ {waiting, done}`。 */
+const idleAgent = (state: AgentState | null | undefined): boolean =>
+  state === 'waiting' || state === 'done'
 
 /**
- * 按 §E.8 的表判定 Ticket 的阶段；`agentState` 是 Orca 新加的维度，省略表示未知。
+ * 按 §E.8 的表判定 Ticket 的阶段；`agentState` 是 Orca 新加的维度，`null`/省略表示
+ * 尚未观察到——它不满足任何集合成员条件，因此那两行都不命中，按表继续往下落。
  *
  * | 行 | 条件 | 阶段 |
  * | --- | --- | --- |
@@ -49,12 +50,12 @@ const idleAgent = (state: AgentState | undefined): boolean =>
  * | 2 | Input 投递失败（`delivery` 未清） | person / delivery |
  * | 3 | 有 Attention | person / answer |
  * | 4 | 最近 Report 是 `ready` | person / review |
- * | 5 | 最近 Report 是 `blocked`/`failed`，此后无人消息，且 agent 已停（blocked/done） | person / blocked·failed |
+ * | 5 | 最近 Report 是 `blocked`/`failed`，此后无人消息，且 `agentState ∈ {blocked, done}` | person / blocked·failed |
  * | 6 | 无 Assignment 或 pending | working / queued |
- * | 7 | 最近 Report 是 `waiting` 或 Assignment 已结束，且 agent 空闲（waiting/done） | idle |
+ * | 7 | 最近 Report 是 `waiting` 或 Assignment 已结束，且 `agentState ∈ {waiting, done}` | idle |
  * | 8 | 其余 | working |
  */
-export function ticketStage(ticket: Ticket, agentState?: AgentState): TicketStage {
+export function ticketStage(ticket: Ticket, agentState?: AgentState | null): TicketStage {
   if (ticket.ended) return { stage: 'ended' }
   if (ticket.delivery) return { stage: 'person', action: 'delivery' }
   if (ticket.attention) return { stage: 'person', action: 'answer' }
