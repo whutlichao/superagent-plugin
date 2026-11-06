@@ -21,7 +21,7 @@ Single-context repo (most repos):
 │   ├── 0001-event-sourced-orders.md
 │   └── 0002-postgres-for-write-model.md
 └── src/
-```text
+```
 
 Multi-context repo (presence of `GLOSSARY-MAP.md` at the root):
 
@@ -36,7 +36,7 @@ Multi-context repo (presence of `GLOSSARY-MAP.md` at the root):
     └── billing/
         ├── GLOSSARY.md
         └── docs/adr/
-```text
+```
 
 ## Use the glossary's vocabulary
 
