@@ -1,0 +1,55 @@
+import { assert, test } from 'orca/testing'
+import {
+  isNavPage,
+  NAV_PAGES,
+  PLUGIN_PANEL_EVENTS,
+  PLUGIN_REQUESTS,
+  type AttentionItem,
+  type PanelState
+} from '../src/panel/protocol'
+
+// 面板壳协议测试：契约集中一处，两侧共用，且纯数据层不把 `orca` 的运行时值拖进来。
+
+test('the worker push is the one state.changed event, carrying a monotonic revision', () => {
+  assert.deepEqual([...PLUGIN_PANEL_EVENTS], ['state.changed'])
+})
+
+test('the panel declares the state snapshot and the pause action, nothing more', () => {
+  assert.deepEqual([...PLUGIN_REQUESTS], ['state', 'pause'])
+})
+
+test('the state request returns the shared PanelState shape, not a loose object', () => {
+  const item: AttentionItem = { id: 't1', title: 'Fix it', action: 'review', at: 1 }
+  const state: PanelState = {
+    revision: 1,
+    booted: true,
+    health: {
+      error: false,
+      paused: false,
+      setupMissing: false,
+      activity: { received: 0, evaluated: 0, accepted: 0, ignored: 0, ended: 0 },
+      executor: { running: 0, maxWorkers: 4 }
+    },
+    attention: { answer: 1, review: 0, problems: 0, items: [item] }
+  }
+  assert.equal(state.attention.items[0]?.title, 'Fix it')
+})
+
+test('the seven navigation pages are the design list, in order', () => {
+  assert.deepEqual([...NAV_PAGES], [
+    'overview',
+    'source',
+    'trigger',
+    'eval',
+    'execution',
+    'settings',
+    'search'
+  ])
+})
+
+test('a remembered page is accepted only when it is one of the seven', () => {
+  for (const page of NAV_PAGES) assert.equal(isNavPage(page), true)
+  for (const value of ['glossary', 'policy', '', 7, null, undefined, { page: 'eval' }]) {
+    assert.equal(isNavPage(value), false, String(value))
+  }
+})

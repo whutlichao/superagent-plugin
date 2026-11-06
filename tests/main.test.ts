@@ -47,9 +47,57 @@ test('subscribes every contributed event and the one hook', async () => {
   await worker.deactivate()
 })
 
-test('answers the panel state request with a booting status', async () => {
+test('answers the panel state request with the shell contract snapshot', async () => {
   const worker = await mountWorker(main)
-  assert.deepEqual(await worker.request('superagent.state'), { status: 'booting' })
+  const state = (await worker.request('state')) as {
+    revision: number
+    booted: boolean
+    health: { paused: boolean }
+    attention: { answer: number; review: number; problems: number; items: readonly unknown[] }
+  }
+  assert.equal(state.booted, true)
+  assert.equal(state.revision >= 1, true)
+  assert.equal(state.health.paused, false)
+  assert.deepEqual(state.attention, { answer: 0, review: 0, problems: 0, items: [] })
+  await worker.deactivate()
+})
+
+test('pausing through the panel contract bumps the revision and pushes state.changed', async () => {
+  const worker = await mountWorker(main)
+  const before = (await worker.request('state')) as { revision: number }
+  const paused = (await worker.request('pause', { paused: true })) as {
+    revision: number
+    health: { paused: boolean }
+  }
+  assert.equal(paused.health.paused, true)
+  assert.equal(paused.revision, before.revision + 1, 'the revision is monotonic')
+  assert.deepEqual(worker.posts, [{ event: 'state.changed', payload: { revision: paused.revision } }])
+  await worker.deactivate()
+})
+
+test('the pause command answers a string Orca shows as-is, and moves the same state', async () => {
+  const worker = await mountWorker(main)
+  assert.equal(await worker.command('superagent.pause'), 'Superagent: processing paused.')
+  assert.equal(await worker.command('superagent.resume'), 'Superagent: processing resumed.')
+  const state = (await worker.request('state')) as { revision: number }
+  assert.equal(state.revision, 3, 'pause and resume each moved it once')
+  await worker.deactivate()
+})
+
+test('a malformed pause request is refused with invalid_params, not silently accepted', async () => {
+  const worker = await mountWorker(main)
+  await assert.rejects(worker.request('pause', { paused: 'yes' }), /paused/)
+  await worker.deactivate()
+})
+
+test('updates the status bar item the manifest contributes', async () => {
+  const worker = await mountWorker(main)
+  const calls = worker.host.callsOf('statusBar.update')
+  assert.ok(calls.length >= 1, 'the shell publishes the first status bar value')
+  const first = calls[0] as { id: string; text?: string; tone?: string; tooltip?: string }
+  assert.equal(first.id, 'superagent')
+  assert.equal(first.text, 'Superagent')
+  assert.equal(first.tone, 'success')
   await worker.deactivate()
 })
 

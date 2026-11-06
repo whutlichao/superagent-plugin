@@ -31,6 +31,27 @@ interface ImportMeta {
   readonly url: string
 }
 
+/**
+ * `node:test` 里本仓库唯一用到的成员：`mock.timers`。
+ * 面板测试用它把「2 秒后只重试一次」推进到虚拟时间，绝不真的 sleep（§P.1 第 4 条）。
+ */
+declare module 'node:test' {
+  export const mock: {
+    timers: {
+      enable(options: { apis: readonly ('setTimeout' | 'setInterval' | 'setImmediate' | 'Date')[] }): void
+      tick(milliseconds: number): void
+      reset(): void
+    }
+  }
+}
+
+/**
+ * 定时器：面板的冷启动重试用它（§M.6 的唯一一次 2 s 重试），测试用 `node:test` 的虚拟时钟推进。
+ * 返回值按 Node 的 `Timeout` 处理（`clearTimeout` 接受它）。
+ */
+declare function setTimeout(handler: () => void, milliseconds: number): unknown
+declare function clearTimeout(handle: unknown): void
+
 /** 取消信号：运行缝的接口参数用它，具体实现由后续票提供。 */
 interface AbortSignal {
   readonly aborted: boolean
