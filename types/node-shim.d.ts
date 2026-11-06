@@ -3,7 +3,9 @@
 // `npx tsc -p .`。成员随使用增长时在这里补，不引入 npm 类型包。
 //
 // 当前用到：`node:fs`（store/lock/migration 与 tests/support/repo.ts）、`node:path`、
-// `node:os`（临时状态目录）、`node:sqlite`（§D.2 的唯一真源）、`import.meta.dirname`、
+// `node:os`（临时状态目录）、`node:sqlite`（§D.2 的唯一真源）、`node:crypto` 的
+// createHash（`core/ids.ts`，§C.2 规则 1 允许的唯一内置模块）、`node:test` /
+// `node:assert/strict`（纯领域测试不 import `orca/testing`，§P.6）、`import.meta.dirname`、
 // `process.env|pid` 与 `AbortSignal`（运行缝签名）。
 
 /** `node:path` 的 `join` / `dirname` / `resolve`，只声明本仓库用到的签名。 */
@@ -55,6 +57,15 @@ declare module 'node:os' {
   export function homedir(): string
 }
 
+/** `node:crypto` 的 hash 子集：领域只用它派生稳定 key（§D.1、§C.2 规则 1）。 */
+declare module 'node:crypto' {
+  export interface Hash {
+    update(data: string): Hash
+    digest(encoding: 'hex'): string
+  }
+  export function createHash(algorithm: 'sha256'): Hash
+}
+
 /**
  * `node:sqlite` 的同步 API（§D.2 指定的唯一打开方式）。
  * 只声明本仓库用到的成员；`DatabaseSync` 与 `StatementSync` 的方法签名与 Node 25 一致。
@@ -91,6 +102,40 @@ declare module 'node:sqlite' {
     prepare(sql: string): StatementSync
     location(dbName?: string): string
   }
+}
+
+/**
+ * `node:test` 的最小声明：纯领域测试（不依赖 Orca）用它，见 §P.6 与 §P.2 的 `stage` /
+ * `core-engine` / `memory` 套件。只声明本仓库用到的成员。
+ */
+declare module 'node:test' {
+  export function describe(name: string, fn: () => unknown): void
+  export function test(name: string, fn: () => unknown): void
+  export function beforeEach(fn: () => unknown): void
+  export function afterEach(fn: () => unknown): void
+}
+
+/** `node:assert/strict` 的断言子集，与 `orca/testing` 的 `assert` 同一套方法。 */
+declare module 'node:assert/strict' {
+  interface Assert {
+    (value: unknown, message?: string): asserts value
+    equal(actual: unknown, expected: unknown, message?: string): void
+    notEqual(actual: unknown, expected: unknown, message?: string): void
+    deepEqual(actual: unknown, expected: unknown, message?: string): void
+    notDeepEqual(actual: unknown, expected: unknown, message?: string): void
+    ok(value: unknown, message?: string): asserts value
+    strictEqual(actual: unknown, expected: unknown, message?: string): void
+    throws(fn: () => unknown, expected?: unknown, message?: string): void
+    throws(
+      fn: () => unknown,
+      validate: (error: unknown) => boolean,
+      message?: string
+    ): void
+    rejects(promise: Promise<unknown>, expected?: unknown, message?: string): Promise<void>
+    match(value: string, pattern: RegExp, message?: string): void
+  }
+  const assert: Assert
+  export default assert
 }
 
 /** ESM 元信息：`orca plugin test` 以系统 Node 执行，`dirname`/`filename` 可用。 */
