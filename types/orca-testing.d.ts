@@ -3,7 +3,7 @@
 // pinned to Orca 1.4.251 —— 来源 `orca skills get orca-plugin-authoring` 的
 // references/testing.md。只声明本仓库测试实际用到的成员；不写实现、不写 `any` 逃逸。
 
-import type { JsonValue, OrcaNode } from 'orca'
+import type { JsonValue, OrcaNode, PanelContext } from 'orca'
 import type { OrcaWorkerApi } from 'orca/worker'
 
 /** 宿主错误（refusals 与注入的失败）。 */
@@ -51,7 +51,7 @@ export interface MockHostOptions {
 export interface MockHost {
   readonly calls: readonly { readonly method: string; readonly params: unknown }[]
   readonly refusals: readonly MockHostRefusal[]
-  callsOf(method: string): readonly { readonly method: string; readonly params: unknown }[]
+  callsOf(method: string): readonly unknown[]
   respond(method: string, result: JsonValue): void
   data(): {
     readonly storage: Readonly<Record<string, JsonValue>>
@@ -70,23 +70,47 @@ export interface MountOptions {
   readonly persisted?: {
     readonly plugin?: Readonly<Record<string, JsonValue>>
     readonly workspace?: Readonly<Record<string, JsonValue>>
+    /** `persist: 'storage'` 的 keyed atom 的种子值（写进插件私有存储）。 */
+    readonly storage?: Readonly<Record<string, JsonValue>>
   }
 }
 
 /** 面板模块：默认导出的组件函数，可选 `setup`。 */
 export interface PanelModule {
   readonly default: () => OrcaNode
-  readonly setup?: (context: unknown) => void | (() => void)
+  readonly setup?: (context: PanelContext) => void | (() => void)
+}
+
+/** 一个查到的元素（`find` / `findAll` 的结果）。 */
+export interface TestElement {
+  readonly type: string
+  readonly role: string
+  readonly label?: string
+  readonly text?: string
+  readonly disabled: boolean
+  readonly path: string
+}
+
+/** 面板里已持久化的值：按作用域分。 */
+export interface PersistedValues {
+  readonly plugin: Readonly<Record<string, JsonValue>>
+  readonly workspace: Readonly<Record<string, JsonValue>>
+  readonly storage: Readonly<Record<string, JsonValue>>
 }
 
 /** `mount` 返回的测试面板。 */
 export interface TestPanel {
   readonly host: MockHost
+  /** 渲染或处理器抛出的错误，以及 Orca 会拒绝的渲染。 */
   readonly errors: readonly PanelIssue[]
+  /** Orca 会丢弃的 props 与组件，附它自己的警告。 */
   readonly warnings: readonly string[]
+  /** 即便面板接住了，Orca 也会拒绝的宿主调用。 */
   readonly refusals: readonly MockHostRefusal[]
-  find(query: TestQuery): { readonly text?: string } | null
-  findAll(query: TestQuery): readonly { readonly text?: string }[]
+  /** 面板此刻持久化的值。 */
+  readonly persisted: PersistedValues
+  find(query: TestQuery): TestElement | null
+  findAll(query: TestQuery): readonly TestElement[]
   tree(): JsonValue
   summary(): readonly string[]
   press(target: TestQuery): Promise<void>
@@ -94,9 +118,13 @@ export interface TestPanel {
   submit(target: TestQuery): Promise<void>
   toggle(target: TestQuery): Promise<void>
   select(target: TestQuery, value: string): Promise<void>
+  slide(target: TestQuery, value: number): Promise<void>
   valueOf(target: TestQuery): JsonValue
   emit(event: string, payload: JsonValue): Promise<void>
   post(event: string, payload?: JsonValue): Promise<void>
+  /** 隐藏或显示面板，像切走侧边栏那样。 */
+  setVisible(visible: boolean): Promise<void>
+  rerender(): Promise<void>
   settled(): Promise<void>
   unmount(): Promise<void>
 }

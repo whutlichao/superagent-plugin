@@ -216,6 +216,17 @@ declare module 'node:test' {
   export function test(name: string, fn: () => unknown): void
   export function beforeEach(fn: () => unknown): void
   export function afterEach(fn: () => unknown): void
+  /**
+   * 虚拟时钟：面板测试用它把「2 秒后只重试一次」推进到虚拟时间，绝不真的 sleep
+   * （§P.1 第 4 条）。只声明本仓库用到的 `timers`。
+   */
+  export const mock: {
+    timers: {
+      enable(options: { apis: readonly ('setTimeout' | 'setInterval' | 'setImmediate' | 'Date')[] }): void
+      tick(milliseconds: number): void
+      reset(): void
+    }
+  }
 }
 
 /** `node:assert/strict` 的断言子集，与 `orca/testing` 的 `assert` 同一套方法。 */
@@ -262,7 +273,8 @@ declare const process: {
 declare function setInterval(handler: () => void, milliseconds: number): TimerHandle
 declare function clearInterval(handle: TimerHandle): void
 declare function setTimeout(handler: () => void, milliseconds: number): TimerHandle
-declare function clearTimeout(handle: TimerHandle): void
+/** 面板与状态栏用 `Number(handle)` 把句柄收成数字再交回（注入的节流器只认不透明句柄）。 */
+declare function clearTimeout(handle: TimerHandle | number): void
 declare function setImmediate(handler: (...args: readonly unknown[]) => void): void
 
 /** Node 定时器句柄：`unref()` 让它不拖住进程退出。 */

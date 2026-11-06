@@ -20,7 +20,7 @@ import {
   LOCALIZED_GROUPS,
   TERMS
 } from '../src/panel/copy.ts'
-import type { CopyKey } from '../src/panel/copy.ts'
+import type { TermKey } from '../src/panel/copy.ts'
 
 /** 码表 → 它需要的术语键（`terms.ts` 的键由 `copy.ts` 导出）。 */
 const TERM_KEYS: Readonly<Record<string, readonly string[]>> = {
@@ -36,7 +36,7 @@ const TERM_KEYS: Readonly<Record<string, readonly string[]>> = {
 }
 
 /** 术语键在文案表里的全名：`reason.timeout`、`report.ready`…… */
-const copyKey = (group: string, code: string): CopyKey => `${group}.${code}` as CopyKey
+const copyKey = (group: string, code: string): TermKey => `${group}.${code}` as TermKey
 
 describe('terms tables', () => {
   for (const [group, codes] of Object.entries(TERM_KEYS)) {
