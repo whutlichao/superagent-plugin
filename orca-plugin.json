@@ -1,0 +1,82 @@
+{
+  "manifestVersion": 2,
+  "id": "superagent",
+  "name": "Superagent",
+  "description": "Supervises a proactive coding agent for one repository: sources, tickets, Orca workers, reports.",
+  "version": "0.1.0",
+  "engines": { "orca": ">=1.4.250" },
+  "execution": "trusted-worker",
+  "pluginApi": 1,
+  "license": "MIT",
+  "main": "src/worker/main.ts",
+  "contributes": {
+    "panels": [
+      {
+        "id": "superagent",
+        "title": "Superagent",
+        "icon": "bot",
+        "entry": "src/panel/panel.tsx",
+        "ui": "components"
+      }
+    ],
+    "commands": [
+      { "id": "superagent.pause", "title": "Superagent: Pause processing" },
+      { "id": "superagent.resume", "title": "Superagent: Resume processing" },
+      { "id": "superagent.restartRouter", "title": "Superagent: Restart router" },
+      { "id": "superagent.checkSetup", "title": "Superagent: Check setup" }
+    ],
+    "events": [{ "on": "agent.status.changed" }, { "on": "workspace.created" }, { "on": "workspace.removed" }],
+    "hooks": [{ "event": "agent.launch.before", "onError": "pass" }],
+    "settings": [
+      {
+        "key": "stateDir",
+        "title": "State directory",
+        "type": "string",
+        "description": "Absolute path for the database, logs and tokens.",
+        "multiline": false
+      },
+      {
+        "key": "agent",
+        "title": "Worker agent",
+        "type": "string",
+        "default": "claude",
+        "description": "Orca agent id used for ticket workers."
+      },
+      {
+        "key": "routerAgent",
+        "title": "Router agent",
+        "type": "string",
+        "default": "claude",
+        "description": "Orca agent id used for the long-lived router session."
+      },
+      {
+        "key": "baseRepo",
+        "title": "Base repository",
+        "type": "string",
+        "description": "Repo selector (path:<p>, name:<n> or id:<id>) that ticket worktrees are created from."
+      }
+    ],
+    "statusBarItems": [
+      {
+        "id": "superagent",
+        "text": "Superagent",
+        "icon": "bot",
+        "tone": "neutral",
+        "tooltip": "Superagent",
+        "command": "superagent.pause"
+      }
+    ]
+  },
+  "capabilities": [
+    { "kind": "workspace:read" },
+    { "kind": "workspace:write" },
+    { "kind": "agent:read" },
+    { "kind": "agent:launch" },
+    { "kind": "terminal:send" },
+    { "kind": "terminal:read" },
+    { "kind": "notifications:show" },
+    { "kind": "storage:own" },
+    { "kind": "secrets:own" },
+    { "kind": "settings:own" }
+  ]
+}
