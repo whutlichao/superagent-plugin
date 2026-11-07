@@ -1,11 +1,13 @@
 // `doctor` 的检查实现（§G.2 的 doctor 行、§N.4、§O）。
 //
-// 七项逐条给 `ok | warn | fail`：
+// 八项逐条给 `ok | warn | fail`：
 //   token        主 token 文件在不在、权限是否是 0600（**只 stat，不读值**）
 //   port         端口文件是否指向一个活着的端口（能连上 → ok；文件在但连不上 → warn）
 //   lock         `<stateDir>/lock`：有活实例 / 陈旧遗留 / 没有
 //   database     库在不在、schema 版本与插件一致（只读打开，绝不迁移）
 //   cli          CLI 入口（`src/bin/superagent.mjs`）是否存在
+//   gitconfig    `<stateDir>/worker-gitconfig` 在不在、权限是否是 0600（**只 stat，不读内容**，
+//                里面只有 helper、SSH→HTTPS 重写与 agent 身份，没有秘密）
 //   gh           `gh auth status`（§I.4：agent 账号的 CLI 能读到账号）
 //   lark         `lark-cli auth status` 的 bot 身份（可选：没装 lark-cli 只是 warn）
 //
@@ -20,6 +22,7 @@ import { existsSync, statSync } from 'node:fs'
 import { connect } from 'node:net'
 import { join } from 'node:path'
 import { LOCK_FILE, lockAgeMs, readLock, STALE_AFTER_MS } from '../infra/lock.ts'
+import { GITCONFIG_MODE, inspectWorkerGitConfig } from '../infra/gitconfig.ts'
 import { API_TOKEN_FILE, TOKEN_MODE } from '../infra/tokens.ts'
 import { DEFAULT_PORT, PORT_FILE, readPortRecord } from '../http/port-file.ts'
 import type { DatabaseInspection } from './store.ts'
@@ -53,7 +56,7 @@ export interface DoctorOptions {
 /** 端口探测的上限（§O：HTTP handler 不做超过 10 s 的等待；doctor 更短）。 */
 export const PORT_PROBE_TIMEOUT_MS = 200
 
-/** 跑完全部七项检查。任何一项都不抛错：读不到就是读不到，结论如实写进条目。 */
+/** 跑完全部八项检查。任何一项都不抛错：读不到就是读不到，结论如实写进条目。 */
 export async function runDoctor(options: DoctorOptions): Promise<DoctorResult> {
   const stateDir = options.stateDir
   const now = options.now ?? (() => new Date().toISOString())
@@ -66,6 +69,7 @@ export async function runDoctor(options: DoctorOptions): Promise<DoctorResult> {
   checks.push(checkLock(stateDir))
   checks.push(checkDatabase(options.inspectDatabase))
   checks.push(checkCli(options.cliPath))
+  checks.push(checkGitConfig(stateDir))
   checks.push(await checkGh(run))
   checks.push(await checkLark(run))
 
@@ -238,6 +242,36 @@ function checkCli(cliPath: string | undefined): DoctorCheck {
     return doctorCheck('cli', 'fail', `the CLI entry is missing: ${cliPath}`, 'reinstall the plugin')
   }
   return doctorCheck('cli', 'ok', `the CLI entry exists: ${cliPath}`)
+}
+
+// ---------------------------------------------------------------- gitconfig
+
+/**
+ * `<stateDir>/worker-gitconfig`：在不在、权限对不对。**只 stat，不读内容**——里面的身份/helper
+ * 不是秘密，但 doctor 的红线是「只报有没有」（§O）。
+ *
+ * 三档读数：存在且 0600 → ok；不存在 → warn（启动时没写：agent 账号或邮箱未配，或写失败）；
+ * 权限过宽 → warn（里面没有 token，但仍然是只有属主该读的文件）。
+ */
+function checkGitConfig(stateDir: string): DoctorCheck {
+  const inspection = inspectWorkerGitConfig(stateDir)
+  if (inspection.state === 'missing') {
+    return doctorCheck(
+      'gitconfig',
+      'warn',
+      `the worker git config is missing: ${inspection.path}`,
+      'start the plugin once with the agent account and commit email configured (superagent setup check shows which is missing)'
+    )
+  }
+  if (inspection.mode !== GITCONFIG_MODE) {
+    return doctorCheck(
+      'gitconfig',
+      'warn',
+      `the worker git config is readable by more than its owner (mode ${inspection.mode.toString(8)})`,
+      `chmod 600 ${inspection.path}`
+    )
+  }
+  return doctorCheck('gitconfig', 'ok', 'the worker git config exists with mode 0600')
 }
 
 // ---------------------------------------------------------------- gh / lark-cli

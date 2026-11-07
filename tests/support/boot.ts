@@ -41,6 +41,8 @@ export function settingsOf(stateDir: string): Record<string, unknown> {
     stateDir,
     agent: 'pi',
     baseRepo: '/repos/widgets',
+    // worker 的提交身份（§H.11）：没有它就不写 `worker-gitconfig`，setup 会报一条具名问题。
+    githubCommitEmail: '1+acme-agent@users.noreply.github.com',
     executor: { agent: 'pi', maxWorkers: 2, confirmDelivery: false },
     sources: {
       github: { enabled: true, config: { repository: 'acme/widgets', cli: 'gh', pollSeconds: 60 } }

@@ -8,6 +8,7 @@ import { mkdirSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { runDoctor, botStatus, defaultPortProbe } from '../src/worker/app/doctor'
 import { doctorExitCode, orderChecks, stateRank, summarize } from '../src/worker/app/doctor-types'
+import { GITCONFIG_MODE, workerGitConfigPath, writeWorkerGitConfig } from '../src/worker/infra/gitconfig'
 import type { DoctorCheck } from '../src/worker/http/api-types'
 import { openStore } from '../src/worker/app/store'
 import { acquireLock } from '../src/worker/infra/lock'
@@ -67,13 +68,13 @@ function checkOf(checks: readonly DoctorCheck[], name: string): DoctorCheck {
   return found as DoctorCheck
 }
 
-test('the seven checks are always reported, in the design order', async () => {
+test('the eight checks are always reported, in the design order', async () => {
   const stateDir = tempStateDir()
   try {
     const result = await doctorOf(stateDir, { cliPath: join(stateDir, 'superagent.mjs') })
     assert.deepEqual(
       result.checks.map((check) => check.name),
-      ['token', 'port', 'lock', 'database', 'cli', 'gh', 'lark']
+      ['token', 'port', 'lock', 'database', 'cli', 'gitconfig', 'gh', 'lark']
     )
     assert.deepEqual(result.checks.map((check) => check.state), [
       'fail', // 没有 token
@@ -81,10 +82,11 @@ test('the seven checks are always reported, in the design order', async () => {
       'ok', // 没有锁
       'warn', // 没有库
       'fail', // CLI 入口不存在
+      'warn', // 没有 worker git 配置（还没启动过）
       'ok', // gh 已登录（注入的 runner）
       'ok' // lark-cli 的 bot 身份 ready（注入的 runner）
     ])
-    assert.deepEqual(result.summary, { ok: 3, warn: 1, fail: 3 })
+    assert.deepEqual(result.summary, { ok: 3, warn: 2, fail: 3 })
     assert.equal(doctorExitCode(result), 1, 'a fail makes the doctor exit non-zero')
     assert.equal(result.at, AT)
     assert.equal(result.stateDir, stateDir)
@@ -285,6 +287,35 @@ test('a doctor result with only warnings and oks exits 0', async () => {
     const clean = await doctorOf(stateDir, { portOpen: false, cliPath: join(stateDir, 'missing') })
     assert.equal(clean.summary.fail, 0)
     assert.equal(doctorExitCode(clean), 0)
+  } finally {
+    rmSync(stateDir, { recursive: true, force: true })
+  }
+})
+
+test('the gitconfig check reads existence and mode, never the contents', async () => {
+  const stateDir = tempStateDir()
+  try {
+    // 缺失：warn，并说清怎么让它出现（不是静默，也不把缺失说成坏掉）。
+    const missing = checkOf((await doctorOf(stateDir)).checks, 'gitconfig')
+    assert.equal(missing.state, 'warn')
+    assert.equal(typeof missing.hint, 'string')
+
+    // 存在且 0600：ok。doctor 只 stat，不读内容（账号与邮箱不出现在结果里）。
+    const email = '1+acme-agent@users.noreply.github.com'
+    assert.equal(writeWorkerGitConfig({ stateDir, account: 'acme-agent', email }).state, 'written')
+    const ok = checkOf((await doctorOf(stateDir)).checks, 'gitconfig')
+    assert.equal(ok.state, 'ok')
+    assert.equal(JSON.stringify(ok).includes('acme-agent'), false, 'the contents are never read')
+    assert.equal(JSON.stringify(ok).includes(email), false)
+
+    // 权限过宽：warn，且给出 chmod（与 token 检查同一口径）。
+    const path = workerGitConfigPath(stateDir)
+    const { chmodSync } = await import('node:fs')
+    chmodSync(path, 0o644)
+    const tooOpen = checkOf((await doctorOf(stateDir)).checks, 'gitconfig')
+    assert.equal(tooOpen.state, 'warn')
+    assert.equal(tooOpen.detail.includes('644'), true, 'the actual mode is reported')
+    assert.equal(GITCONFIG_MODE, 0o600)
   } finally {
     rmSync(stateDir, { recursive: true, force: true })
   }

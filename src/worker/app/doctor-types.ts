@@ -6,13 +6,14 @@
 /** `doctor` 的三档状态。 */
 export type DoctorState = 'ok' | 'warn' | 'fail'
 
-/** `doctor` 的检查项名字（§G.2 的 doctor 行：token/端口/锁/库迁移/CLI 路径/gh 登录/lark-cli 配置）。 */
+/** `doctor` 的检查项名字（§G.2 的 doctor 行：token/端口/锁/库迁移/CLI 路径/worker git 配置/gh 登录/lark-cli 配置）。 */
 export type DoctorCheckName =
   | 'token'
   | 'port'
   | 'lock'
   | 'database'
   | 'cli'
+  | 'gitconfig'
   | 'gh'
   | 'lark'
 
@@ -54,6 +55,7 @@ export const DOCTOR_ORDER: readonly DoctorCheckName[] = [
   'lock',
   'database',
   'cli',
+  'gitconfig',
   'gh',
   'lark'
 ]

@@ -898,6 +898,7 @@ function settingsWithFeishu(stateDir: string, feishu: Record<string, unknown>): 
     stateDir,
     agent: 'pi',
     baseRepo: '/repos/widgets',
+    githubCommitEmail: '1+acme-agent@users.noreply.github.com',
     executor: { agent: 'pi', maxWorkers: 2, confirmDelivery: false },
     sources: {
       github: { enabled: true, config: { repository: 'acme/widgets', cli: 'gh', pollSeconds: 60 } },
