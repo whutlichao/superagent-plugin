@@ -483,6 +483,62 @@ test('read maps source resources onto one whole path segment and keeps paging fl
   )
 })
 
+test('read maps the view resources onto their §G.3 routes and keeps their query flags', async () => {
+  // 视图资源各走 §G.3 自己的路由（`read thread/<key>` → `threads/<key>` 等），查询串的名字与
+  // 路由表同字面量；这里断言「参数放对位置」，语义由 worker 的读模型判。
+  const { readPath, readQuery } = await import('../src/worker/cli/commands')
+  const args = (flags: Record<string, string>) => ({ positionals: [], flags, repeated: {}, text: false })
+  assert.equal(readPath('overview', undefined), 'overview')
+  assert.equal(readPath('sources', undefined), 'sources')
+  assert.equal(readPath('search', undefined), 'search')
+  assert.equal(readPath('threads', undefined), 'threads')
+  assert.equal(readPath('thread', 'gh:o/r #1'), 'threads/gh%3Ao%2Fr%20%231')
+  assert.equal(readPath('decisions', undefined), 'decisions')
+  assert.equal(readPath('tickets', undefined), 'tickets')
+  assert.equal(readPath('ticket', 'ticket-1'), 'tickets/ticket-1')
+  assert.equal(readPath('settings', undefined), 'settings')
+  assert.equal(readPath('models', undefined), 'models')
+
+  // `threads` 的筛选与分页；`thread` 的复合游标；`decisions` 的 kind/window；
+  // `tickets` 的 state；`settings` 的 block；`search` 的 q——都进查询串，原样交给服务端。
+  assert.deepEqual(readQuery('threads', args({ filter: 'subscribed', offset: '2', limit: '5' })), {
+    filter: 'subscribed',
+    offset: 2,
+    limit: 5
+  })
+  assert.deepEqual(readQuery('threads', args({})), { limit: 20 })
+  assert.deepEqual(readQuery('thread', args({ before: '2026-11-07T03:26:00.000Z|trigger-a' })), {
+    before: '2026-11-07T03:26:00.000Z|trigger-a'
+  })
+  assert.deepEqual(readQuery('thread', args({ around: '2026-11-07T03:26:00.000Z|trigger-a', limit: '3' })), {
+    around: '2026-11-07T03:26:00.000Z|trigger-a',
+    limit: 3
+  })
+  assert.deepEqual(readQuery('decisions', args({ kind: 'accept', window: '24h' })), {
+    kind: 'accept',
+    window: '24h',
+    limit: 20
+  })
+  assert.deepEqual(readQuery('tickets', args({ state: 'open' })), { state: 'open', limit: 20 })
+  assert.deepEqual(readQuery('settings', args({ block: 'policy' })), { block: 'policy' })
+  assert.deepEqual(readQuery('search', args({ q: '#12' })), { q: '#12' })
+  // 形状不对在客户端就拒（不发注定失败的请求）：search 缺 q、thread 同时给两个游标。
+  for (const [resource, flags] of [
+    ['search', {}],
+    ['thread', { before: 'a|b', around: 'a|b' }]
+  ] as const) {
+    assert.throws(
+      () => readQuery(resource, args(flags)),
+      (error: unknown) => error instanceof ApiError && error.code === 'invalid_params',
+      JSON.stringify(flags)
+    )
+  }
+  // `models`/`overview`/`sources` 没有客户端参数：不编一个空的 limit。
+  for (const resource of ['models', 'overview', 'sources']) {
+    assert.deepEqual(readQuery(resource, args({})), {}, resource)
+  }
+})
+
 test('an unreachable worker is retried exactly once, after the fixed 200 ms', async () => {
   // 一个真实但已经没人监听的端口：`not_ready` 必须来自一次真实连接失败，不是假成功。
   // 端口取自内核临时区间之外的窄带（#53），不会被别的测试或另一轮测试半途绑定。

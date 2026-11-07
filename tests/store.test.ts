@@ -134,6 +134,56 @@ test('a thread timeline pages by the (at, id) composite cursor without loss or r
   }
 })
 
+test('the tail and before reads walk a thread timeline backwards without loss or repetition', () => {
+  const { store, cleanup } = openTempStore()
+  try {
+    // 五条同一时刻的 Trigger：只有 (at, id) 复合游标能既不丢也不重。
+    const ids = ['trigger-a', 'trigger-b', 'trigger-c', 'trigger-d', 'trigger-e']
+    for (const id of ids) {
+      store.triggers.insert({
+        id,
+        source: 'github',
+        at: AT,
+        actor: { source: 'github', id: 'alice' },
+        human: true,
+        addressed: null,
+        text: id,
+        url: null,
+        body: {}
+      })
+      store.triggerThreads.link({
+        threadKey: 'github:1',
+        at: AT,
+        triggerId: id,
+        human: true,
+        primaryThread: false
+      })
+    }
+    const tail = store.triggerThreads.tail('github:1', 2)
+    assert.deepEqual(tail.items.map((item) => item.triggerId), ['trigger-d', 'trigger-e'])
+    assert.deepEqual(tail.before, { at: AT, triggerId: 'trigger-d' })
+
+    const second = store.triggerThreads.before('github:1', tail.before as never, 2)
+    assert.deepEqual(second.items.map((item) => item.triggerId), ['trigger-b', 'trigger-c'])
+    assert.deepEqual(second.before, { at: AT, triggerId: 'trigger-b' })
+
+    const third = store.triggerThreads.before('github:1', second.before as never, 2)
+    assert.deepEqual(third.items.map((item) => item.triggerId), ['trigger-a'])
+    assert.equal(third.before, null, 'the earliest page ends the walk')
+
+    // `item` 是 `around` 的锚点：恰好落在游标上的那一行。
+    assert.equal(store.triggerThreads.item('github:1', { at: AT, triggerId: 'trigger-c' })?.triggerId, 'trigger-c')
+    assert.equal(store.triggerThreads.item('github:1', { at: AT, triggerId: 'trigger-nope' }), undefined)
+    assert.equal(
+      store.triggerThreads.item('github:2', { at: AT, triggerId: 'trigger-c' }),
+      undefined,
+      'another thread never anchors'
+    )
+  } finally {
+    cleanup()
+  }
+})
+
 test('the working sets are read through generated columns and partial indexes only', () => {
   const { store, cleanup } = openTempStore()
   try {

@@ -53,16 +53,18 @@ import {
 } from '../src/worker/http/server'
 import type { HttpHost } from '../src/worker/http/state'
 import { openStore } from '../src/worker/app/store'
+import { createRepositories } from '../src/worker/app/repositories'
 import { SCHEMA_VERSION } from '../src/worker/app/schema'
 import { runIdempotent } from '../src/worker/http/idempotency'
 import { createDecisionHandlers, withDecisionHandlers } from '../src/worker/http/decisions'
 import { createSettingsHandlers, withSettingsHandlers } from '../src/worker/http/settings'
 import { createSettings } from '../src/worker/app/settings'
-import type { Decision, Ticket } from '../src/worker/core/model'
+import type { Decision, Thread, Ticket } from '../src/worker/core/model'
 import type { Trigger } from '../src/worker/core/model'
 import { createReadHandlers, withReadHandlers } from '../src/worker/http/read'
 import { createReadTools } from '../src/worker/app/read'
 import { FakeCommands, cliFailure } from './support/fake-commands'
+import { createTestViewTools } from './support/view-host'
 import { tempStateDir } from './support/state'
 import { holdPortBlock } from './support/ports'
 
@@ -253,7 +255,8 @@ interface HarnessOptions {
   readonly preferredPort?: number
   readonly rateLimiter?: RateLimiter
   readonly host?: Partial<HttpHost>
-  readonly routes?: readonly RouteDefinition[]
+  /** 路由表，或一个按本服务器自己打开的库造路由表的函数（视图读面要用真库）。 */
+  readonly routes?: readonly RouteDefinition[] | ((store: Store) => readonly RouteDefinition[])
   readonly startedAt?: string
   readonly pid?: number
   readonly clock?: () => Date
@@ -305,8 +308,9 @@ async function startHarness(options: HarnessOptions = {}): Promise<Harness> {
     settings: createSettings({ store, now: () => STARTED_AT })
   })
   const routes =
-    options.routes ??
-    withSettingsHandlers(ROUTE_TABLE, settingsHandlers)
+    typeof options.routes === 'function'
+      ? options.routes(store)
+      : (options.routes ?? withSettingsHandlers(ROUTE_TABLE, settingsHandlers))
   const server = await startHttpServer({
     stateDir,
     host,
@@ -662,7 +666,8 @@ test('the error table is observable end to end: 400/401/403/404/409/413/429/503/
     assert.equal(boomError.code, 'internal')
     assert.equal(boomError.message.includes('secret'), false, 'internal failures are not echoed')
 
-    const stub = await harness.call('/superagent/api/overview')
+    // 仍未落地的路由（面板动作的票）给固定的 unavailable；视图读面已接线，不再用它当例子。
+    const stub = await harness.call('/superagent/api/router/restart', { method: 'POST', body: {} })
     assert.equal(stub.status, 503)
     assert.equal(failureOf(stub).code, 'unavailable')
 
@@ -1075,8 +1080,8 @@ test('every route refuses a role below its minimum with not_permitted_role', asy
         checked += 1
       }
     }
-    // 42 条路由：34 条高于 assignment（8 条是 assignment 档），13 条是 operator → 47 次拒绝。
-    assert.equal(checked, 47, 'every route above assignment refuses it, and every operator route refuses router')
+    // 43 条路由：33 条高于 assignment（10 条是 assignment 档），11 条是 operator → 44 次拒绝。
+    assert.equal(checked, 44, 'every route above assignment refuses it, and every operator route refuses router')
   } finally {
     harness.close()
   }
@@ -1169,7 +1174,8 @@ async function startReadHarness(options: {
     tickets: () => options.tickets ?? [readTicket(), otherReadTicket()]
   })
   const harness = await startHarness({
-    routes: withReadHandlers(ROUTE_TABLE, createReadHandlers({ tools }))
+    routes: (store) =>
+      withReadHandlers(ROUTE_TABLE, createReadHandlers({ tools, views: createTestViewTools(store) }))
   })
   return { harness, commands }
 }
@@ -1481,6 +1487,290 @@ test('dismissing an unavailable decision answers it; an unknown one is a missing
     })
     assert.equal(noHeader.status, 403)
     assert.equal(failureOf(noHeader).code, 'origin_forbidden')
+  } finally {
+    harness.close()
+  }
+})
+
+// ---------------------------------------------------------------- 视图读面（#59）
+
+/** 视图读面的真库夹具：两条 Thread、三条 Trigger、两张 Ticket、两条 Decision。 */
+function seedViewStore(store: Store): void {
+  const repo = createRepositories(store)
+  const thread: Thread = {
+    key: 'github:12',
+    ref: { source: 'github', id: '12' },
+    createdAt: STARTED_AT,
+    lastAt: STARTED_AT,
+    subscriptions: ['ticket-own'],
+    correlated: [],
+    pending: [],
+    meta: { label: 'Login redirect', url: 'https://github.com/acme/widgets/issues/12' }
+  }
+  const other: Thread = {
+    key: 'github:99',
+    ref: { source: 'github', id: '99' },
+    createdAt: STARTED_AT,
+    lastAt: STARTED_AT,
+    subscriptions: [],
+    correlated: [],
+    pending: [],
+    meta: { label: 'Another thread' }
+  }
+  repo.threads.save(thread)
+  repo.threads.save(other)
+  const same = '2026-11-07T03:20:00.000Z'
+  for (const [id, at] of [
+    ['trigger-a', same],
+    ['trigger-b', same],
+    ['trigger-c', '2026-11-07T03:25:00.000Z']
+  ] as const) {
+    repo.triggers.save({
+      id,
+      source: 'github',
+      threads: [thread.ref],
+      actor: { source: 'github', id: 'alice' },
+      human: true,
+      at,
+      text: `message ${id}`,
+      meta: {}
+    })
+  }
+  repo.triggers.saveDisposition('trigger-b', { fanout: [], decisionId: 'decision-recent', at: STARTED_AT })
+  repo.tickets.save(readTicket())
+  repo.tickets.save(otherReadTicket())
+  repo.decisions.save({
+    id: 'decision-recent',
+    evalId: 'eval-recent',
+    threadKey: 'github:12',
+    triggerIds: ['trigger-b'],
+    policyVersion: 'v1',
+    at: '2026-11-07T01:26:00.000Z',
+    kind: 'ignore',
+    reason: [{ code: 'noRuleMatched' }],
+    strength: 'inferred'
+  })
+  repo.decisions.save({
+    id: 'decision-old',
+    evalId: 'eval-old',
+    threadKey: 'github:12',
+    triggerIds: [],
+    policyVersion: 'v1',
+    at: '2026-11-05T03:25:00.000Z',
+    kind: 'accept',
+    reason: [{ code: 'routed', values: { ticket: 'ticket-own' } }],
+    strength: 'explicit'
+  })
+}
+
+/** 一个接了视图读面的测试服务器：数据落在服务器自己的真库上。 */
+async function startViewHarness(): Promise<Harness> {
+  return startHarness({
+    routes: (store) => {
+      seedViewStore(store)
+      const tools = createReadTools({
+        commands: new FakeCommands(),
+        sourceConfig: () => undefined,
+        trigger: () => undefined,
+        tickets: () => []
+      })
+      return withSettingsHandlers(
+        withReadHandlers(
+          ROUTE_TABLE,
+          createReadHandlers({ tools, views: createTestViewTools(store) })
+        ),
+        createSettingsHandlers({ settings: createSettings({ store, now: () => STARTED_AT }) })
+      )
+    }
+  })
+}
+
+/** 一个 router token（每次签发都写进本服务器的真库）。 */
+function routerTokenOf(harness: Harness): string {
+  return issueRouterToken({ store: harness.store, stateDir: harness.stateDir }).token
+}
+
+test('GET overview/sources/models serve the panel read models, and router may read them', async () => {
+  const harness = await startViewHarness()
+  try {
+    const token = routerTokenOf(harness)
+    const overview = await harness.call('/superagent/api/overview', { token })
+    assert.equal(overview.status, 200)
+    const view = resultOf(overview) as Record<string, unknown>
+    assert.deepEqual(Object.keys(view).sort(), [
+      'activity',
+      'attention',
+      'executor',
+      'health',
+      'problems',
+      'revision',
+      'sources'
+    ])
+    assert.equal(typeof (view['attention'] as Record<string, unknown>)['items'], 'object')
+
+    const sources = await harness.call('/superagent/api/sources', { token })
+    assert.equal(sources.status, 200)
+    assert.deepEqual(resultOf(sources), { items: [] })
+
+    const models = await harness.call('/superagent/api/models', { token })
+    assert.equal(models.status, 200)
+    const modelView = resultOf(models) as Record<string, unknown>
+    assert.deepEqual(Object.keys(modelView).sort(), ['catalog', 'models', 'note', 'roles'])
+    assert.deepEqual(modelView['models'], [], 'pi has no configured model id by default')
+
+    // assignment 连概览都不读（§O 的角色阶梯）。
+    const assignment = issueAssignmentToken({
+      store: harness.store,
+      stateDir: harness.stateDir,
+      ticketId: 'ticket-own',
+      assignmentId: 'assignment-1',
+      expiresAt: '2026-11-08T03:26:00.000Z'
+    }).token
+    const denied = await harness.call('/superagent/api/overview', { token: assignment })
+    assert.equal(denied.status, 403)
+    assert.equal(failureOf(denied).code, 'not_permitted_role')
+  } finally {
+    harness.close()
+  }
+})
+
+test('GET threads pages the list and GET threads/:key walks the (at, id) cursor', async () => {
+  const harness = await startViewHarness()
+  try {
+    const token = routerTokenOf(harness)
+    const first = await harness.call('/superagent/api/threads?limit=1', { token })
+    assert.equal(first.status, 200)
+    const firstPage = resultOf(first) as {
+      readonly items: readonly Record<string, unknown>[]
+      readonly next_offset: number | null
+    }
+    assert.deepEqual(firstPage.items.map((item) => item['key']), ['github:12'])
+    assert.equal(firstPage.next_offset, 1)
+    const second = await harness.call('/superagent/api/threads?offset=1&limit=1', { token })
+    const secondPage = resultOf(second) as { readonly items: readonly Record<string, unknown>[] }
+    assert.deepEqual(secondPage.items.map((item) => item['key']), ['github:99'])
+    // 未知筛选值是固定拒绝，不是空页。
+    const badFilter = await harness.call('/superagent/api/threads?filter=nope', { token })
+    assert.equal(badFilter.status, 400)
+    assert.equal(failureOf(badFilter).code, 'invalid_value')
+
+    // 详情：默认是最近一页（同一时刻的两条按 id），`before` 可以继续往更早走。
+    const detail = await harness.call('/superagent/api/threads/github%3A12?limit=2', { token })
+    assert.equal(detail.status, 200)
+    const thread = resultOf(detail) as {
+      readonly thread: Record<string, unknown>
+      readonly items: readonly Record<string, unknown>[]
+      readonly before: string | null
+      readonly decisions: readonly Record<string, unknown>[]
+    }
+    assert.equal(thread.thread['title'], 'Login redirect')
+    assert.deepEqual(thread.items.map((item) => item['id']), ['trigger-b', 'trigger-c'])
+    assert.equal(thread.before, '2026-11-07T03:20:00.000Z|trigger-b')
+    assert.equal(
+      thread.items.find((item) => item['id'] === 'trigger-b')?.['decisionId'],
+      'decision-recent'
+    )
+    assert.deepEqual(thread.decisions.map((item) => item['id']), ['decision-recent', 'decision-old'])
+    const older = await harness.call(
+      `/superagent/api/threads/github%3A12?before=${encodeURIComponent(thread.before as string)}&limit=2`,
+      { token }
+    )
+    const olderPage = resultOf(older) as {
+      readonly items: readonly Record<string, unknown>[]
+      readonly before: string | null
+    }
+    assert.deepEqual(olderPage.items.map((item) => item['id']), ['trigger-a'])
+    assert.equal(olderPage.before, null)
+
+    // 不存在的 Thread 是 missing；坏的游标是 invalid_value。
+    const missing = await harness.call('/superagent/api/threads/github%3Anope', { token })
+    assert.equal(missing.status, 404)
+    assert.equal(failureOf(missing).code, 'missing')
+    const badCursor = await harness.call('/superagent/api/threads/github%3A12?before=nope', { token })
+    assert.equal(badCursor.status, 400)
+    assert.equal(failureOf(badCursor).code, 'invalid_value')
+
+    // assignment：自己的 Thread 读得到，别人的读不到（§O）。
+    const assignment = issueAssignmentToken({
+      store: harness.store,
+      stateDir: harness.stateDir,
+      ticketId: 'ticket-own',
+      assignmentId: 'assignment-1',
+      expiresAt: '2026-11-08T03:26:00.000Z'
+    }).token
+    assert.equal((await harness.call('/superagent/api/threads/github%3A12', { token: assignment })).status, 200)
+    const foreign = await harness.call('/superagent/api/threads/github%3A99', { token: assignment })
+    assert.equal(foreign.status, 403)
+    assert.equal(failureOf(foreign).code, 'not_permitted_role')
+  } finally {
+    harness.close()
+  }
+})
+
+test('GET decisions filters by kind and window; GET search stays operator-only', async () => {
+  const harness = await startViewHarness()
+  try {
+    const token = routerTokenOf(harness)
+    const all = await harness.call('/superagent/api/decisions?limit=1', { token })
+    assert.equal(all.status, 200)
+    const firstPage = resultOf(all) as {
+      readonly items: readonly Record<string, unknown>[]
+      readonly next_offset: number | null
+    }
+    assert.deepEqual(firstPage.items.map((item) => item['id']), ['decision-recent'])
+    assert.equal(firstPage.next_offset, 1)
+    // 窗口由服务端换算：两条都在一小时之外，于是空页而不是固定拒绝。
+    const window = await harness.call('/superagent/api/decisions?window=1h', { token })
+    assert.deepEqual((resultOf(window) as { readonly items: unknown[] }).items, [])
+    const accepted = await harness.call('/superagent/api/decisions?kind=accept', { token })
+    assert.deepEqual(
+      (resultOf(accepted) as { readonly items: readonly Record<string, unknown>[] }).items.map((item) => item['id']),
+      ['decision-old']
+    )
+    const badKind = await harness.call('/superagent/api/decisions?kind=maybe', { token })
+    assert.equal(badKind.status, 400)
+    assert.equal(failureOf(badKind).code, 'invalid_value')
+
+    // Search 仍是 operator（§G.3 的面板专属视图）：router 不够。
+    const denied = await harness.call('/superagent/api/search?q=build', { token })
+    assert.equal(denied.status, 403)
+    assert.equal(failureOf(denied).code, 'not_permitted_role')
+    const search = await harness.call('/superagent/api/search?q=%2312')
+    assert.equal(search.status, 200)
+    const grouped = resultOf(search) as Record<string, { readonly items: readonly unknown[] }>
+    assert.deepEqual(
+      grouped['threads']?.items.map((item) => (item as Record<string, unknown>)['key']),
+      ['github:12']
+    )
+    // 没有 q 是固定拒绝，不是空结果。
+    const empty = await harness.call('/superagent/api/search')
+    assert.equal(empty.status, 400)
+    assert.equal(failureOf(empty).code, 'invalid_value')
+  } finally {
+    harness.close()
+  }
+})
+
+test('read settings is router and above: an assignment gets not_permitted_role, never the settings text', async () => {
+  const harness = await startViewHarness()
+  try {
+    const assignment = issueAssignmentToken({
+      store: harness.store,
+      stateDir: harness.stateDir,
+      ticketId: 'ticket-own',
+      assignmentId: 'assignment-1',
+      expiresAt: '2026-11-08T03:26:00.000Z'
+    }).token
+    const denied = await harness.call('/superagent/api/settings', { token: assignment })
+    assert.equal(denied.status, 403)
+    assert.equal(failureOf(denied).code, 'not_permitted_role')
+    // 设置全文一个字都不回（§O：读不到就说读不到，绝不泄露）。
+    assert.equal(denied.text.includes('blocks'), false)
+    assert.equal(denied.text.includes('revision'), false)
+    // router 读得到（同一份 settings handler，与 settings get 共用）。
+    const allowed = await harness.call('/superagent/api/settings', { token: routerTokenOf(harness) })
+    assert.equal(allowed.status, 200)
+    assert.ok(Array.isArray((resultOf(allowed) as Record<string, unknown>)['blocks']))
   } finally {
     harness.close()
   }

@@ -330,6 +330,18 @@ function claimsOf(ticket: Ticket, triggerOf: (id: string) => Trigger | undefined
   return { threads, triggers, shas }
 }
 
+/**
+ * 一张 Ticket 认领的 Thread 键集合（§I.2 的 Thread 键）。Source 资源读面用它判 assignment
+ * 能不能读某个资源（`authorize`），视图读面（`read thread/<key>`）用同一个判定——
+ * 「自己 Ticket 相关的 Thread」只有一处说法（§O）。
+ */
+export function ticketThreads(
+  ticket: Ticket,
+  triggerOf: (id: string) => Trigger | undefined
+): ReadonlySet<string> {
+  return claimsOf(ticket, triggerOf).threads
+}
+
 /** `github:<n>` 与 `github:<n>/…`（评审线程 `github:<n>/rt/<root>`）都算这个编号的 Thread。 */
 function threadTouches(threads: ReadonlySet<string>, number: number): boolean {
   const prefix = `github:${number}`
