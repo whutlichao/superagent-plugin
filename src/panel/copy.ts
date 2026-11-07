@@ -122,6 +122,199 @@ export const COPY = {
   },
   'page.notFound': { zh: '没有这一页。', en: 'No such page.' },
 
+  // ---- Deployment 组（§M.3 Deployment）：部署读数、限额与诊断 ----
+  'deployment.title': { zh: '部署', en: 'Deployment' },
+  'deployment.intro': {
+    zh: '这台机器的部署读数：缺什么、在用的限额、各部件健康、Router 与诊断。',
+    en: "This machine's deployment: what is missing, the limits in force, each part's health, the router and its diagnosis."
+  },
+  'deployment.stateDir': { zh: '状态目录', en: 'State directory' },
+  'deployment.stateDirReadOnly': {
+    zh: '只读：数据库、日志与 token 都在这个目录里。请选中路径复制。',
+    en: 'Read-only: the database, logs and tokens live here. Select the path to copy it.'
+  },
+  'deployment.stateDirChange': {
+    zh: '改它要去 Orca 设置 → Superagent → State directory；改完重启插件才生效。',
+    en: 'Change it in Orca Settings → Superagent → State directory; a new path takes effect after the plugin restarts.'
+  },
+  'deployment.limits': { zh: '机器限额', en: 'Machine limits' },
+  'deployment.limitsIntro': {
+    zh: '本机设置；这里只读。改限额是部署变更，改完要重启插件（没有热重载）。',
+    en: "This machine's settings, read-only here. Changing a limit is a deployment change: it needs a plugin restart (there is no hot reload)."
+  },
+  'deployment.limit.promptMaxChars': { zh: '提示词上限（字符）', en: 'Prompt limit (characters)' },
+  'deployment.limit.admissionContextMaxPages': { zh: '一次评估的语境页数', en: 'Context pages per Eval' },
+  'deployment.limit.admissionContextTimeoutMs': {
+    zh: '一次语境读取的时限（毫秒）',
+    en: 'Context timeout (ms)'
+  },
+  'deployment.limit.retentionDays': { zh: '保留天数', en: 'Retention (days)' },
+  'deployment.paused': { zh: '暂停处理', en: 'Pause processing' },
+  'deployment.pausedHint': {
+    zh: '暂停期间来源继续记录触发，但派发、新评估与回复都停下。',
+    en: 'While paused the Sources keep recording Triggers, but dispatch, new Evals and replies stop.'
+  },
+  'deployment.setup': { zh: '部署检查', en: 'Setup' },
+  'deployment.setupIntro': {
+    zh: '每条问题只报缺什么，并给出修法与重跑入口。修好外部条件后按「检查一次」，不必重启 Orca。',
+    en: 'Each problem names only what is missing, with how to fix it and where to re-run the check. Fix it, then press Check again; Orca need not restart.'
+  },
+  'deployment.setupPassed': {
+    zh: '部署检查通过，没有缺什么。',
+    en: 'Setup passed; nothing is missing.'
+  },
+  'deployment.checkAgain': { zh: '检查一次', en: 'Check again' },
+  'deployment.checking': { zh: '正在检查…', en: 'Checking…' },
+  'deployment.nothingToCheck': {
+    zh: '现在没有 setup 问题，没有可重跑的东西。',
+    en: 'Setup has no problems left; there is nothing to check again.'
+  },
+  'deployment.fix': { zh: '修法：{fix}', en: 'Fix: {fix}' },
+  'deployment.checkAgainCommand': { zh: '也可以自己跑：', en: 'Or run it yourself:' },
+  'deployment.place.orca': { zh: 'Orca', en: 'Orca' },
+  'deployment.place.state': { zh: '状态目录', en: 'State directory' },
+  'deployment.place.executor': { zh: '执行器', en: 'Executor' },
+  'deployment.place.github': { zh: 'GitHub 来源', en: 'GitHub Source' },
+  'deployment.place.feishu': { zh: '飞书来源', en: 'Feishu Source' },
+  'deployment.kind.missing': { zh: '缺配置', en: 'Missing' },
+  'deployment.kind.broken': { zh: '读不通', en: 'Broken' },
+  'deployment.health': { zh: '健康明细', en: 'Health' },
+  'deployment.healthIntro': {
+    zh: '每个部件一条：状态与明细（明细里带计数）。下一次成功即清除，连续失败三次才报错。',
+    en: 'One entry per part: its state and detail (the detail carries the counts). The next success clears it; three failures in a row report an error.'
+  },
+  'deployment.group.runtime': { zh: '运行时', en: 'Runtime' },
+  'deployment.group.passes': { zh: '轮次与模型', en: 'Passes' },
+  'deployment.group.effects': { zh: '副作用', en: 'Effects' },
+  'deployment.group.executor': { zh: '执行器', en: 'Executor' },
+  'deployment.group.router': { zh: 'Router', en: 'Router' },
+  'deployment.group.sources': { zh: '来源与同步', en: 'Sources' },
+  'deployment.group.other': { zh: '其他', en: 'Other' },
+  'deployment.state.starting': { zh: '启动中', en: 'Starting' },
+  'deployment.state.ready': { zh: '就绪', en: 'Ready' },
+  'deployment.state.paused': { zh: '已暂停', en: 'Paused' },
+  'deployment.state.error': { zh: '出错', en: 'Error' },
+  'deployment.router': { zh: 'Router', en: 'Router' },
+  'deployment.routerIntro': {
+    zh: '每三秒探活一次；重启会关掉旧会话、换一个新会话并轮换 Router 的 token。',
+    en: 'Liveness is checked every three seconds; a restart closes the old session, starts a new one and rotates the router token.'
+  },
+  'deployment.routerTerminal': { zh: '终端', en: 'Terminal' },
+  'deployment.routerSince': { zh: '起始时间', en: 'Since' },
+  'deployment.routerRestarts': { zh: '十分钟内重启次数', en: 'Restarts in 10 min' },
+  'deployment.routerLastError': { zh: '最后错误', en: 'Last error' },
+  'deployment.routerRestart': { zh: '重启 Router', en: 'Restart the router' },
+  'deployment.routerRestarted': { zh: '已请求重启 Router。', en: 'Router restart requested.' },
+  'deployment.empty': { zh: '—', en: '—' },
+  'deployment.doctor': { zh: '诊断（doctor）', en: 'Doctor' },
+  'deployment.doctorIntro': {
+    zh: '本机诊断：只报有没有，不报值。它判断的是这台机器；能不能开工由上面的部署检查决定。',
+    en: 'Machine diagnosis: present or missing, never a value. It judges this machine; whether work may start is what Setup above decides.'
+  },
+  'deployment.doctorRun': { zh: '运行诊断', en: 'Run doctor' },
+  'deployment.doctorRunning': { zh: '正在诊断…', en: 'Running doctor…' },
+  'deployment.doctorSummary': {
+    zh: '{ok} 就绪 · {warn} 警告 · {fail} 失败',
+    en: '{ok} ok · {warn} warn · {fail} fail'
+  },
+  'deployment.doctorState.ok': { zh: '就绪', en: 'Ok' },
+  'deployment.doctorState.warn': { zh: '警告', en: 'Warning' },
+  'deployment.doctorState.fail': { zh: '失败', en: 'Failed' },
+  'deployment.doctorCheck': { zh: '检查项', en: 'Check' },
+  'deployment.doctorDetail': { zh: '结论', en: 'Detail' },
+  'deployment.doctorFailed': { zh: '诊断没有跑成：{reason}', en: 'The diagnosis did not run: {reason}' },
+  'deployment.token': { zh: '主 token', en: 'Operator token' },
+  'deployment.tokenIntro': {
+    zh: 'CLI 与面板用一个主 token 访问 loopback API（文件权限 0600）。轮换后旧 token 立即失效；客户端每次都读同一个文件。',
+    en: 'The CLI and the panel use one operator token for the loopback API (file mode 0600). After a rotation the old token stops working at once; clients read that same file every time.'
+  },
+  'deployment.rotateToken': { zh: '轮换主 token', en: 'Rotate the operator token' },
+  'deployment.rotated': {
+    zh: '已轮换；新的 token 文件：{file}',
+    en: 'Rotated; the new token file: {file}'
+  },
+  'deployment.tokenValueHidden': {
+    zh: 'token 的值不显示在这里，也不进日志。',
+    en: 'The token value is never shown here, and never logged.'
+  },
+
+  // ---- 已知限制（§A.3 的十一项近似；面板 Limitations 段与 README 同源同措辞）----
+  'deployment.limitations': { zh: '已知限制', en: 'Limitations' },
+  'limitation.intro': {
+    zh: '以下十一项只能近似；每一条都在设计的 §H 差异表里注明影响。',
+    en: 'These eleven capabilities can only be approximated; each names its impact in the design §H table.'
+  },
+  'limitation.preset.title': { zh: 'Session preset 的工具裁剪', en: 'Session preset tool trimming' },
+  'limitation.preset.impact': {
+    zh: 'Worker 与 Router 都是普通 Orca agent 会话，工具集不可裁剪：「Router 不读代码」只由提示词约束，Router 理论上仍能改代码；worker 可用的工具也与上游的 WORK_TOOLS 不完全相同（H.1、H.19）。',
+    en: 'Worker and Router are ordinary Orca agent sessions whose tool sets cannot be trimmed: "the Router does not read code" rests on the prompt alone, so the Router could still edit code, and a worker\'s tools differ from the upstream WORK_TOOLS (H.1, H.19).'
+  },
+  'limitation.systemPrompt.title': {
+    zh: '系统提示词在 launch 时一次性注入',
+    en: 'The system prompt is injected once, at launch'
+  },
+  'limitation.systemPrompt.impact': {
+    zh: '运行中的会话不会自动看到新的 Policy 段；变更只用消息告知 revision 与读法，全文对新会话才完整生效（H.2）。',
+    en: 'A running session never sees a new Policy section by itself; a change only sends a message naming the revision and how to re-read it, and the full text takes effect for new sessions (H.2).'
+  },
+  'limitation.background.title': {
+    zh: '看不到 agent 内部的后台工作与 30 分钟预算',
+    en: 'Background work inside the agent and the 30-minute budget are not observable'
+  },
+  'limitation.background.impact': {
+    zh: '30 分钟规则退化为「发收尾指令并标记过期」，不杀进程：长任务可能继续占着 slot，也可能被误判为过期（H.3）。',
+    en: 'The 30-minute rule degrades to "send a wrap-up instruction and mark it stale" without killing anything: a long task may keep its slot, and a healthy task may be marked stale (H.3).'
+  },
+  'limitation.modelRetry.title': { zh: '模型预算重试由 Orca 负责', en: 'Model budget retries belong to Orca' },
+  'limitation.modelRetry.impact': {
+    zh: '插件只做三次 launch 重试；看不到预算重试状态，provider 抖动时工单可能直接失败；models 健康项恒为就绪并写明「由 Orca 负责」（H.4）。',
+    en: 'The plugin only retries a launch three times; budget retries are invisible, a Ticket may fail outright while a provider wobbles, and the models health entry is always ready and says "handled by Orca" (H.4).'
+  },
+  'limitation.pluginManager.title': { zh: '没有 DSH Plugin Manager 页面', en: 'There is no DSH Plugin Manager page' },
+  'limitation.pluginManager.impact': {
+    zh: '少量项在 Orca 设置里改，其余在面板的 Settings → Deployment 组；两处不重复（H.5）。',
+    en: 'A few settings are changed in Orca Settings and the rest in the panel under Settings → Deployment; the two lists never overlap (H.5).'
+  },
+  'limitation.webPanel.title': { zh: '没有 DSH 的 Web 面板与端口', en: 'There is no DSH web panel or port' },
+  'limitation.webPanel.impact': {
+    zh: '面板只在 Orca 客户端里打开，没有可跨设备访问的 URL（H.6；视为改进）。',
+    en: 'The panel opens inside the Orca client only; there is no URL to reach it from another device (H.6; counted as an improvement).'
+  },
+  'limitation.serviceScript.title': {
+    zh: '生命周期归 Orca，没有服务脚本与 tmux',
+    en: 'Lifecycle belongs to Orca; no service script or tmux'
+  },
+  'limitation.serviceScript.impact': {
+    zh: '没有 start/stop 命令，也没有 tmux 会话；「停」用 paused 表达，读数用 superagent status 的 0/1/2/3 退出码（H.7）。',
+    en: 'There is no start/stop command and no tmux session; "stopped" is expressed as paused, and readings come from superagent status with exit codes 0/1/2/3 (H.7).'
+  },
+  'limitation.skills.title': { zh: 'Skills 不是宿主注册表', en: 'Skills are not a host registry' },
+  'limitation.skills.impact': {
+    zh: '内置 skills 写到 <stateDir>/skills/<name>/SKILL.md，提示词只给绝对路径；agent 可能不读（H.8）。',
+    en: 'Built-in skills are written to <stateDir>/skills/<name>/SKILL.md and the prompt only gives their absolute paths; the agent may not read them (H.8).'
+  },
+  'limitation.dshCli.title': { zh: '没有 dsh CLI 与 profile', en: 'There is no dsh CLI or profile' },
+  'limitation.dshCli.impact': {
+    zh: '用 superagent CLI 与 orca CLI 顶上；没有 profile、没有 --from-default-profile，安装步骤与上游完全不同（H.9）。',
+    en: 'The superagent CLI and the orca CLI stand in; there is no profile and no --from-default-profile, and installation differs from upstream entirely (H.9).'
+  },
+  'limitation.questions.title': {
+    zh: '无法移除 worker 的提问工具',
+    en: "The worker's question tools cannot be removed"
+  },
+  'limitation.questions.impact': {
+    zh: 'worker 可能在自己的终端里等人，而不是用 report --human-action；插件把 blocked 状态当作 Attention 兜住，但问题文本只是终端摘要（H.10）。',
+    en: 'A worker may ask in its own terminal instead of reporting --human-action; the plugin catches the blocked state as Attention, but the question text is only a terminal summary (H.10).'
+  },
+  'limitation.environment.title': {
+    zh: '进程隔离与执行环境注入只是近似',
+    en: 'Process isolation and execution-environment injection are approximations'
+  },
+  'limitation.environment.impact': {
+    zh: 'blocked commands 与账号 shim 依赖 agent.launch.before 钩子（2 秒、失败即放行），不是安全边界；worker 的 git 配置是最小副本（凭据 helper、SSH→HTTPS、提交身份），http.*、LFS 等其余全局项只剩系统级配置；插件不做进程隔离，建议专用 OS 账号（H.11、H.20）。',
+    en: 'Blocked commands and the account shim rely on the agent.launch.before hook (2 s, fail-open) and are not a security boundary; the worker git config is a minimal copy (credential helper, SSH→HTTPS, commit identity), so http.*, LFS and other global entries fall back to system configuration only; the plugin adds no process isolation and recommends a dedicated OS account (H.11, H.20).'
+  },
+
   // ---- 确认对话（§M.2：行内二次确认，无模态框）----
   'confirm.title': { zh: '确认{action}', en: 'Confirm {action}' },
   'confirm.body': { zh: '确定要{action}吗？「{target}」', en: 'Really {action} “{target}”?' },

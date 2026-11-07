@@ -170,6 +170,38 @@ export function reportMark(state: ReportState): Mark {
   }
 }
 
+/** 健康条目的四档状态（§N.4：启动中 / 就绪 / 暂停 / 错误）；措辞在 `deployment.state.*`。 */
+export type HealthState = 'starting' | 'ready' | 'paused' | 'error'
+
+/** 健康条目的标记：错误最重，其次启动中（还没接上），就绪是成功，暂停是安静。 */
+export function healthMark(state: HealthState): Mark {
+  switch (state) {
+    case 'ready':
+      return { labelKey: 'deployment.state.ready', tone: 'success', icon: 'check' }
+    case 'error':
+      return { labelKey: 'deployment.state.error', tone: 'danger', icon: 'error' }
+    case 'paused':
+      return { labelKey: 'deployment.state.paused', tone: 'neutral', icon: 'pause' }
+    default:
+      return { labelKey: 'deployment.state.starting', tone: 'neutral', icon: 'info' }
+  }
+}
+
+/** doctor 的三档（§G.2、§N.4）：只报有没有。 */
+export type DoctorState = 'ok' | 'warn' | 'fail'
+
+/** doctor 结论的标记：失败最重，警告提醒，就绪是成功。 */
+export function doctorMark(state: DoctorState): Mark {
+  switch (state) {
+    case 'ok':
+      return { labelKey: 'deployment.doctorState.ok', tone: 'success', icon: 'check' }
+    case 'warn':
+      return { labelKey: 'deployment.doctorState.warn', tone: 'warning', icon: 'warning' }
+    default:
+      return { labelKey: 'deployment.doctorState.fail', tone: 'danger', icon: 'error' }
+  }
+}
+
 /** 把标记渲染成某语言的文字；`values` 填 `{count}` 之类的占位符。 */
 export function markLabel(locale: string, mark: Mark, values: CopyValues = {}): string {
   return translate(locale, mark.labelKey, values)

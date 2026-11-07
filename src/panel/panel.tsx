@@ -25,6 +25,7 @@ import {
   type PanelContext
 } from 'orca'
 import { GLOSSARY_GROUPS, translate, type CopyKey } from './copy'
+import { Deployment, loadDeployment, openDeployment, resetDeployment } from './deployment'
 import { markLabel, ticketMark, type MarkTone } from './marks'
 import {
   isNavPage,
@@ -139,12 +140,20 @@ export function setup(ctx: PanelContext): () => void {
       if (payload.revision <= read(revision)) return
       if (!read(ctx.visible)) return
       void load()
+      // 部署页读的是另一份读数（限额、health、Router）：停留在这页时跟着推送刷新，但不重跑
+      // doctor（那是人要的时候才跑的 `gh`/`lark-cli` 诊断）。
+      if (read(page) === 'settings') void loadDeployment()
     })
   )
-  if (read(ctx.visible)) void load()
-  else set(phase, 'starting')
+  const startPage = read(page)
+  if (read(ctx.visible)) {
+    void load()
+    // 重开面板时停在 Deployment 组：这一页的读数也要读一次（渲染里不发请求）。
+    if (startPage === 'settings') void openDeployment()
+  } else set(phase, 'starting')
   return () => {
     disposed = true
+    resetDeployment()
     if (retryTimer !== null) {
       clearTimeout(retryTimer)
       retryTimer = null
@@ -399,11 +408,16 @@ function Execution(props: { readonly locale: string; readonly state: PanelState 
   )
 }
 
-/** 一页：Overview 与 Execution 有真实读数，其余页面在页面票里填充（本票只交付壳）。 */
+/** 一页：Overview 与 Execution 有真实读数，Settings 现在是 Deployment 组；其余页面归后续票。 */
 function PageBody(props: { readonly locale: string; readonly current: NavPage }): OrcaElement {
   const locale = props.locale
   const state = read(snapshot)
   const stage = read(phase)
+  if (props.current === 'settings') {
+    // Settings 页的其余四组（Sources/Eval/Execution/Prompts）由 #42/#43 填进同一页；
+    // 本票交付的是 Deployment 组，它自己管读取、错误态与动作。
+    return <Deployment locale={locale} />
+  }
   if (props.current === 'overview' || props.current === 'execution') {
     if (stage === 'error') {
       return <ErrorStateView locale={locale} />
@@ -496,7 +510,10 @@ export default function Panel(): OrcaElement {
         label={words(locale, 'panel.title')}
         value={current}
         onChange={(next) => {
-          if (isNavPage(next)) set(page, next)
+          if (!isNavPage(next)) return
+          set(page, next)
+          // Deployment 组打开时才读（隐藏与未打开的页面不发请求，§M.6）。
+          if (next === 'settings') void openDeployment()
         }}
       >
         {NAV_PAGES.map((item) => (
