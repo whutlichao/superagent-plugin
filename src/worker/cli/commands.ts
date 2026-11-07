@@ -283,7 +283,7 @@ export const CLI_COMMANDS: readonly CommandDefinition[] = [
     flags: [{ name: 'text', kind: 'value', hint: 'the note (at most 100 words)', required: true }, REQUEST_ID_FLAG],
     positionals: [{ name: 'ticket_id', required: true }],
     write: true,
-    available: false
+    available: true
   },
   {
     name: ['ticket', 'request-status'],
@@ -291,7 +291,7 @@ export const CLI_COMMANDS: readonly CommandDefinition[] = [
     flags: [REQUEST_ID_FLAG],
     positionals: [{ name: 'ticket_id', required: true }],
     write: true,
-    available: false
+    available: true
   },
   {
     name: ['ticket', 'list'],
@@ -315,10 +315,10 @@ export const CLI_COMMANDS: readonly CommandDefinition[] = [
   {
     name: ['trigger', 'handback'],
     summary: 'hand a trigger back as beyond this ticket',
-    flags: [{ name: 'reason', kind: 'value', hint: 'one sentence' }, REQUEST_ID_FLAG],
+    flags: [{ name: 'reason', kind: 'value', hint: 'one sentence', required: true }, REQUEST_ID_FLAG],
     positionals: [{ name: 'trigger_id', required: true }],
     write: true,
-    available: false
+    available: true
   },
   {
     name: ['thread', 'unsubscribe'],
@@ -800,6 +800,21 @@ async function run(
           trigger: valueArgs(args.flags, 'trigger'),
           text: valueArgs(args.flags, 'text')
         })
+      })
+    case 'ticket note':
+      return call(`tickets/${encodePathSegment(args.positionals[0] ?? '')}/note`, {
+        method: 'POST',
+        body: { text: valueArgs(args.flags, 'text') ?? '' }
+      })
+    case 'ticket request-status':
+      return call(`tickets/${encodePathSegment(args.positionals[0] ?? '')}/request-status`, {
+        method: 'POST',
+        body: {}
+      })
+    case 'trigger handback':
+      return call(`triggers/${encodePathSegment(args.positionals[0] ?? '')}/handback`, {
+        method: 'POST',
+        body: { reason: valueArgs(args.flags, 'reason') ?? '' }
       })
     case 'report':
       return call('report', {

@@ -13,7 +13,7 @@ import { REPORT_STATES } from '../core/index.ts'
 import type { EngineForExecutor, EngineForMainSession, Ticket, WorkerReport } from '../core/index.ts'
 import type { RouteDefinition, RouteHandler, RouteInput } from './routes.ts'
 import { TICKET_FILTERS, ticketsPage, ticketView, type TicketFilter } from '../app/views.ts'
-import type { TicketView } from '../app/views.ts'
+import type { TicketFollowup, TicketView } from '../app/views.ts'
 
 /** `reply` 的三种用途（§G.2）。 */
 export const REPLY_PURPOSES = ['answer', 'result', 'attention'] as const
@@ -28,10 +28,21 @@ export interface DomainHandlerOptions {
   readonly report: EngineForExecutor['report']
   /** `Engine.reply`（回复与确认）。 */
   readonly reply: EngineForMainSession['reply']
+  /** `Engine.note`（主 Session 给 worker 的一条事实，§G.2 的 `ticket note`）。 */
+  readonly note: EngineForMainSession['note']
+  /** `Engine.requestStatus`（向等待中的 worker 要一次状态，§G.2 的 `ticket request-status`）。 */
+  readonly requestStatus: EngineForMainSession['requestStatus']
+  /** `Engine.handback`（worker 把它超出范围的消息交回 Eval，§G.2 的 `trigger handback`）。 */
+  readonly handback: EngineForExecutor['handback']
   /** 读一条 Ticket（详情与写入的返回）。 */
   readonly ticketOf: (id: string) => Ticket | undefined
   /** 全部 Ticket（列表读模型）。 */
   readonly tickets: () => readonly Ticket[]
+  /**
+   * 一张 Ticket 仍拥有的人 follow-up（读模型里的「已投递到该 Ticket」标记）。缺省不标：
+   * 只有组合根知道归属（`app/views.ts` 的 `deliveredFollowups`）。
+   */
+  readonly followups?: (ticket: Ticket) => readonly TicketFollowup[]
   /** 一次写成功后的推推送/刷新钩子（面板 `state.changed` 与状态栏）。 */
   readonly afterWrite?: () => void
 }
@@ -136,13 +147,17 @@ export interface TicketsResult {
  */
 export function createDomainHandlers(options: DomainHandlerOptions): ReadonlyMap<string, RouteHandler> {
   const handlers = new Map<string, RouteHandler>()
+  /** 一条 Ticket 的读模型（列表与详情同一份，含仍归它的人 follow-up 标记）。 */
+  const viewOf = (ticket: Ticket): TicketView =>
+    ticketView(ticket, options.followups === undefined ? [] : options.followups(ticket))
 
   handlers.set('GET tickets', ({ query }) => {
     const filter = query['state'] === undefined ? undefined : ticketFilterOf(query['state'])
     const result: TicketsResult = ticketsPage(options.tickets(), {
       limit: numberParam(query['limit'], 20),
       offset: numberParam(query['offset'], 0),
-      ...(filter === undefined ? {} : { filter })
+      ...(filter === undefined ? {} : { filter }),
+      ...(options.followups === undefined ? {} : { followups: options.followups })
     })
     return result
   })
@@ -152,7 +167,29 @@ export function createDomainHandlers(options: DomainHandlerOptions): ReadonlyMap
     if (ticket === undefined) {
       throw new ApiError(ERROR_CODES.missing, 'No such ticket', { ticket: params['id'] ?? '' })
     }
-    return ticketView(ticket)
+    return viewOf(ticket)
+  })
+
+  handlers.set('POST tickets/:id/note', (input) => {
+    // `ticket note` 只带一个事实：100 词上限是固定拒绝（§G.2），领域只加一条 `note` Input。
+    const body = bodyObject(input.body)
+    const text = requiredText(body, 'text')
+    assertWords(text)
+    options.note(input.params['id'] ?? '', text)
+    options.afterWrite?.()
+    return { sent: true }
+  })
+
+  handlers.set('POST tickets/:id/request-status', (input) => {
+    // 人的一次唤醒，不是新工作：只问已经在跑的 worker（§E.6）；没有在跑的就如实回 `asked:false`。
+    const ticketId = input.params['id'] ?? ''
+    const ticket = options.ticketOf(ticketId)
+    if (ticket === undefined) {
+      throw new ApiError(ERROR_CODES.missing, 'No such ticket', { ticket: ticketId })
+    }
+    const asked = options.requestStatus(ticketId)
+    options.afterWrite?.()
+    return { asked, ticket: viewOf(options.ticketOf(ticketId) ?? ticket) }
   })
 
   handlers.set('POST report', (input) => {
@@ -162,7 +199,7 @@ export function createDomainHandlers(options: DomainHandlerOptions): ReadonlyMap
     const ticket = options.report(ticketId, report)
     options.afterWrite?.()
     return {
-      ticket: ticketView(ticket),
+      ticket: viewOf(ticket),
       assignment: ticket.assignments.at(-1) ?? null,
       ...(ticket.attention === undefined ? {} : { attention: ticket.attention })
     }
@@ -197,6 +234,16 @@ export function createDomainHandlers(options: DomainHandlerOptions): ReadonlyMap
     })
     options.afterWrite?.()
     return { id: reply.id, status: reply.status, reused: reply.reused }
+  })
+
+  handlers.set('POST triggers/:id/handback', (input) => {
+    // worker 交回一条到达过它、但超出它的消息：每次一条，Ticket 来自它的 token（§G.2）。
+    const body = bodyObject(input.body)
+    const ticketId = callerTicket(input, body)
+    const reason = requiredText(body, 'reason')
+    const queued = options.handback(ticketId, input.params['id'] ?? '', reason)
+    options.afterWrite?.()
+    return { queued }
   })
 
   handlers.set('POST ack', (input) => {
