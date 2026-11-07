@@ -195,6 +195,32 @@ describe('reading a resource by its name', () => {
     assert.equal(read.body['next_resource'], null)
   })
 
+  test('a pull request description keeps its state, draft and branches', async () => {
+    const commands = new FakeCommands().script(['api', `repos/${REPOSITORY}/pulls/45`], () =>
+      json(pullJson({ state: 'closed', merged: true, draft: true }))
+    )
+    const read = await readResource(commands, 'github/pulls/45')
+    assert.equal(read.status, 'available')
+    assert.deepEqual(descriptionOfRead(read), {
+      number: 45,
+      isPull: true,
+      title: 'docs: describe the identity of the agent account',
+      state: 'closed',
+      url: 'https://github.com/acme/widgets/pull/45',
+      merged: true,
+      draft: true,
+      head: 'docs/account',
+      base: 'main',
+      message: {
+        id: 'https://github.com/acme/widgets/pull/45',
+        from: 'alice',
+        at: '2026-11-07T04:00:00Z',
+        text: 'docs: describe the identity of the agent account\n\nClarifies the account paragraph.',
+        url: 'https://github.com/acme/widgets/pull/45'
+      }
+    })
+  })
+
   test('a comments page holds 20 entries and names the next page while one may follow', async () => {
     const rows = Array.from({ length: 20 }, (_, index) => commentJson(9001 + index))
     const commands = new FakeCommands().script(pageArgs('issues/12/comments', 1), () => json(rows))
