@@ -498,6 +498,207 @@ describe('subscription fan-out', () => {
     }
   })
 
+  test('fans a message out on every one of its threads, and a ticket subscribed to several of them still receives it once', () => {
+    const h = harness()
+    const first = accepted(h).ticketId!
+    const second = accepted(h, '2', 't2').ticketId!
+    const elsewhere = accepted(h, '3', 't3').ticketId!
+    // 第二个 Ticket 也订阅 t1，第一个也订阅 t8：同一条消息经两个 Thread 到达第一个两次。
+    h.engine.bindThread(second, { source: 'chat', id: 't1' }, false)
+    h.engine.bindThread(first, { source: 'chat', id: 't8' }, false)
+    h.tick(5)
+    h.engine.receive(
+      trigger('9', {
+        actor: guest,
+        threads: [
+          { source: 'chat', id: 't1' },
+          { source: 'chat', id: 't8' }
+        ]
+      })
+    )
+    h.settle()
+    for (const ticketId of [first, second]) {
+      const ticket = h.opened.tickets.get(ticketId)!
+      assert.equal(
+        ticket.inputs.filter((input) => input.kind === 'trigger' && input.triggerId === '9').length,
+        1,
+        `${ticketId} receives it once`
+      )
+      assert.equal(h.delivered.filter(([id]) => id === ticketId).length, 1)
+    }
+    // 去向里每个 Ticket 只出现一次；副 Thread 只加语境（correlated），不额外路由。
+    assert.deepEqual(h.opened.triggers.disposition('9')?.fanout, [first, second])
+    assert.equal(h.opened.triggers.disposition('9')?.context, undefined)
+    assert.deepEqual(h.opened.threads.get('chat:t8')?.correlated, ['chat:t1'])
+    assert.deepEqual(h.opened.tickets.get(elsewhere)!.inputs, [])
+  })
+
+  test('gives a message on a Thread a ticket follows only for context to that ticket as context, and routes it nowhere', () => {
+    const h = harness()
+    const owner = accepted(h).ticketId!
+    const follower = accepted(h, '2', 't2').ticketId!
+    assert.equal(h.engine.followForContext(follower, { source: 'chat', id: 't1' }), true)
+    assert.equal(h.engine.followForContext(follower, { source: 'chat', id: 't1' }), false)
+    const requests = h.requests.length
+    const decisions = h.opened.decisions.byThread('chat:t1').length
+    h.engine.receive(trigger('3', { actor: guest }))
+    h.settle()
+    // 只加语境：worker 的副本标 `context`，去向里也标出来——它不拥有这条消息。语境到达本身就是
+    // 一条带 `context: true` 的 Input（§D.1、§K.3），不产生的是一条「路由给它」的 Input 与候选。
+    assert.deepEqual(h.opened.triggers.disposition('3'), {
+      fanout: [owner, follower],
+      context: [follower],
+      at: h.opened.triggers.disposition('3')!.at
+    })
+    assertMatches(h.opened.tickets.get(follower)!.inputs.at(-1), {
+      kind: 'trigger',
+      triggerId: '3',
+      context: true
+    })
+    // 不路由：没有新候选、没有新 Decision、Thread 的队列空着，主 Session 也不能把它交给它。
+    assert.equal(h.requests.length, requests)
+    assert.equal(h.opened.decisions.byThread('chat:t1').length, decisions)
+    assert.deepEqual(h.opened.threads.get('chat:t1')?.pending, [])
+    assert.equal(h.engine.candidate('3'), undefined)
+    assert.throws(
+      () => h.engine.decide('3', { kind: 'accept', title: 'More', scope: 'small', reason: 'asked' }),
+      (error: unknown) => error instanceof UserError && error.code === 'workerDecides'
+    )
+  })
+
+  test('resumes no ticket from a Thread it follows only for context, so the message reaches Eval instead', () => {
+    const h = harness()
+    const ticketId = accepted(h).ticketId!
+    h.engine.followForContext(ticketId, { source: 'chat', id: 'issue' })
+    h.engine.report(ticketId, { state: 'ready', summary: 'done' })
+    assert.ok(h.opened.tickets.get(ticketId)!.ended)
+    const decisions = h.opened.decisions.byThread('chat:issue').length
+    h.engine.receive(trigger('2', { threads: [{ source: 'chat', id: 'issue' }] }))
+    // 语境 Thread 不恢复已结束的 Ticket：没有第二条 Input，也没有投递。
+    assert.ok(h.opened.tickets.get(ticketId)!.ended)
+    assert.deepEqual(h.opened.tickets.get(ticketId)!.undelivered, [])
+    assert.deepEqual(h.opened.triggers.disposition('2')?.fanout, [])
+    assert.deepEqual(h.opened.triggers.disposition('2')?.context, undefined)
+    // 没人决定它，于是它进 primary thread 的 Eval：候选只对着那条消息，Thread 还没被判。
+    h.pump()
+    assert.deepEqual(h.requests.at(-1)!.thread.key, 'chat:issue')
+    assert.deepEqual(h.requests.at(-1)!.triggers.map((item) => item.id), ['2'])
+    assert.equal(h.opened.decisions.byThread('chat:issue').length, decisions)
+  })
+
+  test('promotes a Thread a ticket follows only for context once the main Session attaches one of its messages', () => {
+    const h = harness()
+    const ticketId = accepted(h).ticketId!
+    h.engine.followForContext(ticketId, { source: 'chat', id: 'issue' })
+    h.engine.report(ticketId, { state: 'ready', summary: 'done' })
+    h.engine.receive(trigger('2', { threads: [{ source: 'chat', id: 'issue' }] }))
+    h.pump()
+    const mandate = h.opened.tickets.get(ticketId)!.mandate
+    // 语境 Thread 上的消息先到 Eval；主 Session 可以把它交给这张 Ticket。
+    const attached = h.engine.attach(ticketId, '2', 'It belongs here after all')
+    // attach 把订阅变成它自己的：语境标记消失，已结束的 Ticket 在不变的 Mandate 下恢复。
+    assert.deepEqual(h.opened.threads.get('chat:issue')?.context, [])
+    assert.equal(attached.ended, undefined)
+    assert.deepEqual(attached.mandate, mandate)
+    h.settle()
+    const requests = h.requests.length
+    // 此后那条 Thread 上人的消息是它的 follow-up：直接到 worker，不再进 Eval。
+    h.engine.receive(trigger('3', { actor: guest, threads: [{ source: 'chat', id: 'issue' }] }))
+    h.settle()
+    assertMatches(h.opened.tickets.get(ticketId)!.inputs.at(-1), { kind: 'trigger', triggerId: '3' })
+    assert.equal('context' in h.opened.tickets.get(ticketId)!.inputs.at(-1)!, false)
+    assert.equal(h.requests.length, requests)
+    assert.deepEqual(h.opened.triggers.disposition('3'), {
+      fanout: [ticketId],
+      at: h.opened.triggers.disposition('3')!.at
+    })
+  })
+
+  test('attaches a message from another Thread to a live ticket without opening a ticket or a new mandate', () => {
+    const h = harness()
+    const decision = accepted(h)
+    const ticketId = decision.ticketId!
+    const before = h.opened.tickets.get(ticketId)!
+    h.engine.receive(trigger('2', { actor: guest, threads: [{ source: 'chat', id: 't9' }] }))
+    h.pump()
+    const decisions = h.opened.decisions.byThread('chat:t9').length
+    assert.deepEqual(h.opened.triggers.disposition('2')?.fanout, [])
+    const attached = h.engine.attach(ticketId, '2', 'It belongs to this fix')
+    // 不新开 Ticket、不新开 Decision、不换 Mandate、不换 Assignment。
+    assert.equal(h.opened.tickets.list().length, 1)
+    assert.equal(h.opened.decisions.byThread('chat:t9').length, decisions)
+    assert.deepEqual(attached.mandate, before.mandate)
+    assert.equal(attached.assignments.length, before.assignments.length)
+    assert.equal(attached.ended, undefined)
+    // attach = 订阅那些 Thread + 一条带说明的 Input（人写的消息仍标 human）。
+    assertMatches(attached.inputs.at(-1), {
+      kind: 'trigger',
+      triggerId: '2',
+      note: 'It belongs to this fix',
+      human: true
+    })
+    assert.deepEqual(h.opened.threads.get('chat:t9')?.subscriptions, [ticketId])
+    assert.deepEqual(h.opened.triggers.disposition('2')?.fanout, [ticketId])
+    h.settle()
+    // 投递沿用既有投递路径：同一条 running Assignment。
+    assert.deepEqual(h.delivered.at(-1), [ticketId, attached.inputs.at(-1)!.id])
+    assert.equal(h.starts, 1)
+  })
+
+  test('leaves both sides as they were when the message still belongs to another worker, or came back from this one', () => {
+    const h = harness()
+    const first = accepted(h).ticketId!
+    const second = accepted(h, '2', 't2').ticketId!
+    h.engine.receive(trigger('3', { actor: guest, threads: [{ source: 'chat', id: 't2' }] }))
+    h.settle()
+    const before = h.opened.tickets.get(first)!
+    const owned = h.opened.triggers.disposition('3')
+    // 第二个 Ticket 的 worker 决定它：主 Session 不能把它抢给第一个，两边都不动。
+    assert.throws(
+      () => h.engine.attach(first, '3'),
+      (error: unknown) => error instanceof UserError && error.code === 'workerDecides'
+    )
+    assert.deepEqual(h.opened.tickets.get(first), before)
+    assert.deepEqual(h.opened.triggers.disposition('3'), owned)
+    // 交回之后，同一条不能再被 attach 回交回它的那张 Ticket。
+    assert.equal(h.engine.handback(second, '3', 'It is about the first fix'), true)
+    const handed = h.opened.triggers.disposition('3')
+    const returned = h.opened.tickets.get(second)
+    assert.throws(
+      () => h.engine.attach(second, '3'),
+      (error: unknown) => error instanceof UserError && error.code === 'handedBackHere'
+    )
+    assert.deepEqual(h.opened.tickets.get(second), returned)
+    assert.deepEqual(h.opened.triggers.disposition('3'), handed)
+  })
+
+  test('refuses an attach for a ticket a person stopped or whose mandate no longer passes, touching neither', () => {
+    const h = harness()
+    const stopped = accepted(h).ticketId!
+    h.engine.stopTicket(stopped, 'not needed')
+    const ended = accepted(h, '2', 't2').ticketId!
+    h.engine.report(ended, { state: 'ready', summary: 'done' })
+    h.engine.receive(trigger('3', { actor: guest, threads: [{ source: 'chat', id: 't9' }] }))
+    h.pump()
+    const owned = h.opened.triggers.disposition('3')
+    const stoppedBefore = h.opened.tickets.get(stopped)
+    assert.throws(
+      () => h.engine.attach(stopped, '3'),
+      (error: unknown) => error instanceof UserError && error.code === 'ticketStopped'
+    )
+    assert.deepEqual(h.opened.tickets.get(stopped), stoppedBefore)
+    assert.deepEqual(h.opened.triggers.disposition('3'), owned)
+    // 已结束的 Ticket 只有在其 Mandate 仍复验得过时才能 attach（§K.3）。
+    h.setVersion('revoked')
+    const endedBefore = h.opened.tickets.get(ended)
+    assert.throws(
+      () => h.engine.attach(ended, '3'),
+      (error: unknown) => error instanceof UserError && error.code === 'mandateRevoked'
+    )
+    assert.deepEqual(h.opened.tickets.get(ended), endedBefore)
+    assert.deepEqual(h.opened.triggers.disposition('3'), owned)
+  })
+
   test('keeps inputs undelivered until an assignment is running, and asks to launch one whose launch failed again', () => {
     const h = harness()
     h.engine.receive(trigger('1'))
@@ -537,6 +738,61 @@ describe('subscription fan-out', () => {
     assert.deepEqual(h.opened.tickets.get(decision.ticketId!)!.inputs, [])
   })
 
+  test('drops every subscription of a Thread at once, for every ticket on it, and stops following it', () => {
+    const h = harness()
+    const first = accepted(h).ticketId!
+    const second = accepted(h, '2', 't2').ticketId!
+    const context = accepted(h, '6', 't6').ticketId!
+    h.engine.bindThread(second, { source: 'chat', id: 't1' }, false)
+    h.engine.followForContext(context, { source: 'chat', id: 't1' })
+    assert.deepEqual(h.opened.threads.get('chat:t1')?.subscriptions, [first, second, context])
+    assert.deepEqual(h.opened.threads.get('chat:t1')?.context, [context])
+    assert.equal(h.engine.unsubscribe('chat:t1'), true)
+    // 多对多的每一条都丢掉，包括只当语境的那张；跟随也一起停（§I.5 第 6 条：关闭不再结束它）。
+    assert.deepEqual(h.opened.threads.get('chat:t1')?.subscriptions, [])
+    assert.deepEqual(h.opened.threads.get('chat:t1')?.context, [])
+    assert.equal(h.opened.tickets.get(second)?.follows, undefined)
+    h.engine.receive(trigger('3', { actor: guest }))
+    h.settle()
+    for (const ticketId of [first, second, context]) {
+      const ticket = h.opened.tickets.get(ticketId)!
+      assert.deepEqual(
+        ticket.inputs.filter((input) => input.kind === 'trigger' && input.triggerId === '3'),
+        []
+      )
+    }
+    // 再取消一次什么都不丢：固定返回 false，不假装做了事。
+    assert.equal(h.engine.unsubscribe('chat:t1'), false)
+    // 新的 Decision 订阅它之后，扇出恢复，且只到新 Ticket。
+    h.engine.receive(trigger('4'))
+    h.pump()
+    const subscribed = h.decide(h.requests.at(-1)!, {
+      kind: 'accept',
+      title: 'Again',
+      scope: 'small',
+      reason: 'asked',
+      rules: ['copy']
+    }).ticketId!
+    h.settle()
+    h.tick(5)
+    h.engine.receive(trigger('5', { actor: guest }))
+    h.settle()
+    assert.equal(
+      h.opened.tickets
+        .get(subscribed)!
+        .inputs.filter((input) => input.kind === 'trigger' && input.triggerId === '5').length,
+      1
+    )
+    for (const ticketId of [first, second, context]) {
+      assert.equal(
+        h.opened.tickets
+          .get(ticketId)!
+          .inputs.some((input) => input.kind === 'trigger' && input.triggerId === '5'),
+        false
+      )
+    }
+  })
+
   test('lets an Executor drop a thread attached to its ticket, keeping the thread\'s other tickets, but not its own threads', () => {
     const h = harness()
     const first = accepted(h).ticketId!
@@ -560,6 +816,71 @@ describe('subscription fan-out', () => {
     assert.throws(
       () => h.engine.markUnrelated(first, 'gh:pr-9', 'its PR'),
       (error: unknown) => error instanceof UserError && error.code === 'followedThread'
+    )
+  })
+})
+
+describe('hand-back and release', () => {
+  test('hands a message back once with its reason, and releases it to an Eval that may route it elsewhere', () => {
+    const h = harness()
+    const ticketId = accepted(h).ticketId!
+    h.engine.receive(trigger('2', { actor: guest }))
+    h.settle()
+    // 它的 worker 先判，但判断是「这超出本 Ticket」：交回一次，写下原因。
+    assert.equal(h.engine.handback(ticketId, '2', 'It asks for another repository'), true)
+    assert.deepEqual(h.opened.triggers.disposition('2')?.handbacks, [
+      { ticketId, reason: 'It asks for another repository', at: h.opened.triggers.disposition('2')!.handbacks![0]!.at }
+    ])
+    // 第二次固定拒绝，无论原因；记录仍只有第一次那一条。
+    assert.throws(
+      () => h.engine.handback(ticketId, '2', 'again'),
+      (error: unknown) => error instanceof UserError && error.code === 'handedBack'
+    )
+    assert.equal(h.opened.triggers.disposition('2')?.handbacks?.length, 1)
+    // 释放：下一次 pass 把它交给新 Eval，可以开别处的活。
+    h.pump()
+    const candidate = h.requests.at(-1)!
+    assert.deepEqual(candidate.triggers.map((item) => item.id), ['2'])
+    assert.equal(h.engine.candidate('2')?.evalId, candidate.evalId)
+    const elsewhere = h.decide(candidate, {
+      kind: 'accept',
+      title: 'Elsewhere',
+      scope: 'small',
+      reason: 'asked',
+      rules: ['copy']
+    })
+    assert.notEqual(elsewhere.ticketId, ticketId)
+    // 交回不动订阅：原 Ticket 仍跟随这个 Thread（人后续的话还会到它）。
+    assert.deepEqual(h.opened.threads.get('chat:t1')?.subscriptions, [ticketId, elsewhere.ticketId])
+    // 只有到过这张 Ticket 的消息能交回。
+    assert.throws(
+      () => h.engine.handback(ticketId, '9', 'never mine'),
+      (error: unknown) => error instanceof UserError && error.code === 'notReached'
+    )
+  })
+
+  test('records a hand-back without queueing again a message the ticket never decided, such as one it read for context', () => {
+    const h = harness()
+    const ticketId = accepted(h).ticketId!
+    h.engine.followForContext(ticketId, { source: 'chat', id: 'issue' })
+    h.engine.receive(trigger('2', { threads: [{ source: 'chat', id: 'issue' }] }))
+    const pending = h.opened.threads.get('chat:issue')?.pending
+    // 它已经到了 Eval：交回只记原因，不再排一次。
+    assert.equal(h.engine.handback(ticketId, '2', 'Not this ticket'), false)
+    assert.deepEqual(h.opened.triggers.disposition('2')?.handbacks, [
+      { ticketId, reason: 'Not this ticket', at: h.opened.triggers.disposition('2')!.handbacks![0]!.at }
+    ])
+    assert.deepEqual(h.opened.threads.get('chat:issue')?.pending, pending)
+    // 已交回的消息不会被主 Session attach 回同一张 Ticket。
+    assert.throws(
+      () => h.engine.attach(ticketId, '2'),
+      (error: unknown) => error instanceof UserError && error.code === 'handedBackHere'
+    )
+    // 一条根本没到过这张 Ticket 的消息不是它能交回的。
+    h.engine.receive(trigger('3', { threads: [{ source: 'chat', id: 'elsewhere' }] }))
+    assert.throws(
+      () => h.engine.handback(ticketId, '3', 'Never mine'),
+      (error: unknown) => error instanceof UserError && error.code === 'notReached'
     )
   })
 })
