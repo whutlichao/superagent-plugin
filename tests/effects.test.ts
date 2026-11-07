@@ -15,7 +15,7 @@ import {
   type EffectKind
 } from '../src/worker/app/effects'
 import { HealthBoard } from '../src/worker/infra/health'
-import { createGate, openQueue, until } from './support/queue'
+import { createGate, openQueue, until, type QueueHarness } from './support/queue'
 
 test('an effect queued inside a transaction runs only once that transaction commits', async () => {
   const h = openQueue()
@@ -839,3 +839,178 @@ test('a handler that defers with Later while paused retries five seconds later a
   }
 })
 
+
+// ---------------------------------------------------------------- kind 矩阵：逐 kind 成功、失败、并发
+
+/**
+ * §J.2 kind 表的一行（手抄，不从 `EFFECT_RULES` 推导）：key 的形状、并发上限、首次退避。
+ * `enqueue` 收在闭包里，于是每行的 payload 形状由它自己保证（表格里没有类型逃逸）。
+ */
+interface MatrixRow {
+  readonly kind: EffectKind
+  /** 设计表 key 列的一个示例值。 */
+  readonly key: string
+  /** 这条 payload 的原样：handler 收到的必须就是它。 */
+  readonly payload: unknown
+  /** 首次退避（毫秒）。 */
+  readonly retry: number
+  /** 同时最多几个（全局并发 4 之内）。 */
+  readonly concurrent: number
+  /** 按这一行的 payload 形状入队；`key` 可换（同 key 会合并，并发用例要不同的 key）。 */
+  readonly enqueue: (h: QueueHarness, key?: string) => void
+}
+
+/** 设计 §J.2 的七行，逐行手抄。 */
+const MATRIX: readonly MatrixRow[] = [
+  {
+    kind: 'assessment',
+    key: 'eval-1',
+    payload: { triggerId: 'trigger-1' },
+    retry: 2000,
+    concurrent: 4,
+    enqueue: (h, key) => h.effects.enqueue('assessment', key ?? 'eval-1', { triggerId: 'trigger-1' })
+  },
+  {
+    kind: 'launch',
+    key: 'ticket-1',
+    payload: { ticketId: 'ticket-1', assignmentId: 'assignment-1' },
+    retry: 5000,
+    concurrent: 4,
+    // payload 不随 key 变：并发用例只换行 key（同 key 会合并成一行）。
+    enqueue: (h, key) =>
+      h.effects.enqueue('launch', key ?? 'ticket-1', {
+        ticketId: 'ticket-1',
+        assignmentId: 'assignment-1'
+      })
+  },
+  {
+    kind: 'delivery',
+    key: 'ticket-1',
+    payload: { ticketId: 'ticket-1' },
+    retry: 2000,
+    concurrent: 4,
+    enqueue: (h, key) => h.effects.enqueue('delivery', key ?? 'ticket-1', { ticketId: 'ticket-1' })
+  },
+  {
+    kind: 'relay',
+    key: 'router',
+    payload: { messageId: 'message-1', kind: 'report', summary: 'a report' },
+    retry: 2000,
+    concurrent: 1,
+    enqueue: (h, key) =>
+      h.effects.enqueue('relay', key ?? 'router', {
+        messageId: 'message-1',
+        kind: 'report',
+        summary: 'a report'
+      })
+  },
+  {
+    kind: 'notice',
+    key: 'router',
+    payload: { summary: 'prompts updated to r2' },
+    retry: 2000,
+    concurrent: 1,
+    enqueue: (h, key) =>
+      h.effects.enqueue('notice', key ?? 'router', { summary: 'prompts updated to r2' })
+  },
+  {
+    kind: 'reply',
+    key: 'message-1',
+    payload: { messageId: 'message-1' },
+    retry: 5000,
+    concurrent: 1,
+    enqueue: (h, key) => h.effects.enqueue('reply', key ?? 'message-1', { messageId: key ?? 'message-1' })
+  },
+  {
+    kind: 'return',
+    key: 'trigger-1',
+    payload: { triggerKey: 'trigger-1' },
+    retry: 2000,
+    concurrent: 1,
+    enqueue: (h, key) => h.effects.enqueue('return', key ?? 'trigger-1', { triggerKey: key ?? 'trigger-1' })
+  }
+]
+
+test('the kind matrix covers the seven kinds of the design table, once each, in order', () => {
+  assert.deepEqual(
+    MATRIX.map((row) => row.kind),
+    [...EFFECT_KINDS]
+  )
+  // 每行的并发与退避与 §J.2 一致（与 `EFFECT_RULES` 的逐行断言互相独立：这里读的是 dispatch 行为）。
+  for (const row of MATRIX) {
+    assert.deepEqual(EFFECT_RULES[row.kind].retry[0], row.retry, `${row.kind} first backoff`)
+  }
+})
+
+for (const row of MATRIX) {
+  test(`the ${row.kind} kind carries its key and payload once and leaves no row`, async () => {
+    const h = openQueue()
+    const seen: { payload: unknown; key: string }[] = []
+    try {
+      h.effects.handle(row.kind, async (payload: unknown, key: string) => {
+        seen.push({ payload, key })
+      })
+      row.enqueue(h)
+      await h.effects.idle()
+      // 一次成功：handler 收到的 payload 原样、key 是设计表的那一列。
+      assert.deepEqual(seen, [{ payload: row.payload, key: row.key }])
+      assert.equal(h.effects.pending(row.kind, row.key), false)
+      assert.deepEqual(h.board.all()[row.kind], { state: 'ready', detail: 'waiting 0, failed 0' })
+    } finally {
+      h.cleanup()
+    }
+  })
+
+  test(`the ${row.kind} kind keeps a failed row, backs off ${row.retry} ms and counts one failure`, async () => {
+    const h = openQueue()
+    const seen: string[] = []
+    try {
+      h.effects.handle(row.kind, async (_payload: unknown, key: string) => {
+        seen.push(key)
+        throw new Error(`${row.kind} failed on purpose`)
+      })
+      row.enqueue(h)
+      await h.effects.idle()
+      // 一次失败不是问题（连续三条才是，§J.2）：行留下、按本 kind 的首次退避重试。
+      assert.deepEqual(seen, [row.key])
+      const stored = h.store.effects.get(row.kind, row.key)
+      assert.equal(stored?.attempts, 1)
+      assert.equal(stored?.lastError, `${row.kind} failed on purpose`)
+      assert.equal(stored?.dueAt, new Date(h.clock.now() + row.retry).toISOString())
+      assert.equal(h.effects.pending(row.kind, row.key), true)
+      assert.deepEqual(h.board.all()[row.kind], { state: 'ready', detail: 'waiting 1, failed 1' })
+      // 退避没到之前不再跑。
+      h.clock.advance(row.retry - 1)
+      await h.effects.idle()
+      assert.deepEqual(seen, [row.key])
+    } finally {
+      h.cleanup()
+    }
+  })
+
+  test(`the ${row.kind} kind runs at most ${row.concurrent} at once`, async () => {
+    const h = openQueue()
+    let inside = 0
+    let peak = 0
+    const release = createGate()
+    try {
+      h.effects.handle(row.kind, async () => {
+        inside += 1
+        peak = Math.max(peak, inside)
+        await release.opened
+        inside -= 1
+      })
+      // 六个不同的 key：同 key 会合并成一行，测不到并发。
+      for (let index = 0; index < 6; index += 1) row.enqueue(h, `${row.kind}-${index}`)
+      await until(() => inside === row.concurrent)
+      assert.equal(peak, row.concurrent, `${row.kind} fills exactly its limit`)
+      release.open()
+      await h.effects.idle()
+      // 放行之后不再超过上限，六行全部跑过。
+      assert.equal(peak, row.concurrent)
+      assert.equal(h.effects.pending(row.kind), false)
+    } finally {
+      h.cleanup()
+    }
+  })
+}

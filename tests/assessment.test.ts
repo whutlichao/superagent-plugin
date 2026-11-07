@@ -8,8 +8,14 @@
 // 键（`rule_assessments` / `intent_evidence` / `target_basis`）。
 import { describe, test } from 'node:test'
 import assert from 'node:assert/strict'
+import { Engine } from '../src/worker/core/index.ts'
+import type { Policy, Trigger } from '../src/worker/core/index.ts'
+import { createDeterministicAssessor } from '../src/worker/app/assessor.ts'
+import { registerAssessmentEffects, type RouterCard } from '../src/worker/app/notices.ts'
+import { createRepositories } from '../src/worker/app/repositories.ts'
 import { assessmentOutcome, directionAllowed } from '../src/worker/policy/index.ts'
 import type { AssessmentPolicy } from '../src/worker/policy/index.ts'
+import { openQueue } from './support/queue.ts'
 
 /** 两份启用规则 + 一份停用规则：完整性只数启用的。 */
 const RULES = [
@@ -269,5 +275,187 @@ describe('the payload shape', () => {
     )
     assert.equal(ignore.ok, true, JSON.stringify(ignore))
     if (ignore.ok) assert.equal(ignore.outcome.kind, 'ignore')
+  })
+})
+
+// ---------------------------------------------------------------- assessment effect (§J.2、§K.7)
+
+/**
+ * 候选卡怎么送到 Router、Eval 计时何时起算（§K.7：候选**送达 Router** 时才起算）。
+ *
+ * 接缝是 `registerAssessmentEffects()` 注册的 handler：真 SQLite 上的效果队列 + 真 `Engine`
+ * （领域），只有「写 Router 终端」这一外部端口是记录型的（§P.1：执行器/Router 这类外部世界
+ * 的替身允许，内部层不 mock）。
+ */
+describe('the assessment effect relays the candidate card (§J.2, §K.7)', () => {
+  /** 一次评估的夹具：真库 + 真队列 + 真领域，Router 终端由 `cards` 记录。 */
+  function harness(options: { deliver?: (card: RouterCard) => Promise<void> } = {}) {
+    const h = openQueue()
+    const repo = createRepositories(h.store)
+    const cards: RouterCard[] = []
+    const delivered: string[] = []
+    const policy: Policy = {
+      version: 'policy-1',
+      paused: false,
+      evalTimeoutMs: 60_000,
+      gate: (item) =>
+        item.actor.id === 'alice'
+          ? { admissible: true, strength: 'explicit', basis: { via: 'addressed', addressed: 'mention' } }
+          : { admissible: true, strength: 'inferred', basis: { via: 'followup' } },
+      revalidate: () => true,
+      admitsInferred: () => true
+    }
+    let engine: Engine | undefined
+    const assessor = createDeterministicAssessor({
+      decide: (triggerId, outcome) => engine!.decide(triggerId, outcome),
+      // 这是 boot 里的那条接线：不是本票评估器决定的那类候选，走 `assessment` effect 交给 Router。
+      relayCandidate: (candidate) => {
+        h.effects.enqueue('assessment', candidate.evalId, { triggerId: candidate.triggers[0]!.id })
+      }
+    })
+    engine = new Engine({
+      repo,
+      scope: { scope: () => ({ listened: true, observed: true }) },
+      policy: () => policy,
+      assessor,
+      executor: {
+        start: () => undefined,
+        deliver: () => undefined,
+        stop: () => undefined
+      },
+      outbox: {
+        send: () => undefined,
+        status: () => undefined,
+        withdraw: () => undefined,
+        withdrawTicket: () => undefined
+      },
+      now: () => h.clock.iso()
+    })
+    registerAssessmentEffects({
+      effects: h.effects,
+      candidate: (triggerId) => engine!.candidate(triggerId),
+      delivered: (evalId) => {
+        delivered.push(evalId)
+        engine!.candidateDelivered(evalId)
+      },
+      deliver:
+        options.deliver ??
+        (async (card) => {
+          cards.push(card)
+        }),
+      now: () => h.clock.now()
+    })
+    return { ...h, repo, engine, cards, delivered }
+  }
+
+  /** 一条来自非名单成员的 Trigger：Gate 判成 inferred，由 Router 评估（§K.2）。 */
+  function incoming(id: string, actor = 'bob'): Trigger {
+    return {
+      id,
+      source: 'chat',
+      threads: [{ source: 'chat', id: 't1' }],
+      actor: { source: 'chat', id: actor },
+      human: true,
+      at: `2026-11-07T03:26:0${id}Z`,
+      text: `please change thing number ${id}`,
+      channel: { source: 'chat', thread: 't1', address: { message: id } },
+      meta: {}
+    }
+  }
+
+  test('an inferred candidate is relayed as one card, and its Eval clock starts at delivery', async () => {
+    const h = harness()
+    try {
+      h.engine.receive(incoming('1'))
+      h.engine.evaluateDue()
+      const evaluating = h.repo.threads.get('chat:t1')?.evaluating
+      assert.ok(evaluating)
+      // 行在领域事务里就写好了（先存后做），但还没人送：终端上没有卡、时钟没起算。
+      assert.equal(h.effects.pending('assessment', evaluating.id), true)
+      assert.deepEqual(h.cards, [])
+      assert.equal(evaluating.delivered, undefined)
+
+      // Router 忙了 30 秒之后才收下这张卡：截止时间从「送达」起算，不是从「入队」起算。
+      h.clock.advance(30_000)
+      await h.effects.idle()
+      assert.equal(h.cards.length, 1)
+      assert.deepEqual(h.delivered, [evaluating.id])
+      assert.equal(h.effects.pending('assessment'), false)
+      const card = h.cards[0]!
+      assert.equal(card.name, `eval-${evaluating.id}`)
+      assert.match(card.summary, /inferred/)
+      // 正文带着 Router 评估要的编号：它是 `superagent eval <trigger_id>` 的入参。
+      assert.match(card.body, /trigger: 1/)
+      assert.match(card.body, /policy-1/)
+      const after = h.repo.threads.get('chat:t1')!.evaluating!
+      assert.equal(after.delivered, h.clock.iso())
+      assert.equal(Date.parse(after.deadline), h.clock.now() + 60_000)
+    } finally {
+      h.cleanup()
+    }
+  })
+
+  test('an explicit candidate is decided here, so the Router is not asked and no card is queued', async () => {
+    const h = harness()
+    try {
+      h.engine.receive(incoming('1', 'alice'))
+      h.engine.evaluateDue()
+      assert.equal(h.effects.pending('assessment'), false)
+      await h.effects.idle()
+      assert.deepEqual(h.cards, [])
+    } finally {
+      h.cleanup()
+    }
+  })
+
+  test('a candidate whose Eval ended before delivery is dropped: no card, no clock', async () => {
+    const h = harness()
+    try {
+      h.engine.receive(incoming('1'))
+      h.engine.evaluateDue()
+      const evalId = h.repo.threads.get('chat:t1')!.evaluating!.id
+      // 评估在送达之前就结束了（人从卡片上忽略、或 Policy 复评）：这张卡已经没有意义。
+      h.engine.decide('1', { evalId, kind: 'ignore', reason: 'not ours' })
+      await h.effects.idle()
+      assert.deepEqual(h.cards, [])
+      assert.deepEqual(h.delivered, [])
+      assert.equal(h.effects.pending('assessment'), false)
+    } finally {
+      h.cleanup()
+    }
+  })
+
+  test('a delivery that fails keeps the row, backs off two seconds and never starts the clock early', async () => {
+    let failing = true
+    const cards: RouterCard[] = []
+    const h = harness({
+      deliver: async (card) => {
+        cards.push(card)
+        if (failing) throw new Error('the router terminal is not available')
+      }
+    })
+    try {
+      h.engine.receive(incoming('1'))
+      h.engine.evaluateDue()
+      const evalId = h.repo.threads.get('chat:t1')!.evaluating!.id
+
+      await h.effects.idle()
+      // 终端没接：行留下，按 assessment 的 2 s 退避（§J.2），时钟仍然没起算。
+      assert.equal(cards.length, 1)
+      const row = h.store.effects.get('assessment', evalId)
+      assert.equal(row?.attempts, 1)
+      assert.equal(row?.dueAt, new Date(h.clock.now() + 2000).toISOString())
+      assert.deepEqual(h.delivered, [])
+      assert.equal(h.repo.threads.get('chat:t1')!.evaluating!.delivered, undefined)
+
+      failing = false
+      h.clock.advance(2000)
+      await h.effects.idle()
+      assert.equal(cards.length, 2)
+      assert.deepEqual(h.delivered, [evalId])
+      assert.equal(h.effects.pending('assessment'), false)
+    } finally {
+      h.cleanup()
+    }
   })
 })

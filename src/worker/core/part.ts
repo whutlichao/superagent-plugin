@@ -29,6 +29,12 @@ export interface EngineOptions {
    */
   prepareTicket?: (ticket: Ticket, outcome: Extract<AssessmentOutcome, { kind: 'accept' }>) => Ticket
   /**
+   * 把一条人的消息交回 Eval 的**持久意图**（§J.2 的 `return` kind）：实现把一行写进效果
+   * 队列，提交后才执行。缺省时退回同步入队——那是没有效果队列的最小接线（纯领域测试），
+   * 生产组合根总会接上它，否则一次崩溃就会丢掉「它该回到 Eval」这件事。
+   */
+  returns?: { enqueue(triggerId: string): void }
+  /**
    * 时钟。core 自己不读环境时钟：真实时间源由组合根注入（§P.1 其四「注入的虚拟时钟」），
    * 领域因此是确定性的、可重放的。
    */
@@ -80,7 +86,30 @@ export abstract class EnginePart {
     const disposition = this.repo.triggers.disposition(trigger.id) ?? { fanout: [], at: this.now() }
     const handbacks = [...(disposition.handbacks ?? []), { ticketId, reason, at: this.now() }]
     this.repo.triggers.saveDisposition(trigger.id, { ...disposition, handbacks })
-    return decided && !this.owners(trigger).length && this.queueForEval(trigger)
+    return decided && !this.owners(trigger).length && this.enqueueReturn(trigger)
+  }
+
+  /**
+   * 把一条回到 Eval 的人的消息排成 `return` effect（§J.2 的 kind 表）：事务里只写意图，
+   * 提交后才由 handler 经 `Engine.returnToEval` 重排。因此命令返回时候选还没出现——它在
+   * `return` 跑过之后才出现（`{queued:true}` 的含义是「会进入 Eval」，不是「已经进了」）。
+   * 已经在等或正被评估的一条不再多排一行。
+   */
+  protected enqueueReturn(trigger: Trigger): boolean {
+    if (this.awaitingEval(trigger)) return true
+    const returns = this.options.returns
+    if (returns === undefined) return this.queueForEval(trigger)
+    returns.enqueue(trigger.id)
+    return true
+  }
+
+  /** 这条 Trigger 已经在某次 Eval 里等、或正被评估。 */
+  protected awaitingEval(trigger: Trigger): boolean {
+    const primary = this.thread(trigger.threads[0]!)
+    return (
+      primary.pending.includes(trigger.id) ||
+      (primary.evaluating?.triggerIds.includes(trigger.id) ?? false)
+    )
   }
 
   /** 记录某 Ticket 的 worker 把一条人的消息当作本 Ticket 的工作接手（确认或回答）。 */

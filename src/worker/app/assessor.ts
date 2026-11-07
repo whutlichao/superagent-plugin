@@ -24,6 +24,11 @@ interface Queued {
 export interface DeterministicAssessorOptions {
   /** 交给 `Engine.decide`；实现里捕获异常并记日志，不要让一条坏候选挡住整批。 */
   readonly decide: (triggerId: string, outcome: Outcome) => void
+  /**
+   * 本评估器**不**决定的候选（主动候选，§K.4 的 accept mode 与规则判定）：交给它把候选卡
+   * 排给 Router。缺省不排（测试与不需要 Router 的接线里就是空的）。
+   */
+  readonly relayCandidate?: (candidate: Candidate) => void
   /** 一条决定失败时的日志（缺省静默；组合根接插件日志）。 */
   readonly onError?: (error: unknown, evalId: string) => void
 }
@@ -102,8 +107,12 @@ export function createDeterministicAssessor(
     request(candidate: Candidate): void {
       const trigger = candidate.triggers[0]
       if (trigger === undefined) return
-      // 主动候选留给 Router 的 `eval-decide`（accept mode 与规则判定，§K.4）。
-      if (candidate.strength !== 'explicit') return
+      // 主动候选留给 Router 的 `eval-decide`（accept mode 与规则判定，§K.4）：候选卡经
+      // `assessment` effect 送到 Router，送达之后才开始算 Eval 的截止时间（§K.7）。
+      if (candidate.strength !== 'explicit') {
+        options.relayCandidate?.(candidate)
+        return
+      }
       remember({
         evalId: candidate.evalId,
         triggerId: trigger.id,
