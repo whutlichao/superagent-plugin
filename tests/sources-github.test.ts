@@ -900,7 +900,12 @@ test('a missing repository or CLI leaves the Source in setup and starts no polli
       // 组合根不造轮询器：`pollOnce` 返回空读数，且一个 gh 调用都没有（连账号探针都不跑）。
       assert.deepEqual(await h.handle.pollOnce(), { notifications: 0, triggers: 0, skipped: 0 })
       assert.equal(h.handle.snapshot().health.setupMissing, true, 'the panel sees a setup problem')
-      assert.deepEqual(h.commands.calls, [], 'no gh call happens before setup completes')
+      // 一个 `gh` 调用都没有：setup 没完成之前连账号探针都不跑（git 探针与本例无关）。
+      assert.deepEqual(
+        h.commands.calls.filter((call) => call.program === 'gh'),
+        [],
+        'no gh call happens before setup completes'
+      )
     } finally {
       await h.cleanup()
     }
@@ -1016,7 +1021,11 @@ test('the channel reads the existing comments before writing, and appends a hidd
   commands.script(['api', 'repos/acme/widgets/issues/42/comments?per_page=100', '-q'], () => '')
   commands.script(['api', 'repos/acme/widgets/issues/42/comments', '-f'], () => '{}')
   const result = await githubKind.channel?.send(
-    { run: (program, args, options) => commands.run(program, args, options ?? {}), withSignal: () => commands },
+    {
+      run: (program, args, options) => commands.run(program, args, options ?? {}),
+      stream: (program, args, options) => commands.stream(program, args, options),
+      withSignal: () => commands
+    },
     {
       id: 'reply-1',
       channel: {
@@ -1052,7 +1061,11 @@ test('a comment that already carries the marker is not written again', async () 
     () => 'Done.\n\n<!-- superagent:reply-1 -->'
   )
   const result = await githubKind.channel?.send(
-    { run: (program, args, options) => commands.run(program, args, options ?? {}), withSignal: () => commands },
+    {
+      run: (program, args, options) => commands.run(program, args, options ?? {}),
+      stream: (program, args, options) => commands.stream(program, args, options),
+      withSignal: () => commands
+    },
     {
       id: 'reply-1',
       channel: { source: 'github', thread: 'github:42', address: { repo: 'acme/widgets', issue: '42' } },
@@ -1070,7 +1083,11 @@ test('a locked or deleted issue is gone; any other failure is an error the queue
     commands.script(['api', 'repos/acme/widgets/issues/42/comments?per_page=100', '-q'], () => '')
     commands.fail('gh', ['api', 'repos/acme/widgets/issues/42/comments', '-f'], error)
     return (await githubKind.channel?.send(
-      { run: (program, args, options) => commands.run(program, args, options ?? {}), withSignal: () => commands },
+      {
+      run: (program, args, options) => commands.run(program, args, options ?? {}),
+      stream: (program, args, options) => commands.stream(program, args, options),
+      withSignal: () => commands
+    },
       {
         id: 'reply-1',
         channel: { source: 'github', thread: 'github:42', address: { repo: 'acme/widgets', issue: '42' } },

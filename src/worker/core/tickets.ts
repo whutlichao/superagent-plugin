@@ -364,6 +364,10 @@ export class Tickets extends EnginePart {
       current?.subscriptions.filter((id) => ticketId === undefined || id === ticketId) ?? []
     if (!current || !tickets.length) return false
     current.subscriptions = current.subscriptions.filter((id) => !tickets.includes(id))
+    // 语境标记是订阅的一个限定（`Thread.context` 的「订阅者中」）：订阅丢了，它也不再是其中之一。
+    if (current.context?.length) {
+      current.context = current.context.filter((id) => !tickets.includes(id))
+    }
     this.repo.threads.save(current)
     for (const id of tickets) {
       const ticket = this.repo.tickets.get(id)

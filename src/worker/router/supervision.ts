@@ -107,8 +107,12 @@ export interface RouterSupervisionOptions {
   readonly rotateToken: () => string
   /** 当前 prompt revision（launch prompt 里写明）。 */
   readonly promptRevision: number
-  /** setup 是否就绪：未就绪时保持 paused，不建 worktree、不 launch（§N.1 同一口径）。 */
-  readonly enabled: boolean
+  /**
+   * setup 是否就绪：未就绪时保持 paused，不建 worktree、不 launch（§N.1 同一口径）。
+   * 也接受一个取值函数：`superagent setup check` 修好设置后不必重启 Orca，下一次 `start()`
+   * 就能把会话建起来（§G.2 的 `setup check` 行）。
+   */
+  readonly enabled: boolean | (() => boolean)
   /** 未决候选数（`thread.pending` 非空的 Thread 数）；缺省 0。 */
   readonly undecidedCandidates?: () => number
   readonly now?: () => number
@@ -187,10 +191,13 @@ export function revisionNotice(revision: number): string {
 export function createRouterSupervision(options: RouterSupervisionOptions): RouterSupervision {
   const now = options.now ?? (() => Date.now())
   const log = options.log ?? (() => undefined)
+  // 布尔与取值函数都接受：内部只问 `enabledNow()`，于是「setup 修好了」能立刻改变行为。
+  const enabledOption = options.enabled
+  const enabledNow = (): boolean => (typeof enabledOption === 'function' ? enabledOption() : enabledOption)
   const tickMs = options.tickMs ?? ROUTER_TICK_MS
   const entry: HealthEntryHandle = options.health.claim('router', {
-    state: options.enabled ? 'starting' : 'paused',
-    detail: options.enabled ? 'not started yet' : 'setup not ready'
+    state: enabledNow() ? 'starting' : 'paused',
+    detail: enabledNow() ? 'not started yet' : 'setup not ready'
   })
 
   let terminal: RouterTerminalState | null = null
@@ -210,7 +217,7 @@ export function createRouterSupervision(options: RouterSupervisionOptions): Rout
   let running = false
   let stopped = false
   let timer: unknown = null
-  let detail = options.enabled ? 'not started yet' : 'setup not ready'
+  let detail = enabledNow() ? 'not started yet' : 'setup not ready'
 
   /** 写一次健康条目：error 只在「连续 3 次失败」或「十分钟内五次重启」时（§N.4、§F.1）。 */
   const report = (): void => {
@@ -220,7 +227,7 @@ export function createRouterSupervision(options: RouterSupervisionOptions): Rout
     if (lastError !== null) parts.push(`last error: ${lastError}`)
     detail = parts.join(', ')
     let state: HealthEntry['state']
-    if (!options.enabled) state = 'paused'
+    if (!enabledNow()) state = 'paused'
     else if (restarts >= RESTART_ERROR_THRESHOLD || failures >= FAILURES_BEFORE_ERROR) state = 'error'
     else if (terminal !== null) state = 'ready'
     else state = 'starting'
@@ -316,7 +323,7 @@ export function createRouterSupervision(options: RouterSupervisionOptions): Rout
   }
 
   const tick = async (): Promise<void> => {
-    if (!options.enabled || stopped || running) return
+    if (!enabledNow() || stopped || running) return
     running = true
     try {
       const at = now()
@@ -350,11 +357,12 @@ export function createRouterSupervision(options: RouterSupervisionOptions): Rout
   return {
     async start(): Promise<void> {
       if (started) return
-      started = true
-      if (!options.enabled) {
+      if (!enabledNow()) {
+        // 未就绪**不算**启动过：`setup check` 把设置补齐后再调一次 `start()` 就真的开始。
         report()
         return
       }
+      started = true
       await tick()
       // 认回的是旧会话、而配置里的 revision 已经变过：补一条通知（角色层仍要重启才换，§F.4）。
       if (terminal !== null && terminal.promptRevision < currentRevision) {
@@ -392,7 +400,7 @@ export function createRouterSupervision(options: RouterSupervisionOptions): Rout
       waits.length = 0
     },
     async restart(reason: string): Promise<void> {
-      if (!options.enabled || stopped) return
+      if (!enabledNow() || stopped) return
       const current = terminal ?? options.state.terminal()
       if (current !== null) {
         try {
