@@ -350,6 +350,49 @@ describe('relaying to the router terminal', () => {
     }
   })
 
+  test('a candidate card writes relay/<name>.md and waits in the same FIFO as relay and notice', async () => {
+    const h = openRelay()
+    try {
+      // 候选卡（`assessment` 的送达）与 relay/notice 都是往 Router 终端写：同一个互斥（§J.2 末注）。
+      let release: (() => void) | undefined
+      const gate = new Promise<void>((resolve) => {
+        release = resolve
+      })
+      let first = true
+      h.runtime.script.sendText = async () => {
+        if (first) {
+          first = false
+          await gate
+        }
+        return { accepted: true }
+      }
+      const handlers = h.relay.handlers()
+      const body = '# Candidate eval-1\n\n- trigger: trigger-1\n'
+      const carded = handlers.card({
+        name: 'eval-1',
+        summary: 'inferred candidate from bob: change it',
+        body
+      })
+      const relayed = handlers.relay({ messageId: 'm2', kind: 'report', summary: 'after the card' }, 'router')
+      await Promise.resolve()
+      assert.equal(h.runtime.calls.sent.length, 1, 'the card holds the terminal write')
+      release?.()
+      await Promise.all([carded, relayed])
+      const order = h.runtime.calls.sent.map((entry) => entry.text)
+      assert.equal(order.length, 2)
+      assert.ok(order[0]!.includes('[superagent eval #eval-1]'))
+      assert.ok(order[0]!.includes('candidate'))
+      assert.equal(order[0]!.includes('\n'), false, 'a card is one line on the terminal')
+      assert.ok(order[1]!.includes('after the card'), 'the relay came after the card, not beside it')
+      // 正文落盘：终端里出现指针时文件已经在。
+      const file = join(h.stateDir, 'relay', 'eval-1.md')
+      assert.equal(readFileSync(file, 'utf8'), body)
+      assert.ok(order[0]!.includes(file), 'the line points at the card file')
+    } finally {
+      h.cleanup()
+    }
+  })
+
   test('a relay without a live terminal fails so the queue retries it instead of dropping it', async () => {
     const h = openRelay({ terminal: null })
     try {
