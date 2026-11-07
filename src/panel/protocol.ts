@@ -176,6 +176,72 @@ export interface PanelReason {
   readonly triggerId?: string
 }
 
+/**
+ * Trigger 页的四档 Thread 筛选（§M.2：Subscribed / Evaluating / New in 24 h / All）。取值是面板
+ * 的语言，worker 把它映射到读模型自己的判定（`app/views/threads.ts`），两边只有一个映射。
+ */
+export const THREAD_FILTERS = ['subscribed', 'evaluating', 'recent', 'all'] as const
+export type ThreadFilter = (typeof THREAD_FILTERS)[number]
+
+/** 一个值是否是四档 Thread 筛选之一（存储里的旧值与 worker 的入参都用这一处判定）。 */
+export function isThreadFilter(value: unknown): value is ThreadFilter {
+  return typeof value === 'string' && (THREAD_FILTERS as readonly string[]).includes(value)
+}
+
+/**
+ * Thread 的阶段（§M.2 的 Trigger 状态标记）：`marks.ts` 的 `threadMark` 按它给标记与语气。
+ * 面板不 import worker（§C.2 规则 3），所以这里写一份字符串联合而不是转出领域类型。
+ */
+export type ThreadStageName =
+  | 'subscribed'
+  | 'evaluating'
+  | 'queued'
+  | 'error'
+  | 'dormant'
+  | 'unsubscribed'
+
+/** 一条 Thread 行（§M.2 的 Trigger 表）：定位、订阅数、最近触发与状态标记。 */
+export interface PanelThread {
+  readonly key: string
+  readonly source: string
+  /** 人读的定位：Source 给的 label，没有就用 url，再没有就是 key。 */
+  readonly title: string
+  readonly url?: string
+  readonly stage: ThreadStageName
+  /** 排队中的触发数（`stage === 'queued'` 时标记会带这个数）。 */
+  readonly pending: number
+  /** 订阅数（还在订阅这条 Thread 的工单数）。 */
+  readonly subscriptions: number
+  /** 最新一条 Trigger 的时刻（epoch ms）；没有触发时是这条 Thread 的创建时刻。 */
+  readonly lastAt: number
+  readonly createdAt: number
+  /** 最近一条 Trigger 的一句话（`actor` 是人读的 `<source>:<id>`）。 */
+  readonly latest?: {
+    readonly actor: string
+    readonly human: boolean
+    readonly at: number
+    readonly preview: string
+  }
+  /** Source 的轮询失败：行内给出原因，状态标记是 `error`。 */
+  readonly pollError?: string
+}
+
+/** 一页 Thread 行；`nextOffset` 为 `null` 表示没有下一页。 */
+export interface ThreadListPage {
+  readonly items: readonly PanelThread[]
+  readonly nextOffset: number | null
+}
+
+/** 一次 Thread 列表请求：筛选 + 分页窗口（与 CLI 的 `read threads?filter=&offset=&limit=` 同义）。 */
+export interface ThreadListInput {
+  /** 缺省是全部（四档之外没有「不筛」的第二套语义）。 */
+  readonly filter?: ThreadFilter
+  /** 从第几行开始（缺省 0）。 */
+  readonly offset?: number
+  /** 一页最多几行（缺省 50，§M.4）。 */
+  readonly limit?: number
+}
+
 /** Decision 的四种（§D.2，与 `core` 的 `DECISION_KINDS` 同值）。 */
 export type PanelDecisionKind = 'accept' | 'stop' | 'ignore' | 'unavailable'
 
@@ -188,6 +254,11 @@ export interface PanelDecision {
   readonly policyVersion: string
   /** 决定落库的时刻（epoch ms）；页面交给 `RelativeTime`，绝不自己计时。 */
   readonly at: number
+  /**
+   * 接单时开的那张工单（accept 才有）。Eval 页不用它；Trigger 页的时间线据此给出「打开工单」，
+   * 所以列表行也带上它。
+   */
+  readonly ticketId?: string
 }
 
 /** Eval 列表的一次请求：只有分页窗口（§M.4：无虚拟列表，一页 50 条）。 */
@@ -232,6 +303,121 @@ export interface DecisionDetailView {
 /** 一次动作的对象：一条 Decision。 */
 export interface DecisionInput {
   readonly decisionId: string
+}
+
+/** 一条被交回的触发（§M.2「handback 原因」）：哪个 Ticket 交回的、为什么。 */
+export interface PanelHandback {
+  readonly ticketId: string
+  readonly ticketTitle: string
+  readonly reason: string
+  readonly at: number
+}
+
+/**
+ * 时间线上的一条 Trigger（§M.2 的触发卡）：原话、来源者、去向与消费它的决定。
+ * 去重的四档（排队 / 评估中 / 已投递 / 已扇出）就是「这条消息现在归谁」的四个答案。
+ */
+export interface PanelTriggerCard {
+  readonly id: string
+  readonly source: string
+  /** 谁说的（`<source>:<id>`）。 */
+  readonly actor: string
+  readonly human: boolean
+  /** 这条触发的时刻（epoch ms）。 */
+  readonly at: number
+  readonly url?: string
+  /** 原话（读模型按面板的渲染上限截断，§M.4 的已知限制）。 */
+  readonly text: string
+  /** 还在等 Eval（没有执行器拥有它）。 */
+  readonly queued: boolean
+  /** 正在被一次 Eval 处理。 */
+  readonly evaluating: boolean
+  /** 执行器拥有它（人的 follow-up 由那个 worker 决定，不再回 Eval）。 */
+  readonly delivered: boolean
+  /** 扇出到的 Ticket id。 */
+  readonly fanout: readonly string[]
+  /** 被交回的记录与原因。 */
+  readonly handbacks: readonly PanelHandback[]
+  /** 消费它的 Decision（时间线上的决定）。 */
+  readonly decision?: PanelDecision
+  /** 人可以把它重新送进 Eval（「再评估一次」的可用性）。 */
+  readonly canRequeue: boolean
+}
+
+/** 一条 Thread 的订阅（§M.2 的订阅块）：哪张工单、还是不是活的、是否只当语境。 */
+export interface PanelThreadTicket {
+  readonly id: string
+  readonly title: string
+  readonly state: 'open' | 'ended' | 'unknown'
+  /** 只订阅作语境（§D.1 / §I.5）：这条 Thread 上的消息不路由给它。 */
+  readonly context: boolean
+}
+
+/** 正在进行的一次 Eval（§M.2 的评估横幅）。 */
+export interface PanelEvaluating {
+  readonly id: string
+  readonly strength: 'explicit' | 'inferred'
+  /** 这次 Eval 持有几条触发。 */
+  readonly triggers: number
+  readonly startedAt: number
+  readonly deadline: number
+}
+
+/** 时间线的复合游标 `(at, id)`（§D.2 要点 1）；`earlier` 就是下一页要交回的 `before`。 */
+export interface PanelTimelineCursor {
+  /** 触发时刻（ISO-8601 文本，与存储里的 `at` 同形）。 */
+  readonly at: string
+  readonly triggerId: string
+}
+
+/** 一条 Thread 的详情（§M.2）：时间线、决定、订阅与 handback 原因。 */
+export interface ThreadDetailView {
+  readonly key: string
+  readonly source: string
+  readonly title: string
+  readonly url?: string
+  readonly stage: ThreadStageName
+  readonly createdAt: number
+  readonly lastAt: number
+  /** Source 的轮询失败（详情里也给原因，不只是列表的一格）。 */
+  readonly pollError?: string
+  /** 排队中的触发数。 */
+  readonly pending: number
+  readonly evaluating?: PanelEvaluating
+  readonly subscriptions: readonly PanelThreadTicket[]
+  /** 这条 Thread 上做过的决定（新的在前）。 */
+  readonly decisions: readonly PanelDecision[]
+  /** 时间线的一页（最新在前；「更早」从 `earlier` 起）。 */
+  readonly timeline: readonly PanelTriggerCard[]
+  readonly earlier: PanelTimelineCursor | null
+}
+
+/** 一次 Thread 详情请求：`before` 是「更早一页」的游标，`limit` 是一页几条。 */
+export interface ThreadDetailInput {
+  readonly threadKey: string
+  /** 上一页返回的 `earlier`；不给就是从最新一页开始。 */
+  readonly before?: PanelTimelineCursor
+  readonly limit?: number
+}
+
+/** 「再评估一次」的对象：一条 Trigger。 */
+export interface RequeueTriggerInput {
+  readonly triggerId: string
+}
+
+/** 「再评估一次」的结果：`queued: false` 表示已有 Eval 持有它（此时不动它）。 */
+export interface RequeueOutcome {
+  readonly queued: boolean
+}
+
+/** 「取消订阅」的对象：一条 Thread。 */
+export interface UnsubscribeThreadInput {
+  readonly thread: string
+}
+
+/** 「取消订阅」的结果：`removed: false` 表示本来就没有订阅可丢。 */
+export interface UnsubscribeOutcome {
+  readonly removed: boolean
 }
 
 /** 一份 Report 的面板面（§E.8）：状态 + 摘要 + 时刻。 */
@@ -507,6 +693,10 @@ export const PLUGIN_REQUESTS = [
   'decisions',
   'decision.detail',
   'decision.dismiss',
+  'threads',
+  'thread.detail',
+  'trigger.requeue',
+  'thread.unsubscribe',
   'tickets',
   'ticket.detail',
   'ticket.retry',
@@ -537,6 +727,26 @@ declare module 'orca' {
      * 与 `state` 的区别：`state` 回答缓存的那一份，`check` 真的重跑一次查询（§M.2 的主操作）。
      */
     check: { output: PanelState }
+    /**
+     * Trigger 列表的一页（§M.2 的四档筛选 + §M.4 的分页）：筛选与分页都在 worker 的读模型里，
+     * 面板只画回来的窗口；`nextOffset` 为 `null` 就是没有下一页。
+     */
+    threads: { input: ThreadListInput; output: ThreadListPage }
+    /**
+     * 一条 Thread 的详情（§M.2）：时间线（`(at, id)` 复合游标分页）、决定、订阅与 handback 原因。
+     * `before` 是上一页返回的 `earlier`；不给就是从最新一页开始。
+     */
+    'thread.detail': { input: ThreadDetailInput; output: ThreadDetailView }
+    /**
+     * 再评估一次（§G.2 的 `trigger requeue`）：把一条触发重新排进 Eval。执行器仍拥有它、
+     * 或已有 Eval 持有它时不动它，如实回 `queued: false`。
+     */
+    'trigger.requeue': { input: RequeueTriggerInput; output: RequeueOutcome }
+    /**
+     * 取消订阅一条 Thread（§G.2 的 `thread unsubscribe`，破坏性：丢弃它上面全部 Ticket 的订阅）。
+     * 面板先做行内二次确认；`removed: false` 表示本来就没有订阅可丢。
+     */
+    'thread.unsubscribe': { input: UnsubscribeThreadInput; output: UnsubscribeOutcome }
     /**
      * 人的重试（§E.5、§G.2 的 `ticket retry`）：结束卡住的 Assignment，在同一个 worktree、
      * 分支与 PR 上再起一个，带恢复说明。可用性由领域判定（不可重试时按 `invalid_params` 拒绝）。

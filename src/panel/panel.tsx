@@ -14,6 +14,7 @@ import {
   Field,
   IconButton,
   KeyValue,
+  Link,
   List,
   ListItem,
   plugin,
@@ -38,13 +39,23 @@ import { GLOSSARY_GROUPS, translate, type CopyKey } from './copy'
 import { Deployment, loadDeployment, openDeployment, resetDeployment } from './deployment'
 import { problemDecisionId, reasonText, reasonsText } from './eval'
 import { executionMark, executionRow } from './execution'
-import { decisionMark, markLabel, problemMark, reportMark, ticketMark, type MarkTone } from './marks'
+import {
+  decisionMark,
+  markLabel,
+  problemMark,
+  reportMark,
+  threadMark,
+  ticketMark,
+  type MarkTone
+} from './marks'
 import { orderWaiting, problemPage } from './overview'
 import {
   EXECUTION_FILTERS,
   isExecutionFilter,
   isNavPage,
+  isThreadFilter,
   NAV_PAGES,
+  THREAD_FILTERS,
   type AttentionItem,
   type DecisionDetailView,
   type DecisionListPage,
@@ -56,11 +67,19 @@ import {
   type PanelSubscription,
   type PanelTicket,
   type PanelDecision,
+  type PanelReason,
+  type PanelThread,
+  type PanelTimelineCursor,
+  type PanelTriggerCard,
   type SystemProblem,
+  type ThreadDetailView,
+  type ThreadFilter,
+  type ThreadListPage,
   type TicketDetailView,
   type TicketListPage
 } from './protocol'
 import { TicketRow } from './rows'
+import { filterLabelKey, threadCells, threadColumns } from './trigger'
 import {
   BootingState,
   ConfirmAction,
@@ -253,6 +272,17 @@ export function setup(ctx: PanelContext): () => void {
   // 上一次挂载还在飞行的列表/详情请求作废（它们的答案不该画进这一次）。
   listRequest += 1
   decisionRequest += 1
+  // Trigger 页的 atom 同样是模块级的（筛选是持久化的，脏值在这里改回第一档）。
+  if (!isThreadFilter(read(threadFilter))) set(threadFilter, 'subscribed')
+  set(threadList, null)
+  set(threadError, '')
+  set(threadDetail, null)
+  set(threadDetailError, '')
+  set(threadNotice, null)
+  set(threadActionError, '')
+  set(timelineBusy, false)
+  set(threadActing, false)
+  threadRequest += 1
   ctx.subscriptions.push(
     plugin.on('state.changed', (payload) => {
       // 更旧的推送不触发读取；隐藏时也不发请求（下次可见后的第一次推送会补上）。
@@ -274,6 +304,14 @@ export function setup(ctx: PanelContext): () => void {
         if (focused?.page === 'eval') void loadDecisionDetail(focused.id)
         else void refreshDecisions()
       }
+      // Trigger 页同理：详情重读这一条 Thread，列表重读已经读到的那几页；还没读过就先读一次
+      // （面板可以在隐藏状态下启动，那一次的首屏读取只能由第一次可见的推送补上）。
+      if (read(page) === 'trigger') {
+        const focused = read(focus)
+        if (focused?.page === 'trigger') void loadThreadDetail(focused.id)
+        else if (read(threadList) === null) void loadThreadList()
+        else void refreshThreadList()
+      }
     })
   )
   const startPage = read(page)
@@ -285,6 +323,8 @@ export function setup(ctx: PanelContext): () => void {
     if (startPage === 'execution') enterExecution()
     // 停在 Eval：同理（焦点指向一条决定就是详情，否则是列表）。
     if (startPage === 'eval') enterEval()
+    // 停在 Trigger：焦点指向一条 Thread 就是详情，否则是当前筛选的列表。
+    if (startPage === 'trigger') enterTriggers()
   } else set(phase, 'starting')
   return () => {
     disposed = true
@@ -1676,15 +1716,629 @@ function EvalPage(props: { readonly locale: string }): OrcaElement {
   )
 }
 
-/** 一页：Overview、Eval 与 Execution 有真实读数，Settings 现在是 Deployment 组；其余页面在页面票里填充。 */
-function PageBody(props: { readonly locale: string; readonly current: NavPage }): OrcaElement {
+// ---------------------------------------------------------------------------
+// Trigger 页（§M.2）：Thread 列表的四档筛选与分页、Thread 详情的时间线与两个动作。读数全部
+// 经 worker 的读模型（`threads` / `thread.detail`）；「再评估一次」与「取消订阅」也是 worker
+// 的命令（与 CLI 的 `trigger requeue` / `thread unsubscribe` 同一批 handler）。
+// ---------------------------------------------------------------------------
+
+/** 四档筛选（§M.2）；写进插件存储，重开面板还停在那一档。 */
+const threadFilter = atom<ThreadFilter>('panel.threadFilter', 'subscribed', { persist: 'storage' })
+
+/** 列表已读到的行与下一页的位置；`null` 表示这一档还没读过。 */
+const threadList = atom<{
+  readonly items: readonly PanelThread[]
+  readonly nextOffset: number | null
+} | null>(null)
+
+/** 列表的读取失败原因（行内给原因与重试；已读到的行不因此消失）。 */
+const threadError = atom('')
+
+/** 一条 Thread 的详情读数与它的读失败原因。 */
+const threadDetail = atom<ThreadDetailView | null>(null)
+const threadDetailError = atom('')
+
+/** 时间线在读「更早」那一页。 */
+const timelineBusy = atom(false)
+
+/** 详情页的动作在飞行中：确认与按钮不可重复按。 */
+const threadActing = atom(false)
+
+/** 动作的结论（一行提示；措辞由页面按 `kind` 取文案）。 */
+type ThreadNotice = 'requeued' | 'requeueHeld' | 'unsubscribed' | 'notSubscribed'
+const threadNotice = atom<ThreadNotice | null>(null)
+
+/** 详情页动作失败的原因（不替换整页）。 */
+const threadActionError = atom('')
+
+/**
+ * 列表请求的代号：只有最后一次请求的答案落地（`set` 是批量生效的，所以在飞行中换档时
+ * 用同步计数器判断，不在 await 之后重读 atom）。
+ */
+let threadRequest = 0
+
+/** 读一页 Thread 列表：`more` 是「加载更多」，否则从第一行重读。 */
+async function loadThreadList(options: { readonly more?: boolean } = {}): Promise<void> {
+  const filter = read(threadFilter)
+  const current = read(threadList)
+  if (options.more === true && (current === null || current.nextOffset === null)) return
+  const offset = options.more === true && current !== null ? (current.nextOffset ?? 0) : 0
+  const seq = ++threadRequest
+  set(threadError, '')
+  try {
+    const next: ThreadListPage = await plugin.request('threads', { filter, offset, limit: PAGE_ROWS })
+    // 又发了一次请求（换档或再点一次）：这一次的答案作废，否则两档的行会混在一起。
+    if (disposed || seq !== threadRequest) return
+    set(threadList, {
+      items: offset === 0 ? next.items : [...(read(threadList)?.items ?? []), ...next.items],
+      nextOffset: next.nextOffset
+    })
+  } catch (error) {
+    if (disposed) return
+    set(threadError, reasonOf(error))
+  }
+}
+
+/**
+ * 推送后重读已经读到的那些页（不轮询：推送本身就是变化的信号）。重读失败给出原因，但不
+ * 覆盖已读到的行——一次读失败不该把页面清空（§M.2 的行内错误 + 重试）。
+ */
+async function refreshThreadList(): Promise<void> {
+  const loaded = read(threadList)?.items.length ?? 0
+  if (loaded === 0) return
+  const filter = read(threadFilter)
+  const seq = ++threadRequest
+  const items: PanelThread[] = []
+  let offset: number | null = 0
+  try {
+    while (offset !== null && items.length < loaded) {
+      const next: ThreadListPage = await plugin.request('threads', {
+        filter,
+        offset,
+        limit: PAGE_ROWS
+      })
+      if (disposed || seq !== threadRequest) return
+      if (next.items.length === 0) break
+      items.push(...next.items)
+      offset = next.nextOffset
+    }
+    set(threadList, { items, nextOffset: offset })
+    set(threadError, '')
+  } catch (error) {
+    if (!disposed) set(threadError, reasonOf(error))
+  }
+}
+
+/**
+ * 读一条 Thread 的详情（§M.2）：默认从最新一页读起；`earlier` 是「更早」那一页。分页交给
+ * worker 的 `(at, id)` 复合游标（§D.2 要点 1），面板不自己切。
+ */
+async function loadThreadDetail(
+  threadKey: string,
+  options: { readonly earlier?: boolean } = {}
+): Promise<void> {
+  const current = read(threadDetail)
+  const before: PanelTimelineCursor | null =
+    options.earlier === true && current !== null && current.key === threadKey
+      ? current.earlier
+      : null
+  if (options.earlier === true && before === null) return
+  if (options.earlier === true) set(timelineBusy, true)
+  set(threadDetailError, '')
+  try {
+    const page: ThreadDetailView = await plugin.request('thread.detail', {
+      threadKey,
+      limit: PAGE_ROWS,
+      ...(before === null ? {} : { before })
+    })
+    if (disposed) return
+    if (before === null) {
+      set(threadDetail, page)
+      return
+    }
+    // 更早的一页接在前面；同一个 id 只出现一次（同刻的对子在页边界上也不重）。
+    const latest = read(threadDetail)
+    if (latest === null || latest.key !== threadKey) {
+      set(threadDetail, page)
+      return
+    }
+    const seen = new Set(latest.timeline.map((card) => card.id))
+    set(threadDetail, {
+      ...latest,
+      timeline: [...page.timeline.filter((card) => !seen.has(card.id)), ...latest.timeline],
+      earlier: page.earlier
+    })
+  } catch (error) {
+    if (disposed) return
+    set(threadDetailError, reasonOf(error))
+  } finally {
+    if (!disposed) set(timelineBusy, false)
+  }
+}
+
+/** 进入 Trigger 页时读它要的那一份：`focus` 指向一条 Thread 就是详情，否则是当前筛选的列表。 */
+function enterTriggers(): void {
+  const focused = read(focus)
+  if (focused?.page === 'trigger') {
+    if (read(threadDetail)?.key !== focused.id) void loadThreadDetail(focused.id)
+    return
+  }
+  if (read(threadList) === null) void loadThreadList()
+}
+
+/** 打开一条 Thread 的详情（§M.2「点行→详情」）。 */
+function openThread(key: string): void {
+  set(focus, { page: 'trigger', id: key })
+  set(threadNotice, null)
+  set(threadActionError, '')
+  void loadThreadDetail(key)
+}
+
+/** 回到列表（清掉「从别处点进来的那一条」）；还没读过列表就当场读一次。 */
+function backToThreads(): void {
+  set(focus, null)
+  set(threadDetail, null)
+  set(threadNotice, null)
+  set(threadActionError, '')
+  if (read(threadList) === null) void loadThreadList()
+}
+
+/** 动作收尾：采纳结论、重读这一条 Thread，再（静默地）刷新列表里的这一行。 */
+async function afterThreadAction(action: () => Promise<void>, threadKey: string): Promise<void> {
+  set(threadActionError, '')
+  set(threadActing, true)
+  try {
+    await action()
+    if (disposed) return
+    await loadThreadDetail(threadKey)
+    void refreshThreadList()
+  } catch (error) {
+    if (!disposed) set(threadActionError, reasonOf(error))
+  } finally {
+    if (!disposed) set(threadActing, false)
+  }
+}
+
+/**
+ * 再评估一次（§G.2 的 `trigger requeue`）：把一条触发重新排进 Eval，并如实回「排上了没有」
+ * ——已有 Eval 持有它时不动它，页面照实说。
+ */
+async function requeueTrigger(threadKey: string, triggerId: string): Promise<void> {
+  set(threadNotice, null)
+  await afterThreadAction(async () => {
+    const outcome = await plugin.request('trigger.requeue', { triggerId })
+    set(threadNotice, outcome.queued ? 'requeued' : 'requeueHeld')
+  }, threadKey)
+}
+
+/** 取消订阅一条 Thread（§G.2 的 `thread unsubscribe`）：破坏性，已过行内二次确认才到这里。 */
+async function unsubscribeThread(threadKey: string): Promise<void> {
+  set(threadNotice, null)
+  await afterThreadAction(async () => {
+    const outcome = await plugin.request('thread.unsubscribe', { thread: threadKey })
+    set(threadNotice, outcome.removed ? 'unsubscribed' : 'notSubscribed')
+  }, threadKey)
+}
+
+/** 一条 Thread 的行列表：四档筛选 + 分页 50 条 + 行内错误与重试（§M.2）。 */
+function TriggerListPage(props: { readonly locale: string }): OrcaElement {
   const locale = props.locale
+  const filter = read(threadFilter)
+  const page = read(threadList)
+  const failure = read(threadError)
+  const items = page?.items ?? []
+  const rows: TableRow[] = items.map((thread) => ({
+    key: thread.key,
+    cells: threadCells(locale, thread)
+  }))
+  return (
+    <Stack gap="md">
+      <RadioGroup
+        label={words(locale, 'thread.filters')}
+        orientation="horizontal"
+        value={filter}
+        options={THREAD_FILTERS.map((value) => ({
+          value,
+          label: translate(locale, filterLabelKey(value))
+        }))}
+        onChange={(next) => {
+          if (!isThreadFilter(next) || next === filter) return
+          set(threadFilter, next)
+          set(threadList, null)
+          void loadThreadList()
+        }}
+      />
+      {failure === '' ? null : (
+        <Callout tone="danger" title={words(locale, 'state.errorTitle')} icon="error">
+          <Stack gap="sm">
+            <Text size="sm">{failure}</Text>
+            <Row gap="xs">
+              <Button variant="outline" size="sm" icon="refresh" onPress={() => void loadThreadList()}>
+                {words(locale, 'state.retry')}
+              </Button>
+            </Row>
+          </Stack>
+        </Callout>
+      )}
+      {page !== null && items.length === 0 && failure === '' ? (
+        <EmptyStateBlock title={words(locale, 'thread.empty')} icon="layers" />
+      ) : null}
+      {page === null && failure !== '' ? null : (
+        <Table
+          label={translate(locale, 'nav.trigger')}
+          columns={threadColumns(locale)}
+          rows={rows}
+          loading={page === null}
+          hasMore={page !== null && page.nextOffset !== null}
+          onRowAction={(row) => openThread(row.key)}
+          onLoadMore={() => void loadThreadList({ more: true })}
+        />
+      )}
+    </Stack>
+  )
+}
+
+/**
+ * 时间线上的一张触发卡（§M.2）：谁在什么时候说了什么、它现在归谁、消费它的决定、谁把它
+ * 交回了评估（及原因），以及人能不能把它再送进 Eval。
+ *
+ * 卡片是 `ListItem`（标题是原话）：行内的按钮各自发请求，整行不可点——Orca 不允许
+ * 「可点的 ListItem 里再放 Button」（与 Overview 的待人工行同一条约束）。
+ */
+function TriggerCardRow(props: {
+  readonly locale: string
+  readonly card: PanelTriggerCard
+  readonly busy: boolean
+  readonly onRequeue: () => void
+  readonly onOpenTicket: (ticketId: string) => void
+}): OrcaElement {
+  const locale = props.locale
+  const card = props.card
+  const decision = card.decision
+  const mark = decision === undefined ? undefined : decisionMark(decision.kind)
+  return (
+    <ListItem
+      key={card.id}
+      title={card.text === '' ? card.id : card.text}
+      icon={card.human ? 'info' : 'download'}
+    >
+      <Stack gap="xs">
+        <Row gap="xs" align="center" wrap>
+          {card.actor === '' ? null : (
+            <Text muted size="xs">
+              {card.actor}
+            </Text>
+          )}
+          {card.human ? (
+            <MarkBadge label={words(locale, 'execution.human')} tone="accent" />
+          ) : null}
+          <RelativeTime at={card.at} format="short" muted />
+          {card.queued ? (
+            <MarkBadge label={words(locale, 'thread.disposition.queued')} tone="warning" />
+          ) : null}
+          {card.evaluating ? (
+            <MarkBadge label={translate(locale, 'thread.evaluating')} tone="accent" />
+          ) : null}
+          {card.delivered ? (
+            <MarkBadge label={words(locale, 'thread.delivered')} tone="neutral" />
+          ) : null}
+          {card.fanout.length === 0 || card.delivered ? null : (
+            <Text muted size="xs">
+              {translate(locale, 'thread.fanout', { count: card.fanout.length })}
+            </Text>
+          )}
+          {decision === undefined || mark === undefined ? null : (
+            <>
+              <MarkBadge label={markLabel(locale, mark)} tone={mark.tone} />
+              <Text muted size="xs">
+                {reasonsText(locale, decision.reasons)}
+              </Text>
+            </>
+          )}
+        </Row>
+        {card.handbacks.map((handback) => (
+          <Hint
+            key={`${handback.ticketId}:${handback.at}`}
+            text={translate(locale, 'thread.handedBack', {
+              ticket: handback.ticketTitle,
+              reason: handback.reason
+            })}
+          />
+        ))}
+        <Row gap="xs" align="center" wrap>
+          {decision?.ticketId === undefined ? null : (
+            <Button
+              variant="ghost"
+              size="sm"
+              icon="next"
+              onPress={() => props.onOpenTicket(decision.ticketId as string)}
+            >
+              {words(locale, 'thread.openTicket')}
+            </Button>
+          )}
+          {card.canRequeue ? (
+            <Button
+              variant="ghost"
+              size="sm"
+              icon="refresh"
+              disabled={props.busy}
+              onPress={props.onRequeue}
+            >
+              {words(locale, 'thread.requeue')}
+            </Button>
+          ) : null}
+        </Row>
+      </Stack>
+    </ListItem>
+  )
+}
+
+/** 动作结论的文案键（`threadNotice` 的四档）。 */
+const THREAD_NOTICE_KEYS: Readonly<Record<ThreadNotice, CopyKey>> = {
+  requeued: 'thread.requeued',
+  requeueHeld: 'thread.requeueHeld',
+  unsubscribed: 'thread.unsubscribeDone',
+  notSubscribed: 'thread.notSubscribed'
+}
+
+/**
+ * 一条 Thread 的详情（§M.2）：时间线（触发卡 + 决定 + handback 原因）、订阅、决定列表与
+ * 两个动作（再评估一次、取消订阅要二次确认）。读数来自 `thread.detail`；写动作全部经 worker
+ * 的 handler，成功后重读这一条。
+ */
+function ThreadDetailPage(props: { readonly locale: string; readonly threadKey: string }): OrcaElement {
+  const locale = props.locale
+  const thread = read(threadDetail)
+  const failure = read(threadDetailError)
+  const notice = read(threadNotice)
+  const actionFailure = read(threadActionError)
+  const back = (
+    <Button variant="ghost" size="sm" icon="next" onPress={backToThreads}>
+      {words(locale, 'thread.back')}
+    </Button>
+  )
+  const shown = thread !== null && thread.key === props.threadKey ? thread : null
+  if (shown === null) {
+    return (
+      <Stack gap="md">
+        <PageHeader title={translate(locale, 'nav.trigger')} actions={back} />
+        {failure === '' ? (
+          <LoadingState label={words(locale, 'state.loading')} />
+        ) : (
+          <ErrorState
+            title={words(locale, 'state.errorTitle')}
+            reason={failure}
+            locale={locale}
+            onRetry={() => void loadThreadDetail(props.threadKey)}
+          />
+        )}
+      </Stack>
+    )
+  }
+  const mark = threadMark({ stage: shown.stage, pending: shown.pending })
+  return (
+    <Stack gap="md">
+      <PageHeader
+        title={shown.title}
+        subtitle={translate(locale, 'nav.trigger')}
+        actions={
+          <Row gap="xs" align="center" wrap>
+            <MarkBadge
+              label={markLabel(locale, mark, { count: shown.pending })}
+              tone={mark.tone}
+            />
+            <RelativeTime at={shown.lastAt} format="short" muted />
+            {back}
+          </Row>
+        }
+      />
+      {failure === '' ? null : (
+        <Text tone="danger" size="xs">
+          {failure}
+        </Text>
+      )}
+      <Row gap="md" wrap>
+        <Text muted size="xs">
+          {translate(locale, 'thread.source', { source: shown.source })}
+        </Text>
+        <Row gap="xs" align="center">
+          <Text muted size="xs">
+            {words(locale, 'thread.created')}
+          </Text>
+          <RelativeTime at={shown.createdAt} format="short" muted />
+        </Row>
+        <Row gap="xs" align="center">
+          <Text muted size="xs">
+            {words(locale, 'thread.latestAt')}
+          </Text>
+          <RelativeTime at={shown.lastAt} format="short" muted />
+        </Row>
+        {shown.url === undefined ? null : (
+          <Link href={shown.url}>{words(locale, 'thread.openOriginal')}</Link>
+        )}
+      </Row>
+
+      {shown.evaluating === undefined ? null : (
+        <Callout
+          tone="neutral"
+          icon="refresh"
+          title={translate(locale, 'thread.evaluatingBanner', {
+            count: shown.evaluating.triggers,
+            strength: translate(locale, `strength.${shown.evaluating.strength}` as CopyKey)
+          })}
+        >
+          <Row gap="xs" align="center">
+            <Text muted size="xs">
+              {words(locale, 'thread.evaluatingDeadline')}
+            </Text>
+            <RelativeTime at={shown.evaluating.deadline} format="short" muted />
+          </Row>
+        </Callout>
+      )}
+
+      {shown.pollError === undefined ? null : (
+        <Text tone="danger" size="xs">
+          {translate(locale, 'thread.pollFailed', { error: shown.pollError })}
+        </Text>
+      )}
+
+      <Section title={words(locale, 'thread.subscribedTickets')} count={shown.subscriptions.length}>
+        {shown.subscriptions.length === 0 ? (
+          <Hint text={words(locale, 'thread.noSubscribedTickets')} />
+        ) : (
+          <List label={words(locale, 'thread.subscribedTickets')}>
+            {shown.subscriptions.map((ticket) => (
+              <ListItem
+                key={ticket.id}
+                title={ticket.title}
+                description={translate(locale, `thread.ticket.${ticket.state}` as CopyKey)}
+                icon={ticket.state === 'open' ? 'play' : 'stop'}
+              >
+                <Row gap="xs" align="center" wrap>
+                  <MarkBadge
+                    label={translate(locale, `thread.ticket.${ticket.state}` as CopyKey)}
+                    tone={ticket.state === 'open' ? 'accent' : 'neutral'}
+                  />
+                  {ticket.context ? (
+                    <MarkBadge label={words(locale, 'thread.contextOnly')} tone="neutral" />
+                  ) : null}
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    icon="next"
+                    onPress={() => openTicket(ticket.id)}
+                  >
+                    {words(locale, 'thread.openTicket')}
+                  </Button>
+                </Row>
+              </ListItem>
+            ))}
+          </List>
+        )}
+      </Section>
+
+      <Section title={words(locale, 'thread.decisions')} count={shown.decisions.length}>
+        {shown.decisions.length === 0 ? (
+          <Hint text={words(locale, 'thread.noDecisions')} />
+        ) : (
+          <List label={words(locale, 'thread.decisions')}>
+            {shown.decisions.map((decision) => {
+              const decisionMarkOf = decisionMark(decision.kind)
+              return (
+                <ListItem
+                  key={decision.id}
+                  title={markLabel(locale, decisionMarkOf)}
+                  description={reasonsText(locale, decision.reasons)}
+                  icon={decisionMarkOf.icon}
+                >
+                  <Row gap="xs" align="center" wrap>
+                    <MarkBadge
+                      label={markLabel(locale, decisionMarkOf)}
+                      tone={decisionMarkOf.tone}
+                    />
+                    <Text muted size="xs">
+                      {translate(locale, 'term.strength')} ·{' '}
+                      {translate(locale, `strength.${decision.strength}` as CopyKey)}
+                    </Text>
+                    <Text muted size="xs">
+                      {translate(locale, 'term.policyVersion')} · {decision.policyVersion}
+                    </Text>
+                    <RelativeTime at={decision.at} format="short" muted />
+                  </Row>
+                </ListItem>
+              )
+            })}
+          </List>
+        )}
+      </Section>
+
+      <Section title={words(locale, 'thread.timeline')} count={shown.timeline.length}>
+        {shown.timeline.length === 0 ? (
+          <Hint text={words(locale, 'thread.noTriggers')} />
+        ) : (
+          <List label={words(locale, 'thread.timeline')}>
+            {shown.timeline.map((card) => (
+              <TriggerCardRow
+                key={card.id}
+                locale={locale}
+                card={card}
+                busy={read(threadActing)}
+                onRequeue={() => void requeueTrigger(shown.key, card.id)}
+                onOpenTicket={openTicket}
+              />
+            ))}
+          </List>
+        )}
+        {shown.earlier === null ? null : (
+          <Row>
+            <Button
+              variant="outline"
+              size="sm"
+              disabled={read(timelineBusy)}
+              onPress={() => void loadThreadDetail(shown.key, { earlier: true })}
+            >
+              {words(locale, 'thread.loadEarlier')}
+            </Button>
+          </Row>
+        )}
+      </Section>
+
+      {shown.subscriptions.length === 0 ? null : (
+        <Toolbar label={words(locale, 'thread.actions')}>
+          <ConfirmAction
+            id={`unsubscribe:${shown.key}`}
+            label={words(locale, 'thread.unsubscribe')}
+            action={words(locale, 'thread.unsubscribe')}
+            target={shown.title}
+            locale={locale}
+            icon="close"
+            onConfirm={() => void unsubscribeThread(shown.key)}
+          />
+        </Toolbar>
+      )}
+      <Hint text={words(locale, 'thread.unsubscribeHint')} />
+
+      {notice === null ? null : <Hint text={words(locale, THREAD_NOTICE_KEYS[notice])} />}
+      {actionFailure === '' ? null : (
+        <Text tone="danger" size="xs">
+          {actionFailure}
+        </Text>
+      )}
+    </Stack>
+  )
+}
+
+/** Trigger 页：`focus` 指向一条 Thread 时是详情，否则是当前筛选的列表（§M.2）。 */
+function TriggerPage(props: { readonly locale: string }): OrcaElement {
+  const focused = read(focus)
+  return focused?.page === 'trigger' ? (
+    <ThreadDetailPage locale={props.locale} threadKey={focused.id} />
+  ) : (
+    <TriggerListPage locale={props.locale} />
+  )
+}
+
+/** 一页：Overview、Eval 与 Execution 有真实读数，Settings 现在是 Deployment 组；其余页面在页面票里填充。 */
+function PageBody(props: {
+  readonly locale: string
+  readonly current: NavPage
+  readonly active: boolean
+}): OrcaElement {
+  const locale = props.locale
+  // 只有当前页画内容：`Tabs` 把每个 `Tab` 的子节点都放进同一棵树，隐藏页的表格会抢走
+  // 「第一个表格」这类位置，也会让别的页面的内容混进这一屏。
+  if (!props.active) return <Stack gap="sm" />
   const state = read(snapshot)
   const stage = read(phase)
   if (props.current === 'settings') {
     // Settings 页的其余四组（Sources/Eval/Execution/Prompts）由 #42/#43 填进同一页；
     // 本票交付的是 Deployment 组，它自己管读取、错误态与动作。
     return <Deployment locale={locale} />
+  }
+  if (props.current === 'trigger') {
+    // Trigger 页的三态在自己的 `Table` 上（§M.2：加载是 `Table loading`、读失败是行内错误 +
+    // 重试），因此它不借用快照的首屏骨架——但 worker 完全不应答时仍是整页的错误态。
+    return stage === 'error' ? <ErrorStateView locale={locale} /> : <TriggerPage locale={locale} />
   }
   if (props.current === 'overview' || props.current === 'eval' || props.current === 'execution') {
     if (stage === 'error') {
@@ -1787,11 +2441,12 @@ export default function Panel(): OrcaElement {
           if (next === 'settings') void openDeployment()
           if (next === 'execution') enterExecution()
           if (next === 'eval') enterEval()
+          if (next === 'trigger') enterTriggers()
         }}
       >
         {NAV_PAGES.map((item) => (
           <Tab key={item} value={item} label={translate(locale, `nav.${item}` as CopyKey)}>
-            <PageBody locale={locale} current={item} />
+            <PageBody locale={locale} current={item} active={item === current} />
           </Tab>
         ))}
       </Tabs>

@@ -14,6 +14,10 @@ import { REPLY_WORD_LIMIT, wordCount } from './http/domain'
 import {
   EXECUTION_FILTERS,
   isExecutionFilter,
+  isThreadFilter,
+  THREAD_FILTERS,
+  type ThreadDetailInput,
+  type ThreadListInput,
   type DecisionListInput,
   type TicketListInput
 } from '../panel/protocol'
@@ -133,6 +137,73 @@ function ticketListOf(input: unknown): TicketListInput {
     ...(offset === undefined ? {} : { offset }),
     ...(limit === undefined ? {} : { limit })
   }
+}
+
+/** 一次 Trigger 列表请求（§M.2 的四档筛选 + §M.4 的分页）；越界的窗口按 `invalid_params` 拒绝。 */
+function threadListOf(input: unknown): ThreadListInput {
+  const window = (input ?? {}) as { filter?: unknown; offset?: unknown; limit?: unknown }
+  const filter = window.filter
+  if (filter !== undefined && !isThreadFilter(filter)) {
+    throw invalidParams(`threads needs filter ∈ ${THREAD_FILTERS.join(', ')}`)
+  }
+  const count = (value: unknown, name: string): number | undefined => {
+    if (value === undefined) return undefined
+    if (typeof value !== 'number' || !Number.isInteger(value) || value < 0) {
+      throw invalidParams(`threads needs { ${name}: a non-negative integer }`)
+    }
+    return value
+  }
+  const offset = count(window.offset, 'offset')
+  const limit = count(window.limit, 'limit')
+  return {
+    ...(isThreadFilter(filter) ? { filter } : {}),
+    ...(offset === undefined ? {} : { offset }),
+    ...(limit === undefined ? {} : { limit })
+  }
+}
+
+/** 一次请求里的 `{ threadKey: string }`（详情与取消订阅都按 Thread 键）。 */
+function threadKeyOf(input: unknown, name: string): string {
+  const threadKey = (input as { threadKey?: unknown } | null)?.threadKey
+  if (typeof threadKey !== 'string' || threadKey === '') {
+    throw invalidParams(`${name} needs { threadKey: string }`)
+  }
+  return threadKey
+}
+
+/**
+ * 一次详情请求：`before` 是上一页返回的 `(at, id)` 复合游标（§D.2 要点 1），
+ * `limit` 是一页几条。形状不对按 `invalid_params` 拒绝，不猜。
+ */
+function threadDetailOf(input: unknown): Omit<ThreadDetailInput, 'threadKey'> {
+  const window = (input ?? {}) as { before?: unknown; limit?: unknown }
+  const limit = window.limit
+  if (limit !== undefined && (typeof limit !== 'number' || !Number.isInteger(limit) || limit < 1)) {
+    throw invalidParams('thread.detail needs { limit: a positive integer }')
+  }
+  const raw = window.before
+  if (raw === undefined) return typeof limit === 'number' ? { limit } : {}
+  const cursor = raw as { at?: unknown; triggerId?: unknown } | null
+  if (
+    typeof cursor !== 'object' ||
+    cursor === null ||
+    typeof cursor.at !== 'string' ||
+    cursor.at === '' ||
+    typeof cursor.triggerId !== 'string' ||
+    cursor.triggerId === ''
+  ) {
+    throw invalidParams('thread.detail needs before: { at: string, triggerId: string }')
+  }
+  return { before: { at: cursor.at, triggerId: cursor.triggerId }, ...(typeof limit === 'number' ? { limit } : {}) }
+}
+
+/** 一次请求里的 `{ triggerId: string }`（再评估一次）。 */
+function triggerIdOf(input: unknown, name: string): string {
+  const triggerId = (input as { triggerId?: unknown } | null)?.triggerId
+  if (typeof triggerId !== 'string' || triggerId === '') {
+    throw invalidParams(`${name} needs { triggerId: string }`)
+  }
+  return triggerId
 }
 
 /**
@@ -262,6 +333,33 @@ export default function activate(orca: OrcaWorkerApi): void {
     const booted = await ready()
     try {
       return booted.dismissDecision(decisionIdOf(input, 'decision.dismiss'))
+    } catch (error) {
+      throw Object.assign(new Error(messageOf(error)), { code: codeOf(error, 'invalid_params') })
+    }
+  })
+  // Trigger 页（§M.2）：列表与详情是读；「再评估一次」与「取消订阅」是写，都经 boot 的同一批
+  // handler（命令行的 `trigger requeue` / `thread unsubscribe` 走同一批领域函数）。
+  host.handleRequest('threads', async (input) => (await ready()).threads(threadListOf(input)))
+  host.handleRequest('thread.detail', async (input) => {
+    const booted = await ready()
+    try {
+      return booted.threadDetail(threadKeyOf(input, 'thread.detail'), threadDetailOf(input))
+    } catch (error) {
+      throw Object.assign(new Error(messageOf(error)), { code: codeOf(error, 'invalid_params') })
+    }
+  })
+  host.handleRequest('trigger.requeue', async (input) => {
+    const booted = await ready()
+    try {
+      return { queued: booted.requeueTrigger(triggerIdOf(input, 'trigger.requeue')) }
+    } catch (error) {
+      throw Object.assign(new Error(messageOf(error)), { code: codeOf(error, 'invalid_params') })
+    }
+  })
+  host.handleRequest('thread.unsubscribe', async (input) => {
+    const booted = await ready()
+    try {
+      return { removed: booted.unsubscribeThread(threadKeyOf(input, 'thread.unsubscribe')) }
     } catch (error) {
       throw Object.assign(new Error(messageOf(error)), { code: codeOf(error, 'invalid_params') })
     }

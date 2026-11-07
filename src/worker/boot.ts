@@ -18,6 +18,10 @@ import type {
   DeploymentView,
   PanelState,
   PanelTerminal,
+  ThreadDetailInput,
+  ThreadDetailView,
+  ThreadListInput,
+  ThreadListPage,
   TicketDetailView,
   TicketListInput,
   TicketListPage
@@ -82,6 +86,7 @@ import {
 } from './app/state-source.ts'
 import { deliveredFollowups, ticketDetail } from './app/views.ts'
 import { decisionDetail, decisionPage } from './app/views/decisions.ts'
+import { threadDetailView, threadListPage, threadRecordsOf } from './app/views/threads.ts'
 import {
   followupOwners,
   latestAssignment,
@@ -254,6 +259,20 @@ export interface BootHandle {
    * 不让整个详情失败。未知工单抛 `unknownTicket`。
    */
   ticketDetail(ticketId: string): Promise<TicketDetailView>
+  /** Trigger 列表的一页（§M.2 的四档筛选 + §M.4 的分页）：筛选与分页都在读模型里。 */
+  threads(input: ThreadListInput): ThreadListPage
+  /**
+   * 一条 Thread 的详情（§M.2）：时间线（`(at, id)` 游标分页）、决定、订阅与 handback 原因。
+   * 未知的 Thread 抛 `unknownThread`。
+   */
+  threadDetail(
+    threadKey: string,
+    input: Omit<ThreadDetailInput, 'threadKey'>
+  ): ThreadDetailView
+  /** 再评估一次（§G.2 的 `trigger requeue`）：返回它是否排进了 Eval（已有 Eval 持有时是 false）。 */
+  requeueTrigger(triggerId: string): boolean
+  /** 取消订阅一条 Thread（§G.2 的 `thread unsubscribe`）：返回是否真的丢了订阅。 */
+  unsubscribeThread(threadKey: string): boolean
   /** 人的停止（§E.5、§K.3：撤回 Mandate）；面板先做行内二次确认。 */
   stopTicket(ticketId: string): PanelState
   /** 发一条 fact note（§G.2 的 `ticket note`）：只加语境，不授权任何事。 */
@@ -410,6 +429,23 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
           code: 'unavailable'
         })
       },
+      // follower 不读库：Trigger 页的读数与两条动作都属于拥有者（固定拒绝，不假装成功）。
+      threads: () => ({ items: [], nextOffset: null }),
+      threadDetail: () => {
+        throw Object.assign(new Error('another Superagent instance owns this state directory'), {
+          code: 'unavailable'
+        })
+      },
+      requeueTrigger: () => {
+        throw Object.assign(new Error('another Superagent instance owns this state directory'), {
+          code: 'action_failed'
+        })
+      },
+      unsubscribeThread: () => {
+        throw Object.assign(new Error('another Superagent instance owns this state directory'), {
+          code: 'action_failed'
+        })
+      },
       stopTicket: () => {
         throw Object.assign(new Error('another Superagent instance owns this state directory'), {
           code: 'action_failed'
@@ -484,6 +520,8 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
   claimModelsEntry(board)
   const paused = createPausedState(store, now)
   const repo = createRepositories(store)
+  // Trigger 页的读模型：真库上的时间线 + 真仓储的归属判定（组合根与测试同一处构造）。
+  const threadRecords = threadRecordsOf(repo, store)
 
   // ---- 设置与 setup 探针（§N.1、§I.4）：一次只告诉人缺什么，不把「没配置」写成 error
   const executorSettings = resolveExecutorSettings(settings)
@@ -1675,6 +1713,36 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
         { threads: repo.threads, triggers: repo.triggers },
         terminal === undefined ? {} : { terminal }
       )
+    },
+    // Trigger 页（§M.2）：列表、详情与两条动作都读/写同一份记录——时间线由 `trigger_thread`
+    // 供（`(at, id)` 复合游标），归属判定就是 `followupOwners`。
+    threads: (input: ThreadListInput): ThreadListPage =>
+      threadListPage(threadRecords, { ...input, now: now() }),
+    threadDetail: (threadKey: string, input: Omit<ThreadDetailInput, 'threadKey'>): ThreadDetailView => {
+      const detail = threadDetailView(threadRecords, threadKey, input)
+      if (detail === undefined) throw new UserError('unknownThread', { thread: threadKey })
+      return detail
+    },
+    // `trigger requeue`（§G.2）：执行器仍拥有的人消息不能被绕过——那会绕开决定它的 worker
+    // （§K.2 第 3 条）。已有 Eval 持有时如实回 false，不当成成功。
+    requeueTrigger: (triggerId: string): boolean => {
+      const trigger = repo.triggers.get(triggerId)
+      if (trigger === undefined) throw new UserError('unknownTrigger')
+      const owners = followupOwners(trigger, repo)
+      if (owners.length > 0) throw new UserError('notRequeueable', { tickets: owners.join(',') })
+      const queued = engine.reevaluate(triggerId)
+      refresh()
+      return queued
+    },
+    // `thread unsubscribe`（§G.2）：丢这条 Thread 上全部 Ticket 的订阅。没有订阅可丢时回
+    // false（面板照实说，不当成「取消了」）。
+    unsubscribeThread: (threadKey: string): boolean => {
+      if (repo.threads.get(threadKey) === undefined) {
+        throw new UserError('unknownThread', { thread: threadKey })
+      }
+      const removed = engine.unsubscribe(threadKey)
+      refresh()
+      return removed
     },
     // §E.5、§G.2：停止（撤回 Mandate）与重试是同一个领域写入面；note 只加一条语境，
     // request-status 只问已经在等的 worker（返回它是否真的发了一条问题）。
