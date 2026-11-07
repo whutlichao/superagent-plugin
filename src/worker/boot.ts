@@ -445,7 +445,10 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
   // ---- 注册表与 kind
   const registry = new SourceRegistry({ health: board, settings: () => sourceSettings })
   registry.register(createGithubKind(String(githubSetup.config['cli'] ?? 'gh')))
-  registry.register(createFeishuKind())
+  // Feishu 的 kind 绑定配置的 CLI 与 stateDir：语境读/图片下载要它们（§I.3、§H.17）。
+  registry.register(
+    createFeishuKind(feishuSetup.cli === '' ? 'lark-cli' : feishuSetup.cli, { stateDir: resolved })
+  )
   const githubHealth = registry.healthEntries(['github']).get('github')
   const feishuHealth = registry.healthEntries(['feishu', 'history'])
   /**

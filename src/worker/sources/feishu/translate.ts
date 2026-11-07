@@ -41,6 +41,8 @@ export interface FeishuMessage {
   readonly chatId: string
   readonly chatType: 'p2p' | 'group'
   readonly senderId: string
+  /** 发送者的显示名（读取路径可能给；事件流没有）。读语境时优先用它，缺了才退回 open_id。 */
+  readonly senderName?: string
   readonly senderType: 'user' | 'bot'
   readonly text: string
   readonly mentions: readonly FeishuMention[]
@@ -178,8 +180,9 @@ export function feishuEventOf(value: unknown): FeishuMessage | undefined {
 }
 
 /**
- * 读取路径给出的一条消息（`+chat-messages-list` / `+threads-messages-list` 的一项）→ 归一化。
- * 列表输出不带 `chat_id`，所以群与是否私聊由调用方给（它知道自己读的是哪个会话）。
+ * 读取路径给出的一条消息（`+chat-messages-list` / `+threads-messages-list` / `+messages-mget`
+ * 的一项）→ 归一化。列表输出不带 `chat_id`，所以群与是否私聊由调用方给（它知道自己读的是
+ * 哪个会话）；`+messages-mget` 带 `chat_id` 时以它为准，这样跨群的返回能被调用方发现。
  */
 export function feishuHistoryOf(
   value: unknown,
@@ -193,6 +196,9 @@ export function feishuHistoryOf(
   // 机器人发送者带 `open_bot_id`（与事件流的 open_id 对齐）；没有就用 id。
   const senderId = textOf(sender, 'open_bot_id') || textOf(sender, 'id')
   if (senderId.length === 0) return undefined
+  const senderName = textOf(sender, 'name')
+  const rowChatId = textOf(value, 'chat_id')
+  const chatId = rowChatId.length === 0 ? input.chatId : rowChatId
   const rootId = textOf(value, 'root_id')
   const parentId = textOf(value, 'parent_id')
   const threadId = textOf(value, 'thread_id')
@@ -200,9 +206,10 @@ export function feishuHistoryOf(
   const updateTime = textOf(value, 'update_time')
   return {
     messageId,
-    chatId: input.chatId,
+    chatId,
     chatType: input.direct ? 'p2p' : 'group',
     senderId,
+    ...(senderName.length === 0 ? {} : { senderName }),
     senderType: senderTypeOf(textOf(sender, 'sender_type')),
     text: historyText(value['content']),
     mentions: mentionsOf(value['mentions']),
