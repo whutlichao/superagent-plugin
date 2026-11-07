@@ -482,8 +482,15 @@ test('marks a follow-up that a worker still owns as delivered to that ticket, so
     // 同一条标记说明「不要再路由」：Router 没有候选，也没有第二张 Ticket。
     assert.equal(h.handle.routerStatus().undecidedCandidates, 0)
     assert.deepEqual(h.handle.snapshot().tickets?.map((item) => item.id), [ticket.id])
-    // 读面每次都从同一份状态推出它：再读一次是同一份标记。
+    // 读面每次都从同一份状态推出它：再读一次是同一份标记；列表与详情是同一份。
     assert.deepEqual((await ticketOf(h, ticket.id, token))['followups'], followups)
+    const list = await cli(h.stateDir, portOf(h), ['read', 'tickets'], token)
+    const [row] = (resultOf(list.envelope)['items'] ?? []) as readonly {
+      readonly id: string
+      readonly followups?: readonly unknown[]
+    }[]
+    assert.equal(row?.id, ticket.id)
+    assert.deepEqual(row?.followups, followups)
   } finally {
     await h.cleanup()
   }
