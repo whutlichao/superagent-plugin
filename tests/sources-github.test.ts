@@ -979,6 +979,64 @@ test('a missing repository or CLI leaves the Source in setup and starts no polli
   }
 })
 
+// §M.2 的「打开/关闭」、§I.2 的通知轮询：面板的开关写设置（origin=panel）后由组合根的
+// Source 运行时通知到轮询器——关掉就不再发一个 `gh` 调用、不再产生 Trigger，重新打开就恢复。
+test('the panel switch stops the poller in place and starts it again on enable', async () => {
+  const h = await openBoot()
+  try {
+    const ghCalls = (): number => h.commands.calls.filter((call) => call.program === 'gh').length
+    // 打开时：一轮读通知与评论，产生一条 Trigger。
+    assert.deepEqual(await h.handle.pollOnce(), { notifications: 1, triggers: 1, skipped: 0 })
+    const received = h.handle.refresh().health.activity.received
+    assert.equal(received, 1)
+
+    // 关掉：卡片立刻说 off、health 说 paused/disabled（不必等下一轮）。
+    const off = h.handle.setSourceEnabled('github', false)
+    const card = off.items.find((item) => item.id === 'github')
+    assert.equal(card?.enabled, false)
+    assert.equal(card?.state, 'off')
+    assert.deepEqual(card?.health, [{ name: 'github', state: 'paused', detail: 'disabled' }])
+
+    // 下一轮：一个 CLI 调用都不发，也不产生 Trigger（§M.2 的「关闭即停」）。
+    const before = ghCalls()
+    assert.deepEqual(await h.handle.pollOnce(), { notifications: 0, triggers: 0, skipped: 0 })
+    assert.equal(ghCalls(), before, 'a disabled Source issues no CLI call')
+    assert.equal(h.handle.refresh().health.activity.received, received, 'and produces no Trigger')
+
+    // 再打开：下一轮恢复轮询；游标停住，因此不重复产生同一条 Trigger。
+    const on = h.handle.setSourceEnabled('github', true)
+    assert.equal(on.items.find((item) => item.id === 'github')?.enabled, true)
+    assert.notEqual(on.items.find((item) => item.id === 'github')?.state, 'off')
+    assert.deepEqual(await h.handle.pollOnce(), { notifications: 1, triggers: 0, skipped: 0 })
+    assert.ok(ghCalls() > before, 'the next pass reads the Source again')
+  } finally {
+    await h.cleanup()
+  }
+})
+
+test('a Source disabled at boot starts polling when the panel opens it', async () => {
+  const stateDir = mkdtempSync(join(tmpdir(), 'superagent-source-off-'))
+  const settings = settingsOf(stateDir)
+  const h = await openBoot({
+    stateDir,
+    settings: {
+      ...settings,
+      sources: {
+        github: { enabled: false, config: { repository: 'acme/widgets', cli: 'gh', pollSeconds: 60 } }
+      }
+    }
+  })
+  try {
+    // 启动时关着：没有轮询，也没有 Trigger。
+    assert.deepEqual(await h.handle.pollOnce(), { notifications: 0, triggers: 0, skipped: 0 })
+    // 面板打开：不必重启，下一轮就真的读了。
+    h.handle.setSourceEnabled('github', true)
+    assert.deepEqual(await h.handle.pollOnce(), { notifications: 1, triggers: 1, skipped: 0 })
+  } finally {
+    await h.cleanup()
+  }
+})
+
 test('the composition root polls Threads subscribed by a live Ticket from the real store', async () => {
   const h = await openBoot()
   try {

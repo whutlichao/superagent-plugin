@@ -197,6 +197,12 @@ export function createSettings(input: {
   readonly store: SettingsStore
   readonly now: () => string
   readonly policy?: SettingsPolicyPort
+  /**
+   * 保存成功（真的写了新版本）之后的回调：组合根用它把 `source:<id>` 的开关立刻交给
+   * Source 运行时（§M.2「打开/关闭」不必重启）。回调在保存事务之外、事务之后调，
+   * 因此不能要求它回滚已提交的版本；回滚退错由回调自己消化。
+   */
+  readonly saved?: (record: SettingsVersionRecord) => void
 }): Settings {
   const { store, now } = input
 
@@ -296,6 +302,8 @@ export function createSettings(input: {
       if (versionChanged && version !== null) {
         policyPort().apply({ from: previousVersion, to: version, effects })
       }
+      // 8. 保存已提交：通知挂在写者上的部件（组合根把 `source:<id>` 的开关接给 Source 运行时）。
+      input.saved?.(result)
       return result
     }
   }
