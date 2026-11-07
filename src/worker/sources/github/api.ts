@@ -5,6 +5,7 @@
 // `skipped` 由调用方跳过（§I.2「畸形条目跳过并计数」）。传输层失败（不是 JSON）与形状不符
 // 分开：前者抛错让这一轮失败、游标不动；后者只计数。
 import type { JsonValue } from '../../core/index.ts'
+import { CliError } from '../commands.ts'
 import type { CommandsHost } from '../commands.ts'
 
 /** 一次读取的读数：解析出来的条目，以及被跳过的畸形条目数（不是失败）。 */
@@ -45,6 +46,8 @@ export interface GithubPull {
   readonly url: string
   readonly state: string
   readonly merged: boolean
+  /** PR 的 head 提交：CI 读这个提交的检查与状态（§I.2 CI 行）。 */
+  readonly headSha: string
   readonly updatedAt: string
   readonly body: string
   readonly login: string
@@ -82,6 +85,32 @@ export interface GithubReview {
   readonly url: string
 }
 
+/** 一条检查运行（`/commits/<sha>/check-runs` 的一项，只取结果面）。 */
+export interface GithubCheckRun {
+  readonly name: string
+  /** `queued` | `in_progress` | `completed`（GitHub 原值）。 */
+  readonly status: string
+  /** 完成后的结论；还在跑时为 null。 */
+  readonly conclusion: string | null
+}
+
+/** 一条提交状态（`/commits/<sha>/statuses` 的一项，只取结果面）。 */
+export interface GithubCommitStatus {
+  readonly context: string
+  /** `pending` | `success` | `failure` | `error`（GitHub 原值）。 */
+  readonly state: string
+}
+
+/**
+ * 一个提交的 CI 读数（§I.2 CI 行）：检查运行 + 提交状态。两组都按名字排序：轮询据此算
+ * 稳定指纹，顺序变化不算变化；状态按 context 只留最新一条（GitHub 新的在前）。
+ */
+export interface GithubChecks {
+  readonly headSha: string
+  readonly checks: readonly GithubCheckRun[]
+  readonly statuses: readonly GithubCommitStatus[]
+}
+
 /** GitHub 的读取面（测试用 FakeCommands 实现同一个契约）。 */
 export interface GithubApi {
   /** 未读通知；`gh api notifications --paginate`（§I.2）。 */
@@ -100,6 +129,11 @@ export interface GithubApi {
   pullReviews(repository: string, issue: number): Promise<GithubRead<GithubReview>>
   /** 一个 PR 的评审评论页（`/pulls/:n/comments`，行内讨论）。 */
   pullComments(repository: string, issue: number): Promise<GithubRead<GithubComment>>
+  /**
+   * 一个提交的 CI 读数（§I.2 CI 行）：检查运行 + 提交状态。畸形页/条目进 `skipped`，
+   * 与其它读一致。
+   */
+  checks(repository: string, sha: string): Promise<GithubRead<GithubChecks>>
 }
 
 /** 从任意值里取字符串字段（缺失 → 空串）。 */
@@ -210,6 +244,7 @@ export function pullOf(value: unknown): GithubPull | undefined {
     url: text(value, 'html_url'),
     state: text(value, 'state'),
     merged: flag(value, 'merged'),
+    headSha: text(isRecord(value['head']) ? value['head'] : {}, 'sha'),
     updatedAt: text(value, 'updated_at'),
     body: text(value, 'body'),
     login: author.login,
@@ -239,6 +274,60 @@ export function commentOf(value: unknown): GithubComment | undefined {
   }
 }
 
+/** 解析一组检查运行页：每页是 `{check_runs: [...]}`（`--slurp` 包成数组）。 */
+function checkRunsOf(pages: readonly unknown[]): { checks: GithubCheckRun[]; skipped: number } {
+  const checks: GithubCheckRun[] = []
+  let skipped = 0
+  for (const page of pages) {
+    const runs = isRecord(page) ? page['check_runs'] : undefined
+    if (!Array.isArray(runs)) {
+      skipped += 1
+      continue
+    }
+    for (const value of runs) {
+      const parsed = checkRunOf(value)
+      if (parsed === undefined) skipped += 1
+      else checks.push(parsed)
+    }
+  }
+  return { checks, skipped }
+}
+
+/** 检查按名字、状态、结论排序：GitHub 的返回顺序不参与指纹。 */
+function sortedChecks(checks: readonly GithubCheckRun[]): GithubCheckRun[] {
+  return [...checks].sort(
+    (left, right) =>
+      left.name.localeCompare(right.name) ||
+      left.status.localeCompare(right.status) ||
+      (left.conclusion ?? '').localeCompare(right.conclusion ?? '')
+  )
+}
+
+/** 每个 context 只留最新一条（GitHub 新的在前，所以第一条就是最新），再按 context 排序。 */
+function latestStatuses(statuses: readonly GithubCommitStatus[]): GithubCommitStatus[] {
+  const latest = new Map<string, GithubCommitStatus>()
+  for (const status of statuses) if (!latest.has(status.context)) latest.set(status.context, status)
+  return [...latest.values()].sort((left, right) => left.context.localeCompare(right.context))
+}
+
+/** 一条检查运行 → 端口形状；缺名字或缺状态的条目返回 undefined（跳过）。 */
+export function checkRunOf(value: unknown): GithubCheckRun | undefined {
+  if (!isRecord(value)) return undefined
+  const name = text(value, 'name')
+  const status = text(value, 'status')
+  if (name.length === 0 || status.length === 0) return undefined
+  const conclusion = text(value, 'conclusion')
+  return { name, status, conclusion: conclusion.length === 0 ? null : conclusion }
+}
+
+/** 一条提交状态 → 端口形状；缺 context 或 state 的条目返回 undefined（跳过）。 */
+export function commitStatusOf(value: unknown): GithubCommitStatus | undefined {
+  if (!isRecord(value)) return undefined
+  const context = text(value, 'context')
+  const state = text(value, 'state')
+  return context.length === 0 || state.length === 0 ? undefined : { context, state }
+}
+
 /** 一条评审 → 端口形状；缺 id 的条目返回 undefined。 */
 export function reviewOf(value: unknown): GithubReview | undefined {
   if (!isRecord(value)) return undefined
@@ -266,6 +355,20 @@ export function issueNumberOf(apiUrl: string): number | undefined {
 /** 打开分页的读参数（`--method GET` 是关键：`gh api -f` 默认把请求改成 POST）。 */
 function pageArgs(path: string): string[] {
   return ['api', path, '--paginate', '--method', 'GET', '-f', 'per_page=100']
+}
+
+/** 限流的文案（与 `commands.test.ts` 的错误脱敏形状一致：只认标准错误里的这几句）。 */
+const RATE_LIMITED = /rate limit|secondary rate|abuse detection/i
+
+/**
+ * 这个 CLI 失败是不是限流（§I.2 CI 行的失败处理列）：限流会自己恢复，所以读的人应当记录
+ * 并在下一轮重试，不当成 Source 的连续失败。GitHub 的限流是 429，或带限流文案的 403
+ * （primary / secondary rate limit、abuse detection）。
+ */
+export function rateLimited(error: unknown): boolean {
+  if (!(error instanceof CliError)) return false
+  if (error.code === 429) return true
+  return error.code === 403 && RATE_LIMITED.test(error.message)
 }
 
 /**
@@ -325,6 +428,38 @@ export function createGithubApi(commands: CommandsHost, cli: string): GithubApi 
     },
     pullComments(repository: string, issue: number): Promise<GithubRead<GithubComment>> {
       return readList(pageArgs(`repos/${repository}/pulls/${issue}/comments`), commentOf)
+    },
+    async checks(repository: string, sha: string): Promise<GithubRead<GithubChecks>> {
+      // check-runs 是对象响应：`--slurp` 把分页包成数组，再逐页展平（§I.2 CI 行）。
+      const pages = parseJson(
+        await commands.run(cli, [
+          'api',
+          `repos/${repository}/commits/${sha}/check-runs`,
+          '--paginate',
+          '--slurp',
+          '--method',
+          'GET',
+          '-f',
+          'per_page=100'
+        ])
+      )
+      if (!Array.isArray(pages)) throw new Error('GitHub returned a non-array response')
+      const runs = checkRunsOf(pages)
+      // 总体状态：`/statuses` 是数组响应，与其它列表同一条读法。
+      const statuses = await readList(
+        pageArgs(`repos/${repository}/commits/${sha}/statuses`),
+        commitStatusOf
+      )
+      return {
+        items: [
+          {
+            headSha: sha,
+            checks: sortedChecks(runs.checks),
+            statuses: latestStatuses(statuses.items)
+          }
+        ],
+        skipped: runs.skipped + statuses.skipped
+      }
     }
   }
 }

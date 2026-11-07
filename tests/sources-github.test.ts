@@ -11,10 +11,18 @@ import type { Thread, Ticket, Trigger } from '../src/worker/core/index.ts'
 import { CliError } from '../src/worker/sources/commands'
 import { SourceRegistry, EMPTY_SOURCE_SETTINGS } from '../src/worker/sources/registry'
 import { githubKind } from '../src/worker/sources/github/kind'
-import { createGithubApi } from '../src/worker/sources/github/api'
-import type { GithubComment, GithubReview } from '../src/worker/sources/github/api'
+import { createGithubApi, rateLimited } from '../src/worker/sources/github/api'
+import type {
+  GithubChecks,
+  GithubCheckRun,
+  GithubComment,
+  GithubCommitStatus,
+  GithubReview
+} from '../src/worker/sources/github/api'
 import {
   bodyFingerprint,
+  ciState,
+  ciTrigger,
   commentTrigger,
   issueBodyTrigger,
   reviewCommentTrigger,
@@ -22,7 +30,8 @@ import {
 } from '../src/worker/sources/github/translate'
 import { createGithubPoller, subscribedThreads, withinHorizon } from '../src/worker/sources/github/poll'
 import { githubSetupProblem } from '../src/worker/sources/github/config'
-import { githubBodyKey, githubCursorKey } from '../src/worker/app/kv'
+import { createPolicy, validatePolicy } from '../src/worker/policy/index'
+import { githubBodyKey, githubCiKey, githubCursorKey } from '../src/worker/app/kv'
 import { FakeCommands } from './support/fake-commands'
 import { FakeHealthBoard } from './support/health-board'
 import { mkdtempSync } from 'node:fs'
@@ -402,6 +411,8 @@ test('the PR read keeps the PR state a later ticket needs for the closing rule',
         url: 'https://github.com/acme/widgets/pull/45',
         state: 'closed',
         merged: true,
+        // CI 读这个 head 提交的检查与状态（#19）。
+        headSha: CI_SHA,
         updatedAt: '2026-11-07T03:09:36Z',
         body: 'When the agent account is described in the docs, a reader cannot tell whether the worker signs its commits with a token or a dedicated account.\n\nThis change says the agent CLI is signed in to the agent account and that the commit email is the noreply address. No behaviour changes.',
         login: 'bob',
@@ -1702,4 +1713,530 @@ test('editing a comment, review or review comment is a new Trigger; the same ver
     })
   assert.equal(inlineAt('2026-11-07T06:01:00Z').id, inlineAt('2026-11-07T06:01:00Z').id)
   assert.notEqual(inlineAt('2026-11-07T06:01:00Z').id, inlineAt('2026-11-07T06:11:00Z').id)
+})
+
+// ---- #19：CI 检查结果作为 Trigger（§I.2 CI 行、§K.2 第 6 条） ----
+
+/** 夹具 PR 的 head 提交（`pull.json` 的 `head.sha`）。 */
+const CI_SHA = '724125307bfe91a1cceb2a0406a8020fed6f6def'
+
+/** 一条检查运行（`/commits/<sha>/check-runs` 的一项），端口形状。 */
+function checkRun(overrides: Partial<GithubCheckRun> = {}): GithubCheckRun {
+  return { name: 'build', status: 'completed', conclusion: 'success', ...overrides }
+}
+
+/** 一条提交状态（`/commits/<sha>/statuses` 的一项），端口形状。 */
+function commitStatus(overrides: Partial<GithubCommitStatus> = {}): GithubCommitStatus {
+  return { context: 'ci/legacy', state: 'success', ...overrides }
+}
+
+/** 一个提交的 CI 读数（端口形状）。 */
+function checks(overrides: Partial<GithubChecks> = {}): GithubChecks {
+  return { headSha: CI_SHA, checks: [checkRun()], statuses: [], ...overrides }
+}
+
+test('a CI result classifies as failure, running or success', () => {
+  assert.equal(ciState(checks({ checks: [checkRun({ status: 'in_progress', conclusion: null })] })), 'running')
+  assert.equal(ciState(checks({ checks: [checkRun({ conclusion: 'failure' })] })), 'failure')
+  assert.equal(ciState(checks({ statuses: [commitStatus({ state: 'pending' })] })), 'running')
+  assert.equal(ciState(checks({ statuses: [commitStatus({ state: 'error' })] })), 'failure')
+  assert.equal(ciState(checks()), 'success')
+  // 失败优先于进行中：等待恢复时先报失败（上游同）。
+  assert.equal(
+    ciState(
+      checks({
+        checks: [
+          checkRun({ conclusion: 'failure' }),
+          checkRun({ name: 'lint', status: 'in_progress', conclusion: null })
+        ]
+      })
+    ),
+    'failure'
+  )
+})
+
+test('a CI result becomes a Trigger with no sender, its PR thread and the CI summary', () => {
+  const snapshot = checks({
+    checks: [checkRun({ conclusion: 'failure' }), checkRun({ name: 'lint' })]
+  })
+  const trigger = ciTrigger({
+    repository: 'acme/widgets',
+    pull: 45,
+    checks: snapshot,
+    at: '2026-11-07T04:00:00.000Z',
+    url: 'https://github.com/acme/widgets/pull/45'
+  })
+  // 没有发送者：actor 是 Source 自己、id 为空；永不寻址、永不「人写的」。
+  assert.deepEqual(trigger.actor, { source: 'github', id: '' })
+  assert.equal(trigger.human, false)
+  assert.equal(trigger.addressed, undefined)
+  assert.deepEqual(trigger.threads, [{ source: 'github', id: '45' }])
+  assert.equal(trigger.at, '2026-11-07T04:00:00.000Z')
+  assert.equal(
+    trigger.text,
+    'CI failed 1/2 on PR #45 at 7241253: build\nRead github/pulls/45/checks for every check.'
+  )
+  assert.equal(trigger.url, 'https://github.com/acme/widgets/pull/45')
+  assert.deepEqual(trigger.channel, {
+    source: 'github',
+    thread: 'github:45',
+    address: { repo: 'acme/widgets', issue: '45' }
+  })
+  assert.deepEqual(trigger.meta, {
+    kind: 'ci',
+    repository: 'acme/widgets',
+    issue: 45,
+    headSha: CI_SHA,
+    state: 'failure'
+  })
+  // 同一结果同一个 id；结果变了才是新事件（§I.2 CI 行：只在变化时出 Trigger）。
+  const again = ciTrigger({
+    repository: 'acme/widgets',
+    pull: 45,
+    checks: snapshot,
+    at: '2026-11-07T05:00:00.000Z'
+  })
+  assert.equal(again.id, trigger.id)
+  const changed = ciTrigger({
+    repository: 'acme/widgets',
+    pull: 45,
+    checks: checks({
+      checks: [checkRun({ conclusion: 'failure' }), checkRun({ name: 'lint', conclusion: 'failure' })]
+    }),
+    at: '2026-11-07T05:00:00.000Z'
+  })
+  assert.notEqual(changed.id, trigger.id)
+})
+
+test('CI has no sender, so only the last admission cell can admit it', () => {
+  const trigger = ciTrigger({
+    repository: 'acme/widgets',
+    pull: 45,
+    checks: checks(),
+    at: '2026-11-07T04:00:00.000Z'
+  })
+  // Source 的监听范围：CI 行只有开了 observeCi 才可用（§I.2 准入行）。
+  assert.deepEqual(githubKind.scope?.(trigger, config({ observeCi: true })), {
+    listened: true,
+    observed: true,
+    row: 'ci'
+  })
+  assert.deepEqual(githubKind.scope?.(trigger, config()), { listened: false, reason: 'ci_not_observed' })
+  // 准入表：CI 行只有最后一格可用，两个「寻址」格永远是 false（不会要求寻址判定）。
+  const rows = githubKind.policy?.rows?.({ ...config({ observeCi: true }) }) ?? []
+  const row = rows.find((entry) => entry.id === 'ci')
+  assert.deepEqual(row?.cells, {
+    listedUnaddressed: false,
+    unlistedAddressed: false,
+    unlistedUnaddressed: true
+  })
+  // 真实 Gate：trigger 没有 addressed，仍然只按 `ci` 行的最后一格准入（§K.2 第 6 条）。
+  const parsed = validatePolicy(
+    {
+      acceptMode: 'auto',
+      sources: {
+        github: { allowed: [], bots: [], admission: { ci: { unlistedUnaddressed: 'inferred' } } }
+      }
+    },
+    { kinds: (source) => (source === 'github' ? { rows: () => rows } : undefined) }
+  )
+  assert.equal(parsed.success, true, JSON.stringify(parsed))
+  if (!parsed.success) throw new Error('unreachable')
+  const policy = createPolicy({
+    block: () => parsed.data,
+    sources: {
+      scope: (value) =>
+        githubKind.scope?.(value, config({ observeCi: true })) ?? {
+          listened: false,
+          reason: 'unknown'
+        }
+    },
+    rows: (source) => (source === 'github' ? rows : [])
+  })
+  const thread: Thread = {
+    key: 'github:45',
+    ref: { source: 'github', id: '45' },
+    createdAt: '2026-11-07T03:00:00Z',
+    subscriptions: [],
+    correlated: [],
+    pending: [],
+    meta: {}
+  }
+  assert.deepEqual(policy.gate(trigger, thread, []), {
+    admissible: true,
+    strength: 'inferred',
+    basis: {
+      source: 'github',
+      scope: trigger.meta,
+      row: 'ci',
+      via: 'admission',
+      cell: 'unlistedUnaddressed',
+      observation: { mode: 'auto' }
+    }
+  })
+})
+
+test('the check-runs and statuses reads use the documented endpoints and keep one status per context', async () => {
+  const commands = new FakeCommands()
+  commands.script(['api', `repos/acme/widgets/commits/${CI_SHA}/check-runs`, '--paginate'], () =>
+    JSON.stringify([
+      {
+        total_count: 3,
+        check_runs: [
+          // 真实响应还有 id / details_url / app …，端口只取结果面。
+          { id: 1, name: 'lint', status: 'completed', conclusion: 'success', details_url: 'https://x/1' },
+          { id: 2, name: 'build', status: 'in_progress', conclusion: null }
+        ]
+      },
+      { total_count: 3, check_runs: [{ id: 3, name: 'docs', status: 'completed', conclusion: 'neutral' }] }
+    ])
+  )
+  commands.script(['api', `repos/acme/widgets/commits/${CI_SHA}/statuses`, '--paginate'], () =>
+    JSON.stringify([
+      // 同一个 context 有多条时 GitHub 新的在前：只有第一条（最新）算数。
+      { context: 'ci/legacy', state: 'pending', updated_at: '2026-11-07T03:10:00Z' },
+      { context: 'ci/legacy', state: 'success', updated_at: '2026-11-07T03:00:00Z' },
+      { context: 'ci/other', state: 'failure', updated_at: '2026-11-07T03:05:00Z' }
+    ])
+  )
+  const read = await api(commands).checks('acme/widgets', CI_SHA)
+  assert.deepEqual(read, {
+    items: [
+      {
+        headSha: CI_SHA,
+        checks: [
+          { name: 'build', status: 'in_progress', conclusion: null },
+          { name: 'docs', status: 'completed', conclusion: 'neutral' },
+          { name: 'lint', status: 'completed', conclusion: 'success' }
+        ],
+        statuses: [
+          { context: 'ci/legacy', state: 'pending' },
+          { context: 'ci/other', state: 'failure' }
+        ]
+      }
+    ],
+    skipped: 0
+  })
+  assert.deepEqual(
+    commands.calls.map((call) => call.args),
+    [
+      [
+        'api',
+        `repos/acme/widgets/commits/${CI_SHA}/check-runs`,
+        '--paginate',
+        '--slurp',
+        '--method',
+        'GET',
+        '-f',
+        'per_page=100'
+      ],
+      [
+        'api',
+        `repos/acme/widgets/commits/${CI_SHA}/statuses`,
+        '--paginate',
+        '--method',
+        'GET',
+        '-f',
+        'per_page=100'
+      ]
+    ]
+  )
+})
+
+test('a malformed check-run page, check run or status is skipped with a counter', async () => {
+  const commands = new FakeCommands()
+  commands.script(['api', `repos/acme/widgets/commits/${CI_SHA}/check-runs`, '--paginate'], () =>
+    JSON.stringify([
+      // 一整页没有 check_runs（契约坏了一页）：只计数，其余页照读。
+      { total_count: 0 },
+      {
+        total_count: 3,
+        check_runs: [
+          { id: 1 },
+          { id: 2, name: 'build', status: 'completed', conclusion: 'success' },
+          { id: 3, name: 'lint' }
+        ]
+      }
+    ])
+  )
+  commands.script(['api', `repos/acme/widgets/commits/${CI_SHA}/statuses`, '--paginate'], () =>
+    JSON.stringify([
+      { state: 'success' },
+      { context: 'ci/legacy', state: 'success' },
+      { context: 'ci/other' },
+      7
+    ])
+  )
+  const read = await api(commands).checks('acme/widgets', CI_SHA)
+  assert.equal(read.skipped, 6)
+  assert.deepEqual(read.items[0]?.checks, [{ name: 'build', status: 'completed', conclusion: 'success' }])
+  assert.deepEqual(read.items[0]?.statuses, [{ context: 'ci/legacy', state: 'success' }])
+})
+
+/** check-runs 的分页响应（真实响应是对象 `{total_count, check_runs}`；`--slurp` 把分页包成数组）。 */
+function checkRunsJson(raw: readonly Record<string, unknown>[]): string {
+  return JSON.stringify([{ total_count: raw.length, check_runs: raw }])
+}
+
+/** 端口形状 → check-runs 的一项（真实响应还有 id / details_url 等，端口只取结果面）。 */
+function checkRunJson(check: GithubCheckRun): Record<string, unknown> {
+  return { id: 1, name: check.name, status: check.status, conclusion: check.conclusion }
+}
+
+/** 端口形状 → statuses 数组。 */
+function statusesJson(statuses: readonly GithubCommitStatus[]): string {
+  return JSON.stringify(statuses.map((status) => ({ context: status.context, state: status.state })))
+}
+
+/** 一份仍开着的 PR（夹具是已合并的真实 PR；CI 只轮询还开着的 PR，§I.5）。 */
+function openPull(): string {
+  const pull = JSON.parse(fixture('pull.json')) as Record<string, unknown>
+  return JSON.stringify({ ...pull, state: 'open', merged: false })
+}
+
+/** 一份订阅着的 PR 45 的所有读面；任何没脚本化的调用都会让测试失败。 */
+function scriptPull45(commands: FakeCommands, pull = openPull()): FakeCommands {
+  return commands
+    .script('gh api notifications', () => JSON.stringify([]))
+    .script(['api', 'repos/acme/widgets/issues/45'], () => fixture('pull-as-issue.json'))
+    .script(['api', 'repos/acme/widgets/pulls/45'], () => pull)
+    .script(['api', 'repos/acme/widgets/issues/45/comments', '--paginate'], () => JSON.stringify([]))
+    .script(['api', 'repos/acme/widgets/pulls/45/reviews', '--paginate'], () => JSON.stringify([]))
+    .script(['api', 'repos/acme/widgets/pulls/45/comments', '--paginate'], () => JSON.stringify([]))
+}
+
+/** 轮询订阅着的 PR 45（CI 开关打开），四轮用 `now` 固定在一个时刻。 */
+function pull45Poller(commands: FakeCommands, h: ReturnType<typeof host>, overrides: Record<string, unknown> = {}) {
+  return createGithubPoller({
+    api: api(commands),
+    config: config({ observeCi: true }),
+    login: 'acme-agent',
+    host: h.port,
+    cursorKey: githubCursorKey,
+    ciKey: githubCiKey,
+    subscribed: () => [{ issue: 45, live: true, lastAt: '2026-11-07T03:00:00Z' }],
+    now: () => Date.parse('2026-11-07T04:00:00Z'),
+    ...overrides
+  })
+}
+
+test('a CI change on a subscribed PR becomes one Trigger; the same result stays quiet', async () => {
+  const commands = scriptPull45(new FakeCommands())
+  const running = [checkRunJson(checkRun({ status: 'in_progress', conclusion: null }))]
+  const passed = [checkRunJson(checkRun())]
+  // 四轮：基线（进行中）、同样的进行中、通过、同样的通过。
+  for (const result of [running, running, passed, passed]) {
+    commands.next('gh', ['api', `repos/acme/widgets/commits/${CI_SHA}/check-runs`], checkRunsJson(result))
+    commands.next('gh', ['api', `repos/acme/widgets/commits/${CI_SHA}/statuses`], JSON.stringify([]))
+  }
+  const h = host()
+  const poller = pull45Poller(commands, h)
+  assert.equal((await poller.poll()).triggers, 0, 'the first read only sets the baseline')
+  assert.equal(typeof h.state.get(githubCiKey(45, CI_SHA)), 'string')
+  assert.equal((await poller.poll()).triggers, 0, 'the same result is not a change')
+  assert.equal((await poller.poll()).triggers, 1, 'the completed check is one change')
+  assert.equal((await poller.poll()).triggers, 0, 'the same result repeats as a duplicate')
+  assert.equal(h.received.length, 1)
+  const trigger = h.received[0] as Trigger
+  assert.equal(trigger.meta['kind'], 'ci')
+  assert.equal(trigger.meta['headSha'], CI_SHA)
+  assert.equal(trigger.meta['state'], 'success')
+  assert.equal(trigger.actor.id, '')
+  assert.equal(trigger.human, false)
+  assert.equal(trigger.addressed, undefined)
+  assert.equal(trigger.at, '2026-11-07T04:00:00.000Z')
+  assert.equal(
+    trigger.text,
+    'CI passed 1/1 on PR #45 at 7241253\nRead github/pulls/45/checks for every check.'
+  )
+})
+
+test('a rate-limited CI read is recorded, retried next round, and never a Source failure', async () => {
+  const commands = scriptPull45(new FakeCommands())
+  const rateLimit = new CliError(
+    'gh exited with code 1: API rate limit exceeded for installation (HTTP 403)',
+    403,
+    1
+  )
+  // 三轮限流后才成功：若限流算进连续失败，第三轮 health 就已是 error。
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    commands.fail('gh', ['api', `repos/acme/widgets/commits/${CI_SHA}/check-runs`], rateLimit, {
+      once: true
+    })
+  }
+  commands.script(['api', `repos/acme/widgets/commits/${CI_SHA}/check-runs`, '--paginate'], () =>
+    checkRunsJson([checkRunJson(checkRun())])
+  )
+  commands.script(['api', `repos/acme/widgets/commits/${CI_SHA}/statuses`, '--paginate'], () =>
+    JSON.stringify([])
+  )
+  const logs: string[] = []
+  const h = host()
+  const poller = pull45Poller(commands, h, { log: (line: string) => logs.push(line) })
+  for (let round = 0; round < 3; round += 1) {
+    assert.equal((await poller.poll()).triggers, 0)
+    assert.equal(
+      h.state.get(githubCiKey(45, CI_SHA)),
+      undefined,
+      'the fingerprint stays unset so the next round retries'
+    )
+    assert.equal(h.meta.get('github:45')?.pollError, undefined, 'a rate limit is not a Thread failure')
+  }
+  assert.equal(h.health.some((entry) => entry.state === 'error'), false, 'a rate limit is not a Source failure')
+  assert.equal(
+    /rate limit/.test(String(h.health.at(-1)?.detail)),
+    true,
+    'the round records the deferred read'
+  )
+  assert.equal(
+    logs.some((line) => /rate limit/i.test(line)),
+    true,
+    'the rate limit is recorded'
+  )
+  assert.equal((await poller.poll()).triggers, 0, 'the retried read only sets the baseline')
+  assert.equal(typeof h.state.get(githubCiKey(45, CI_SHA)), 'string')
+})
+
+test('only rate limiting is deferred; other CI read failures still fail the round', () => {
+  const failure = (code: number, message: string) => new CliError(`gh exited with code 1: ${message} (HTTP ${code})`, code, 1)
+  assert.equal(rateLimited(failure(429, 'Too many requests')), true)
+  assert.equal(rateLimited(failure(403, 'API rate limit exceeded for installation')), true)
+  assert.equal(rateLimited(failure(403, 'You have exceeded a secondary rate limit')), true)
+  assert.equal(rateLimited(failure(403, 'issue is locked')), false)
+  assert.equal(rateLimited(failure(500, 'Internal Server Error')), false)
+  assert.equal(rateLimited(new Error('boom')), false)
+})
+
+test('CI is neither read nor translated while observeCi is off', async () => {
+  const commands = scriptPull45(new FakeCommands())
+  const h = host()
+  const result = await pull45Poller(commands, h, { config: config() }).poll()
+  assert.equal(result.triggers, 0)
+  // FakeCommands 对没脚本化的调用直接失败：没有脚本化 check-runs 就证明一次都没读。
+  assert.equal(commands.calls.some((call) => String(call.args[1]).includes('/check-runs')), false)
+  assert.equal(commands.calls.some((call) => String(call.args[1]).includes('/statuses')), false)
+})
+
+test('a closed or merged pull request stops being polled for checks', async () => {
+  const commands = scriptPull45(new FakeCommands(), fixture('pull.json'))
+  const h = host()
+  const result = await pull45Poller(commands, h).poll()
+  assert.equal(result.triggers, 0)
+  assert.equal(commands.calls.some((call) => String(call.args[1]).includes('/check-runs')), false)
+})
+
+test('a malformed check run is skipped and counted in the round', async () => {
+  const commands = scriptPull45(new FakeCommands())
+  commands.script(['api', `repos/acme/widgets/commits/${CI_SHA}/check-runs`, '--paginate'], () =>
+    checkRunsJson([{ id: 1 }, checkRunJson(checkRun())])
+  )
+  commands.script(['api', `repos/acme/widgets/commits/${CI_SHA}/statuses`, '--paginate'], () =>
+    JSON.stringify([{ state: 'success' }])
+  )
+  const result = await pull45Poller(commands, host()).poll()
+  assert.equal(result.skipped, 2)
+  assert.equal(result.triggers, 0)
+})
+
+test('a commit status changing is a CI change like a check run', async () => {
+  const commands = scriptPull45(new FakeCommands())
+  const pending = [commitStatus({ state: 'pending' })]
+  const failed = [commitStatus({ state: 'failure' })]
+  // 三轮：基线（pending）、同样的 pending、失败。
+  for (const statuses of [pending, pending, failed]) {
+    commands.next('gh', ['api', `repos/acme/widgets/commits/${CI_SHA}/check-runs`], checkRunsJson([]))
+    commands.next('gh', ['api', `repos/acme/widgets/commits/${CI_SHA}/statuses`], statusesJson(statuses))
+  }
+  const h = host()
+  const poller = pull45Poller(commands, h)
+  assert.equal((await poller.poll()).triggers, 0, 'the baseline is the running status')
+  assert.equal((await poller.poll()).triggers, 0)
+  assert.equal((await poller.poll()).triggers, 1, 'a failing status is a change')
+  assert.equal(h.received[0]?.meta['state'], 'failure')
+  assert.equal(
+    h.received[0]?.text,
+    'CI failed 1/1 on PR #45 at 7241253: ci/legacy\nRead github/pulls/45/checks for every check.'
+  )
+})
+
+test('a PR whose subscriptions have all ended is read but no longer polled for checks', async () => {
+  const commands = scriptPull45(new FakeCommands())
+  const h = host()
+  // 已结束的 Ticket 仍在两周水位线内：Thread 照读（新评论可恢复），CI 不再读。
+  const result = await pull45Poller(commands, h, {
+    subscribed: () => [{ issue: 45, live: false, lastAt: '2026-11-01T00:00:00Z' }]
+  }).poll()
+  assert.equal(result.triggers, 0)
+  assert.equal(commands.calls.some((call) => String(call.args[1]).includes('/check-runs')), false)
+})
+
+test('the composition root reads CI for a subscribed PR when CI observation is on', async () => {
+  const stateDir = mkdtempSync(join(tmpdir(), 'superagent-ci-boot-'))
+  const h = await openBoot({
+    stateDir,
+    settings: {
+      ...settingsOf(stateDir),
+      sources: {
+        github: {
+          enabled: true,
+          config: { repository: 'acme/widgets', cli: 'gh', pollSeconds: 60, observeCi: true }
+        }
+      }
+    },
+    scripts: (commands) => {
+      // 一条 PR 通知（45）而不是 Issue：工单挂到 PR Thread 上，CI 才会被轮询（§I.2 CI 行）。
+      commands.script('gh api notifications', () =>
+        JSON.stringify([
+          {
+            id: 'notification-45',
+            updated_at: '2026-11-07T03:26:00Z',
+            last_read_at: '2026-11-07T03:25:00Z',
+            subject: {
+              title: 'docs: describe the identity of the agent account',
+              url: 'https://api.github.com/repos/acme/widgets/pulls/45',
+              type: 'PullRequest'
+            },
+            repository: { full_name: 'acme/widgets' }
+          }
+        ])
+      )
+      commands.script(['api', 'repos/acme/widgets/issues/45'], () => fixture('pull-as-issue.json'))
+      commands.script(['api', 'repos/acme/widgets/pulls/45'], () => openPull())
+      commands.script(['api', 'repos/acme/widgets/issues/45/comments', '--paginate'], () =>
+        JSON.stringify([
+          { ...comment(), html_url: 'https://github.com/acme/widgets/pull/45#issuecomment-9001' }
+        ])
+      )
+      commands.script(['api', 'repos/acme/widgets/pulls/45/reviews', '--paginate'], () => JSON.stringify([]))
+      commands.script(['api', 'repos/acme/widgets/pulls/45/comments', '--paginate'], () => JSON.stringify([]))
+      commands.script(['api', `repos/acme/widgets/commits/${CI_SHA}/check-runs`, '--paginate'], () =>
+        checkRunsJson([checkRunJson(checkRun())])
+      )
+      commands.script(['api', `repos/acme/widgets/commits/${CI_SHA}/statuses`, '--paginate'], () =>
+        JSON.stringify([])
+      )
+    }
+  })
+  try {
+    // 通知 → 工单：三次 pass 之后 Ticket 订阅了 github:45。
+    await h.handle.pollOnce()
+    await h.handle.passOnce()
+    await h.handle.passOnce()
+    await h.handle.passOnce()
+    const before = h.commands.calls.length
+    const second = await h.handle.pollOnce()
+    assert.equal(second.triggers, 0, 'the first CI read only sets the baseline')
+    const read = h.commands.calls
+      .slice(before)
+      .map((call) => String(call.args[1] ?? ''))
+      .filter((path) => path.length > 0)
+    assert.equal(
+      read.includes(`repos/acme/widgets/commits/${CI_SHA}/check-runs`),
+      true,
+      'the composition root passes the CI fingerprint key, so checks are read'
+    )
+    assert.equal(read.includes(`repos/acme/widgets/commits/${CI_SHA}/statuses`), true)
+  } finally {
+    await h.cleanup()
+  }
 })
