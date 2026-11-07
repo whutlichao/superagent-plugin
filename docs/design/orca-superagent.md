@@ -863,6 +863,7 @@ Router/Worker 用的命令（等价上游 `orchestrator_*` 工具）：
 | `POST policy-sync/:id` | `policy sync` | |
 | `POST sources/:id/labels` | `source labels` | |
 | `POST triggers/:id/requeue`、`POST decisions/:id/dismiss` | 同名 | |
+| `POST triggers/:id/handback` | `trigger handback` | worker 的命令：Ticket 来自 assignment token，错误码 `not_owned`/`already_handed_back` |
 | `POST threads/:key/unsubscribe` | `thread unsubscribe` | |
 | `POST tickets/:id/retry`、`POST tickets/:id/stop`、`POST tickets/:id/note` | 同名 | |
 | `POST tickets/:id/request-status` | 同名 | |

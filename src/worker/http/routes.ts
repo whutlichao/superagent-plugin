@@ -144,7 +144,8 @@ export function assertTicketVisible(caller: RouteCaller, ticketId: string): void
  * 已落地的 handler 由 `server.ts` 在启动时替换 `state` 行的 stub（它需要 HTTP 自身读数）。
  *
  * 最低角色的依据：
- * - `assignment`：`state`（worker 的 `status --json` 自检，§G.5）与 `tickets/:id`（只读自己的）。
+ * - `assignment`：`state`（worker 的 `status --json` 自检，§G.5）、`tickets/:id`（只读自己的），
+ *   以及 worker 自己的 `report`/`reply`/`ack`/`trigger handback`（Ticket 来自它的 token）。
  * - `router`：§F.6 列出的 Router 命令（read 的各类资源、route/eval 之外的路由动作、
  *   settings/policy/prompts、ticket 三件、trigger requeue、thread unsubscribe）。
  * - `operator`：面板专属视图（overview/sources/search/policy 历史）、面板动作
@@ -174,6 +175,8 @@ export const ROUTE_TABLE: readonly RouteDefinition[] = [
   // ---- Router 的动作（§F.6）
   { method: 'POST', path: 'policy-sync/:id', command: 'policy sync', minimumRole: 'router', handler: stub },
   { method: 'POST', path: 'triggers/:id/requeue', command: 'trigger requeue', minimumRole: 'router', handler: stub },
+  // `trigger handback` 是 worker 的命令（§G.2）：Ticket 来自 assignment token，不是参数。
+  { method: 'POST', path: 'triggers/:id/handback', command: 'trigger handback', minimumRole: 'assignment', handler: stub },
   { method: 'POST', path: 'threads/:key/unsubscribe', command: 'thread unsubscribe', minimumRole: 'router', handler: stub },
   { method: 'POST', path: 'tickets/:id/retry', command: 'ticket retry', minimumRole: 'router', handler: stub },
   { method: 'POST', path: 'tickets/:id/stop', command: 'ticket stop', minimumRole: 'router', handler: stub },

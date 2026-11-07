@@ -18,6 +18,7 @@ import { parseArgs } from '../src/worker/cli/io'
 import { main } from '../src/worker/cli/main'
 import { createDomainHandlers, withDomainHandlers } from '../src/worker/http/domain'
 import { ROUTE_TABLE } from '../src/worker/http/routes'
+import { UserError } from '../src/worker/core/index'
 import { AT, tempStateDir } from './support/state'
 import { startTestServer, type TestServer } from './support/cli-server'
 import type { Ticket } from '../src/worker/core/index'
@@ -128,6 +129,33 @@ const WIRED: readonly (readonly [string, Case, Case])[] = [
       exit: 2,
       code: 'not_permitted_role'
     }
+  ],
+  // #28 的 `ticket note`：100 词上限由 handler 固定拒绝；成功面是一条 `note` Input。
+  [
+    'ticket note',
+    { argv: ['ticket', 'note', 'ticket-own', '--text=a fact'], exit: 0, resultKeys: ['sent'] },
+    { argv: ['ticket', 'note', 'ticket-own', '--text=' + 'word '.repeat(101)], exit: 2, code: 'too_long' }
+  ],
+  [
+    'ticket request-status',
+    { argv: ['ticket', 'request-status', 'ticket-own'], exit: 0, resultKeys: ['asked', 'ticket'] },
+    { argv: ['ticket', 'request-status', 'nope'], exit: 2, code: 'missing' }
+  ],
+  // `trigger handback` 是 worker 的命令：Ticket 来自 assignment token（§G.2）。
+  [
+    'trigger handback',
+    {
+      argv: ['trigger', 'handback', 'trigger-1', '--reason=It is a different request.'],
+      exit: 0,
+      resultKeys: ['queued'],
+      token: 'assignment'
+    },
+    {
+      argv: ['trigger', 'handback', 'never-reached', '--reason=Not mine.'],
+      exit: 2,
+      code: 'not_owned',
+      token: 'assignment'
+    }
   ]
 ]
 
@@ -139,11 +167,8 @@ const PENDING: readonly string[][] = [
   ['eval-decide', 't-1'],
   ['ticket', 'retry', 't-1'],
   ['ticket', 'stop', 't-1'],
-  ['ticket', 'note', 't-1', '--text=a note'],
-  ['ticket', 'request-status', 't-1'],
   ['ticket', 'list'],
   ['trigger', 'requeue', 't-1'],
-  ['trigger', 'handback', 't-1'],
   ['thread', 'unsubscribe', 'k'],
   ['thread', 'follow', 'k'],
   ['thread', 'unrelated', 'k'],
@@ -185,6 +210,13 @@ function commandRoutes(): ReturnType<typeof withDomainHandlers> {
     createDomainHandlers({
       report: () => ticket,
       reply: () => ({ id: 'reply-1', status: 'pending', reused: false }),
+      note: () => ticket,
+      requestStatus: () => true,
+      handback: (ticketId, triggerId) => {
+        // 到达过这张 Ticket 的消息可以交回；其余的给核心的固定拒绝（`not_owned`）。
+        if (triggerId !== 'trigger-1') throw new UserError('notReached')
+        return ticketId === ticket.id
+      },
       ticketOf: (id) => (id === ticket.id ? ticket : undefined),
       tickets: () => [ticket]
     })

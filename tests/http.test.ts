@@ -16,6 +16,7 @@ import {
   type ApiEnvelope,
   type ErrorPayload
 } from '../src/worker/http/errors'
+import { UserError } from '../src/worker/core/errors'
 import {
   createRateLimiter,
   RATE_LIMIT_BURST,
@@ -66,6 +67,9 @@ test('every error-code family maps to the status §G.3 item 8 fixes', () => {
     ['refused', 400],
     ['stale_revision', 400],
     ['too_long', 400],
+    // 命令级的固定拒绝（§G.2 的「主要错误码」）与 `refused` 同为 400。
+    ['not_owned', 400],
+    ['already_handed_back', 400],
     ['unauthorized', 401],
     ['not_permitted_role', 403],
     ['origin_forbidden', 403],
@@ -81,6 +85,18 @@ test('every error-code family maps to the status §G.3 item 8 fixes', () => {
   for (const [code, status] of cases) {
     assert.equal(statusForErrorCode(code), status, code)
   }
+})
+
+test('a command-level refusal keeps the code §G.2 names for it', () => {
+  // 核心的语义不变（`notReached`/`handedBack`），信封里落成 `trigger handback` 的固定码。
+  const notOwned = toApiError(new UserError('notReached'))
+  assert.equal(notOwned.code, 'not_owned')
+  assert.equal(notOwned.status, 400)
+  const again = toApiError(new UserError('handedBack'))
+  assert.equal(again.code, 'already_handed_back')
+  assert.equal(again.status, 400)
+  // 其余核心拒绝照旧是 `refused`：只有 §G.2 写明了码的那几条转名。
+  assert.equal(toApiError(new UserError('ticketEnded')).code, 'refused')
 })
 
 test('an ApiError carries its code, status and fixed values', () => {
@@ -762,6 +778,7 @@ test('the route table carries every row §G.3 names', () => {
     'POST tickets/:id/request-status',
     'POST tickets/:id/retry',
     'POST tickets/:id/stop',
+    'POST triggers/:id/handback',
     'POST triggers/:id/requeue',
     'POST workspaces/:id/open',
     'PUT prompts',

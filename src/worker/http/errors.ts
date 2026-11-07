@@ -30,6 +30,13 @@ export const ERROR_CODES = {
   originForbidden: 'origin_forbidden',
   /** 目标不存在，或路径没有对应的操作。 */
   missing: 'missing',
+  /**
+   * 命令级的固定拒绝（§G.2 各命令行的「主要错误码」）。它们与 `refused` 同为 400：语义由该
+   * 命令决定，面板与 CLI 能按码区分，不必解析文案。`not_owned`/`already_handed_back` 属于
+   * `trigger handback`（Trigger 没到达这个 worker / 这张 Ticket 已交回过它）。
+   */
+  notOwned: 'not_owned',
+  alreadyHandedBack: 'already_handed_back',
   /** 并发冲突（同名资源已存在等）。 */
   conflict: 'conflict',
   /** body 超过 1 MiB（§G.3 第 6 条）。 */
@@ -57,6 +64,15 @@ export type ApiEnvelope =
   | { readonly ok: true; readonly result: unknown }
   | { readonly ok: false; readonly error: ErrorPayload }
 
+/**
+ * 核心的用户可见码 → 命令在 §G.2 里写明的固定码（只映有分行的那几条）：领域语义不变，
+ * 信封里落成调用方（面板与 agent）按码处理的那个名字。目前只有 `trigger handback`。
+ */
+export const COMMAND_ERROR_CODES: Readonly<Record<string, string>> = {
+  notReached: ERROR_CODES.notOwned,
+  handedBack: ERROR_CODES.alreadyHandedBack
+}
+
 /** 错误码 → HTTP 状态码（§G.3 第 8 条 + 三条边界码）。未知码一律 500。 */
 export function statusForErrorCode(code: string): number {
   if (code.startsWith('invalid_')) return 400
@@ -64,6 +80,8 @@ export function statusForErrorCode(code: string): number {
     case ERROR_CODES.refused:
     case ERROR_CODES.staleRevision:
     case ERROR_CODES.tooLong:
+    case ERROR_CODES.notOwned:
+    case ERROR_CODES.alreadyHandedBack:
       return 400
     case ERROR_CODES.unauthorized:
       return 401
@@ -123,7 +141,7 @@ export function toApiError(error: unknown): ApiError {
   if (error instanceof ApiError) return error
   if (error instanceof UserError) {
     return new ApiError(
-      error.missing ? ERROR_CODES.missing : ERROR_CODES.refused,
+      COMMAND_ERROR_CODES[error.code] ?? (error.missing ? ERROR_CODES.missing : ERROR_CODES.refused),
       error.message,
       error.values
     )

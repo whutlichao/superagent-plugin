@@ -42,6 +42,7 @@ import {
   threadSeenKey
 } from './app/kv.ts'
 import { createRefreshableStateSource, type RefreshableStateSource } from './app/state-source.ts'
+import { deliveredFollowups } from './app/views.ts'
 import { statusBarView } from './app/status-bar.ts'
 import type { StatusBarView } from './app/status-bar.ts'
 import { Effects, ROUTER_EFFECT_KEY } from './app/effects.ts'
@@ -76,6 +77,7 @@ import {
 } from './sources/feishu/index.ts'
 import type { Deployment } from './sources/kind.ts'
 import { OrcaExecutor, registerExecutorEffects, registerExecutorLifecycle, resolveExecutorSettings } from './executor/orca-executor.ts'
+import { launchCapacity } from './executor/slots.ts'
 import { resumeAfterUpgrade, type ResumeReport } from './executor/resume.ts'
 import { DEFAULT_MAX_WORKERS } from './http/state.ts'
 import { createDomainHandlers, withDomainHandlers } from './http/domain.ts'
@@ -387,10 +389,9 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
     health,
     now: nowMs,
     paused: () => paused.paused(),
-    slots: () => {
-      const counts = store.assignmentCounts()
-      return Math.max(0, executorSettings.maxWorkers - counts.running)
-    }
+    // §E.6：`launch` 的取行上限 = 普通槽空位 + 「有人的唤醒在等」时那一个人人类槽。
+    // 人/自动的精确判定仍在执行器里（拿不到槽抛 `Later`，不算失败）。
+    slots: () => launchCapacity(repo.tickets.list(), executorSettings.maxWorkers)
   })
   const outbox = createOutbox({ store, effects, now })
   // ---- Policy（§K.1、§K.2）：块从宿主设置里解析；Source 的 Policy 部分与准入行由 kind 认领。
@@ -601,8 +602,13 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
   const domain = createDomainHandlers({
     report: (ticketId, report) => engine.report(ticketId, report),
     reply: (request) => engine.reply(request),
+    note: (ticketId, text) => engine.note(ticketId, text),
+    requestStatus: (ticketId) => engine.requestStatus(ticketId),
+    handback: (ticketId, triggerId, reason) => engine.handback(ticketId, triggerId, reason),
     ticketOf: (id) => repo.tickets.get(id),
     tickets: () => repo.tickets.list(),
+    // 读模型里的「已投递到该 Ticket」：归属判定与扇出/交回同一份记录（`followupOwners`）。
+    followups: (ticket) => deliveredFollowups(ticket, repo),
     afterWrite: () => {
       refresh()
     }

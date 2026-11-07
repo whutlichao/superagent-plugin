@@ -2,12 +2,61 @@
 //
 // 一处定义：CLI、HTTP 与面板快照都从这里取同一份形状，避免「列表里有、详情里没有」的两套
 // 说法。stage 用 §E.8 的表（`core/stage.ts`），不在这里重写一遍判定。
-import { latestAssignment, latestReport, ticketStage, type Ticket } from '../core/index.ts'
+import {
+  followupOwners,
+  latestAssignment,
+  latestReport,
+  ticketStage,
+  type FollowupRecords,
+  type Ticket,
+  type Trigger
+} from '../core/index.ts'
 import type { StageLabel } from '../core/stage.ts'
 
 /** Ticket 列表的一个筛选（`superagent ticket list --state`）。 */
 export const TICKET_FILTERS = ['open', 'person', 'working', 'idle', 'ended'] as const
 export type TicketFilter = (typeof TICKET_FILTERS)[number]
+
+/** 一条仍归这张 Ticket 的人 follow-up（面板据此标「已投递到该 Ticket」，不再路由第二次）。 */
+export interface TicketFollowup {
+  readonly triggerId: string
+  /** 人写那条消息的时刻。 */
+  readonly at: string
+  /** 仍拥有它的那张 Ticket（就是这条读模型自己的 id）。 */
+  readonly deliveredTo: string
+  /** 执行器把它交给了哪个 Assignment；还在等投递时省略（领域记作 `input.deliveredTo`）。 */
+  readonly assignmentId?: string
+}
+
+/** 读一条 Ticket 的归属时要读的记录（比 `FollowupRecords` 多一个 Trigger 本身的读取口）。 */
+export interface FollowupLookup extends FollowupRecords {
+  readonly triggers: FollowupRecords['triggers'] & { get(id: string): Trigger | undefined }
+}
+
+/**
+ * 仍归这张 Ticket 的人 follow-up：归属判定与 `followupOwners` 同一口径（§K.2 第 3 条、
+ * §L.2 `runtime/work`），所以这个标记就是「不要再路由」的那个事实本身。交回过的、只当语境
+ * 读的、被人重排进 Eval 的都不再算它的。
+ */
+export function deliveredFollowups(
+  ticket: Ticket,
+  records: FollowupLookup
+): readonly TicketFollowup[] {
+  const found = new Map<string, TicketFollowup>()
+  for (const input of ticket.inputs) {
+    if (input.kind !== 'trigger' || input.human !== true) continue
+    const trigger = records.triggers.get(input.triggerId)
+    if (trigger === undefined || !followupOwners(trigger, records).includes(ticket.id)) continue
+    if (found.has(trigger.id)) continue
+    found.set(trigger.id, {
+      triggerId: trigger.id,
+      at: trigger.at,
+      deliveredTo: ticket.id,
+      ...(input.deliveredTo === undefined ? {} : { assignmentId: input.deliveredTo })
+    })
+  }
+  return [...found.values()]
+}
 
 /** 一条 Ticket 的读模型：列表与详情同一份。 */
 export interface TicketView {
@@ -30,11 +79,16 @@ export interface TicketView {
   readonly worktree?: { readonly name: string; readonly directory: string }
   /** 当前等人回答的问题。 */
   readonly attention?: { readonly id: string; readonly question: string; readonly at: string }
+  /** 仍归这张 Ticket 的人 follow-up（没有时省略）；面板按它标「已投递到该 Ticket」。 */
+  readonly followups?: readonly TicketFollowup[]
   readonly ended?: { readonly at: string; readonly by: string; readonly outcome: string; readonly reason?: string }
 }
 
 /** 一条 Ticket → 读模型（不猜 stage：没有 agent 状态时按 §E.8 的表落）。 */
-export function ticketView(ticket: Ticket): TicketView {
+export function ticketView(
+  ticket: Ticket,
+  followups: readonly TicketFollowup[] = []
+): TicketView {
   const assignment = latestAssignment(ticket)
   const report = latestReport(ticket)
   const label = ticketStage(ticket)
@@ -84,6 +138,7 @@ export function ticketView(ticket: Ticket): TicketView {
             at: ticket.attention.at
           }
         }),
+    ...(followups.length === 0 ? {} : { followups }),
     ...(ticket.ended === undefined ? {} : { ended: ticket.ended })
   }
 }
@@ -115,11 +170,19 @@ export interface TicketPage {
 /** 列表读模型：按创建时间降序（与 `Repositories.tickets.list()` 同序）。 */
 export function ticketsPage(
   tickets: readonly Ticket[],
-  options: { readonly offset?: number; readonly limit?: number; readonly filter?: TicketFilter } = {}
+  options: {
+    readonly offset?: number
+    readonly limit?: number
+    readonly filter?: TicketFilter
+    /** 每条 Ticket 的 follow-up 标记（与详情页同一份，缺省不标）。 */
+    readonly followups?: (ticket: Ticket) => readonly TicketFollowup[]
+  } = {}
 ): TicketPage {
   const limit = Math.max(1, Math.min(50, options.limit ?? 20))
   const offset = Math.max(0, options.offset ?? 0)
-  const filtered = tickets.filter((ticket) => matchesFilter(ticket, options.filter)).map(ticketView)
+  const view = (ticket: Ticket): TicketView =>
+    ticketView(ticket, options.followups === undefined ? [] : options.followups(ticket))
+  const filtered = tickets.filter((ticket) => matchesFilter(ticket, options.filter)).map(view)
   const items = filtered.slice(offset, offset + limit)
   return {
     items,
