@@ -35,8 +35,9 @@ import {
   Toolbar,
   type PanelContext
 } from 'orca'
-import { GLOSSARY_GROUPS, translate, translateReason, type CopyKey } from './copy'
+import { GLOSSARY_GROUPS, translate, type CopyKey } from './copy'
 import { Deployment, loadDeployment, openDeployment, resetDeployment } from './deployment'
+import { problemDecisionId, reasonText, reasonsText } from './eval'
 import { executionMark, executionRow } from './execution'
 import {
   decisionMark,
@@ -56,6 +57,8 @@ import {
   NAV_PAGES,
   THREAD_FILTERS,
   type AttentionItem,
+  type DecisionDetailView,
+  type DecisionListPage,
   type ExecutionFilter,
   type HumanSlot,
   type NavPage,
@@ -63,6 +66,7 @@ import {
   type PanelState,
   type PanelSubscription,
   type PanelTicket,
+  type PanelDecision,
   type PanelReason,
   type PanelThread,
   type PanelTimelineCursor,
@@ -159,12 +163,30 @@ const noteDraft = atom('')
 /** 详情页的动作在飞行中：确认与发送不可重复按。 */
 const acting = atom(false)
 
-/**
- * 列表请求的代号：只有最后一次请求的答案落地。`set` 是批量生效的（同一个事件里连着
+/** Eval 列表已读到的窗口；`null` 表示还没读过。 */
+const decisionList = atom<DecisionListPage | null>(null)
+
+/** Eval 列表在读（首屏给 `Table` 的 loading，再读只靠按钮的状态）。 */
+const decisionLoading = atom(false)
+
+/** Eval 列表的读取失败原因。 */
+const decisionError = atom('')
+
+/** 一条决定详情的读数与它的错误态。 */
+const decisionDetail = atom<DecisionDetailView | null>(null)
+const decisionDetailError = atom('')
+
+/** 详情页的动作在飞行中（dismiss 不可重复按）。 */
+const decisionActing = atom(false)
+
+/** 列表请求的代号：只有最后一次请求的答案落地。`set` 是批量生效的（同一个事件里连着
  * `set` + 读，读到的可能是上一批的值），所以「筛选在飞行中变了」用同步计数器判断，
  * 不用在 await 之后重读 atom。
  */
 let listRequest = 0
+
+/** Eval 列表请求的代号：与 Execution 同一条理由（旧的答案不能画进新的一页）。 */
+let decisionRequest = 0
 
 /** 面板是否已被卸载：晚到的响应不再改状态。 */
 let disposed = false
@@ -240,6 +262,16 @@ export function setup(ctx: PanelContext): () => void {
   set(statusAsked, null)
   set(noteDraft, '')
   set(acting, false)
+  // Eval 页的 atom 同样是模块级的：上一次挂载留下的列表、详情与错误不带进这一次。
+  set(decisionList, null)
+  set(decisionLoading, false)
+  set(decisionError, '')
+  set(decisionDetail, null)
+  set(decisionDetailError, '')
+  set(decisionActing, false)
+  // 上一次挂载还在飞行的列表/详情请求作废（它们的答案不该画进这一次）。
+  listRequest += 1
+  decisionRequest += 1
   // Trigger 页的 atom 同样是模块级的（筛选是持久化的，脏值在这里改回第一档）。
   if (!isThreadFilter(read(threadFilter))) set(threadFilter, 'subscribed')
   set(threadList, null)
@@ -250,8 +282,6 @@ export function setup(ctx: PanelContext): () => void {
   set(threadActionError, '')
   set(timelineBusy, false)
   set(threadActing, false)
-  // 上一次挂载还在飞行的列表/详情请求作废（它们的答案不该画进这一次）。
-  listRequest += 1
   threadRequest += 1
   ctx.subscriptions.push(
     plugin.on('state.changed', (payload) => {
@@ -267,6 +297,12 @@ export function setup(ctx: PanelContext): () => void {
         const focused = read(focus)
         if (focused?.page === 'execution') void loadTicketDetail(focused.id)
         else void refreshExecutionList()
+      }
+      // Eval 页同理：详情重读那一条决定（dismiss 与新的决定都会改变它），否则重读列表。
+      if (read(page) === 'eval') {
+        const focused = read(focus)
+        if (focused?.page === 'eval') void loadDecisionDetail(focused.id)
+        else void refreshDecisions()
       }
       // Trigger 页同理：详情重读这一条 Thread，列表重读已经读到的那几页；还没读过就先读一次
       // （面板可以在隐藏状态下启动，那一次的首屏读取只能由第一次可见的推送补上）。
@@ -285,6 +321,8 @@ export function setup(ctx: PanelContext): () => void {
     if (startPage === 'settings') void openDeployment()
     // 停在 Execution：焦点指向一张工单就是详情，否则是列表。
     if (startPage === 'execution') enterExecution()
+    // 停在 Eval：同理（焦点指向一条决定就是详情，否则是列表）。
+    if (startPage === 'eval') enterEval()
     // 停在 Trigger：焦点指向一条 Thread 就是详情，否则是当前筛选的列表。
     if (startPage === 'trigger') enterTriggers()
   } else set(phase, 'starting')
@@ -609,6 +647,12 @@ function backToExecution(): void {
 /** 从 Overview 打开一条系统问题的归属页（§M.2「点行→对应详情页」）。 */
 function openProblem(problem: SystemProblem): void {
   const target = problemPage(problem)
+  // unavailable 行带着背后的 Decision id：Eval 页要打开的是那条决定，不是合成的问题 id。
+  if (target === 'eval') {
+    set(page, 'eval')
+    openDecisionDetail(problemDecisionId(problem))
+    return
+  }
   set(focus, { page: target, id: problem.id })
   set(page, target)
 }
@@ -713,6 +757,143 @@ async function refreshExecutionList(): Promise<void> {
     set(executionList, { items, nextOffset: offset })
   } catch {
     // 静默：已读到的行仍然是真的，下一次推送会再读。
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Eval 页的读数与动作（§M.2 的 Eval 行、§K.7 的四条件）：列表、详情与 dismiss 都经 worker
+// 的同一批 handler；「24 h 内未解决」是 worker 读模型的判定（面板没有时钟，§M.6）。
+// ---------------------------------------------------------------------------
+
+/** 读一页 Eval 列表：`more` 是「加载更多」，否则从第一行重读。 */
+async function loadDecisions(options: { readonly more?: boolean } = {}): Promise<void> {
+  const current = read(decisionList)
+  if (options.more === true && (current === null || current.nextOffset === null)) return
+  const offset = options.more === true && current !== null ? (current.nextOffset ?? 0) : 0
+  const seq = ++decisionRequest
+  set(decisionLoading, true)
+  set(decisionError, '')
+  try {
+    const next: DecisionListPage = await plugin.request('decisions', { offset, limit: PAGE_ROWS })
+    if (disposed || seq !== decisionRequest) return
+    set(decisionList, {
+      items: offset === 0 ? next.items : [...(read(decisionList)?.items ?? []), ...next.items],
+      nextOffset: next.nextOffset,
+      unresolved: next.unresolved
+    })
+  } catch (error) {
+    if (disposed) return
+    set(decisionError, reasonOf(error))
+  } finally {
+    if (!disposed) set(decisionLoading, false)
+  }
+}
+
+/**
+ * 推送后重读已经读到的那些页（与 Execution 同一条理由：推送本身就是变化的信号）。重读失败
+ * 不覆盖已读到的行；待人工条数取最后一次回答——它与 Overview 的 System problems 同源。
+ */
+async function refreshDecisions(): Promise<void> {
+  const current = read(decisionList)
+  if (current === null) return
+  // 读过但是空的：新的决定可能刚出现，重读第一页（否则页面会一直停在旧空态）。
+  if (current.items.length === 0) {
+    await loadDecisions()
+    return
+  }
+  const loaded = current.items.length
+  const seq = ++decisionRequest
+  const items: PanelDecision[] = []
+  let offset: number | null = 0
+  let unresolved = read(decisionList)?.unresolved ?? 0
+  try {
+    while (offset !== null && items.length < loaded) {
+      const next: DecisionListPage = await plugin.request('decisions', {
+        offset,
+        limit: PAGE_ROWS
+      })
+      if (disposed || seq !== decisionRequest) return
+      if (next.items.length === 0) break
+      items.push(...next.items)
+      unresolved = next.unresolved
+      offset = next.nextOffset
+    }
+    set(decisionList, { items, nextOffset: offset, unresolved })
+  } catch {
+    // 静默：已读到的行仍然是真的，下一次推送会再读。
+  }
+}
+
+/** 读一条决定的详情（§M.2 的 Eval 详情）。 */
+async function loadDecisionDetail(decisionId: string): Promise<void> {
+  set(decisionDetailError, '')
+  try {
+    const next = await plugin.request('decision.detail', { decisionId })
+    if (disposed) return
+    set(decisionDetail, next)
+  } catch (error) {
+    if (disposed) return
+    set(decisionDetailError, reasonOf(error))
+  }
+}
+
+/** 进入 Eval 页时读它要的那一份：`focus` 指向一条决定就是详情，否则是列表。 */
+function enterEval(): void {
+  const focused = read(focus)
+  if (focused?.page === 'eval') {
+    if (read(decisionDetail)?.id !== focused.id) void loadDecisionDetail(focused.id)
+    return
+  }
+  if (read(decisionList) === null) void loadDecisions()
+}
+
+/** 打开一条决定的详情（§M.2「点行→详情」）：列表的行与 Overview 的系统问题共用它。 */
+function openDecisionDetail(decisionId: string): void {
+  set(focus, { page: 'eval', id: decisionId })
+  set(decisionDetail, null)
+  void loadDecisionDetail(decisionId)
+}
+
+/** 回到列表（清掉「从别处点进来的那一条」）；还没读过列表就当场读一次。 */
+function backToEval(): void {
+  set(focus, null)
+  set(decisionDetail, null)
+  set(decisionDetailError, '')
+  // 回到列表时按最新读数重读（详情期间的推送只刷新了详情；待人工条数也在这份读数里）。
+  if (read(decisionList) === null) void loadDecisions()
+  else void refreshDecisions()
+}
+
+/** 打开决定所在的 Thread（Trigger 页的详情；页面由 #39 填充，焦点是两页的共享契约）。 */
+function openDecisionThread(threadKey: string): void {
+  set(focus, { page: 'trigger', id: threadKey })
+  set(page, 'trigger')
+}
+
+/** 打开决定开的工单（Execution 详情）：与 Overview 的行同一个动作。 */
+function openDecisionTicket(ticketId: string): void {
+  set(page, 'execution')
+  openTicketDetail(ticketId)
+}
+
+/**
+ * Dismiss 一条 unavailable 决定暴露的问题（§K.7；破坏性已由行内二次确认收下）：采纳写后的
+ * 快照，再重读列表与详情——不猜写后的样子。
+ */
+async function dismissDecision(decisionId: string): Promise<void> {
+  set(actionError, '')
+  set(decisionActing, true)
+  try {
+    const next = await plugin.request('decision.dismiss', { decisionId })
+    if (disposed) return
+    adopt(next)
+    if (read(decisionList) === null) await loadDecisions()
+    else await refreshDecisions()
+    await loadDecisionDetail(decisionId)
+  } catch (error) {
+    if (!disposed) set(actionError, reasonOf(error))
+  } finally {
+    if (!disposed) set(decisionActing, false)
   }
 }
 
@@ -1291,6 +1472,251 @@ function ExecutionPage(props: { readonly locale: string }): OrcaElement {
 }
 
 // ---------------------------------------------------------------------------
+// Eval 页（§M.2）：列表（五列 + 待人工条数）、详情（原因 + 到 Thread/Ticket 的链接 + dismiss）
+// ---------------------------------------------------------------------------
+
+/**
+ * Eval 列表：kind、reason、strength、policy version、at 五列，分页 50 条。上面的提示是
+ * worker 的 §K.7 判定（24 h 内、最新、未 dismiss、Thread 不忙），不在面板里重算。
+ */
+function EvalListPage(props: { readonly locale: string }): OrcaElement {
+  const locale = props.locale
+  const page = read(decisionList)
+  const loading = read(decisionLoading)
+  const failure = read(decisionError)
+  const items = page?.items ?? []
+  const rows: TableRow[] = items.map((decision) => ({
+    key: decision.id,
+    cells: {
+      kind: markLabel(locale, decisionMark(decision.kind)),
+      reason: reasonsText(locale, decision.reasons),
+      strength: translate(locale, `strength.${decision.strength}` as CopyKey),
+      policyVersion: decision.policyVersion,
+      at: { type: 'relative', at: decision.at, format: 'short' }
+    }
+  }))
+  return (
+    <Stack gap="md">
+      {page !== null && page.unresolved > 0 ? (
+        <Callout tone="warning" title={words(locale, 'eval.needsPerson')} icon="info">
+          <Text size="sm">{translate(locale, 'eval.unresolved', { count: page.unresolved })}</Text>
+        </Callout>
+      ) : null}
+      {failure === '' ? null : (
+        <Callout tone="danger" title={words(locale, 'state.errorTitle')} icon="error">
+          <Stack gap="sm">
+            <Text size="sm">{failure}</Text>
+            <Row gap="xs">
+              <Button variant="outline" size="sm" icon="refresh" onPress={() => void loadDecisions()}>
+                {words(locale, 'state.retry')}
+              </Button>
+            </Row>
+          </Stack>
+        </Callout>
+      )}
+      {page !== null && items.length === 0 && failure === '' ? (
+        <EmptyStateBlock title={words(locale, 'eval.empty')} icon="check" />
+      ) : null}
+      {page === null && failure !== '' ? null : (
+        <Table
+          label={translate(locale, 'nav.eval')}
+          columns={[
+            { key: 'kind', label: words(locale, 'column.kind'), width: 'sm' },
+            { key: 'reason', label: words(locale, 'column.reason') },
+            {
+              key: 'strength',
+              label: words(locale, 'column.strength'),
+              width: 'xs',
+              hideBelow: 'sm'
+            },
+            {
+              key: 'policyVersion',
+              label: words(locale, 'column.policyVersion'),
+              width: 'xs',
+              hideBelow: 'md'
+            },
+            {
+              key: 'at',
+              label: words(locale, 'column.at'),
+              align: 'end',
+              width: 'xs',
+              hideBelow: 'sm'
+            }
+          ]}
+          rows={rows}
+          loading={loading && page === null}
+          hasMore={page !== null && page.nextOffset !== null}
+          onRowAction={(row) => openDecisionDetail(row.key)}
+          onLoadMore={() => void loadDecisions({ more: true })}
+        />
+      )}
+    </Stack>
+  )
+}
+
+/** 一条决定的字段（KeyValue）：种类、强度、policy version、Thread、可选的 Ticket 与触发。 */
+function decisionItems(locale: string, decision: DecisionDetailView): readonly KeyValueItem[] {
+  const items: KeyValueItem[] = [
+    { label: words(locale, 'column.kind'), value: markLabel(locale, decisionMark(decision.kind)) },
+    {
+      label: words(locale, 'column.strength'),
+      value: translate(locale, `strength.${decision.strength}` as CopyKey)
+    },
+    { label: translate(locale, 'term.policyVersion'), value: decision.policyVersion },
+    { label: translate(locale, 'term.thread'), value: decision.thread.title, code: true }
+  ]
+  if (decision.ticket !== undefined) {
+    items.push({ label: translate(locale, 'term.ticket'), value: decision.ticket.title })
+  }
+  items.push({
+    label: translate(locale, 'term.trigger'),
+    value:
+      decision.triggerIds.length === 0 ? words(locale, 'state.empty') : decision.triggerIds.join(', '),
+    ...(decision.triggerIds.length === 0 ? {} : { code: true })
+  })
+  return items
+}
+
+/**
+ * 一条决定的详情（§M.2）：上下文（种类、强度、policy version、Thread/Ticket、触发）、原因列表、
+ * 现在是否仍要人（§K.7 的四条件）与动作（打开 Thread/Ticket、只有 unavailable 才有的 dismiss）。
+ */
+function DecisionDetailPage(props: {
+  readonly locale: string
+  readonly decisionId: string
+}): OrcaElement {
+  const locale = props.locale
+  const decision = read(decisionDetail)
+  const failure = read(decisionDetailError)
+  const busy = read(decisionActing)
+  const actionFailure = read(actionError)
+  const back = (
+    <Button variant="ghost" size="sm" icon="next" onPress={backToEval}>
+      {words(locale, 'action.back')}
+    </Button>
+  )
+  const shown = decision !== null && decision.id === props.decisionId ? decision : null
+  if (shown === null) {
+    return (
+      <Stack gap="md">
+        <PageHeader title={translate(locale, 'nav.eval')} actions={back} />
+        {failure === '' ? (
+          <LoadingState label={words(locale, 'state.loading')} />
+        ) : (
+          <ErrorState
+            title={words(locale, 'state.errorTitle')}
+            reason={failure}
+            locale={locale}
+            onRetry={() => void loadDecisionDetail(props.decisionId)}
+          />
+        )}
+      </Stack>
+    )
+  }
+  const mark = decisionMark(shown.kind)
+  return (
+    <Stack gap="md">
+      <PageHeader
+        title={markLabel(locale, mark)}
+        subtitle={translate(locale, 'term.decision')}
+        actions={
+          <Row gap="xs" align="center" wrap>
+            <MarkBadge label={markLabel(locale, mark)} tone={mark.tone} />
+            <RelativeTime at={shown.at} format="short" muted />
+            {back}
+          </Row>
+        }
+      />
+      {failure === '' ? null : (
+        <Text tone="danger" size="xs">
+          {failure}
+        </Text>
+      )}
+      {shown.unresolved ? (
+        <Callout tone="warning" title={words(locale, 'eval.needsPerson')} icon="info">
+          <Text size="sm">{words(locale, 'eval.needsPersonHint')}</Text>
+        </Callout>
+      ) : null}
+      {shown.dismissed ? (
+        <Callout tone="neutral" title={words(locale, 'eval.dismissed')} icon="check">
+          <Text size="sm">{words(locale, 'eval.dismissedHint')}</Text>
+        </Callout>
+      ) : null}
+
+      <KeyValue
+        label={translate(locale, 'term.decision')}
+        items={decisionItems(locale, shown)}
+      />
+
+      <Section title={translate(locale, 'column.reason')} count={shown.reasons.length}>
+        {shown.reasons.length === 0 ? (
+          <Hint text={words(locale, 'eval.noReasons')} />
+        ) : (
+          <List label={translate(locale, 'column.reason')}>
+            {shown.reasons.map((reason, index) => (
+              <ListItem
+                key={`${reason.code}:${reason.triggerId ?? ''}:${index}`}
+                title={reasonText(locale, reason)}
+                icon="info"
+              />
+            ))}
+          </List>
+        )}
+      </Section>
+
+      <Toolbar label={words(locale, 'eval.actions')}>
+        <Button
+          variant="outline"
+          size="sm"
+          icon="next"
+          onPress={() => openDecisionThread(shown.thread.key)}
+        >
+          {words(locale, 'eval.openThread')}
+        </Button>
+        {shown.ticket === undefined ? null : (
+          <Button
+            variant="outline"
+            size="sm"
+            icon="layers"
+            onPress={() => openDecisionTicket(shown.ticket?.id ?? '')}
+          >
+            {words(locale, 'eval.openTicket')}
+          </Button>
+        )}
+        {shown.canDismiss ? (
+          <ConfirmAction
+            id={`dismiss:${shown.id}`}
+            label={words(locale, 'eval.dismiss')}
+            action={words(locale, 'eval.dismiss')}
+            target={shown.thread.title}
+            locale={locale}
+            icon="close"
+            onConfirm={() => void dismissDecision(shown.id)}
+          />
+        ) : null}
+      </Toolbar>
+
+      {busy ? <Hint text={translate(locale, 'confirm.pending')} /> : null}
+      {actionFailure === '' ? null : (
+        <Text tone="danger" size="xs">
+          {actionFailure}
+        </Text>
+      )}
+    </Stack>
+  )
+}
+
+/** Eval 页：`focus` 指向一条决定时是详情，否则是列表（§M.2）。 */
+function EvalPage(props: { readonly locale: string }): OrcaElement {
+  const focused = read(focus)
+  return focused?.page === 'eval' ? (
+    <DecisionDetailPage locale={props.locale} decisionId={focused.id} />
+  ) : (
+    <EvalListPage locale={props.locale} />
+  )
+}
+
+// ---------------------------------------------------------------------------
 // Trigger 页（§M.2）：Thread 列表的四档筛选与分页、Thread 详情的时间线与两个动作。读数全部
 // 经 worker 的读模型（`threads` / `thread.detail`）；「再评估一次」与「取消订阅」也是 worker
 // 的命令（与 CLI 的 `trigger requeue` / `thread unsubscribe` 同一批 handler）。
@@ -1552,11 +1978,6 @@ function TriggerListPage(props: { readonly locale: string }): OrcaElement {
   )
 }
 
-/** 一条 Decision 的原因，一句话：多条用 `; ` 分隔，未知码原样显示（不装作翻译过）。 */
-function reasonText(locale: string, reasons: readonly PanelReason[]): string {
-  return reasons.map((reason) => translateReason(locale, reason)).join('; ')
-}
-
 /**
  * 时间线上的一张触发卡（§M.2）：谁在什么时候说了什么、它现在归谁、消费它的决定、谁把它
  * 交回了评估（及原因），以及人能不能把它再送进 Eval。
@@ -1610,7 +2031,7 @@ function TriggerCardRow(props: {
             <>
               <MarkBadge label={markLabel(locale, mark)} tone={mark.tone} />
               <Text muted size="xs">
-                {reasonText(locale, decision.reason)}
+                {reasonsText(locale, decision.reasons)}
               </Text>
             </>
           )}
@@ -1807,7 +2228,7 @@ function ThreadDetailPage(props: { readonly locale: string; readonly threadKey: 
                 <ListItem
                   key={decision.id}
                   title={markLabel(locale, decisionMarkOf)}
-                  description={reasonText(locale, decision.reason)}
+                  description={reasonsText(locale, decision.reasons)}
                   icon={decisionMarkOf.icon}
                 >
                   <Row gap="xs" align="center" wrap>
@@ -1897,19 +2318,15 @@ function TriggerPage(props: { readonly locale: string }): OrcaElement {
   )
 }
 
-/**
- * 一页：Overview、Trigger 与 Execution 有真实读数，Settings 现在是 Deployment 组；其余页面在
- * 页面票里填充。
- *
- * 只有当前页画内容：`Tabs` 把每个 `Tab` 的子节点都放进同一棵树，隐藏页的表格会抢走
- * 「第一个表格」这类位置，也会让别的页面的内容混进这一屏。
- */
+/** 一页：Overview、Eval 与 Execution 有真实读数，Settings 现在是 Deployment 组；其余页面在页面票里填充。 */
 function PageBody(props: {
   readonly locale: string
   readonly current: NavPage
   readonly active: boolean
 }): OrcaElement {
   const locale = props.locale
+  // 只有当前页画内容：`Tabs` 把每个 `Tab` 的子节点都放进同一棵树，隐藏页的表格会抢走
+  // 「第一个表格」这类位置，也会让别的页面的内容混进这一屏。
   if (!props.active) return <Stack gap="sm" />
   const state = read(snapshot)
   const stage = read(phase)
@@ -1923,7 +2340,7 @@ function PageBody(props: {
     // 重试），因此它不借用快照的首屏骨架——但 worker 完全不应答时仍是整页的错误态。
     return stage === 'error' ? <ErrorStateView locale={locale} /> : <TriggerPage locale={locale} />
   }
-  if (props.current === 'overview' || props.current === 'execution') {
+  if (props.current === 'overview' || props.current === 'eval' || props.current === 'execution') {
     if (stage === 'error') {
       return <ErrorStateView locale={locale} />
     }
@@ -1937,8 +2354,10 @@ function PageBody(props: {
     }
     return props.current === 'overview' ? (
       <Overview locale={locale} state={state} />
-    ) : (
+    ) : props.current === 'execution' ? (
       <ExecutionPage locale={locale} />
+    ) : (
+      <EvalPage locale={locale} />
     )
   }
   return (
@@ -2018,9 +2437,10 @@ export default function Panel(): OrcaElement {
         onChange={(next) => {
           if (!isNavPage(next)) return
           set(page, next)
-          // Deployment 组打开时才读（隐藏与未打开的页面不发请求，§M.6）。
+          // Deployment 组、Execution 列表与 Eval 列表打开时才读（隐藏与未打开的页面不发请求，§M.6）。
           if (next === 'settings') void openDeployment()
           if (next === 'execution') enterExecution()
+          if (next === 'eval') enterEval()
           if (next === 'trigger') enterTriggers()
         }}
       >

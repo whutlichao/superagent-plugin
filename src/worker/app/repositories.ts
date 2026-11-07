@@ -275,6 +275,11 @@ export function createRepositories(store: Store): Repositories {
         return store.sql
           .all('SELECT * FROM decision WHERE thread_key = ? ORDER BY at, id', [key])
           .map((row) => ({ ...json<Decision>(field(row, 'body'), {} as Decision), id: String(field(row, 'id')) }))
+      },
+      list(): Decision[] {
+        return store.sql
+          .all('SELECT * FROM decision ORDER BY at DESC, id DESC')
+          .map((row) => ({ ...json<Decision>(field(row, 'body'), {} as Decision), id: String(field(row, 'id')) }))
       }
     }
   }

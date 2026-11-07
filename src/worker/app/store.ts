@@ -16,9 +16,13 @@ import { SCHEMA_VERSION, type MigrationStep } from './schema.ts'
 import {
   readAssignmentCounts,
   readTimeline,
+  readTimelineBefore,
+  readTimelineItem,
+  readTimelineTail,
   readWorkingSet,
   workingSetPlan,
   type AssignmentCounts,
+  type TimelineBackPage,
   type TimelineOptions,
   type WorkingSetName
 } from './store-read.ts'
@@ -36,6 +40,8 @@ import type {
   ThreadRow,
   TicketRecord,
   TicketRow,
+  TimelineCursor,
+  TimelineItem,
   TimelinePage,
   TriggerRecord,
   TriggerThreadRecord,
@@ -103,6 +109,12 @@ export interface TriggerThreadRepository {
   unlink(threadKey: string, at: string, triggerId: string): boolean
   /** Thread 时间线：`(at, id)` 复合游标分页（§D.2 要点 1）。 */
   timeline(threadKey: string, options?: TimelineOptions): TimelinePage
+  /** 时间线最新一页（`read thread/<key>` 的默认页）。 */
+  tail(threadKey: string, limit?: number): TimelineBackPage
+  /** 游标之前（更早）的一页；`before` 指向更早还有页的游标。 */
+  before(threadKey: string, cursor: TimelineCursor, limit?: number): TimelineBackPage
+  /** 恰好落在游标上的一行（`around` 的锚点）。 */
+  item(threadKey: string, cursor: TimelineCursor): TimelineItem | undefined
 }
 
 /** Thread 仓储。§D.4：body 由引擎写；meta 只由该 Source 经端口写。 */
@@ -549,6 +561,15 @@ function createTriggerThreadRepository(sql: SqlAccess): TriggerThreadRepository 
     },
     timeline(threadKey: string, options: TimelineOptions = {}): TimelinePage {
       return readTimeline(sql.reader, threadKey, options)
+    },
+    tail(threadKey: string, limit?: number): TimelineBackPage {
+      return readTimelineTail(sql.reader, threadKey, limit)
+    },
+    before(threadKey: string, cursor: TimelineCursor, limit?: number): TimelineBackPage {
+      return readTimelineBefore(sql.reader, threadKey, cursor, limit)
+    },
+    item(threadKey: string, cursor: TimelineCursor): TimelineItem | undefined {
+      return readTimelineItem(sql.reader, threadKey, cursor)
     }
   }
 }

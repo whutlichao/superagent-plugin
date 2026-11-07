@@ -18,6 +18,7 @@ import {
   THREAD_FILTERS,
   type ThreadDetailInput,
   type ThreadListInput,
+  type DecisionListInput,
   type TicketListInput
 } from '../panel/protocol'
 
@@ -86,6 +87,33 @@ function ticketIdOf(input: unknown, name: string): string {
     throw invalidParams(`${name} needs { ticketId: string }`)
   }
   return ticketId
+}
+
+/** 一次面板请求里的 `{ decisionId: string }`（Eval 的详情与 dismiss）。 */
+function decisionIdOf(input: unknown, name: string): string {
+  const decisionId = (input as { decisionId?: unknown } | null)?.decisionId
+  if (typeof decisionId !== 'string' || decisionId === '') {
+    throw invalidParams(`${name} needs { decisionId: string }`)
+  }
+  return decisionId
+}
+
+/** 一次 Eval 列表请求的分页窗口（§M.4）；越界的窗口按 `invalid_params` 拒绝。 */
+function decisionListOf(input: unknown): DecisionListInput {
+  const window = (input ?? {}) as { offset?: unknown; limit?: unknown }
+  const count = (value: unknown, name: string): number | undefined => {
+    if (value === undefined) return undefined
+    if (typeof value !== 'number' || !Number.isInteger(value) || value < 0) {
+      throw invalidParams(`decisions needs { ${name}: a non-negative integer }`)
+    }
+    return value
+  }
+  const offset = count(window.offset, 'offset')
+  const limit = count(window.limit, 'limit')
+  return {
+    ...(offset === undefined ? {} : { offset }),
+    ...(limit === undefined ? {} : { limit })
+  }
 }
 
 /** 一次 Execution 列表请求（§M.2 的筛选 + §M.4 的分页）；越界的窗口按 `invalid_params` 拒绝。 */
@@ -287,6 +315,24 @@ export default function activate(orca: OrcaWorkerApi): void {
     const booted = await ready()
     try {
       return { asked: booted.requestStatus(ticketIdOf(input, 'ticket.requestStatus')) }
+    } catch (error) {
+      throw Object.assign(new Error(messageOf(error)), { code: codeOf(error, 'invalid_params') })
+    }
+  })
+  // Eval 页（§M.2 的 Decision 列表与详情、§K.7 的 dismiss）：列表/详情是读，dismiss 是写。
+  host.handleRequest('decisions', async (input) => (await ready()).decisions(decisionListOf(input)))
+  host.handleRequest('decision.detail', async (input) => {
+    const booted = await ready()
+    try {
+      return booted.decisionDetail(decisionIdOf(input, 'decision.detail'))
+    } catch (error) {
+      throw Object.assign(new Error(messageOf(error)), { code: codeOf(error, 'invalid_params') })
+    }
+  })
+  host.handleRequest('decision.dismiss', async (input) => {
+    const booted = await ready()
+    try {
+      return booted.dismissDecision(decisionIdOf(input, 'decision.dismiss'))
     } catch (error) {
       throw Object.assign(new Error(messageOf(error)), { code: codeOf(error, 'invalid_params') })
     }

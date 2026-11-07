@@ -17,8 +17,8 @@ import type {
   ThreadListInput,
   ThreadListPage
 } from '../../../panel/protocol'
-import type { TimelineOptions } from '../store-read.ts'
-import type { TimelineCursor, TimelineItem, TimelinePage } from '../records.ts'
+import type { TimelineBackPage } from '../store-read.ts'
+import type { TimelineCursor, TimelineItem } from '../records.ts'
 import type { Store } from '../store.ts'
 
 /** 一页最多几行（§M.4：无虚拟列表，长列表靠分页 50 条）。 */
@@ -62,8 +62,14 @@ export interface ThreadReadRecords {
     disposition(id: string): ThreadDisposition | undefined
   }
   readonly decisions: { byThread(threadKey: string): readonly Decision[] }
-  /** Thread 时间线的一页（`order: 'newest'` 从最新一条往回读）。 */
-  readonly timeline: (threadKey: string, options?: TimelineOptions) => TimelinePage
+  /**
+   * Thread 时间线：最新一页与「更早一页」（§D.2 要点 1 的 `(at, id)` 复合游标）。
+   * 两页都按升序给行——面板从最新一条往下画，方向在面板侧翻。
+   */
+  readonly timeline: {
+    tail(threadKey: string, limit?: number): TimelineBackPage
+    before(threadKey: string, cursor: TimelineCursor, limit?: number): TimelineBackPage
+  }
   /** 执行器仍拥有的人 follow-up（`followupOwners`，§K.2 第 3 条）。 */
   readonly owners: (trigger: Trigger) => readonly string[]
 }
@@ -81,7 +87,10 @@ export function threadRecordsOf(
     tickets: repo.tickets,
     triggers: repo.triggers,
     decisions: repo.decisions,
-    timeline: (threadKey, options) => store.triggerThreads.timeline(threadKey, options),
+    timeline: {
+      tail: (threadKey, limit) => store.triggerThreads.tail(threadKey, limit),
+      before: (threadKey, cursor, limit) => store.triggerThreads.before(threadKey, cursor, limit)
+    },
     owners: (trigger) => followupOwners(trigger, repo)
   }
 }
@@ -141,7 +150,8 @@ function threadRow(
   open: ReadonlySet<string>,
   records: ThreadReadRecords
 ): PanelThread {
-  const newest = records.timeline(thread.key, { limit: 1, order: 'newest' }).items[0]
+  // `tail` 给的是升序的一页：取一行时它就是最新的一条。
+  const newest = records.timeline.tail(thread.key, 1).items[0]
   const trigger = newest === undefined ? undefined : records.triggers.get(newest.triggerId)
   const url = textOf(thread.meta['url']) ?? textOf(trigger?.url)
   const label = textOf(thread.meta['label'])
@@ -236,7 +246,7 @@ export function panelDecision(decision: Decision): PanelDecision {
   return {
     id: decision.id,
     kind: decision.kind,
-    reason: decision.reason,
+    reasons: decision.reason,
     strength: decision.strength,
     policyVersion: decision.policyVersion,
     at: epoch(decision.at),
@@ -330,11 +340,11 @@ export function threadDetailView(
   const open = new Set(
     [...tickets.values()].filter((ticket) => ticket.ended === undefined).map((ticket) => ticket.id)
   )
-  const page = records.timeline(key, {
-    limit: Math.max(1, Math.min(THREAD_PAGE_MAX, query.limit ?? THREAD_PAGE_MAX)),
-    order: 'newest',
-    ...(query.before === undefined || query.before === null ? {} : { after: query.before })
-  })
+  const limit = Math.max(1, Math.min(THREAD_PAGE_MAX, query.limit ?? THREAD_PAGE_MAX))
+  const page =
+    query.before === undefined || query.before === null
+      ? records.timeline.tail(key, limit)
+      : records.timeline.before(key, query.before, limit)
   const decisions = records.decisions.byThread(key)
   // 每条 Trigger 消费它的那个 Decision：一批里它出现在哪些 triggerIds 里就归哪条，取最新。
   const byTrigger = new Map<string, Decision>()
@@ -368,9 +378,10 @@ export function threadDetailView(
         }),
     subscriptions: thread.subscriptions.map((id) => threadTicketOf(id, thread, tickets)),
     decisions: [...decisions].reverse().map(panelDecision),
-    timeline: page.items.map((row) =>
+    // 库里的两页都是升序：面板从最新一条往下画（§M.2 的时间线最新在前）。
+    timeline: [...page.items].reverse().map((row) =>
       triggerCard(row, thread, records, byTrigger.get(row.triggerId), tickets)
     ),
-    earlier: page.next
+    earlier: page.before
   }
 }

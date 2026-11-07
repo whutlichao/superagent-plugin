@@ -265,7 +265,7 @@ function threadDetailFixture(rows: readonly PanelThread[], key: string): ThreadD
       {
         id: 'decision-1',
         kind: 'accept',
-        reason: [{ code: 'explicitRouted' }],
+        reasons: [{ code: 'explicitRouted' }],
         strength: 'explicit',
         policyVersion: 'v3',
         at: 1_700_000_000_000,
@@ -309,7 +309,7 @@ function threadDetailFixture(rows: readonly PanelThread[], key: string): ThreadD
         decision: {
           id: 'decision-1',
           kind: 'accept',
-          reason: [{ code: 'explicitRouted' }],
+          reasons: [{ code: 'explicitRouted' }],
           strength: 'explicit',
           policyVersion: 'v3',
           at: 1_700_000_000_000,

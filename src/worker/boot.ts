@@ -12,6 +12,9 @@
 import { mkdirSync } from 'node:fs'
 import { join } from 'node:path'
 import type {
+  DecisionDetailView,
+  DecisionListInput,
+  DecisionListPage,
   DeploymentView,
   PanelState,
   PanelTerminal,
@@ -82,12 +85,14 @@ import {
   type RefreshableStateSource
 } from './app/state-source.ts'
 import { deliveredFollowups, ticketDetail } from './app/views.ts'
+import { decisionDetail, decisionPage } from './app/views/decisions.ts'
 import { threadDetailView, threadListPage, threadRecordsOf } from './app/views/threads.ts'
 import {
   followupOwners,
   latestAssignment,
   runningAssignment,
   UserError,
+  type Decision,
   type Ticket
 } from './core/index.ts'
 import { readEvalsHealth, readUnavailableProblems } from './app/views/attention.ts'
@@ -103,13 +108,16 @@ import type { SetupCheckInput, SetupIssue, SetupProblem, SetupReport } from './a
 import { SourceRegistry, type SourceSettingsView } from './sources/registry.ts'
 import { Commands, type CommandsHost } from './sources/commands.ts'
 import {
+  claimReportedPull,
   createGithubApi,
   createGithubKind,
   createGithubPoller,
+  observePull,
+  pullEndNotices,
   subscribedThreads,
   GITHUB_KIND
 } from './sources/github/index.ts'
-import type { GithubPollResult, GithubPoller } from './sources/github/index.ts'
+import type { GithubPollResult, GithubPoller, GithubPullHost } from './sources/github/index.ts'
 import {
   FEISHU_KIND,
   createFeishuApi,
@@ -138,6 +146,9 @@ import { parseSettingsBlock, validateSettingsBlock } from './app/settings-blocks
 import { createAssessmentHandlers, withAssessmentHandlers } from './http/assessment.ts'
 import { createEvalHandlers, withEvalHandlers } from './http/eval.ts'
 import { createEvalTools } from './app/eval.ts'
+import { createReadHandlers, withReadHandlers } from './http/read.ts'
+import { createReadTools } from './app/read.ts'
+import { createViewReadTools } from './app/views/read.ts'
 import { admissionSettingsOf } from './sources/admission-context.ts'
 import { createDecisionHandlers, withDecisionHandlers } from './http/decisions.ts'
 import { createPromptHandlers, withPromptHandlers } from './http/prompts.ts'
@@ -268,6 +279,15 @@ export interface BootHandle {
   noteTicket(ticketId: string, text: string): PanelState
   /** 请求状态（§G.2 的 `ticket request-status`）：返回是否真的问了一条。 */
   requestStatus(ticketId: string): boolean
+  /** Eval 列表的一页（§M.2 的 Decision 列表）：最新在前，分页 50 条，带 §K.7 的待人工条数。 */
+  decisions(input: DecisionListInput): DecisionListPage
+  /**
+   * 一条 Decision 的详情（§M.2 的 Eval 详情）：字段、原因、到 Thread/Ticket 的链接，
+   * 以及它现在是否仍要人（§K.7）。未知决定抛 `unknownDecision`。
+   */
+  decisionDetail(decisionId: string): DecisionDetailView
+  /** 把一条 unavailable 决定暴露的问题 dismiss（§K.7）：面板先做行内二次确认。 */
+  dismissDecision(decisionId: string): PanelState
   /** 打开一张工单的 worktree（§M.2：面板没有 `workspace.open` 这个宿主方法）。 */
   openTicketWorkspace(ticketId: string): Promise<void>
   /** 移除一张工单的 worktree（§E.1「清理」，破坏性；面板先要人确认）。 */
@@ -437,6 +457,18 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
         })
       },
       requestStatus: () => {
+        throw Object.assign(new Error('another Superagent instance owns this state directory'), {
+          code: 'action_failed'
+        })
+      },
+      // follower 不读库：Eval 的读数与 dismiss 都属于拥有者（固定拒绝，不假装成功）。
+      decisions: () => ({ items: [], nextOffset: null, unresolved: 0 }),
+      decisionDetail: () => {
+        throw Object.assign(new Error('another Superagent instance owns this state directory'), {
+          code: 'unavailable'
+        })
+      },
+      dismissDecision: () => {
         throw Object.assign(new Error('another Superagent instance owns this state directory'), {
           code: 'action_failed'
         })
@@ -789,6 +821,35 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
     },
     onError: (error, evalId) => logger.warn(`the assessment of ${evalId} could not be decided`, { error: stringOf(error) })
   })
+  // ---- GitHub 的 PR 规则（§I.2「PR 规则」行、§I.5）：读一条 PR、绑定与结束判定。宿主把
+  // Engine 的两条命令与仓储的读面拼成 Source 端口（§C.2 规则 2：sources 不 import app），
+  // 报告路径与轮询路径共用同一份，语义因此只有一处。
+  const githubRepository = String(githubSetup.config['repository'] ?? '')
+  const githubCli = String(githubSetup.config['cli'] ?? 'gh')
+  /** GitHub 的读端口：setup 完成（仓库与 CLI 都在）才读，否则 PR 绑定与通知都不接线。 */
+  const githubReady = githubSetup.enabled && githubRepository !== '' && githubCli !== ''
+  const githubApi = createGithubApi(
+    (options.commands ?? new Commands({ configuredPrograms: () => [text(settings['githubCli'])] })).withSignal(),
+    githubCli
+  )
+  const pullHost: GithubPullHost = {
+    api: githubApi,
+    tickets: {
+      get: (ticketId) => repo.tickets.get(ticketId),
+      open: () => repo.tickets.open()
+    },
+    trigger: (triggerId) => repo.triggers.get(triggerId),
+    bind: (ticketId, thread, own) => {
+      engine.bindThread(ticketId, thread, own)
+    },
+    close: (thread, outcome, at) => {
+      engine.threadClosed(thread, outcome, at)
+    },
+    // agent 的账号与配置仓库判「这条 PR 是不是它的」（§I.2 PR 规则行）。
+    login: deploymentFacts.githubLogin,
+    repository: githubRepository,
+    now
+  }
   const executor = new OrcaExecutor({ effects, runtime: options.runtime, log: (message) => logger.info(message) })
   const engine = new Engine({
     repo,
@@ -814,6 +875,16 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
       }
       // 新 Decision 落库即「不再疑似空转」（§F.3 的可观测事实，不是拦截）。
       if (event.type === 'decision.recorded') routerSupervision.noteDecision()
+      // 因 PR 结束的 Ticket 给 chat 发**一条**稳定通知（§I.2「结束通知」行）：键由 PR 号、
+      // Channel 与结局派生，同一结束重复算也只排一条（§J.1 幂等）。GitHub 自己的时间线已经
+      // 显示合并/关闭，所以通知只发往别的 Channel。
+      if (event.type === 'ticket.ended' && githubReady) {
+        const ended = repo.tickets.get(event.data.ticketId)
+        if (ended !== undefined) {
+          const request = repo.triggers.get(ended.origin.triggerId)?.text ?? ''
+          for (const notice of pullEndNotices(ended, request, githubRepository)) outbox.send(notice)
+        }
+      }
     }
   })
   // 候选卡送到 Router 之后才起算 Eval 的截止时间（§K.7）；送达与 relay/notice 共用同一条
@@ -1024,6 +1095,14 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
     tickets: () => repo.tickets.list(),
     // 读模型里的「已投递到该 Ticket」：归属判定与扇出/交回同一份记录（`followupOwners`）。
     followups: (ticket) => deliveredFollowups(ticket, repo),
+    // `report --pr-number` 的绑定（§I.2「PR 规则」行）：读那条 PR、判归属并绑给这张 Ticket；
+    // 拒绝时整条命令落成固定码 `pr_mismatch`。没有 GitHub Source 时无从判归属，不接线。
+    ...(githubReady
+      ? {
+          claimPull: (ticketId: string, pull: { readonly number: number }) =>
+            claimReportedPull(pullHost, ticketId, pull.number)
+        }
+      : {}),
     idempotent,
     afterWrite: () => {
       refresh()
@@ -1064,6 +1143,44 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
     admission: () => evalAdmission,
     roots: evalRoots,
     log: (message) => logger.info(message)
+  })
+  // `read <resource>` 的 Source 读面（§G.2 的 read 行、§I.2 的「资源读取」行、§I.3 的读法）：
+  // 资源名路由到 kind 自己的读模块；Source 配置与 Trigger 现读（设置改了不必重建工具），
+  // Ticket 现读（assignment 只能读自己 Ticket 相关的资源，§O）。
+  const readTools = createReadTools({
+    commands: commandPort,
+    sourceConfig: (kind) => {
+      const instance = registry.instance(kind, sourceSettings)
+      return instance === undefined || !instance.enabled ? undefined : instance.config
+    },
+    trigger: (id) => repo.triggers.get(id),
+    tickets: () => repo.tickets.list(),
+    log: (message) => logger.info(message)
+  })
+  // §G.3 的视图读面（`read overview/sources/search/threads/thread/decisions/models`）：数据来自
+  // 既有读模型（面板快照、注册表总览、角色解析、`find`、Ticket/Thread 仓储与时间线游标），
+  // 视图本身不另建查询。`now` 由组合根给，`window=24h` 与「New in 24 h」在服务端换算。
+  const viewReadTools = createViewReadTools({
+    reader: { sql: store.sql },
+    now,
+    panel: () => stateSource.snapshot(),
+    sources: () => registry.overview(),
+    roles: () => roles,
+    find: (query) => registry.find(query),
+    threads: () => repo.threads.list(),
+    thread: (key) => repo.threads.get(key),
+    timeline: {
+      tail: (key, limit) => store.triggerThreads.tail(key, limit),
+      before: (key, cursor, limit) => store.triggerThreads.before(key, cursor, limit),
+      after: (key, cursor, limit) => store.triggerThreads.timeline(key, { after: cursor, limit }),
+      item: (key, cursor) => store.triggerThreads.item(key, cursor)
+    },
+    trigger: (id) => repo.triggers.get(id),
+    disposition: (id) => repo.triggers.disposition(id),
+    threadDecisions: (key) => repo.decisions.byThread(key),
+    allDecisions: () => repo.decisions.list(),
+    tickets: () => repo.tickets.list(),
+    ticket: (id) => repo.tickets.get(id)
   })
   // Prompt 配置的读/写面（§L.4、§L.5）：版本库、部署事实与「保存后通知 Router」都在这里接线。
   // 部署事实给的是**路径**（CLI 的绝对路径、调用者自己的 token 文件），绝不写 token 值（§D.6）；
@@ -1153,17 +1270,20 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
   const routes: readonly RouteDefinition[] = withSettingsHandlers(
     withDecisionHandlers(
         withPromptHandlers(
-          withEvalHandlers(
-            withAssessmentHandlers(
-              withDomainHandlers(ROUTE_TABLE, domain),
-              createAssessmentHandlers({
-                tools: routerTools,
-                afterWrite: () => {
-                  refresh()
-                }
-              })
+          withReadHandlers(
+            withEvalHandlers(
+              withAssessmentHandlers(
+                withDomainHandlers(ROUTE_TABLE, domain),
+                createAssessmentHandlers({
+                  tools: routerTools,
+                  afterWrite: () => {
+                    refresh()
+                  }
+                })
+              ),
+              createEvalHandlers({ tools: evalTools })
             ),
-            createEvalHandlers({ tools: evalTools })
+            createReadHandlers({ tools: readTools, views: viewReadTools })
           ),
           prompts
         ),
@@ -1239,13 +1359,10 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
   const poller: GithubPoller | null =
     githubSetup.enabled && githubInstance.repository !== '' && githubInstance.cli !== ''
       ? createGithubPoller({
-          api: createGithubApi(
-            (options.commands ?? new Commands()).withSignal(),
-            String(githubSetup.config['cli'] ?? 'gh')
-          ),
+          api: githubApi,
           config: {
-            repository: String(githubSetup.config['repository'] ?? ''),
-            cli: String(githubSetup.config['cli'] ?? 'gh'),
+            repository: githubRepository,
+            cli: githubCli,
             pollSeconds: Number(githubSetup.config['pollSeconds'] ?? 60),
             observeIssues: githubSetup.config['observeIssues'] === true,
             observePulls: githubSetup.config['observePulls'] === true,
@@ -1265,6 +1382,10 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
           // receive-all 的仓库流与默认分支 CI 基线也在这里命名（#36）。
           streamKey: githubStreamKey,
           branchCiKey: githubBranchCiKey,
+          // 读到 PR 就对账（§I.2「PR 规则」行）：绑定与结束都经领域命令，轮询器自己不写库。
+          observePull: (pull) => {
+            observePull(pullHost, pull)
+          },
           host: createSourceContext({
             engine,
             store,
@@ -1620,6 +1741,27 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
       const asked = engine.requestStatus(ticketId)
       refresh()
       return asked
+    },
+    // Eval 页（§M.2、§K.7）：列表/详情的待人工判定与 Overview 的 System problems 同一份读数。
+    decisions: (input: DecisionListInput): DecisionListPage =>
+      decisionPage(
+        repo.decisions.list(),
+        input,
+        readUnavailableProblems({ sql: store.sql }, { now: now() })
+      ),
+    decisionDetail: (decisionId: string): DecisionDetailView => {
+      const decision = repo.decisions.get(decisionId)
+      if (decision === undefined) throw new UserError('unknownDecision', { decision: decisionId })
+      return decisionDetail(
+        decision,
+        { threads: repo.threads, tickets: repo.tickets },
+        readUnavailableProblems({ sql: store.sql }, { now: now() })
+      )
+    },
+    // §K.7：只有 unavailable 能被 dismiss（领域同一条规则）；写后刷新快照与面板推送。
+    dismissDecision: (decisionId: string): PanelState => {
+      engine.dismiss(decisionId)
+      return refresh()
     },
     // §M.2：面板没有打开/移除 worktree 的宿主方法，两者都由 worker 按 Ticket 记录的目录代理。
     openTicketWorkspace: async (ticketId: string): Promise<void> => {

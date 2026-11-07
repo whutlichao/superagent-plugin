@@ -23,8 +23,11 @@ import { runWrite } from '../src/worker/http/idempotency'
 import { EVAL_BLOCK_SCHEMA } from '../src/worker/app/settings-blocks'
 import { createAssessmentHandlers, withAssessmentHandlers } from '../src/worker/http/assessment'
 import { createEvalHandlers, withEvalHandlers } from '../src/worker/http/eval'
+import { createReadHandlers, withReadHandlers } from '../src/worker/http/read'
+import { createReadTools } from '../src/worker/app/read'
 import { createEvalTools } from '../src/worker/app/eval'
 import { FakeCommands } from './support/fake-commands'
+import { createTestViewTools } from './support/view-host'
 import { createPromptHandlers, withPromptHandlers } from '../src/worker/http/prompts'
 import { createPromptVersions } from '../src/worker/app/prompts'
 import type { Store } from '../src/worker/app/store'
@@ -105,8 +108,21 @@ const WIRED: readonly (readonly [string, Case, Case])[] = [
   ],
   [
     'read',
-    { argv: ['read', 'overview'], exit: 3, code: 'unavailable' },
-    { argv: ['read', 'nope'], exit: 2, code: 'missing' }
+    // Source 资源读面（#57）：一个真资源名读到一条 Issue 描述（真 loopback + 假 `gh`）。
+    {
+      argv: ['read', 'github/issues/12'],
+      exit: 0,
+      resultKeys: ['resource', 'kind', 'status', 'items', 'next_offset', 'next', 'body']
+    },
+    // 未知资源名是固定拒绝（`unknown_resource`，退出 2），且**不发请求**：换一种写法是人的事。
+    { argv: ['read', 'nope'], exit: 2, code: 'unknown_resource', offline: true }
+  ],
+  [
+    'read views',
+    // 视图读面（#59）：`read threads` 走 §G.3 的 GET threads，与面板同一份读模型。
+    { argv: ['read', 'threads', '--limit', '5'], exit: 0, resultKeys: ['items', 'next_offset'], token: 'router' },
+    // assignment 连设置全文都读不到（§O：`GET settings` 的最低角色是 router）。
+    { argv: ['read', 'settings'], exit: 2, code: 'not_permitted_role', token: 'assignment' }
   ],
   // 本票接线的 Worker 三条（§G.2 的 report / reply / ack）：打到真的领域 handler。
   [
@@ -457,6 +473,26 @@ function commandRoutes(
     admission: () => ({ maxPages: 1, timeoutMs: 1_000 }),
     roots: () => []
   })
+  // Source 资源读面（#57）：`gh` 经 `FakeCommands`，资源名整段落在 `read/:resource` 上。
+  const readCommands = new FakeCommands()
+  readCommands.script(['api', 'repos/acme/widgets/issues/12'], () =>
+    JSON.stringify({
+      number: 12,
+      title: 'Login redirect loops',
+      state: 'open',
+      body: 'Signing in bounces back to /login.',
+      html_url: 'https://github.com/acme/widgets/issues/12',
+      created_at: AT,
+      updated_at: AT,
+      user: { login: 'alice', type: 'User' }
+    })
+  )
+  const readTools = createReadTools({
+    commands: readCommands,
+    sourceConfig: (kind) => (kind === 'github' ? { repository: 'acme/widgets', cli: 'gh' } : undefined),
+    trigger: () => undefined,
+    tickets: () => [ticket]
+  })
   const keys = (key: string): Thread | undefined => {
     if (!key.startsWith('github:')) return undefined
     const ref = { source: 'github', id: key.slice('github:'.length) }
@@ -542,12 +578,15 @@ function commandRoutes(
   })
   return withSettingsHandlers(
     withPromptHandlers(
-      withEvalHandlers(
+      withReadHandlers(
+        withEvalHandlers(
         withAssessmentHandlers(
           withDomainHandlers(ROUTE_TABLE, domain),
           createAssessmentHandlers({ tools: commandRouterTools() })
         ),
-        createEvalHandlers({ tools: evalTools })
+          createEvalHandlers({ tools: evalTools })
+        ),
+        createReadHandlers({ tools: readTools, views: createTestViewTools(store) })
       ),
       createPromptHandlers({
         versions: createPromptVersions({ store, now: () => AT }),
@@ -764,7 +803,7 @@ test('a request id makes a retried write return the first result, and only once'
 })
 
 test('read applies the documented page defaults and caps before it goes to the wire', async () => {
-  const server = await startTestServer()
+  const server = await startTestServer({ routes: commandRoutes })
   try {
     // §G.2 的 read 行：默认 20、上限 50。上限在客户端就判（`invalid_value`，退出 2），
     // 不发一次注定被拒的请求。
@@ -789,6 +828,9 @@ test('read applies the documented page defaults and caps before it goes to the w
     assert.equal(readPath('tickets', undefined), 'tickets')
     assert.equal(readPath('ticket', 't-1'), 'tickets/t-1')
     assert.equal(readPath('thread', 'gh:o/r #1'), 'threads/gh%3Ao%2Fr%20%231')
+    // Source 的资源名是一整段（`/` 不改变分段），服务端整段解码。
+    assert.equal(readPath('github/issues/12', undefined), 'read/github%2Fissues%2F12')
+    assert.equal(readPath('feishu/om_1/thread', undefined), 'read/feishu%2Fom_1%2Fthread')
     let missing: unknown = null
     try {
       readPath('nope', undefined)
@@ -796,16 +838,78 @@ test('read applies the documented page defaults and caps before it goes to the w
       missing = error
     }
     assert.ok(missing instanceof ApiError)
-    if (missing instanceof ApiError) assert.equal(missing.code, 'missing')
+    if (missing instanceof ApiError) assert.equal(missing.code, 'unknown_resource')
+    // 文本页的 `--limit` 是字符数：CLI 只判较宽的界（8000），形状的上限由服务端判。
+    assert.deepEqual(readQuery('github/issues/12', args({ limit: '8000', offset: '4000' })), {
+      limit: 8000,
+      offset: 4000
+    })
+    assert.deepEqual(readQuery('github/issues/12/comments/1', args({ limit: '51' })), { limit: 51 })
+    assert.deepEqual(readQuery('github/issues/12', args({})), {}, 'a Source read has no client-side default')
+    let tooWide: unknown = null
+    try {
+      readQuery('github/issues/12', args({ limit: '8001' }))
+    } catch (error) {
+      tooWide = error
+    }
+    assert.ok(tooWide instanceof ApiError)
+    if (tooWide instanceof ApiError) assert.equal(tooWide.code, 'invalid_value')
 
-    // 端到端：`read threads --limit 1` 打到未落地的视图路由 → 503 unavailable（退出 3）。
+    // 端到端：`read threads --limit 1` 打到 §G.3 的视图路由（真 handler、真 HTTP 查询串）。
     const result = await dispatch({
       parsed: parseArgs(['read', 'threads', '--limit', '1']),
       target: server.target()
     })
-    assert.equal(result.exit, 3)
-    assert.equal((result.envelope as { error: { code: string } }).error.code, 'unavailable')
+    assert.equal(result.exit, 0, JSON.stringify(result.envelope))
+    const page = (result.envelope as { readonly result?: { readonly items?: unknown } }).result
+    assert.deepEqual(page, { items: [], next_offset: null }, 'the query reached the threads read model')
     assert.equal(server.requests.length, 1, 'one request, to the real route')
+    assert.equal(server.requests[0]?.path, '/superagent/api/threads', 'the log keeps the path, not the query')
+  } finally {
+    server.close()
+  }
+})
+
+test('read routes github/… and feishu/… through one handler, with the role matrix and paging', async () => {
+  const server = await startTestServer({ routes: commandRoutes })
+  try {
+    // 成功面：operator 读一条 Issue（真 HTTP、假 `gh`）。
+    const ok = await runCase(server, { argv: ['read', 'github/issues/12'], exit: 0 })
+    const view = (ok.envelope as { readonly result?: Record<string, unknown> }).result
+    assert.equal(view?.['status'], 'available')
+    assert.equal(view?.['resource'], 'github/issues/12')
+    assert.equal((view?.['items'] as readonly unknown[]).length, 1)
+    // 分页参数真的到了 wire（查询串），并且 handler 认它们。
+    const paged = await runCase(server, {
+      argv: ['read', 'github/issues/12', '--offset', '0', '--limit', '4000'],
+      exit: 0
+    })
+    assert.equal((paged.envelope as { readonly result?: Record<string, unknown> }).result?.['next_offset'], null)
+    // 文本页的 `--limit` 上限是 8000：8001 在客户端就拒（`invalid_value`，退出 2，不发请求）。
+    const tooWide = await runCase(server, {
+      argv: ['read', 'github/issues/12', '--limit', '8001'],
+      exit: 2,
+      code: 'invalid_value',
+      offline: true
+    })
+    assertFailure(tooWide.envelope, 'invalid_value')
+    // 角色矩阵：assignment token 读不到不属于自己 Ticket 的资源（`refused` 是固定拒绝）。
+    const refused = await runCase(server, {
+      argv: ['read', 'github/issues/12'],
+      exit: 2,
+      code: 'refused',
+      token: 'assignment'
+    })
+    assertFailure(refused.envelope, 'refused')
+    // 未知的 Source 资源名：CLI 把它原样交给 `read/:resource`（写法只有一处定义），
+    // 由 handler 回 `unknown_resource`——`/` 不改变分段。
+    const unknown = await runCase(server, {
+      argv: ['read', 'github/labels/12'],
+      exit: 2,
+      code: 'unknown_resource',
+      token: 'router'
+    })
+    assertFailure(unknown.envelope, 'unknown_resource')
   } finally {
     server.close()
   }

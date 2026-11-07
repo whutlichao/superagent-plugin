@@ -14,14 +14,18 @@ test('the worker push is the one state.changed event, carrying a monotonic revis
   assert.deepEqual([...PLUGIN_PANEL_EVENTS], ['state.changed'])
 })
 
-test('the panel declares the state snapshot, the Overview actions, the Trigger and Execution pages and the Deployment group', () => {
+test('the panel declares the state snapshot, the list pages and the Deployment group', () => {
   // 每个票据追加自己那一组请求：Overview 的 `check`/`ticket.retry`/`terminal.focus`（#37）、
-  // Trigger 的列表/详情与两个动作（#39）、Execution 的列表/详情与五个动作（#38），以及
-  // Deployment 组的读数、doctor、重跑探针、轮换 token、重启 Router（#47）。
+  // Execution 的列表/详情与五个动作（#38）、Trigger 的列表/详情与两个动作（#39）、Eval 的
+  // 列表/详情/dismiss（#40），以及 Deployment 组的读数、doctor、重跑探针、轮换 token、
+  // 重启 Router（#47）。
   assert.deepEqual([...PLUGIN_REQUESTS], [
     'state',
     'pause',
     'check',
+    'decisions',
+    'decision.detail',
+    'decision.dismiss',
     'threads',
     'thread.detail',
     'trigger.requeue',

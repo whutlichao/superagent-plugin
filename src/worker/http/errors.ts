@@ -28,6 +28,11 @@ export const ERROR_CODES = {
   tooLate: 'too_late',
   /** `route` 一次超过 20 条（§G.1 限额行）。 */
   tooManyItems: 'too_many_items',
+  /**
+   * `read <resource>` 的未知资源名（§G.2 的 read 行）：调用方据此换一种写法，`values.forms`
+   * 列出可用写法。它属于 `refused` 一族（400），不是 `missing`（那个留给「资源确实不存在」）。
+   */
+  unknownResource: 'unknown_resource',
   /** 固定拒绝：调用方不该重试。 */
   refused: 'refused',
   /** 设置/prompt 的 base revision 已过期。 */
@@ -87,6 +92,11 @@ export const ERROR_CODES = {
   setupFailed: 'setup_failed',
   /** 并发冲突（同名资源已存在等）。 */
   conflict: 'conflict',
+  /**
+   * `report --pr-number` 的固定拒绝（§G.2 的 `report` 行）：这条 PR 不属于本 Ticket（不是它的
+   * 来源 PR，也不是 agent 从它的分支开的），或已经属于另一个活 Ticket。
+   */
+  prMismatch: 'pr_mismatch',
   /** body 超过 1 MiB（§G.3 第 6 条）。 */
   tooLarge: 'too_large',
   /** 超出 60/min + burst 20（§G.3 第 7 条）。 */
@@ -144,6 +154,8 @@ export function statusForErrorCode(code: string): number {
   if (code.startsWith('invalid_')) return 400
   switch (code) {
     case ERROR_CODES.refused:
+    // `read <resource>` 的未知资源名（§G.2 的 read 行）：与 `refused` 一样是不可重试的固定拒绝。
+    case ERROR_CODES.unknownResource:
     case ERROR_CODES.staleRevision:
     case ERROR_CODES.tooLong:
     case ERROR_CODES.tooManyItems:
@@ -156,6 +168,8 @@ export function statusForErrorCode(code: string): number {
     case ERROR_CODES.alreadyHandedBack:
     case ERROR_CODES.alreadyEnded:
     case ERROR_CODES.notRetryable:
+    // `report --pr-number` 的 `pr_mismatch`：PR 不属于本 Ticket（§I.2 的「PR 规则」行）。
+    case ERROR_CODES.prMismatch:
     // 本票接线的命令级固定拒绝（§G.2 的 trigger requeue / thread * / policy sync / settings save）。
     case ERROR_CODES.notRequeueable:
     case ERROR_CODES.ownThread:

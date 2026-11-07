@@ -137,10 +137,14 @@ interface TreeNode {
   readonly children?: readonly (TreeNode | string)[]
 }
 
-/** 第一个某类型的节点（深度优先）。 */
-function nodeOfType(mounted: Awaited<ReturnType<typeof mount>>, type: string): TreeNode | undefined {
+/** 某类型、某个 label 的节点（深度优先；Tabs 的每个页都在原始树里，按 label 区分）。 */
+function nodeOfType(
+  mounted: Awaited<ReturnType<typeof mount>>,
+  type: string,
+  label?: string
+): TreeNode | undefined {
   const seek = (node: TreeNode): TreeNode | undefined => {
-    if (node.type === type) return node
+    if (node.type === type && (label === undefined || node.props?.['label'] === label)) return node
     for (const child of node.children ?? []) {
       if (typeof child === 'string') continue
       const hit = seek(child)
@@ -151,10 +155,10 @@ function nodeOfType(mounted: Awaited<ReturnType<typeof mount>>, type: string): T
   return seek(mounted.tree() as TreeNode)
 }
 
-/** 表格画出的行（`Table` 的 `rows` prop，按绘制顺序）。 */
+/** 表格画出的行（`Table` 的 `rows` prop，按绘制顺序）；按页名取表，别的页也有 Table。 */
 function tableRows(mounted: Awaited<ReturnType<typeof mount>>): readonly Record<string, unknown>[] {
-  const table = nodeOfType(mounted, 'Table')
-  assert.ok(table !== undefined, 'the page draws a Table')
+  const table = nodeOfType(mounted, 'Table', COPY['nav.execution'].en)
+  assert.ok(table !== undefined, 'the page draws the Execution Table')
   const rows = table.props?.['rows']
   return Array.isArray(rows) ? (rows as readonly Record<string, unknown>[]) : []
 }

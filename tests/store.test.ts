@@ -134,66 +134,51 @@ test('a thread timeline pages by the (at, id) composite cursor without loss or r
   }
 })
 
-test('the same (at, id) cursor reads a thread timeline newest first, from the newest page back', () => {
-  // 面板的时间线从最新一条往回读（§M.2 的 Trigger 详情、「更早」）：方向反过来之后，
-  // 同一时刻的两条仍然只能靠 (at, id) 复合游标区分——只用时间做游标会丢掉其中一条。
+test('the tail and before reads walk a thread timeline backwards without loss or repetition', () => {
   const { store, cleanup } = openTempStore()
   try {
-    const rows = [
-      { id: 'trigger-a', at: AT },
-      { id: 'trigger-b', at: AT },
-      { id: 'trigger-c', at: isoAfter(AT, 1000) }
-    ]
-    for (const row of rows) {
+    // 五条同一时刻的 Trigger：只有 (at, id) 复合游标能既不丢也不重。
+    const ids = ['trigger-a', 'trigger-b', 'trigger-c', 'trigger-d', 'trigger-e']
+    for (const id of ids) {
       store.triggers.insert({
-        id: row.id,
+        id,
         source: 'github',
-        at: row.at,
+        at: AT,
         actor: { source: 'github', id: 'alice' },
         human: true,
         addressed: null,
-        text: row.id,
+        text: id,
         url: null,
         body: {}
       })
       store.triggerThreads.link({
         threadKey: 'github:1',
-        at: row.at,
-        triggerId: row.id,
+        at: AT,
+        triggerId: id,
         human: true,
-        primaryThread: row.id === 'trigger-a'
+        primaryThread: false
       })
     }
+    const tail = store.triggerThreads.tail('github:1', 2)
+    assert.deepEqual(tail.items.map((item) => item.triggerId), ['trigger-d', 'trigger-e'])
+    assert.deepEqual(tail.before, { at: AT, triggerId: 'trigger-d' })
 
-    const first = store.triggerThreads.timeline('github:1', { limit: 2, order: 'newest' })
-    assert.deepEqual(
-      first.items.map((item) => item.triggerId),
-      ['trigger-c', 'trigger-b'],
-      'the newest page starts at the newest row, descending'
-    )
-    assert.deepEqual(
-      first.next,
-      { at: AT, triggerId: 'trigger-b' },
-      'the cursor is the oldest row of the page, as (at, id)'
-    )
+    const second = store.triggerThreads.before('github:1', tail.before as never, 2)
+    assert.deepEqual(second.items.map((item) => item.triggerId), ['trigger-b', 'trigger-c'])
+    assert.deepEqual(second.before, { at: AT, triggerId: 'trigger-b' })
 
-    const second = store.triggerThreads.timeline('github:1', {
-      limit: 2,
-      order: 'newest',
-      after: first.next
-    })
-    assert.deepEqual(
-      second.items.map((item) => item.triggerId),
-      ['trigger-a'],
-      'the row sharing its instant is neither skipped nor repeated'
-    )
-    assert.equal(second.next, null, 'no more pages once the last page is short')
+    const third = store.triggerThreads.before('github:1', second.before as never, 2)
+    assert.deepEqual(third.items.map((item) => item.triggerId), ['trigger-a'])
+    assert.equal(third.before, null, 'the earliest page ends the walk')
 
-    const everything = [
-      ...first.items.map((item) => item.triggerId),
-      ...second.items.map((item) => item.triggerId)
-    ]
-    assert.deepEqual(everything, ['trigger-c', 'trigger-b', 'trigger-a'])
+    // `item` 是 `around` 的锚点：恰好落在游标上的那一行。
+    assert.equal(store.triggerThreads.item('github:1', { at: AT, triggerId: 'trigger-c' })?.triggerId, 'trigger-c')
+    assert.equal(store.triggerThreads.item('github:1', { at: AT, triggerId: 'trigger-nope' }), undefined)
+    assert.equal(
+      store.triggerThreads.item('github:2', { at: AT, triggerId: 'trigger-c' }),
+      undefined,
+      'another thread never anchors'
+    )
   } finally {
     cleanup()
   }

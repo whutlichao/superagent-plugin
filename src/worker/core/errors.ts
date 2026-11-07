@@ -4,6 +4,7 @@ export const USER_ERRORS = {
   unknownTicket: ['missing', 'Unknown ticket'],
   unknownTrigger: ['missing', 'Unknown trigger'],
   unknownAssignment: ['missing', 'Unknown assignment'],
+  unknownDecision: ['missing', 'Unknown decision'],
   unknownProblem: ['missing', 'Unavailable Eval not found'],
   unknownThread: ['missing', 'Unknown thread'],
   ticketEnded: ['refused', 'Ticket has ended'],

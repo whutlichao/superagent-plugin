@@ -881,6 +881,7 @@ Router/Worker 用的命令（等价上游 `orchestrator_*` 工具）：
 | `POST router/restart` | Router 重启（面板动作） | |
 | `POST workspaces/:id/open` | `host.call('workspace.open')` | 面板无此 Host 方法，必须走 worker |
 | `GET models` | 可用模型清单（来自 Orca 启动时的模型参数与设置） | 见 §H.17 |
+| `GET read/:resource` | `read <resource>` | 资源名整段（百分号编码，`/` 不改变分段）：`github/…`/`feishu/…` 由 `app/read.ts` 路由到 kind 的读模块；角色在 handler 里细化（assignment 只读自己 Ticket 相关的资源，§O） |
 | `GET eval/:id`、`GET eval-read/:id` | `eval`、`eval-read` | `eval-read` 的四种读法是查询串：`message-id`、`image-id`、`part`（+`cursor`）、`path`；角色 ≥ router |
 | `POST doctor` | `doctor` | |
 

@@ -25,7 +25,10 @@ import {
   EVAL_READ_PARTS,
   READ_MAX_LIMIT,
   READ_DEFAULT_LIMIT,
-  READ_RESOURCES
+  READ_RESOURCES,
+  READ_SOURCE_RESOURCES,
+  READ_TEXT_MAX_CHARS,
+  isSourceResource
 } from '../http/api-types.ts'
 import { EXIT, exitForCode, type Envelope, type ExitCode, type ParsedArgs } from './io.ts'
 
@@ -212,11 +215,22 @@ export const CLI_COMMANDS: readonly CommandDefinition[] = [
     available: true
   },
 
-  // ---- 读面（`read <resource>`；本票只服务运维视图，其余资源由各票接上）
+  // ---- 读面（`read <resource>`）：Source 资源（`github/…`、`feishu/…`）与面板视图各走各的路由。
   {
     name: ['read'],
-    summary: 'read a resource: overview, sources, threads, decisions, tickets, settings, models…',
-    flags: PAGE_FLAGS,
+    summary:
+      'read a resource: github/… or feishu/… (source reads), overview, sources, search, threads, thread/<key>, decisions, tickets, ticket/<id>, settings, models…',
+    flags: [
+      ...PAGE_FLAGS,
+      { name: 'filter', kind: 'value', hint: 'threads: all | subscribed | evaluating | new (default all)' },
+      { name: 'before', kind: 'value', hint: 'thread: the "<at>|<triggerId>" cursor to page older' },
+      { name: 'around', kind: 'value', hint: 'thread: the "<at>|<triggerId>" cursor to center the page on' },
+      { name: 'kind', kind: 'value', hint: 'decisions: accept | stop | ignore | unavailable' },
+      { name: 'window', kind: 'value', hint: 'decisions: a relative window such as 24h, 1h, 30m or 7d' },
+      { name: 'state', kind: 'value', hint: 'tickets: open | person | working | idle | ended' },
+      { name: 'block', kind: 'value', hint: 'settings: policy | eval | executor | source:<id>' },
+      { name: 'q', kind: 'value', hint: 'search: text, a message id, a thread reference or a link' }
+    ],
     positionals: [{ name: 'resource', required: true }, { name: 'id', required: false }],
     write: false,
     available: true
@@ -1038,10 +1052,26 @@ export function evalReadQuery(args: CommandArgs): Record<string, string> {
   return fields
 }
 
-/** `read <resource>` 的路径（`thread/<key>` 与 `ticket/<id>` 各占一段参数）。 */
+/**
+ * `read <resource>` 的路径（`thread/<key>` 与 `ticket/<id>` 各占一段参数；Source 资源名整段
+ * 编成 `read/:resource`，`/` 因此不改变分段）。
+ */
 export function readPath(resource: string, id: string | undefined): string {
+  // Source 的资源名是 `github/issues/12` 这样的多段名字：整段百分号编码后交给 `read/:resource`。
+  // 它**不再**吃第二个位置参数（`read github/issues 12` 是把两个名字拼错的那种写法）。
+  if (isSourceResource(resource)) {
+    if (id !== undefined && id.length > 0) {
+      throw new ApiError(ERROR_CODES.invalidParams, 'a source read takes one resource name, not two', {
+        argument: 'id'
+      })
+    }
+    return `read/${encodePathSegment(resource)}`
+  }
   if (!READ_RESOURCES.includes(resource)) {
-    throw new ApiError(ERROR_CODES.missing, `unknown resource: ${resource}`, { resource })
+    throw new ApiError(ERROR_CODES.unknownResource, `unknown resource: ${resource}`, {
+      resource,
+      forms: READ_SOURCE_RESOURCES.join(', ')
+    })
   }
   if (resource === 'thread' || resource === 'ticket' || resource === 'trigger') {
     if (id === undefined || id.length === 0) throw new ApiError(ERROR_CODES.invalidParams, `read ${resource} needs an id`)
@@ -1051,11 +1081,42 @@ export function readPath(resource: string, id: string | undefined): string {
   return resource
 }
 
-/** `read` 的分页参数：默认 20、上限 50（§G.2 的 read 行）。 */
-export function readQuery(resource: string, args: CommandArgs): Record<string, number> {
-  const query: Record<string, number> = {}
+/**
+ * `read <resource>` 的字符串参数：每个资源只认自己那一组（§G.3 的查询串同名），其余原样
+ * 交给服务端判（未知筛选值是 `invalid_value`，不在客户端猜）。`search` 必须有 `--q`，
+ * `thread` 的 `--before`/`--around` 二选一：这两条是参数形状，客户端先拒（不发注定失败的请求）。
+ */
+const READ_TEXT_FLAGS: Readonly<Record<string, readonly string[]>> = {
+  threads: ['filter'],
+  thread: ['before', 'around'],
+  decisions: ['kind', 'window'],
+  tickets: ['state'],
+  settings: ['block'],
+  search: ['q']
+}
+
+/**
+ * `read` 的查询串（§G.2 的 read 行）。列表页默认 20、上限 50；Source 的文本页（一条长消息）
+ * `--limit` 是字符数，上限 8000——CLI 只判较宽的那个界，具体形状的上限由 `app/read.ts` 判。
+ */
+export function readQuery(resource: string, args: CommandArgs): Record<string, string | number> {
+  const query: Record<string, string | number> = {}
+  for (const flag of READ_TEXT_FLAGS[resource] ?? []) {
+    const value = valueArgs(args.flags, flag)
+    if (value !== undefined) query[flag] = value
+  }
+  if (resource === 'search' && query['q'] === undefined) {
+    throw new ApiError(ERROR_CODES.invalidParams, 'read search needs --q', { flag: 'q' })
+  }
+  if (resource === 'thread' && query['before'] !== undefined && query['around'] !== undefined) {
+    throw new ApiError(ERROR_CODES.invalidParams, 'read thread takes --before or --around, not both', {
+      flag: 'before'
+    })
+  }
   const offset = valueArgs(args.flags, 'offset')
   const limit = valueArgs(args.flags, 'limit')
+  const source = isSourceResource(resource)
+  const maximum = source ? READ_TEXT_MAX_CHARS : READ_MAX_LIMIT
   if (offset !== undefined) {
     const parsed = Number(offset)
     if (!Number.isInteger(parsed) || parsed < 0) {
@@ -1065,13 +1126,13 @@ export function readQuery(resource: string, args: CommandArgs): Record<string, n
   }
   if (limit !== undefined) {
     const parsed = Number(limit)
-    if (!Number.isInteger(parsed) || parsed < 1 || parsed > READ_MAX_LIMIT) {
-      throw new ApiError(ERROR_CODES.invalidValue, `--limit must be between 1 and ${READ_MAX_LIMIT}`, {
-        max: String(READ_MAX_LIMIT)
+    if (!Number.isInteger(parsed) || parsed < 1 || parsed > maximum) {
+      throw new ApiError(ERROR_CODES.invalidValue, `--limit must be between 1 and ${maximum}`, {
+        max: String(maximum)
       })
     }
     query['limit'] = parsed
-  } else if (resource === 'threads' || resource === 'tickets' || resource === 'decisions') {
+  } else if (!source && (resource === 'threads' || resource === 'tickets' || resource === 'decisions')) {
     query['limit'] = READ_DEFAULT_LIMIT
   }
   return query

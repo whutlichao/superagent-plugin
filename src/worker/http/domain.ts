@@ -105,6 +105,15 @@ export interface DomainHandlerOptions {
   /** 一次写成功后的推推送/刷新钩子（面板 `state.changed` 与状态栏）。 */
   readonly afterWrite?: () => void
   /**
+   * `report --pr-number` 的绑定（§I.2 的「PR 规则」行、§G.2 的 `pr_mismatch`）：组合根读那条
+   * PR、判它是不是这张 Ticket 的、并把它绑给 Ticket；返回拒绝原因时这条报告不写，信封里落成
+   * `pr_mismatch`。缺省不绑（没有 GitHub Source 的接线与单元测试都不读网络）。
+   */
+  readonly claimPull?: (
+    ticketId: string,
+    pull: { readonly number: number }
+  ) => Promise<string | undefined> | string | undefined
+  /**
    * 写命令的幂等端口（组合根用真库实现 `runWrite`）；缺省直接执行一次。`--request-id`
    * 一小时内重试返回首次结果（§G.1）：本票接线的四条写命令都过这一个口。
    */
@@ -208,6 +217,18 @@ export function workerReportOf(body: Record<string, unknown>): WorkerReport {
   }
 }
 
+/** `report --pr-number`：正整数（`#9` 这种写法不接受，避免命令层猜语义）。 */
+function pullNumberOf(body: Record<string, unknown>): number | undefined {
+  const value = optionalText(body, 'prNumber')
+  if (value === undefined) return undefined
+  if (!/^\d+$/u.test(value) || Number(value) <= 0) {
+    throw new ApiError(ERROR_CODES.invalidValue, 'prNumber must be a positive integer', {
+      flag: 'pr-number'
+    })
+  }
+  return Number(value)
+}
+
 /** 读面的响应形状（`read tickets`）。 */
 export interface TicketsResult {
   readonly items: readonly TicketView[]
@@ -300,10 +321,21 @@ export function createDomainHandlers(options: DomainHandlerOptions): ReadonlyMap
     return { retried: true, assignment: ticket.assignments.at(-1) ?? null }
   })
 
-  handlers.set('POST report', (input) => {
+  handlers.set('POST report', async (input) => {
     const body = bodyObject(input.body)
     const ticketId = callerTicket(input, body)
     const report = workerReportOf(body)
+    // PR 号只当作**绑定**的输入（§I.2）：先读 PR、判归属，再写报告——拒绝时整条命令不写任何东西。
+    const pull = pullNumberOf(body)
+    if (pull !== undefined && options.claimPull !== undefined) {
+      const refused = await options.claimPull(ticketId, { number: pull })
+      if (refused !== undefined) {
+        throw new ApiError(ERROR_CODES.prMismatch, refused, {
+          ticket: ticketId,
+          pr: String(pull)
+        })
+      }
+    }
     const ticket = options.report(ticketId, report)
     options.afterWrite?.()
     return {

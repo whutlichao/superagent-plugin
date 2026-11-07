@@ -763,7 +763,7 @@ test('the thread detail read model carries the timeline, the decisions, the subs
       {
         id: 'decision-1',
         kind: 'accept',
-        reason: [{ code: 'routed', values: { ticket: 't1' } }],
+        reasons: [{ code: 'routed', values: { ticket: 't1' } }],
         strength: 'explicit',
         policyVersion: 'v3',
         at: Date.parse(AT),
@@ -860,7 +860,7 @@ function decisionOf_(overrides: Partial<PanelDecision> = {}): PanelDecision {
   return {
     id: 'decision-1',
     kind: 'accept',
-    reason: [{ code: 'routed', values: { ticket: 't1' } }],
+    reasons: [{ code: 'routed', values: { ticket: 't1' } }],
     strength: 'explicit',
     policyVersion: 'v3',
     at: 1_700_000_000_000,
