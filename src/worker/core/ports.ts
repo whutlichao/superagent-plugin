@@ -42,9 +42,9 @@ export type ScopeResult =
   | { listened: true; observed: boolean; row?: string }
   | { listened: false; reason: string }
 
-/** 领域看到的 Source 配置：按 trigger 或按已记录的 Mandate 依据判断监听范围。 */
+/** 领域看到的 Source 配置：按 trigger 判断监听范围。 */
 export interface SourceScope {
-  scope(input: { source: string; meta: Record<string, unknown> }): ScopeResult
+  scope(trigger: Trigger): ScopeResult
 }
 
 /**

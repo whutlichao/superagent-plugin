@@ -129,8 +129,18 @@ export function createGithubApi(commands: CommandsHost, cli: string): GithubApi 
       issue: number,
       since: string | null
     ): Promise<readonly GithubComment[]> {
-      const args = ['api', `repos/${repository}/issues/${issue}/comments`, '--paginate', '-f', 'per_page=100']
-      // `gh api -f` 对 GET 是查询参数（§I.2 的 `?per_page=100` 同义）。
+      // `gh api -f` 默认把请求改成 POST（gh 的文档：加了参数就是 POST）；读评论必须显式
+      // `--method GET`，否则这条「读」会在真实仓库里变成一次创建评论的写请求（§I.2）。
+      const args = [
+        'api',
+        `repos/${repository}/issues/${issue}/comments`,
+        '--paginate',
+        '--method',
+        'GET',
+        '-f',
+        'per_page=100'
+      ]
+      // `--method GET` 下 `-f` 是查询参数（§I.2 的 `?per_page=100` 同义）。
       if (since !== null) args.push('-f', `since=${since}`)
       const output = await commands.run(cli, args)
       return parseArray(output).flatMap((value) => {

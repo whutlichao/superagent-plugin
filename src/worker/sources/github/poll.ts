@@ -5,10 +5,10 @@
 // 三轮失败把 health 的 `github` 条目报成 error；任何一次成功清零。自身消息在这一层就被丢弃。
 //
 // 依赖纪律（§C.2）：本文件只 import core 的类型、命令端口与同目录的兄弟模块；它拿不到
-// Engine、Store 或宿主，收 Trigger 只能经注入的 `host.receive`。
+// Engine、Store 或宿主，收 Trigger 只能经注入的 `host.receive`。KV 键名也不由这里拼：
+// `app/kv.ts` 是唯一命名处，组合根把构造函数（`cursorKey`）交进来（§D.3）。
 import type { HealthEntry, Trigger } from '../../core/index.ts'
 import type { SourceContext } from '../kind.ts'
-import { githubCursorKey } from '../../app/kv.ts'
 import type { GithubComment, GithubNotification } from './api.ts'
 import { issueNumberOf, type GithubApi } from './api.ts'
 import { commentTrigger, isSelf } from './translate.ts'
@@ -27,6 +27,11 @@ export interface GithubPollerOptions {
   /** agent 的 GitHub 账号（来自部署/setup 探针；空串时无法判定点名与自身消息）。 */
   readonly login: string
   readonly host: GithubPollHost
+  /**
+   * 一条通知的游标键（`githubCursorKey(notificationId)`）：键名只活在 `app/kv.ts`，
+   * 由组合根注入，Source 自己不拼字面量（§D.3）。
+   */
+  readonly cursorKey: (notificationId: string) => string
   readonly log?: (message: string) => void
 }
 
@@ -91,14 +96,15 @@ export function createGithubPoller(options: GithubPollerOptions): GithubPoller {
   }
 
   const readNotification = async (notification: GithubNotification): Promise<number> => {
-    const cursor = cursorOf(options.host.state.get(githubCursorKey(notification.id)))
+    const key = options.cursorKey(notification.id)
+    const cursor = cursorOf(options.host.state.get(key))
     if (cursor !== null && cursor.updatedAt === notification.updatedAt) return 0
     const issue = issueNumberOf(notification.apiUrl)
     const repository = notification.repository || options.config.repository
     // 本票只读 Issue 评论；PR / Release 等通知记住位置就走（PR 面归 #17/#18）。
     if (notification.type !== 'Issue' || issue === undefined) {
       // 不是 Issue/PR 的通知（例如 Release）：记住位置，不读任何东西。
-      options.host.state.set(githubCursorKey(notification.id), {
+      options.host.state.set(key, {
         updatedAt: notification.updatedAt,
         lastReadAt: notification.lastReadAt,
         skipped: notification.type
@@ -125,7 +131,7 @@ export function createGithubPoller(options: GithubPollerOptions): GithubPoller {
       received += 1
     }
     // 只有读成功才推进游标：被中断的一轮会重读，而不是漏读（§I.2 / §I.6）。
-    options.host.state.set(githubCursorKey(notification.id), {
+    options.host.state.set(key, {
       updatedAt: notification.updatedAt,
       lastReadAt: notification.lastReadAt
     } satisfies Cursor)

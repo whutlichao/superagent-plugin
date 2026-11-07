@@ -477,11 +477,11 @@ export class SourceRegistry implements SourceScope {
 
   /** 领域的监听判定（§I.1 `scope`、§K.2）：给固定原因码，面板据此解释「为什么它没理我」。 */
   scope(
-    input: { source: string; meta: Record<string, unknown> },
+    trigger: Trigger,
     settings: SourceSettingsView = this.#settings()
   ): ScopeResult {
-    const kind = this.#kinds.get(input.source)
-    const stored = settings.sources[input.source]
+    const kind = this.#kinds.get(trigger.source)
+    const stored = settings.sources[trigger.source]
     // kind 没装时无法判定监听范围：存过配置的实例什么都不听，没存过的（内置 kind 未注册）都听。
     if (kind === undefined) {
       return stored === undefined
@@ -497,7 +497,7 @@ export class SourceRegistry implements SourceScope {
     }
     return kind.scope === undefined
       ? { listened: true, observed: false }
-      : kind.scope({ source: input.source, meta: input.meta }, instance.config)
+      : kind.scope(trigger, instance.config)
   }
 
   /**

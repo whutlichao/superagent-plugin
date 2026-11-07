@@ -85,7 +85,8 @@ test('a mention becomes a ticket, an agent, a comment and a panel row', async ()
       .filter((call) => call.args[1] === 'repos/acme/widgets/issues/42/comments' && call.args[2] === '-f')
       .map((call) => String(call.args[3] ?? ''))
     assert.equal(bodies.length, 2, 'the acknowledgement and the result')
-    assert.equal(bodies[0]!.startsWith('On it:'), true)
+    // `gh api -f body=…` 的 argv 形状：正文永远只是参数里的一个值（§I.4）。
+    assert.equal(bodies[0]!.startsWith('body=On it:'), true)
     assert.equal(bodies[1]!.startsWith('body=Done:'), true)
     for (const body of bodies) {
       assert.equal(/<!-- superagent:[a-f0-9]{32} -->/.test(body), true, 'the hidden id marker')
@@ -145,14 +146,15 @@ test('a restart adopts the running assignment instead of opening a second ticket
     await first.handle.passOnce()
     await first.handle.passOnce()
     assert.equal(first.handle.snapshot().tickets?.length, 1)
-    // 终端仍在（FakeOrcaRuntime 的 listTerminals 默认把已启动的 agent 列出来）。
+    // 终端仍在（FakeOrcaRuntime 的 listTerminals 默认把已启动的 agent 列出来）。插件重启只换
+    // 组合根，不换 Orca 宿主：第二段 boot 必须接同一个假宿主，否则模拟的是「应用也重启了」。
     await first.handle.shutdown()
-    const second = await openBoot({ stateDir, boot: async (_dir, runtime, commands) => {
+    const second = await openBoot({ stateDir, boot: async (_dir, _runtime, commands) => {
       const { bootPlugin } = await import('../src/worker/boot')
       return bootPlugin({
-        runtime,
+        runtime: first.runtime,
         readSettings: async () => firstSettings(stateDir),
-        commands: new (await import('../src/worker/sources/commands')).Commands(),
+        commands,
         stateDir,
         disableTimers: true
       })

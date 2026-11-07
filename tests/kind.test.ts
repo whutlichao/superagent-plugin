@@ -268,6 +268,12 @@ describe('the sources type surface', () => {
     assert.deepEqual(files, [
       'src/worker/sources/admission-context.ts',
       'src/worker/sources/commands.ts',
+      'src/worker/sources/github/api.ts',
+      'src/worker/sources/github/config.ts',
+      'src/worker/sources/github/index.ts',
+      'src/worker/sources/github/kind.ts',
+      'src/worker/sources/github/poll.ts',
+      'src/worker/sources/github/translate.ts',
       'src/worker/sources/kind.ts',
       'src/worker/sources/registry.ts'
     ])

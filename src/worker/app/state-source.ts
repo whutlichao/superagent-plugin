@@ -114,7 +114,13 @@ function updatedAt(ticket: Ticket): number {
 
 /** 一条 Ticket → Execution 页的一行。 */
 function panelTicket(ticket: Ticket): PanelTicket {
-  return { id: ticket.id, title: ticket.title, stage: ticketView(ticket).stage, at: updatedAt(ticket) }
+  return {
+    id: ticket.id,
+    title: ticket.title,
+    stage: ticketView(ticket).stage,
+    ...(ticket.ended === undefined ? {} : { outcome: ticket.ended.outcome }),
+    at: updatedAt(ticket)
+  }
 }
 
 /**

@@ -506,7 +506,7 @@ export function splitCommand(parsed: ParsedArgs): {
  * 参数不合法 → `invalid_params`/`invalid_value`（退出 2）；网络不可达 → `not_ready`（退出 3）。
  */
 export async function dispatch(input: DispatchInput): Promise<DispatchResult> {
-  const { command, positionals } = splitCommand(input.parsed)
+  const { command, positionals: words } = splitCommand(input.parsed)
   try {
     if (command === null) {
       throw new ApiError(
@@ -514,7 +514,8 @@ export async function dispatch(input: DispatchInput): Promise<DispatchResult> {
         input.parsed.words.length === 0 ? 'a command is required' : 'unknown command'
       )
     }
-    const flags = commandFlags(command, input.parsed.flags)
+    const flags = commandFlags(command, input.parsed)
+    const positionals = withoutTextValue(command, words, input.parsed)
     validateFlags(command, flags)
     validatePositionals(command, positionals)
     if (!command.available) {
@@ -523,7 +524,9 @@ export async function dispatch(input: DispatchInput): Promise<DispatchResult> {
     const args: CommandArgs = {
       positionals,
       flags,
-      text: input.parsed.text
+      // `reply --text "…"` 里那个 `--text` 是命令值，不是全局的人读输出开关：输出仍是 JSON
+      // 信封，worker 才能解析（§G.1 的 `--text` 只在不被命令声明为值时生效）。
+      text: usesTextValue(command, input.parsed) ? false : input.parsed.text
     }
     const response = await run(command, args, input)
     return fromResponse(command, response)
@@ -570,26 +573,61 @@ function validateFlags(command: CommandDefinition, flags: ParsedArgs['flags']): 
 }
 
 /**
- * `--text` 的双重身份（§G.1 的全局 `--text` 与 §G.2 `ticket note --text`）：
- * - 命令表声明了 `--text` 且它是**值**形态（`ticket note`）：解析层给成开关形态（`true`）
- *   说明调用方漏了值 → `invalid_params`（消息里只提 `--text`，不回显别的词）；
+ * `--text` 的双重身份（§G.1 的全局 `--text` 与 §G.2 的 `--text <text>`）：
+ * - 命令表声明了 `--text` 且它是**值**形态（`reply` / `ack` / `ticket note`）：`--text=value`
+ *   原样可用；`--text value` 时取解析层记下的 `textValue`（那个词仍留在 `words` 里，由
+ *   `withoutTextValue` 取走）；两者都没有 → `invalid_params`（只提 `--text`）；
  * - 命令表声明了 `--text` 且是开关（`prompts get --text`）：原样交给命令；
  * - 命令表没声明：`--text` 是全局输出开关，不进命令参数。
  */
 function commandFlags(
   command: CommandDefinition,
-  flags: ParsedArgs['flags']
+  parsed: ParsedArgs
 ): Readonly<Record<string, string | true>> {
   const spec = command.flags.find((flag) => flag.name === 'text')
   if (spec === undefined) {
-    const rest: Record<string, string | true> = { ...flags }
+    const rest: Record<string, string | true> = { ...parsed.flags }
     delete rest['text']
     return rest
   }
-  if (spec.kind === 'value' && flags['text'] === true) {
-    throw new ApiError(ERROR_CODES.invalidParams, `--text needs a value for ${command.name.join(' ')}`)
+  if (spec.kind === 'value' && parsed.flags['text'] === true) {
+    if (parsed.textValue === undefined) {
+      throw new ApiError(ERROR_CODES.invalidParams, `--text needs a value for ${command.name.join(' ')}`)
+    }
+    return { ...parsed.flags, text: parsed.textValue }
   }
-  return flags
+  return parsed.flags
+}
+
+/**
+ * 一次解析要不要按「人读文本」渲染：全局 `--text` 开关，除非这条命令把它当成了自己的值。
+ * `main` 用它决定 `render(envelope, { text })`，与 `dispatch` 交给命令的 `args.text` 一致。
+ */
+export function outputText(parsed: ParsedArgs): boolean {
+  if (!parsed.text) return false
+  const command = commandFor(parsed.words)
+  return command === null ? true : !usesTextValue(command, parsed)
+}
+
+/** 这条命令是否把 `--text value` 用成了自己的值（而不是全局的人读输出开关）。 */
+function usesTextValue(command: CommandDefinition, parsed: ParsedArgs): boolean {
+  const spec = command.flags.find((flag) => flag.name === 'text')
+  return spec?.kind === 'value' && parsed.flags['text'] === true && parsed.textValue !== undefined
+}
+
+/** `--text value` 的那个值已经被当成 flag：不再把它算成一个多余的位置参数。 */
+function withoutTextValue(
+  command: CommandDefinition,
+  positionals: readonly string[],
+  parsed: ParsedArgs
+): readonly string[] {
+  const spec = command.flags.find((flag) => flag.name === 'text')
+  if (spec?.kind !== 'value' || parsed.flags['text'] !== true || parsed.textValue === undefined) {
+    return positionals
+  }
+  const index = positionals.lastIndexOf(parsed.textValue)
+  if (index < 0) return positionals
+  return [...positionals.slice(0, index), ...positionals.slice(index + 1)]
 }
 
 /** 位置参数：必填的缺了 → `invalid_params`；多余的 → `invalid_params`。 */

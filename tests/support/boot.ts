@@ -6,7 +6,6 @@ import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { bootPlugin, type BootHandle } from '../../src/worker/boot.ts'
-import { Commands } from '../../src/worker/sources/commands.ts'
 import { FakeOrcaRuntime } from './fake-orca-runtime.ts'
 import { FakeCommands } from './fake-commands.ts'
 
@@ -73,7 +72,9 @@ export async function openBoot(options: {
   const commands = new FakeCommands()
   commands.script('gh api user', () => 'acme-agent\n')
   commands.script('gh api notifications', () => JSON.stringify([NOTIFICATION]))
-  commands.script('gh api repos/acme/widgets/issues/42/comments', () =>
+  // 读评论与写评论是同一个路径、不同的参数形状：脚本必须带上区分两者的那一段
+  // （读带 `--paginate`，写带 `-f body=…`），否则先注册的读脚本会把写调用也吃掉。
+  commands.script(['api', 'repos/acme/widgets/issues/42/comments', '--paginate'], () =>
     JSON.stringify(options.scriptComment === false ? [] : [COMMENT])
   )
   commands.script(['api', 'repos/acme/widgets/issues/42/comments?per_page=100', '-q'], () => '')
@@ -83,7 +84,8 @@ export async function openBoot(options: {
     bootPlugin({
       runtime,
       readSettings: async () => settings,
-      commands: new Commands(),
+      // 假 CLI 必须真的进组合根：否则 poll 会跑操作者机器上的真 `gh`（§I.6）。
+      commands,
       stateDir,
       disableTimers: true
     }))

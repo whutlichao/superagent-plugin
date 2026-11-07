@@ -1,5 +1,5 @@
 // GitHub Source kind（§I.1 的协议、§I.2 的最小面）：本票只声明通知轮询与 Issue 评论需要的
-// 那部分协议——配置、字段、facts、health、scope、Channel、Policy 与执行环境。
+// 那部分协议——配置、字段、facts、health、scope、Channel 与 Policy。
 //
 // 这里**不做**通知轮询本身（`poll.ts` 由组合根按 `pollSeconds` 驱动）；kind 只回答
 // 「这条 Trigger 我要不要听」（scope）与「回复怎么发出去」（channel）。
@@ -193,28 +193,6 @@ export function createGithubKind(cli: string): SourceKind<GithubConfig> {
         }
       ]
     },
-    environment: {
-      variables: [
-        {
-          key: 'DSH_SUPERAGENT_GITHUB_REPOSITORY',
-          description: both('GitHub 仓库 owner/name', 'The GitHub repository owner/name')
-        },
-        {
-          key: 'DSH_SUPERAGENT_GITHUB_ACCOUNT',
-          description: both('agent 的 GitHub 账号', 'The agent GitHub login')
-        },
-        {
-          key: 'DSH_SUPERAGENT_GITHUB_NUMBER',
-          description: both('起始 Issue/PR 号', 'The originating issue or pull request number')
-        }
-      ],
-      values: ({ deployment, trigger }) => ({
-        DSH_SUPERAGENT_GITHUB_REPOSITORY: deployment.repository,
-        DSH_SUPERAGENT_GITHUB_ACCOUNT: deployment.githubLogin,
-        DSH_SUPERAGENT_GITHUB_NUMBER:
-          trigger === undefined ? '' : String(trigger.meta['issue'] ?? '')
-      })
-    }
   }
 }
 

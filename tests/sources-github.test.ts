@@ -93,7 +93,8 @@ test('a notification expands into the Issue comments and one Trigger per comment
     api: api(commands),
     config: config(),
     login: 'acme-agent',
-    host: h.port
+    host: h.port,
+    cursorKey: githubCursorKey
   })
   const result = await poller.poll()
   assert.deepEqual(result, { notifications: 1, triggers: 1 })
@@ -134,7 +135,13 @@ test('polling the same notification twice reads the comments once', async () => 
   commands.script('gh api notifications', () => JSON.stringify([NOTIFICATION]))
   commands.script('gh api repos/acme/widgets/issues/42/comments', () => JSON.stringify([comment()]))
   const h = host()
-  const poller = createGithubPoller({ api: api(commands), config: config(), login: 'acme-agent', host: h.port })
+  const poller = createGithubPoller({
+    api: api(commands),
+    config: config(),
+    login: 'acme-agent',
+    host: h.port,
+    cursorKey: githubCursorKey
+  })
   assert.equal((await poller.poll()).triggers, 1)
   assert.equal((await poller.poll()).triggers, 0)
   const commentReads = commands.calls.filter((call) => call.args[1]?.includes('/comments')).length
@@ -148,7 +155,13 @@ test('a comment that does not mention the agent is still translated, with no add
     JSON.stringify([comment({ body: 'just thinking out loud' })])
   )
   const h = host()
-  const poller = createGithubPoller({ api: api(commands), config: config(), login: 'acme-agent', host: h.port })
+  const poller = createGithubPoller({
+    api: api(commands),
+    config: config(),
+    login: 'acme-agent',
+    host: h.port,
+    cursorKey: githubCursorKey
+  })
   await poller.poll()
   assert.equal(h.received[0]?.addressed, undefined)
   // Source 的监听范围：默认只听点名它的消息。
@@ -173,7 +186,8 @@ test('a message the agent wrote itself is dropped, not stored as a Trigger', asy
     api: api(commands),
     config: config(),
     login: 'acme-agent',
-    host: h.port
+    host: h.port,
+    cursorKey: githubCursorKey
   }).poll()
   assert.deepEqual(h.received, [])
 })
@@ -189,7 +203,8 @@ test('a bot comment is human:false and never carries a mention-based mandate', a
     api: api(commands),
     config: config(),
     login: 'acme-agent',
-    host: h.port
+    host: h.port,
+    cursorKey: githubCursorKey
   }).poll()
   assert.equal(h.received[0]?.human, false, 'a bot is never a human author')
   // 页面上的「点名」仍然记下来；能不能成为请求由 Gate 判（bot 永远不是显式请求）。
@@ -211,7 +226,8 @@ test('a non-Issue notification is recorded and skipped without reading anything'
     api: api(commands),
     config: config(),
     login: 'acme-agent',
-    host: h.port
+    host: h.port,
+    cursorKey: githubCursorKey
   }).poll()
   assert.deepEqual(result, { notifications: 1, triggers: 0 })
   assert.equal(commands.calls.length, 1, 'only the notification list was read')
@@ -234,7 +250,13 @@ test('three failing rounds put GitHub in error, and one success clears it', asyn
     )
   }
   const h = host()
-  const poller = createGithubPoller({ api: api(commands), config: config(), login: 'acme-agent', host: h.port })
+  const poller = createGithubPoller({
+    api: api(commands),
+    config: config(),
+    login: 'acme-agent',
+    host: h.port,
+    cursorKey: githubCursorKey
+  })
   await poller.poll()
   await poller.poll()
   assert.equal(h.state.get(githubCursorKey('notification-1')), undefined, 'a failed round does not advance the cursor')

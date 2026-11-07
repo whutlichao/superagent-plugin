@@ -144,6 +144,11 @@ function triggerOf(meta: Record<string, unknown> = {}): Trigger {
   }
 }
 
+/** 一条到达某个 Source 的最小 Trigger（`SourceScope` 只看它自己的字段）。 */
+function scopeTrigger(source: string, meta: Record<string, unknown> = {}): Trigger {
+  return { ...triggerOf(meta), source }
+}
+
 /** 一条出站消息。 */
 function messageOf(source: string, text = 'ok'): OutboundMessage {
   return {
@@ -452,33 +457,33 @@ describe('the SourceScope port', () => {
     const sources = new SourceRegistry({ settings: () => settings })
     sources.register(channelKind({ sent: [], read: [], configs: [] }))
 
-    assert.deepEqual(sources.scope({ source: 'channel-probe', meta: { room: 'room-1' } }), {
+    assert.deepEqual(sources.scope(scopeTrigger('channel-probe', { room: 'room-1' })), {
       listened: true,
       observed: true,
       row: 'room-1'
     })
-    assert.deepEqual(sources.scope({ source: 'channel-probe', meta: { room: 'room-2' } }), {
+    assert.deepEqual(sources.scope(scopeTrigger('channel-probe', { room: 'room-2' })), {
       listened: false,
       reason: 'room_not_allowed'
     })
-    assert.deepEqual(sources.scope({ source: 'channel-probe', meta: { direct: true } }), {
+    assert.deepEqual(sources.scope(scopeTrigger('channel-probe', { direct: true })), {
       listened: false,
       reason: 'direct_messages_not_allowed'
     })
     // 实例被禁用：固定原因码。
-    assert.deepEqual(sources.scope({ source: 'off', meta: {} }), {
+    assert.deepEqual(sources.scope(scopeTrigger('off')), {
       listened: false,
       reason: 'source_not_installed'
     })
     // 没存过配置的未注册 kind：默认监听、不 observed（内置 kind 尚未注册的早期阶段）。
-    assert.deepEqual(sources.scope({ source: 'unknown', meta: {} }), { listened: true, observed: false })
+    assert.deepEqual(sources.scope(scopeTrigger('unknown')), { listened: true, observed: false })
   })
 
   test('a disabled installed instance listens to nothing with its own reason', () => {
     const settings = settingsOf({ 'channel-probe': { enabled: false, config: {} } })
     const sources = new SourceRegistry({ settings: () => settings })
     sources.register(channelKind({ sent: [], read: [], configs: [] }))
-    assert.deepEqual(sources.scope({ source: 'channel-probe', meta: {} }), {
+    assert.deepEqual(sources.scope(scopeTrigger('channel-probe')), {
       listened: false,
       reason: 'source_disabled'
     })
@@ -488,7 +493,7 @@ describe('the SourceScope port', () => {
     const settings = settingsOf({ probe: { enabled: true, config: { interval: 0 } } })
     const sources = new SourceRegistry({ settings: () => settings })
     sources.register(probe)
-    assert.deepEqual(sources.scope({ source: 'probe', meta: {} }), {
+    assert.deepEqual(sources.scope(scopeTrigger('probe')), {
       listened: false,
       reason: 'source_config_invalid'
     })
@@ -498,7 +503,7 @@ describe('the SourceScope port', () => {
     const settings = settingsOf({ probe: { enabled: true, config: {} } })
     const sources = new SourceRegistry({ settings: () => settings })
     sources.register(probe)
-    assert.deepEqual(sources.scope({ source: 'probe', meta: { anything: true } }), {
+    assert.deepEqual(sources.scope(scopeTrigger('probe', { anything: true })), {
       listened: true,
       observed: false
     })

@@ -92,6 +92,8 @@ export interface PanelTicket {
     | 'idle'
     | 'working'
     | 'ended'
+  /** 已结束时的结局（§E.8 的 `outcome.*` 措辞用）；未结束没有它。 */
+  readonly outcome?: 'completed' | 'merged' | 'closed' | 'dropped' | 'stopped'
   /** 最后更新时间（epoch ms）。 */
   readonly at: number
 }

@@ -744,6 +744,7 @@ test('the route table carries every row §G.3 names', () => {
     'GET threads/:key',
     'GET tickets',
     'GET tickets/:id',
+    'POST ack',
     'POST admin/backup',
     'POST admin/rotate-token',
     'POST decisions/:id/dismiss',
@@ -751,6 +752,8 @@ test('the route table carries every row §G.3 names', () => {
     'POST executor/pause',
     'POST policy-sync/:id',
     'POST prompts/preview',
+    'POST reply',
+    'POST report',
     'POST router/restart',
     'POST setup/check',
     'POST sources/:id/labels',
@@ -1007,7 +1010,7 @@ test('every route refuses a role below its minimum with not_permitted_role', asy
         checked += 1
       }
     }
-    // 32 条路由：30 条高于 assignment，13 条是 operator → 43 次拒绝。
+    // 35 条路由：30 条高于 assignment（5 条是 assignment 档），13 条是 operator → 43 次拒绝。
     assert.equal(checked, 43, 'every route above assignment refuses it, and every operator route refuses router')
   } finally {
     harness.close()

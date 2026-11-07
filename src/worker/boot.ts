@@ -25,6 +25,7 @@ import { createMinimalPolicy } from './app/policy.ts'
 import { createDeterministicAssessor } from './app/assessor.ts'
 import { createOutbox, registerReplyEffects } from './app/outbox.ts'
 import { createPausedState } from './app/pause.ts'
+import { githubCursorKey } from './app/kv.ts'
 import { createRefreshableStateSource, type RefreshableStateSource } from './app/state-source.ts'
 import { statusBarView } from './app/status-bar.ts'
 import type { StatusBarView } from './app/status-bar.ts'
@@ -32,12 +33,12 @@ import { Effects } from './app/effects.ts'
 import { createPasses } from './app/passes.ts'
 import { notePluginVersion } from './app/upgrade.ts'
 import { createSourceContext } from './app/source-context.ts'
-import { EMPTY_SOURCE_SETTINGS, SourceRegistry, type SourceSettingsView } from './sources/registry.ts'
-import { Commands } from './sources/commands.ts'
+import { SourceRegistry, type SourceSettingsView } from './sources/registry.ts'
+import { Commands, type CommandsHost } from './sources/commands.ts'
 import { createGithubApi, createGithubKind, createGithubPoller, GITHUB_KIND } from './sources/github/index.ts'
 import type { GithubPollResult, GithubPoller } from './sources/github/index.ts'
 import type { Deployment } from './sources/kind.ts'
-import { OrcaExecutor, registerExecutorEffects, registerExecutorLifecycle, resolveExecutorSettings, type ExecutorLifecycle } from './executor/orca-executor.ts'
+import { OrcaExecutor, registerExecutorEffects, registerExecutorLifecycle, resolveExecutorSettings } from './executor/orca-executor.ts'
 import { resumeAfterUpgrade, type ResumeReport } from './executor/resume.ts'
 import { DEFAULT_MAX_WORKERS } from './http/state.ts'
 import { createDomainHandlers, withDomainHandlers } from './http/domain.ts'
@@ -55,7 +56,7 @@ export interface BootOptions {
   /** 读一次宿主设置（`orca.settings.get()` 的形状）。 */
   readonly readSettings: () => Promise<Readonly<Record<string, unknown>>>
   /** 命令端口（Source 的 `gh` 出口）；缺省按设置建一个。 */
-  readonly commands?: Commands
+  readonly commands?: CommandsHost
   /** `superagent` CLI 的绝对路径；缺省由模块位置推出 `src/bin/superagent.mjs`。 */
   readonly cliPath?: string
   readonly stateDir?: string
@@ -136,6 +137,8 @@ function settingsView(raw: Readonly<Record<string, unknown>>, enabled: boolean, 
 interface GithubSetup {
   readonly enabled: boolean
   readonly config: Record<string, unknown>
+  /** setup 探针读到的 agent 账号（读不到时回落设置；§I.2 的 `@mention` 与自身消息都要它）。 */
+  readonly login: string
   readonly problem?: { readonly place: string; readonly code: string; readonly detail?: string }
 }
 
@@ -383,6 +386,8 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
             observeComments: githubSetup.config['observeComments'] === true
           },
           login: deployment(settings, githubSetup).githubLogin,
+          // 游标键的命名留在 `app/kv.ts`（§D.3）：Source 只拿到构造函数。
+          cursorKey: githubCursorKey,
           host: createSourceContext({
             engine,
             store,
@@ -582,7 +587,7 @@ function deployment(
   return {
     repository: String(github.config['repository'] ?? ''),
     githubCli: String(github.config['cli'] ?? 'gh'),
-    githubLogin: text(settings['githubLogin']) ?? '',
+    githubLogin: github.login || text(settings['githubLogin']) || '',
     githubCommitEmail: text(settings['githubCommitEmail']) ?? '',
     feishuCli: '',
     feishuBotId: '',
@@ -594,9 +599,9 @@ function deployment(
 async function setupGithub(input: {
   readonly raw: Readonly<Record<string, unknown>>
   readonly stored: Record<string, unknown>
-  readonly commands: Commands
+  readonly commands: CommandsHost
   readonly log: (message: string) => void
-}): Promise<GithubSetup & { readonly login: string }> {
+}): Promise<GithubSetup> {
   const config = block(input.stored['config'])
   const enabled = flag(input.stored['enabled'], true)
   const repository = text(config['repository']) ?? text(input.raw['repository']) ?? ''

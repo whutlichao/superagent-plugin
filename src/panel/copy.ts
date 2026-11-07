@@ -71,6 +71,8 @@ export const COPY = {
   // ---- Overview 页（本票只交付壳；读数由 #37 填实）----
   'overview.nothingNeedsYou': { zh: '没有需要你处理的事。', en: 'Nothing needs you.' },
   'overview.awaitingYou': { zh: '待人工', en: 'Needs you' },
+  'overview.otherTickets': { zh: '其他工单', en: 'Other tickets' },
+  'execution.empty': { zh: '没有工单。', en: 'No tickets.' },
   'overview.problems': { zh: '系统问题', en: 'System problems' },
   'overview.problemCount': { zh: '系统问题：{count}', en: 'System problems: {count}' },
   'overview.flow': { zh: '24 小时流水', en: 'Last 24 hours' },

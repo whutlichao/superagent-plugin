@@ -9,7 +9,7 @@
 // 是浅色/深色主题；中英双语的键集合与页面文案由 `tests/locales.test.ts` 与
 // `tests/panel-navigation.test.tsx` 覆盖（它们能传 `locale`）。这条边界在票的回报里记明。
 import { defineCheck } from 'orca/testing'
-import type { AttentionItem, PanelState } from './protocol'
+import type { AttentionItem, PanelState, PanelTicket } from './protocol'
 
 /** 一份快照；只写关心的字段，其余按健康默认值补齐。 */
 function snapshot(overrides: {
@@ -22,6 +22,7 @@ function snapshot(overrides: {
   error?: boolean
   setupMissing?: boolean
   items?: readonly AttentionItem[]
+  tickets?: readonly PanelTicket[]
   activity?: Partial<PanelState['health']['activity']>
   executor?: Partial<PanelState['health']['executor']>
 }): PanelState {
@@ -49,13 +50,24 @@ function snapshot(overrides: {
       review,
       problems: overrides.problems ?? 0,
       items: overrides.items ?? []
-    }
+    },
+    tickets: overrides.tickets ?? []
   }
 }
 
 /** 一名待人工的工单；`at` 是固定时刻（check 不看真实时钟）。 */
 function ticket(id: string, title: string, action: AttentionItem['action'] = 'answer'): AttentionItem {
   return { id, title, action, at: 1_700_000_000_000 }
+}
+
+/** Execution 页的一行：同一个 Ticket 的读数（§Q.1 的验收面：两个情景都要有它）。 */
+function ticketRow(
+  id: string,
+  title: string,
+  stage: PanelTicket['stage'] = 'working',
+  outcome?: PanelTicket['outcome']
+): PanelTicket {
+  return { id, title, stage, at: 1_700_000_000_000, ...(outcome === undefined ? {} : { outcome }) }
 }
 
 /** 长列表：60 行，超过一页（50）。 */
@@ -96,11 +108,12 @@ export default defineCheck({
   },
   /** 健康且没什么要做：空态 + 24 h 流水。 */
   empty: hostFor(snapshot({ activity: { received: 2, evaluated: 1, accepted: 0, ignored: 1 } })),
-  /** 健康且有流水与负载。 */
+  /** 健康且有流水与负载；Execution 页有一张真实形状的工单行。 */
   healthy: hostFor(
     snapshot({
       activity: { received: 12, evaluated: 9, accepted: 3, ignored: 6, ended: 1 },
-      executor: { running: 1, maxWorkers: 4 }
+      executor: { running: 1, maxWorkers: 4 },
+      tickets: [ticketRow('t1', 'Fix the login redirect')]
     })
   ),
   /** 有待人工：两种阶段各一行。 */
@@ -109,7 +122,11 @@ export default defineCheck({
       answer: 1,
       review: 1,
       activity: { received: 6, evaluated: 5, accepted: 2, ignored: 3 },
-      items: [ticket('t1', 'Fix the login redirect'), ticket('t2', 'Review the parser rewrite', 'review')]
+      items: [ticket('t1', 'Fix the login redirect'), ticket('t2', 'Review the parser rewrite', 'review')],
+      tickets: [
+        ticketRow('t1', 'Fix the login redirect', 'answer'),
+        ticketRow('t2', 'Review the parser rewrite', 'review')
+      ]
     })
   ),
   /** 有系统问题：概要与问题数同时可见。 */
@@ -139,12 +156,16 @@ export default defineCheck({
   ),
   /** 浅色主题下的待人工页面（`theme` 是 check 能区分的维度；`locale` 见文件头）。 */
   zh: {
-    ...hostFor(snapshot({ answer: 1, items: [ticket('t1', '修复登录跳转')] })),
+    ...hostFor(
+      snapshot({ answer: 1, items: [ticket('t1', '修复登录跳转')], tickets: [ticketRow('t1', '修复登录跳转', 'answer')] })
+    ),
     theme: 'light' as const
   },
   /** 深色主题下的同一页面。 */
   en: {
-    ...hostFor(snapshot({ answer: 1, items: [ticket('t1', 'Fix the login redirect')] })),
+    ...hostFor(
+      snapshot({ answer: 1, items: [ticket('t1', 'Fix the login redirect')], tickets: [ticketRow('t1', 'Fix the login redirect', 'answer')] })
+    ),
     theme: 'dark' as const
   },
   /** 危险操作入口：暂停态 + 待人工，页面上同时有「恢复处理」（需二次确认）与待办行。 */
