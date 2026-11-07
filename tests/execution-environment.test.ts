@@ -517,9 +517,15 @@ describe('no code path turns message text into a shell string (§O)', () => {
     assert.deepEqual(owners, ['src/worker/executor/environment.ts'])
   })
 
-  test('only the command port starts a child process, so text can never reach a shell elsewhere', () => {
+  test('only the command port and the runtime CLI start a child process, so text can never reach a shell elsewhere', () => {
     const importers = CODE_FILES.filter((file) => codeLines(file).some(({ line }) => line.includes("'node:child_process'")))
-    assert.deepEqual(importers, ['src/worker/sources/commands.ts'])
+    // 两个允许的接缝（§B.1 / §I.4）：Source 的 `gh` 出口与 `runtime/` 里的 `orca` CLI 包装。
+    // 其它目录（core、app、executor、http、cli、panel…）一律不得创建子进程。
+    const allowed = (file: string): boolean =>
+      file === 'src/worker/sources/commands.ts' || file.startsWith('src/worker/runtime/')
+    assert.deepEqual(importers.filter((file) => !allowed(file)), [], 'no other directory starts a child process')
+    assert.ok(importers.includes('src/worker/sources/commands.ts'), 'the Source command port is one seam')
+    assert.ok(importers.includes('src/worker/runtime/cli.ts'), 'the Orca CLI wrapper is the other seam')
   })
 })
 

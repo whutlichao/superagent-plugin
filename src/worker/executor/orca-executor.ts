@@ -256,6 +256,11 @@ function briefBody(text: string, original: string): string {
   } more characters; original: ${original})`
 }
 
+/** 开播后写进终端的一行指针：作业文本在文件里，终端的写入与回执都可观察（§E.4、§Q.1）。 */
+export function assignmentPointer(path: string): string {
+  return `[superagent] assignment ready: read ${path}`
+}
+
 /** 开播前写好的作业文本（`inbox/0.md`）：Ticket 卡 + 原始请求 + 环境 + 工作方式。 */
 export function renderAssignmentBrief(options: {
   readonly ticket: Ticket
@@ -494,6 +499,17 @@ export function registerExecutorEffects(options: RegisterExecutorOptions): void 
       launches: options.launchHook ?? defaultLaunchHook,
       ...(options.wait === undefined ? {} : { wait: options.wait })
     })
+    // 作业文本已落盘（`inbox/0.md`），开播语也指向它；这里再往终端写一行指针（§E.4 的
+    // sendText 形态、§Q.1 的「worktree → launch → sendText」顺序）。写不进去不把 launch
+    // 判成失败：agent 已经跑起来，终端写入由下一次投递重试。
+    try {
+      const receipt = await runtime.sendText(handle.terminalId, assignmentPointer(briefPath), {
+        enter: true
+      })
+      if (!receipt.accepted) log(`the assignment pointer for ${ticket.id} was not accepted`)
+    } catch (error) {
+      log(`could not write the assignment pointer for ${ticket.id}: ${messageOf(error)}`)
+    }
     engine.assignmentStarted(ticket.id, assignment.id, {
       terminalId: handle.terminalId,
       workspace: { short: workspace.short, directory: workspace.handle.path, assignment: brief }

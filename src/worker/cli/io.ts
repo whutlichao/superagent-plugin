@@ -39,6 +39,12 @@ export interface ParsedArgs {
   readonly flags: Readonly<Record<string, string | true>>
   /** `--text`：人读文本输出；缺省（或 `--json`）是 JSON 信封。 */
   readonly text: boolean
+  /**
+   * `--text <value>` 后面那个词：语法层把 `--text` 当开关（全局输出开关的同一名字），
+   * 命令表把它声明为值（§G.2 的 `reply` / `ack` / `ticket note`）时，由 `dispatch` 取走。
+   * 该词仍留在 `words` 里：解析层不认识命令，不替它吞词。
+   */
+  readonly textValue?: string
 }
 
 /** 所有命令都接受的全局开关（其余开关由命令自己的 spec 决定）。 */
@@ -82,6 +88,7 @@ export const BOOLEAN_FLAGS: readonly string[] = [
 export function parseArgs(argv: readonly string[]): ParsedArgs {
   const flags: Record<string, string | true> = {}
   const words: string[] = []
+  let textValue: string | undefined
   let index = 0
 
   while (index < argv.length) {
@@ -111,6 +118,12 @@ export function parseArgs(argv: readonly string[]): ParsedArgs {
     }
     if (BOOLEAN_FLAGS.includes(name)) {
       flags[name] = true
+      // `--text` 的双重身份（§G.1 全局开关 / §G.2 命令值）：记下后面那个词，
+      // 由 `dispatch` 在命令把它声明为值时才取走；解析层绝不替命令吞词。
+      if (name === 'text') {
+        const next = argv[index]
+        if (next !== undefined && !next.startsWith('--')) textValue = next
+      }
       continue
     }
     const value = argv[index]
@@ -119,7 +132,7 @@ export function parseArgs(argv: readonly string[]): ParsedArgs {
     flags[name] = value
   }
 
-  return { words, flags, text: flags['text'] === true }
+  return { words, flags, text: flags['text'] === true, ...(textValue === undefined ? {} : { textValue }) }
 }
 
 /** `invalid_params` 的统一构造：只提 flag 名，不作任何回显。 */

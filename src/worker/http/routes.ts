@@ -64,8 +64,11 @@ export interface RouteInput {
   readonly requestId?: string | null
 }
 
-/** handler 的返回值：直接进 `{ok:true, result}`。 */
-export type RouteResult = unknown
+/**
+ * handler 的返回值：直接进 `{ok:true, result}`。只允许 JSON 能表达的值（对象由调用方
+ * 负责它可序列化），这样 handler 不会把函数、Promise 或 class 实例漏给响应信封。
+ */
+export type RouteResult = object | string | number | boolean | null | undefined | void
 
 /** handler 签名（CLI 与 HTTP 共用同一批 handler）。 */
 export type RouteHandler = (input: RouteInput) => RouteResult | Promise<RouteResult>
@@ -176,6 +179,11 @@ export const ROUTE_TABLE: readonly RouteDefinition[] = [
   { method: 'POST', path: 'tickets/:id/note', command: 'ticket note', minimumRole: 'router', handler: stub },
   { method: 'POST', path: 'tickets/:id/request-status', command: 'ticket request-status', minimumRole: 'router', handler: stub },
 
+  // ---- Worker 的三条（§G.2 的 report / reply / ack；Ticket 来自 assignment token）
+  { method: 'POST', path: 'report', command: 'report', minimumRole: 'assignment', handler: stub },
+  { method: 'POST', path: 'reply', command: 'reply', minimumRole: 'assignment', handler: stub },
+  { method: 'POST', path: 'ack', command: 'ack', minimumRole: 'assignment', handler: stub },
+
   // ---- 面板专属动作与运维动作（operator）
   { method: 'POST', path: 'sources/:id/labels', command: 'source labels', minimumRole: 'operator', handler: stub },
   { method: 'POST', path: 'decisions/:id/dismiss', command: 'read decisions --dismiss', minimumRole: 'operator', handler: stub },
@@ -190,16 +198,19 @@ export const ROUTE_TABLE: readonly RouteDefinition[] = [
   { method: 'POST', path: 'admin/rotate-token', command: 'admin rotate-token', minimumRole: 'operator', handler: stub }
 ]
 
+/** 请求体里可以出现的一条 JSON 值（这里就是设置写入的形状）。 */
+type BodyValue = string | number | boolean | null | readonly BodyValue[] | { readonly [key: string]: BodyValue }
+
 /** 从 `{value, revision}` 的请求体里取 `value`（形状不对交给 handler 报 invalid_params）。 */
-function bodyValue(body: unknown): unknown {
+function bodyValue(body: unknown): BodyValue | undefined {
   if (typeof body !== 'object' || body === null) return undefined
-  return (body as Record<string, unknown>)['value']
+  return (body as { readonly value?: BodyValue }).value
 }
 
 /** 对象（或它的 `config`）是否自带某个键。 */
-function containsKey(value: unknown, key: string): boolean {
+function containsKey(value: BodyValue | undefined, key: string): boolean {
   if (typeof value !== 'object' || value === null) return false
   if (Object.prototype.hasOwnProperty.call(value, key)) return true
-  const config = (value as Record<string, unknown>)['config']
+  const config = (value as { readonly config?: BodyValue }).config
   return typeof config === 'object' && config !== null && Object.prototype.hasOwnProperty.call(config, key)
 }

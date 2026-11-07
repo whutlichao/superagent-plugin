@@ -12,7 +12,7 @@
 // 也不含整段 argv；错误信封只有固定 `code`/`message`/`values`（`values` 是填槽值）。
 import type { CliTarget } from './target.ts'
 import { resolveTarget } from './target.ts'
-import { dispatch } from './commands.ts'
+import { dispatch, outputText } from './commands.ts'
 import { CLI_COMMANDS } from './commands.ts'
 import { EXIT, parseArgs, render, type ExitCode } from './io.ts'
 
@@ -84,7 +84,7 @@ export async function main(options: MainOptions): Promise<MainResult> {
     ...(options.sleep === undefined ? {} : { sleep: options.sleep }),
     ...(options.stdin === undefined ? {} : { stdin: options.stdin })
   })
-  const text = render(result.envelope, { text: parsed.text })
+  const text = render(result.envelope, { text: outputText(parsed) })
   io.out(text)
   if (!result.envelope.ok) {
     io.err(`error: ${result.envelope.error.code}: ${result.envelope.error.message}`)

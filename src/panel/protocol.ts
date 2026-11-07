@@ -78,6 +78,26 @@ export interface WorkerHealth {
   readonly executor: { readonly running: number; readonly maxWorkers: number }
 }
 
+/** Execution 页的一行（本票的垂直切片：真实的 Ticket 读数，详情页归 #38）。 */
+export interface PanelTicket {
+  readonly id: string
+  readonly title: string
+  /** §E.8 的七档之一；已结束是 `ended`。 */
+  readonly stage:
+    | 'delivery'
+    | 'answer'
+    | 'review'
+    | 'blockedFailed'
+    | 'queued'
+    | 'idle'
+    | 'working'
+    | 'ended'
+  /** 已结束时的结局（§E.8 的 `outcome.*` 措辞用）；未结束没有它。 */
+  readonly outcome?: 'completed' | 'merged' | 'closed' | 'dropped' | 'stopped'
+  /** 最后更新时间（epoch ms）。 */
+  readonly at: number
+}
+
 /** 一份面板状态快照。本票只交付恒定骨架；真实读数由后续票填进同一形状。 */
 export interface PanelState {
   /** 单调递增的修订号：面板据此丢弃过期推送。 */
@@ -86,6 +106,11 @@ export interface PanelState {
   readonly booted: boolean
   readonly health: WorkerHealth
   readonly attention: AttentionCounts & { readonly items: readonly AttentionItem[] }
+  /**
+   * Execution 页的行（最近的 Ticket，最多 50 条）。可选：旧快照（面板壳的测试与
+   * `plugin check` 的夹具）没有它时页面按空列表渲染。
+   */
+  readonly tickets?: readonly PanelTicket[]
 }
 
 /** 面板可发起的动作：暂停/恢复处理（§M.2 的 Overview 主操作，破坏性，需行内二次确认）。 */

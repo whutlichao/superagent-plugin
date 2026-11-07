@@ -14,7 +14,8 @@ import {
   type DecisionKind,
   type SourceState,
   type ThreadStage,
-  type TicketAction
+  type TicketAction,
+  type TicketOutcome
 } from './marks'
 import { MarkBadge } from './widgets'
 
@@ -22,21 +23,38 @@ import { MarkBadge } from './widgets'
 export interface TicketRowData {
   readonly id: string
   readonly title: string
-  /** 行的阶段：`queued` 在 working 阶段，其余五个在 person 阶段。 */
-  readonly action: TicketAction
+  /**
+   * 等人做的事（`answer`/`review`/…）或排队；与 `stage` 二选一。
+   * Overview 的「待人工」行用它；Execution 页的行用 `stage`。
+   */
+  readonly action?: TicketAction
+  /** 非「等人」的阶段：`working` / `idle` / `ended`。 */
+  readonly stage?: 'working' | 'idle' | 'ended'
+  /** 已结束时的结局（`stage: 'ended'` 用来措辞）。 */
+  readonly outcome?: TicketOutcome
   /** 最后更新时间（epoch ms）；时间一律交给 `RelativeTime`。 */
   readonly at: number
   /** 行上直接可做的动作；缺省表示只读。 */
   readonly onOpen?: () => void
 }
 
+/** Ticket 行的标记：有 `action` 时按「等谁/做什么」措辞，否则按阶段/结局。 */
+function rowMark(ticket: TicketRowData) {
+  if (ticket.action !== undefined) {
+    return ticket.action === 'queued'
+      ? ticketMark({ stage: 'working', action: 'queued' })
+      : ticketMark({ stage: 'person', action: ticket.action })
+  }
+  return ticketMark({
+    stage: ticket.stage ?? 'working',
+    ...(ticket.outcome === undefined ? {} : { outcome: ticket.outcome })
+  })
+}
+
 /** Ticket 行：阶段标记 + 标题 + 相对时间（§M.2 Overview ①：「每行给直接动作」）。 */
 export function TicketRow(props: { readonly locale: string; readonly ticket: TicketRowData }) {
   const { ticket } = props
-  const mark =
-    ticket.action === 'queued'
-      ? ticketMark({ stage: 'working', action: 'queued' })
-      : ticketMark({ stage: 'person', action: ticket.action })
+  const mark = rowMark(ticket)
   const label = markLabel(props.locale, mark)
   return (
     <ListItem

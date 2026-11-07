@@ -16,8 +16,11 @@ import { ApiError } from '../src/worker/http/errors'
 import { dispatch } from '../src/worker/cli/commands'
 import { parseArgs } from '../src/worker/cli/io'
 import { main } from '../src/worker/cli/main'
-import { tempStateDir } from './support/state'
+import { createDomainHandlers, withDomainHandlers } from '../src/worker/http/domain'
+import { ROUTE_TABLE } from '../src/worker/http/routes'
+import { AT, tempStateDir } from './support/state'
 import { startTestServer, type TestServer } from './support/cli-server'
+import type { Ticket } from '../src/worker/core/index'
 
 /** 一条契约用例。`ok` 为真时断言成功，否则断言 `error.code` 与退出码。 */
 interface Case {
@@ -88,6 +91,42 @@ const WIRED: readonly (readonly [string, Case, Case])[] = [
     'read',
     { argv: ['read', 'overview'], exit: 3, code: 'unavailable' },
     { argv: ['read', 'nope'], exit: 2, code: 'missing' }
+  ],
+  // 本票接线的 Worker 三条（§G.2 的 report / reply / ack）：打到真的领域 handler。
+  [
+    'reply',
+    {
+      argv: ['reply', '--purpose', 'attention', '--text', 'Need a decision', '--human-action', 'Which branch?'],
+      exit: 0,
+      resultKeys: ['id', 'status', 'reused']
+    },
+    { argv: ['reply', '--purpose', 'answer', '--text', 'yes'], exit: 2, code: 'invalid_params' }
+  ],
+  [
+    'ack',
+    {
+      argv: ['ack', '--trigger', 'trigger-1', '--text', 'On it'],
+      exit: 0,
+      resultKeys: ['id', 'status', 'reused'],
+      token: 'assignment'
+    },
+    // 没有 assignment token 的调用者不能替某个 Ticket 确认（§O）。
+    { argv: ['ack', '--trigger', 'trigger-1', '--text', 'On it'], exit: 2, code: 'not_permitted_role' }
+  ],
+  [
+    'report',
+    {
+      argv: ['report', '--state', 'ready', '--summary', 'The redirect is fixed.'],
+      exit: 0,
+      resultKeys: ['ticket', 'assignment'],
+      token: 'assignment'
+    },
+    // report 只属于 assignment：Ticket 来自它的 token，不是参数（§G.2）。
+    {
+      argv: ['report', '--state', 'ready', '--summary', 'The redirect is fixed.'],
+      exit: 2,
+      code: 'not_permitted_role'
+    }
   ]
 ]
 
@@ -107,15 +146,49 @@ const PENDING: readonly string[][] = [
   ['thread', 'unsubscribe', 'k'],
   ['thread', 'follow', 'k'],
   ['thread', 'unrelated', 'k'],
-  ['reply', '--purpose', 'answer', '--trigger', 't-1', '--text=a'],
-  ['ack', '--trigger', 't-1', '--text=a'],
-  ['report', '--state', 'progress', '--summary', 's'],
   ['settings', 'get'],
   ['settings', 'save', '--block', 'executor', '--value={}', '--revision', '1'],
   ['policy', 'sync', 'github'],
   ['prompts', 'get'],
   ['prompts', 'save']
 ]
+
+/** 一个能通过领域 handler 形状检查的最小 Ticket（handler 只读它来组 view）。 */
+function ticketForCommands(): Ticket {
+  return {
+    id: 'ticket-own',
+    title: 'Fix the login redirect',
+    decisionId: 'decision-1',
+    mandate: {
+      strength: 'explicit',
+      policyVersion: 'v1',
+      basis: { via: 'addressed', addressed: 'mention' },
+      actor: { source: 'github', id: 'alice' },
+      scope: 'ticket'
+    },
+    channels: [],
+    assignments: [{ id: 'assignment-1', state: 'running', createdAt: AT, startedAt: AT }],
+    inputs: [],
+    undelivered: [],
+    createdAt: AT,
+    updatedAt: AT,
+    origin: { triggerId: 'trigger-1', triggerIds: ['trigger-1'] }
+  }
+}
+
+/** 真领域 handler 的接线：report/reply/ack 的写入口换成记录用的替身（它们各自有专门测试）。 */
+function commandRoutes(): ReturnType<typeof withDomainHandlers> {
+  const ticket = ticketForCommands()
+  return withDomainHandlers(
+    ROUTE_TABLE,
+    createDomainHandlers({
+      report: () => ticket,
+      reply: () => ({ id: 'reply-1', status: 'pending', reused: false }),
+      ticketOf: (id) => (id === ticket.id ? ticket : undefined),
+      tickets: () => [ticket]
+    })
+  )
+}
 
 /** 跑一次用例：真服务器、真 token、真 HTTP；`offline` 的用例断言零请求。 */
 async function runCase(server: TestServer, entry: Case): Promise<{ readonly exit: number; readonly envelope: unknown }> {
@@ -164,7 +237,8 @@ test('every command that is wired has a success case and a fixed refusal', async
       cliPath: process.execPath,
       now: () => '2026-11-07T03:26:00.000Z',
       portOpen: async () => true
-    }
+    },
+    routes: commandRoutes()
   })
   try {
     for (const [name, success, refusal] of WIRED) {
@@ -364,6 +438,23 @@ test('stdout and stderr never carry the token, and the error line carries the fi
   } finally {
     server.close()
     rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('--text as a command value keeps the JSON envelope (it is not the output switch)', async () => {
+  const server = await startTestServer({ routes: commandRoutes() })
+  try {
+    const out: string[] = []
+    const result = await main({
+      argv: ['reply', '--purpose', 'attention', '--text', 'Need a decision', '--human-action', 'Which branch?'],
+      io: { out: (line) => out.push(line), err: () => undefined },
+      target: server.target()
+    })
+    assert.equal(result.exit, 0)
+    const printed = JSON.parse(out.join('\n')) as { readonly ok?: unknown }
+    assert.equal(printed.ok, true, 'worker scripts parse the JSON envelope, not a human line')
+  } finally {
+    server.close()
   }
 })
 

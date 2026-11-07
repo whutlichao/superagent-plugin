@@ -26,7 +26,15 @@ import {
 } from 'orca'
 import { GLOSSARY_GROUPS, translate, type CopyKey } from './copy'
 import { markLabel, ticketMark, type MarkTone } from './marks'
-import { isNavPage, NAV_PAGES, type AttentionItem, type NavPage, type PanelState } from './protocol'
+import {
+  isNavPage,
+  NAV_PAGES,
+  type AttentionItem,
+  type NavPage,
+  type PanelState,
+  type PanelTicket
+} from './protocol'
+import { TicketRow, type TicketRowData } from './rows'
 import {
   BootingState,
   ConfirmAction,
@@ -184,6 +192,29 @@ function GlossaryOverlay(props: { readonly locale: string; readonly onClose: () 
   )
 }
 
+/** 一条 Execution 行（`PanelTicket`）→ 共享的 Ticket 行（§M.2 Execution；详情归 #38）。 */
+function executionRow(ticket: PanelTicket): TicketRowData {
+  if (ticket.stage === 'ended') {
+    return {
+      id: ticket.id,
+      title: ticket.title,
+      at: ticket.at,
+      stage: 'ended',
+      ...(ticket.outcome === undefined ? {} : { outcome: ticket.outcome })
+    }
+  }
+  if (ticket.stage === 'working' || ticket.stage === 'idle') {
+    return { id: ticket.id, title: ticket.title, at: ticket.at, stage: ticket.stage }
+  }
+  if (ticket.stage === 'queued') {
+    return { id: ticket.id, title: ticket.title, at: ticket.at, action: 'queued' }
+  }
+  if (ticket.stage === 'blockedFailed') {
+    return { id: ticket.id, title: ticket.title, at: ticket.at, action: 'failed' }
+  }
+  return { id: ticket.id, title: ticket.title, at: ticket.at, action: ticket.stage }
+}
+
 /** 一名待人工 Ticket 的行（§M.2 Overview ①）：阶段标记 + 标题 + 相对时间。 */
 function AttentionRow(props: { readonly locale: string; readonly item: AttentionItem }): OrcaElement {
   const mark = ticketMark({ stage: 'person', action: props.item.action })
@@ -226,6 +257,10 @@ function Overview(props: { readonly locale: string; readonly state: PanelState }
   const paused = state.health.paused
   const flow = state.health.activity
   const executor = state.health.executor
+  // 「待人工」已经按动作列出的工单，不在下面重复一遍；其余（工作中/闲置/已结束）在这里
+  // 以同一种行展示（§M.2 Overview 的数据面：Ticket 行来自同一份快照）。
+  const shown = new Set(pending.map((item) => item.id))
+  const otherTickets = (state.tickets ?? []).filter((ticket) => !shown.has(ticket.id))
   return (
     <Stack gap="md">
       {state.health.setupMissing ? (
@@ -276,6 +311,16 @@ function Overview(props: { readonly locale: string; readonly state: PanelState }
         ) : null}
       </Section>
 
+      {otherTickets.length > 0 ? (
+        <Section title={words(locale, 'overview.otherTickets')} count={otherTickets.length}>
+          <List label={words(locale, 'overview.otherTickets')}>
+            {otherTickets.slice(0, read(rows)).map((ticket) => (
+              <TicketRow key={ticket.id} locale={locale} ticket={executionRow(ticket)} />
+            ))}
+          </List>
+        </Section>
+      ) : null}
+
       {state.attention.problems > 0 ? (
         <Section title={words(locale, 'overview.problems')}>
           <Text tone="warning" size="sm">
@@ -323,12 +368,43 @@ async function setPaused(paused: boolean): Promise<void> {
   }
 }
 
-/** 一页：Overview 有读数，其余页面在页面票里填充（本票只交付壳）。 */
+/**
+ * Execution 页（§M.2 的 Ticket 列表；详情归 #38）：行来自 worker 快照的 `tickets`，
+ * 与 Overview 用同一个 `TicketRow`，因此同一张工单在三个页面上的标记与措辞一致。
+ */
+function Execution(props: { readonly locale: string; readonly state: PanelState }): OrcaElement {
+  const locale = props.locale
+  const tickets = props.state.tickets ?? []
+  return (
+    <Stack gap="md">
+      <Section title={translate(locale, 'nav.execution')} count={tickets.length}>
+        {tickets.length === 0 ? (
+          <EmptyStateBlock title={words(locale, 'execution.empty')} icon="layers" />
+        ) : (
+          <List label={translate(locale, 'nav.execution')}>
+            {tickets.slice(0, read(rows)).map((ticket) => (
+              <TicketRow key={ticket.id} locale={locale} ticket={executionRow(ticket)} />
+            ))}
+          </List>
+        )}
+        {tickets.length > read(rows) ? (
+          <Row>
+            <Button variant="outline" size="sm" onPress={() => set(rows, read(rows) + PAGE_ROWS)}>
+              {words(locale, 'state.loadMore')}
+            </Button>
+          </Row>
+        ) : null}
+      </Section>
+    </Stack>
+  )
+}
+
+/** 一页：Overview 与 Execution 有真实读数，其余页面在页面票里填充（本票只交付壳）。 */
 function PageBody(props: { readonly locale: string; readonly current: NavPage }): OrcaElement {
   const locale = props.locale
   const state = read(snapshot)
   const stage = read(phase)
-  if (props.current === 'overview') {
+  if (props.current === 'overview' || props.current === 'execution') {
     if (stage === 'error') {
       return <ErrorStateView locale={locale} />
     }
@@ -339,7 +415,11 @@ function PageBody(props: { readonly locale: string; readonly current: NavPage })
         <BootingState text={words(locale, 'boot.retrying')} />
       )
     }
-    return <Overview locale={locale} state={state} />
+    return props.current === 'overview' ? (
+      <Overview locale={locale} state={state} />
+    ) : (
+      <Execution locale={locale} state={state} />
+    )
   }
   return (
     <Stack gap="sm">
