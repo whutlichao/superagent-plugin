@@ -10,6 +10,8 @@ import { bootPlugin, defaultCliPath, type BootHandle } from './boot'
 import { createStatusBarPublisher } from './app/status-bar'
 import { Commands } from './sources/commands'
 import { LAUNCH_HOOK_EVENT, launchHook, type LaunchHookEvent } from './executor/launch-hook'
+import { REPLY_WORD_LIMIT, wordCount } from './http/domain'
+import { EXECUTION_FILTERS, isExecutionFilter, type TicketListInput } from '../panel/protocol'
 
 /** 四个贡献命令的 id，与 orca-plugin.json 的 contributes.commands 一一对应。 */
 const COMMANDS = {
@@ -62,6 +64,43 @@ function codeOf(error: unknown, fallback: string): string {
       ? (error as { code?: unknown }).code
       : undefined
   return typeof code === 'string' && code !== '' ? code : fallback
+}
+
+/** 面板动作的固定拒绝（形状不对就是 `invalid_params`，与其它面板请求同一口径）。 */
+function invalidParams(message: string): Error & { code: string } {
+  return Object.assign(new Error(message), { code: 'invalid_params' })
+}
+
+/** 一次面板请求里的 `{ ticketId: string }`。 */
+function ticketIdOf(input: unknown, name: string): string {
+  const ticketId = (input as { ticketId?: unknown } | null)?.ticketId
+  if (typeof ticketId !== 'string' || ticketId === '') {
+    throw invalidParams(`${name} needs { ticketId: string }`)
+  }
+  return ticketId
+}
+
+/** 一次 Execution 列表请求（§M.2 的筛选 + §M.4 的分页）；越界的窗口按 `invalid_params` 拒绝。 */
+function ticketListOf(input: unknown): TicketListInput {
+  const window = (input ?? {}) as { filter?: unknown; offset?: unknown; limit?: unknown }
+  const filter = window.filter
+  if (filter !== undefined && !isExecutionFilter(filter)) {
+    throw invalidParams(`tickets needs filter ∈ ${EXECUTION_FILTERS.join(', ')}`)
+  }
+  const count = (value: unknown, name: string): number | undefined => {
+    if (value === undefined) return undefined
+    if (typeof value !== 'number' || !Number.isInteger(value) || value < 0) {
+      throw invalidParams(`tickets needs { ${name}: a non-negative integer }`)
+    }
+    return value
+  }
+  const offset = count(window.offset, 'offset')
+  const limit = count(window.limit, 'limit')
+  return {
+    ...(isExecutionFilter(filter) ? { filter } : {}),
+    ...(offset === undefined ? {} : { offset }),
+    ...(limit === undefined ? {} : { limit })
+  }
 }
 
 /**
@@ -129,6 +168,70 @@ export default function activate(orca: OrcaWorkerApi): void {
     } catch (error) {
       // 领域的 `notRetryable` / 找不到工单都折成面板能显示的拒绝（§G.2 的固定错误面）。
       throw Object.assign(new Error(messageOf(error)), { code: codeOf(error, 'invalid_params') })
+    }
+  })
+  // Execution 页（§M.2）：列表与详情是读；停止、note、请求状态与两条 worktree 动作是写，
+  // 都经 boot 的同一批 handler（命令行的 `ticket *` 走同一批领域函数）。
+  host.handleRequest('tickets', async (input) => (await ready()).tickets(ticketListOf(input)))
+  host.handleRequest('ticket.detail', async (input) => {
+    const booted = await ready()
+    try {
+      return await booted.ticketDetail(ticketIdOf(input, 'ticket.detail'))
+    } catch (error) {
+      throw Object.assign(new Error(messageOf(error)), { code: codeOf(error, 'invalid_params') })
+    }
+  })
+  host.handleRequest('ticket.stop', async (input) => {
+    const booted = await ready()
+    try {
+      return booted.stopTicket(ticketIdOf(input, 'ticket.stop'))
+    } catch (error) {
+      throw Object.assign(new Error(messageOf(error)), { code: codeOf(error, 'invalid_params') })
+    }
+  })
+  host.handleRequest('ticket.note', async (input) => {
+    const text = (input as { text?: unknown } | null)?.text
+    if (typeof text !== 'string' || text.trim() === '') {
+      throw invalidParams('ticket.note needs { ticketId: string, text: string }')
+    }
+    // §G.2 的 `ticket note` 有同一道词数上限：命令行的拒绝与面板的拒绝必须是同一条规则。
+    if (wordCount(text) > REPLY_WORD_LIMIT) {
+      throw Object.assign(
+        new Error(`the note is ${wordCount(text)} words; the limit is ${REPLY_WORD_LIMIT}`),
+        { code: 'too_long' }
+      )
+    }
+    const booted = await ready()
+    try {
+      return booted.noteTicket(ticketIdOf(input, 'ticket.note'), text)
+    } catch (error) {
+      throw Object.assign(new Error(messageOf(error)), { code: codeOf(error, 'invalid_params') })
+    }
+  })
+  host.handleRequest('ticket.requestStatus', async (input) => {
+    const booted = await ready()
+    try {
+      return { asked: booted.requestStatus(ticketIdOf(input, 'ticket.requestStatus')) }
+    } catch (error) {
+      throw Object.assign(new Error(messageOf(error)), { code: codeOf(error, 'invalid_params') })
+    }
+  })
+  host.handleRequest('workspace.open', async (input) => {
+    const booted = await ready()
+    try {
+      await booted.openTicketWorkspace(ticketIdOf(input, 'workspace.open'))
+      return { opened: true }
+    } catch (error) {
+      throw Object.assign(new Error(messageOf(error)), { code: codeOf(error, 'action_failed') })
+    }
+  })
+  host.handleRequest('workspace.remove', async (input) => {
+    const booted = await ready()
+    try {
+      await booted.removeTicketWorkspace(ticketIdOf(input, 'workspace.remove'))
+      return { removed: true }
+    } catch (error) {
+      throw Object.assign(new Error(messageOf(error)), { code: codeOf(error, 'action_failed') })
     }
   })
   host.handleRequest('terminal.focus', async (input) => {

@@ -23,6 +23,8 @@ export const KV_KEY_LITERALS = {
   githubCursorPrefix: 'github-cursor:',
   githubBodyPrefix: 'github-body:',
   githubCiPrefix: 'github-ci:',
+  githubStreamPrefix: 'github-stream:',
+  githubBranchCi: 'github-branch-ci',
   feishuCursorPrefix: 'feishu-cursor:',
   feishuChats: 'feishu-chats',
   feishuTopicsPrefix: 'feishu-topics:',
@@ -87,6 +89,18 @@ export const githubBodyKey = (issue: number | string): string =>
  */
 export const githubCiKey = (pull: number | string, headSha: string): string =>
   `${KV_KEY_LITERALS.githubCiPrefix}${pull}#${headSha}`
+/**
+ * 一条仓库级事件流的读位置（§I.2 receive-all 行、票 #36）：值形状 `{ since, started }`。
+ * `since` 是下一轮从哪读起（最新一条往前 5 秒）；`started` 记录每个条目种类是什么时候被
+ * 打开开关的——「从打开的时候开始，不读以前的」。流名是 `issues` / `comments` / `review-comments`。
+ */
+export const githubStreamKey = (stream: string): string =>
+  `${KV_KEY_LITERALS.githubStreamPrefix}${stream}`
+/**
+ * 默认分支 CI 的基线（§I.2 receive-all 行、票 #36）：值形状 `{ branch, fingerprint }`。
+ * 只存失败集合的指纹：通过、进行中都不是变化；换了默认分支就从新的基线重新开始。
+ */
+export const githubBranchCiKey = KV_KEY_LITERALS.githubBranchCi
 export const feishuCursorKey = (chat: string): string => `${KV_KEY_LITERALS.feishuCursorPrefix}${chat}`
 /**
  * 事件流见过的会话（`chat_id -> 是否私聊`）：回填要它才知道哪些群/私聊可以读（§I.3 回填）。

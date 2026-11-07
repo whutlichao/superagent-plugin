@@ -268,20 +268,44 @@ test('Answer and Review open the ticket, Retry and Open terminal ask the worker'
   panel = undefined
 })
 
-test('a waiting row opens its ticket detail and marks it current', async () => {
+test('a waiting row opens that ticket detail on the Execution page', async () => {
+  let asked: unknown
   const mounted = await openOverview(
     snapshot({
       items: [item('t1', 'review')],
       tickets: [{ id: 't1', title: 'Ticket t1', stage: 'review', at: 1_700_000_000_000 }]
-    })
+    }),
+    {
+      'ticket.detail': (input) => {
+        asked = input
+        return {
+          id: 't1',
+          title: 'Ticket t1',
+          stage: 'review',
+          at: 1_700_000_000_000,
+          mandate: {
+            strength: 'explicit',
+            actor: 'github:alice',
+            policyVersion: 'v1',
+            via: 'addressed',
+            rules: []
+          },
+          waitingInputs: [],
+          subscriptions: [],
+          assignments: [],
+          reports: [],
+          canRetry: false
+        }
+      }
+    }
   )
   // 行内的第一个动作就是「点行」：Orca 不允许可点的 ListItem 里再放 Button，
   // 所以入口是行里的按钮（这里对评审档是 Review）。
   await mounted.press({ text: COPY['overview.review'].en })
   assert.equal(mounted.valueOf({ type: 'Tabs' }), 'execution')
-  const rows = rowsUnderTab(mounted, 'execution').filter((row) => row['title'] === 'Ticket t1')
-  assert.equal(rows.length, 1)
-  assert.equal(rows[0]?.['current'], true, 'the row the person came for is marked')
+  assert.deepEqual(asked, { ticketId: 't1' }, 'the detail asks the worker for that ticket')
+  assert.ok(mounted.find({ text: /Ticket t1/ }), 'the detail names the ticket the person came for')
+  assert.ok(mounted.find({ label: COPY['execution.mandate'].en }), 'and draws its blocks')
   assert.deepEqual(mounted.refusals, [])
   await mounted.unmount()
   panel = undefined

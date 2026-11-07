@@ -2,7 +2,7 @@
 // 并把 worker 挂到同一个替身宿主上，所以面板的 `plugin.request` 真的会走到 worker 的处理器。
 //
 // 情景名单（§M.7）：booting、empty、healthy、needs-person、problems、paused、setup-missing、
-// long-lists、deployment、zh、en、danger-confirm。
+// long-lists、execution、deployment、zh、en、danger-confirm。
 //
 // Overview（§M.2 的四块）由四个情景表达：empty（空态 + Source 概况）、needs-person（待人工行
 // 与它的直接动作）、problems（三类系统问题）、paused（暂停 + 恢复的二次确认）。
@@ -19,10 +19,13 @@ import type {
   AttentionItem,
   DeploymentView,
   DoctorView,
+  ExecutionFilter,
   HumanSlot,
   PanelState,
   PanelTicket,
-  SystemProblem
+  SystemProblem,
+  TicketDetailView,
+  TicketListPage
 } from './protocol'
 
 /** 一份快照；只写关心的字段，其余按健康默认值补齐。 */
@@ -119,6 +122,11 @@ const manyTickets = Array.from({ length: 60 }, (_, index) =>
   ticket(`t${index}`, `Ticket ${index + 1}: keep the payroll export stable`)
 )
 
+/** Execution 列表的长列表：60 张工单（§M.4 的「分页 50 条」）。 */
+const manyRows = Array.from({ length: 60 }, (_, index) =>
+  ticketRow(`t${index}`, `Ticket ${index + 1}: keep the payroll export stable`)
+)
+
 /** 同一份读数，只把修订号加一（动作后的快照；板面的单调计数）。 */
 function nextRevision(state: PanelState, paused = state.health.paused): PanelState {
   return snapshot({
@@ -133,7 +141,88 @@ function nextRevision(state: PanelState, paused = state.health.paused): PanelSta
   })
 }
 
-/** 一个情景的宿主选项：`state` 的答案 + 四个动作的答案（同一份快照的变体）。 */
+/** 五档筛选在夹具上的判定（档位与 worker 的读模型同一口径，只是把 `PanelTicket` 切片）。 */
+const FILTER_STAGES: Readonly<Record<ExecutionFilter, readonly PanelTicket['stage'][]>> = {
+  open: ['delivery', 'answer', 'review', 'blockedFailed', 'queued', 'idle', 'working'],
+  pending: ['delivery', 'answer', 'review', 'blockedFailed'],
+  working: ['working', 'queued'],
+  waiting: ['idle'],
+  ended: ['ended']
+}
+
+/** `tickets` 请求的答案（§M.2 的筛选 + §M.4 的分页 50 条）。 */
+function executionPage(state: PanelState, input: unknown): TicketListPage {
+  const window = (input ?? {}) as {
+    readonly filter?: ExecutionFilter
+    readonly offset?: number
+    readonly limit?: number
+  }
+  const filter = window.filter ?? 'open'
+  const offset = Math.max(0, window.offset ?? 0)
+  const limit = Math.max(1, Math.min(50, window.limit ?? 50))
+  const matching = (state.tickets ?? []).filter((ticket) =>
+    FILTER_STAGES[filter].includes(ticket.stage)
+  )
+  return {
+    items: matching.slice(offset, offset + limit),
+    nextOffset: offset + limit < matching.length ? offset + limit : null
+  }
+}
+
+/** 详情的读数：一张可以直接看的工单（授权、等待中的输入、订阅、派工、报告、待人工、终端）。 */
+function detailFixture(state: PanelState, ticketId: string): TicketDetailView {
+  const ticket = (state.tickets ?? []).find((row) => row.id === ticketId)
+  const title = ticket?.title ?? 'Fix the login redirect'
+  return {
+    id: ticketId,
+    title,
+    stage: ticket?.stage ?? 'working',
+    ...(ticket?.outcome === undefined ? {} : { outcome: ticket.outcome }),
+    at: 1_700_000_000_000,
+    mandate: {
+      strength: 'explicit',
+      actor: 'github:alice',
+      policyVersion: 'v3',
+      via: 'addressed',
+      rules: ['rule-login']
+    },
+    waitingInputs: [
+      { id: 'i-1', kind: 'trigger', at: 1_700_000_000_000, text: 'also update the docs', human: true }
+    ],
+    subscriptions: [
+      { key: 'github:owner/widgets#12', title: 'owner/widgets#12', lastAt: 1_700_000_000_000, context: false }
+    ],
+    assignments: [
+      {
+        id: 'a-1',
+        state: 'running',
+        createdAt: 1_700_000_000_000,
+        startedAt: 1_700_000_000_000,
+        terminalId: 'term_3',
+        report: { state: 'progress', summary: 'reading the router', at: 1_700_000_000_000 }
+      }
+    ],
+    reports: [{ state: 'progress', summary: 'reading the router', at: 1_700_000_000_000 }],
+    ...(ticket?.stage === 'answer'
+      ? {
+          attention: {
+            question: 'Which branch should I target?',
+            at: 1_700_000_000_000,
+            via: 'terminal' as const
+          }
+        }
+      : {}),
+    terminal: {
+      terminalId: 'term_3',
+      lines: ['reading the router', 'Do you want me to continue? [y/N]'],
+      truncated: false
+    },
+    worktree: { name: 'fix-login', directory: '/repos/widgets/superagent-fix-login' },
+    canRetry: false
+  }
+}
+
+/** 一个情景的宿主选项：`state` 的答案 + Execution 列表/详情 + 动作的答案（同一份快照的变体）。 */
 function hostFor(state: PanelState) {
   return {
     requests: {
@@ -144,8 +233,17 @@ function hostFor(state: PanelState) {
       },
       // 「检查一次」只重读读模型：check 不做写入，回的就是同一份读数的新修订。
       check: () => nextRevision(state),
+      // Execution 列表与详情（§M.2）：check 的 `execution` 情景真的走这两条请求。
+      tickets: (input: unknown) => executionPage(state, input),
+      'ticket.detail': (input: unknown) =>
+        detailFixture(state, (input as { ticketId?: string } | null)?.ticketId ?? 't1'),
       'ticket.retry': () => nextRevision(state),
-      'terminal.focus': () => ({ focused: true })
+      'ticket.stop': () => nextRevision(state),
+      'ticket.note': () => nextRevision(state),
+      'ticket.requestStatus': () => ({ asked: true }),
+      'terminal.focus': () => ({ focused: true }),
+      'workspace.open': () => ({ opened: true }),
+      'workspace.remove': () => ({ removed: true })
     }
   }
 }
@@ -285,14 +383,26 @@ export default defineCheck({
       activity: { received: 5, evaluated: 4, accepted: 1, ignored: 3 }
     })
   ),
-  /** 长列表：60 行，首页 50 行 + 「加载更多」。 */
+  /** 长列表：60 行，首页 50 行 + 「加载更多」（Overview 的待人工与 Execution 的工单都带着）。 */
   'long-lists': hostFor(
     snapshot({
       sources: { enabled: 1, problems: 0 },
       activity: { received: 60, evaluated: 60, accepted: 60, ignored: 0 },
-      items: manyTickets
+      items: manyTickets,
+      tickets: manyRows
     })
   ),
+  /** Execution 列表本身：打开就停在这一页，60 张工单、五档筛选、首页 50 行 + 「加载更多」。 */
+  execution: {
+    ...hostFor(
+      snapshot({
+        sources: { enabled: 1, problems: 0 },
+        activity: { received: 60, evaluated: 60, accepted: 60, ignored: 0 },
+        tickets: manyRows
+      })
+    ),
+    storage: { 'panel.page': 'execution', 'panel.executionFilter': 'open' }
+  },
   /** 浅色主题下的待人工页面（`theme` 是 check 能区分的维度；`locale` 见文件头）。 */
   zh: {
     ...hostFor(

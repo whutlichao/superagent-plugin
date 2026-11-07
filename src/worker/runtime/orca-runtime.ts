@@ -244,6 +244,12 @@ export interface OrcaRuntime {
   ensureWorkspace(spec: WorkspaceSpec, signal?: AbortSignal): Promise<WorkspaceHandle>
   listWorkspaces(): Promise<readonly WorkspaceInfo[]>
   openWorkspace(workspaceId: string): Promise<void>
+  /**
+   * 移除一张已存在的工作区（§E.1「清理」：面板与 CLI 的「Remove worktree」，破坏性，调用方
+   * 先要人确认）。Host API 没有删除方法，实现走 `orca worktree rm --worktree path:<p>
+   * --force --delete-branch`（附录 C S3 实测过这条命令）。按 `path` 选择：Ticket 记录的就是它。
+   */
+  removeWorkspace(workspace: Pick<WorkspaceInfo, 'workspaceId' | 'path'>): Promise<void>
 
   // 2. Agent
   launchAgent(spec: AgentSpec, signal?: AbortSignal): Promise<AgentHandle>

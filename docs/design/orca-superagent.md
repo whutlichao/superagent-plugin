@@ -168,6 +168,8 @@ export interface OrcaRuntime {
   ensureWorkspace(spec: WorkspaceSpec, signal?: AbortSignal): Promise<WorkspaceHandle>;
   listWorkspaces(): Promise<readonly WorkspaceInfo[]>;
   openWorkspace(workspaceId: string): Promise<void>;
+  // 面板与 CLI 的「Remove worktree」（§E.1「清理」）：Host API 没有删除方法，走 CLI。
+  removeWorkspace(workspace: Pick<WorkspaceInfo, 'workspaceId' | 'path'>): Promise<void>;
 
   // 2. Agent
   launchAgent(spec: AgentSpec, signal?: AbortSignal): Promise<AgentHandle>;
@@ -211,6 +213,7 @@ export interface OrcaRuntime {
 | `ensureWorkspace` | 先 `listWorkspaces()` 按 `path`/`name` 复用；否则 `spawn orca worktree create --name <name> --repo <sel> --base-branch <ref> --branch <branch> --setup <p> --no-parent --json`，读 `result` 里的 worktree `id`/`path`/`branch` `[probe]`(`orca worktree create --help`) | `cli_failed`（带 CLI 的 `error.code`）、`cli_timeout`（120 s）、`locked`（同名 worktree 被占用） |
 | `listWorkspaces` | `host.call('workspace.list')` `[skill]` | `capability_denied` / `not_permitted` |
 | `openWorkspace` | `host.call('workspace.open')`；面板不直接调（面板无此方法） | `not_permitted`（浏览器客户端） |
+| `removeWorkspace` | §E.1「清理」的「Remove worktree」：`spawn orca worktree rm --worktree path:<p> --force --delete-branch`（Host API 无删除方法；附录 C S3 实测过同一条命令）。面板与 CLI 都要人先确认 | `cli_failed`（worktree 被占用等）、`cli_missing` |
 | `launchAgent` | 首选 `spawn orca agent launch --agent <id> --worktree path:<p> --model <m> --effort <e> --surface terminal --prompt <t> --json`，句柄取 `result.launch.outcome.handle`（旧宿主 `result.agentTerminalHandle`）；`model`/`effort` 缺省且 CLI 不可用时回落 `host.call('agent.launch', { workspaceId, agent, prompt })`（返回 `{ terminalId }`） `[probe]`(`orca agent launch --help`)/`[skill]` | `agent_gone`（回执无 terminalId）、`cli_failed`；字段名见附录 C S2 实测 |
 | `listAgents` | `host.call('agents.list')`；**只返回当前聚焦 workspace 的 agent** `[skill]`，所以只作提示，不作枚举真源 | `unavailable`（Orca 未就绪） |
 | `listTerminals` | `spawn orca terminal list --json`：`terminals[].handle/worktreeId/worktreePath/title/connected/orphaned` `[probe]`；这是「哪些 worker 终端还活着」的**唯一权威枚举** | `cli_failed`；解析失败按空集处理并记 warning |

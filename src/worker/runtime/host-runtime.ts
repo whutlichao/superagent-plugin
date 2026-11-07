@@ -213,6 +213,19 @@ export function createHostRuntime(orca: OrcaWorkerApi, options: HostRuntimeOptio
       await call('workspace.open', { workspaceId })
     },
 
+    async removeWorkspace(workspace: Pick<WorkspaceInfo, 'workspaceId' | 'path'>): Promise<void> {
+      // §E.1「清理」：Host API 没有删除方法，只有 CLI（附录 C S3 实测过同一条命令）。
+      // `--delete-branch` 只删 Orca 能证明已合并的分支，删不掉就算了——不是把失败吞掉。
+      await cli.run([
+        'worktree',
+        'rm',
+        '--worktree',
+        `path:${workspace.path}`,
+        '--force',
+        '--delete-branch'
+      ])
+    },
+
     async launchAgent(spec: AgentSpec, signal?: AbortSignal): Promise<AgentHandle> {
       const launchedAt = Date.now()
       try {

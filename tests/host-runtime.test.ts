@@ -174,3 +174,33 @@ describe('the repo probes of the setup check', () => {
     })
   })
 })
+
+describe('removing a worktree (§E.1「清理」)', () => {
+  test('removes by path with the documented flags and reports no value beyond success', async () => {
+    const cli = fakeCli(() => ({ ok: true, result: { removed: true } }))
+    const runtime = createHostRuntime(fakeHost(), { cli })
+    await runtime.removeWorkspace({ workspaceId: 'repo-1::/repos/widgets/superagent-fix', path: '/repos/widgets/superagent-fix' })
+    // 附录 C S3 实测过的形态：`worktree rm --worktree path:<p> --force --delete-branch`。
+    assert.deepEqual(cli.calls[0], [
+      'worktree',
+      'rm',
+      '--worktree',
+      'path:/repos/widgets/superagent-fix',
+      '--force',
+      '--delete-branch'
+    ])
+  })
+
+  test('a failing removal surfaces as a seam error the panel can show', async () => {
+    const cli: OrcaCli = {
+      async run() {
+        throw Object.assign(new Error('worktree is in use'), { code: 'cli_failed' })
+      }
+    }
+    const runtime = createHostRuntime(fakeHost(), { cli })
+    await assert.rejects(runtime.removeWorkspace({ workspaceId: 'ws', path: '/w/x' }), (error: unknown) => {
+      assert.equal((error as { code?: string }).code, 'cli_failed')
+      return true
+    })
+  })
+})
