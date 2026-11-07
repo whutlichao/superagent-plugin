@@ -181,14 +181,19 @@ orca plugin check . --json
 orca plugin validate . --json
 ```
 
-`scripts/check.sh` 依次跑后四条，并先跑一次 `orca plugin types . --json` 的已知缺陷探针：**Orca 1.4.251 上 `orca plugin types .` 与 `orca plugin create` 都是坏的**——应用包缺 `resources/plugins/declarative/orca.d.ts`，两条命令都报同一个 `ENOENT`（§N.3）：
+`scripts/check.sh` 依次跑后四条，并先对 `orca plugin types . --json` 探一次（§N.3）。版本口径分两段，别混读：
+
+- **当前（Orca 1.4.253，本机实测）**：`orca plugin types .` 与 `orca plugin create <dir> --template worker-panel` 都通过（退出 0；前者写出 `.orca/types`）。所以探针会真的跑一次基于生成类型的额外类型检查。
+- **历史（Orca 1.4.251 实测，不是现状）**：那时候应用包缺 `resources/plugins/declarative/orca.d.ts`，两条命令都报同一个 `ENOENT`。这段记录留着解释「为什么仓库自带手写声明」，不代表今天仍坏。
 
 ```text
 ENOENT: no such file or directory, open
 '/Applications/Orca.app/Contents/Resources/app.asar.unpacked/resources/plugins/declarative/orca.d.ts'
 ```
 
-变通（设计强制，已在仓库里）：`types/orca.d.ts`、`orca-worker.d.ts`、`orca-testing.d.ts` 是手写的最小声明（只声明插件实际用到的 API，标注「pinned to Orca 1.4.251」）；`tsconfig.json` 自包含，**不** `extends ./.orca/types/tsconfig.json`。所以 `npx tsc -p .` 在缺 `orca.d.ts` 的机器上也能过，权威门禁仍是 Orca 自己的三条命令。`scripts/check.sh` 把这个缺陷记为「已知缺陷，忽略」并打印复核语句，而不是让门禁失败；Orca 修好之后它会自动追加一次基于 `.orca/types` 的额外类型检查。复查：
+探针**不参与退出码**，两个方向都是：成功时那次额外类型检查标为 informational——生成类型与仓库手写声明目前不一致（`tsc` 报出多条真实差异），让它变红没有意义；失败时记为「已知缺陷，忽略」并打印复核语句。退出码只由四道基线门禁决定，而 `npx tsc -p .` 不依赖 `.orca/types`。
+
+变通（设计强制，已在仓库里，与探针成功与否无关）：`types/orca.d.ts`、`orca-worker.d.ts`、`orca-testing.d.ts` 是手写的最小声明（只声明插件实际用到的 API，标注「pinned to Orca 1.4.251 references」）；`tsconfig.json` 自包含，**不** `extends ./.orca/types/tsconfig.json`。所以缺 `orca.d.ts` 的机器上 `npx tsc -p .` 也能过，权威门禁仍是 Orca 自己的三条命令。对齐生成类型（迁到宿主类型面）是独立决定，单独立项；`create` 生成的模板与本仓库结构本就不同，只作提示，不要求逐文件对齐。复查探针：
 
 ```sh
 orca plugin types . --json && ls .orca/types

@@ -1614,25 +1614,34 @@ manifest 声明（对齐 `[skill] manifest.md`）：
 
 ### N.3 Types 与环境缺陷的变通（必写）
 
-**实测缺陷** `[probe]`（Orca 1.4.251，命令输出原文保留）：
+**当前实测（Orca 1.4.253，本机；命令输出原文保留）**：`orca plugin types` 与 `orca plugin create` 都可用。
 
 ```text
 $ orca plugin types <dir> --json
-{ "ok": false, "error": { "code": "invalid_argument",
-  "message": "cannot write typings into <dir>: ENOENT: no such file or directory, open
-   '/Applications/Orca.app/Contents/Resources/app.asar.unpacked/resources/plugins/declarative/orca.d.ts'" } }
-退出码 1
+{ "ok": true, "result": { "path": "<dir>", "files": [ ".orca/.gitignore",
+  ".orca/types/orca/index.d.ts", ".orca/types/orca-host/index.d.ts",
+  ".orca/types/orca-frame/index.d.ts", ".orca/types/orca-worker/index.d.ts",
+  ".orca/types/orca-services/index.d.ts", ".orca/types/orca-testing/index.d.ts",
+  ".orca/types/tsconfig.json" ] } }
+退出码 0
+
+$ orca plugin create <dir> --template worker-panel --json
+{ "ok": true, "result": { "path": "<dir>", "template": "worker-panel",
+  "pluginKey": "local.<name>", "files": [ ".gitattributes", ".gitignore", "README.md",
+  "orca-plugin.json", "src/panel.check.ts", "src/panel.test.tsx", "src/panel.tsx",
+  "src/protocol.ts", "src/worker.test.ts", "src/worker.ts", "tsconfig.json" ],
+  "typeFiles": [ … ] } }
+退出码 0
 ```
 
-同一台机器上 `orca plugin test <dir>`（2/2 通过）与 `orca plugin check <dir>`（`ok: true`，`valid: true`）正常。`orca plugin create <dir> --template worker-panel --json` 也失败于同一路径：
+**历史版本行为（Orca 1.4.251 实测，不是现状）**：当时应用包缺 `resources/plugins/declarative/orca.d.ts`，两条命令都因同一个 `ENOENT` 失败——`types` 报 `invalid_argument`，`create` 报 `runtime_error`：
 
 ```text
-{ "ok": false, "error": { "code": "runtime_error",
-  "message": "ENOENT: no such file or directory, open
-   '/Applications/Orca.app/Contents/Resources/app.asar.unpacked/resources/plugins/declarative/orca.d.ts'" } }
+ENOENT: no such file or directory, open
+'/Applications/Orca.app/Contents/Resources/app.asar.unpacked/resources/plugins/declarative/orca.d.ts'
 ```
 
-因此本设计以已有的 `worker-panel` 模板产物为起点，而不是重新 `create`。
+在那台机器上同一时刻 `orca plugin test <dir>`（2/2 通过）与 `orca plugin check <dir>`（`ok: true`，`valid: true`）是正常的，所以本设计以已有的 `worker-panel` 模板产物为起点而不是当场 `create`——这个起点决定不因缺陷消失而改：`create` 今天能跑通只说明缺陷被修好，不是「按模板重新生成」的理由；`create` 产物与本仓库现有结构（`runtime/`、`http/`、`types/` 等）本来就不同，不要求逐文件对齐。
 
 **变通**（设计强制）：
 
@@ -1659,6 +1668,8 @@ $ orca plugin types <dir> --json
 3. **权威门禁仍是 Orca 自己的三件套**：`orca plugin validate` / `orca plugin test` / `orca plugin check`（都正常）。`npx tsc -p .` 只是我们自己的类型门。
 4. 类型漂移的控制：`runtime/host-methods.ts` 是 Host 方法名的唯一清单，`supports()` 用它 + `host.has`；`host-methods.test.ts` 断言「源码里出现过的 `host.call('<m>')` 字面量 ⊆ 清单」，清单里每个方法都写注释指向 `references/host-api.md` 的小节名。宿主升级后若方法改名，测试或 `plugin check` 会先炸，不会静默失败。
 5. 类型文件里**不写实现、不写 `any` 逃逸**（除 `JsonValue` = `unknown` 的受控别名）。
+
+**生成类型只是参考，不是基线**（#65 发现、#67 定规）：`.orca/types` 在本机可以生成了，但生成类型与上面手写的声明目前并不一致——同一次 `tsc` 下实测 50 条错误（`src/worker/runtime/worker-api.ts` 12 条、`tests/executor-orca.test.ts` 6 条、`types/orca-worker.d.ts` 3 条……），另有 4 条来自生成配置自带的 `lib.dom`（`AbortController`/`console` 重复声明）。典型差异：宿主 `MockRequests` 的请求签名比我们面板 mock 的窄、`orca` 没有导出 `SelectOption`。因此 `scripts/check.sh` 把「基于生成类型的额外类型检查」定为 **informational**：照跑、照打印、绝不改变退出码；自包含 `types/*.d.ts` + `tsconfig.json` 仍是唯一的基线。迁移到宿主类型面（对齐生成类型）是独立决定，须单独立项，不在本设计里顺手做。
 
 ### N.4 health 条目
 
@@ -1813,7 +1824,7 @@ $ orca plugin types <dir> --json
 | `widgets.test.tsx` / `draft.test.ts` / `markdown.test.ts` / `marks.test.ts` / `terms.test.ts` / `protocol.test.ts` | 组件契约、草稿状态机与保存栏、Markdown 子集、状态标记、码表与文案键一一对应、面板↔worker 协议形状 | `client.spec.ts`、`controls.spec.ts`（删除：Orca 提供控件） |
 | `locales.test.ts` / `styles.test.ts` | 双语 key 集合与非空；只用主题变量（无 `style`/`className`） | `locales.spec.ts`、`styles.spec.ts` |
 | `runtime-seam.test.ts` / `dependency.test.ts` / `host-methods.test.ts` / `types-surface.test.ts` / `type-surface-config.test.ts` | 运行缝唯一性（`host.call(`/`spawn('orca'`/`from 'orca` 只在 `runtime/`）；§C.2 规则 1–6；`host.call` 字面量 ⊆ 清单；`types/*.d.ts` 与清单对齐；两份 tsconfig 的 `paths` 一致 | 无（Orca 专有） |
-| `manifest-budget.test.ts` / `license.test.ts` / `check-script.test.ts` / `shutdown.test.ts` | 清单形态与每类上限；MIT 与署名句；`scripts/check.sh` 的四道门禁与 `types` 缺陷探针；关停屏障 | `bundle-patch.spec.ts`（删除：改由 `plugin validate` 承担） |
+| `manifest-budget.test.ts` / `license.test.ts` / `check-script.test.ts` / `shutdown.test.ts` | 清单形态与每类上限；MIT 与署名句；`scripts/check.sh` 的四道门禁与 `types` 探针（真跑临时副本：生成类型检查失败仍 exit 0、基线门禁失败 exit 1、`types` 失败也 exit 0）；关停屏障 | `bundle-patch.spec.ts`（删除：改由 `plugin validate` 承担） |
 | `source-state.test.ts` / `log.test.ts` / `schema.test.ts` / `status-bar.test.ts` | Source 只经端口写自己的状态；日志滚动、脱敏、`orca.log`；零依赖校验器的 `strict`/`safeParse`/错误路径；状态栏文本、语气与 2 s 节流 | 无（Orca 专有） |
 | `docs.test.ts` | 本地链接、无冲突标记、编号文档、§C.1 模块表覆盖 `src/` 每个目录、§P.2 ↔ §R.2 互相对得上、README 的十一项限制与 attribution | `docs.spec.ts` |
 | `class-docs.test.ts` | 注释纪律：`src/worker/**` 与 `src/panel/**` 的每个导出类、每个导出具名函数上方都有 JSDoc，每个模块首部都有一段说明（`//` 散文或 JSDoc 都算）；规则配灵敏度自测，豁免表为空 | `class-docs.spec.ts` |
@@ -1862,7 +1873,7 @@ $ orca plugin types <dir> --json
 | 清单 | `orca plugin validate . --json` | 退出 0 |
 | 脚本 | `scripts/check.sh` | 依次跑上面四个，全绿才 0 |
 
-`orca plugin types` **不入门禁**（本机必失败，§N.3），但 `scripts/check.sh` 会跑它并把结果记为「已知缺陷，忽略」而不是失败——避免下一个人以为是自己弄坏的。若未来 Orca 修好（`types` 退出 0），`check.sh` 自动用它生成的 `.orca/types` 做一次「额外」类型检查（存在才跑），仍以自包含 `tsconfig` 为基线。
+`orca plugin types` **不是门禁的一部分**（§N.3）：Orca 1.4.253 上它成功并写出 `.orca/types`（1.4.251 曾因缺 `orca.d.ts` 失败），`scripts/check.sh` 会先跑它探一次——成功时追加一次基于生成类型的额外类型检查，但**只打印、标为 informational，不参与退出码**（生成类型与手写声明目前不一致，让它变红没有意义）；失败时记为「已知缺陷，忽略」并打印复核语句，退出码同样不变。两种情形下，自包含 `tsconfig` + `types/*.d.ts` 都是唯一的基线。
 
 ### P.6 本仓库的 CI
 
@@ -1916,7 +1927,7 @@ manifest + types + tsconfig + boot + lock + sqlite(trigger/thread/ticket/decisio
 
 | 票 | 内容 | 验收面 |
 | --- | --- | --- |
-| F1 类型与清单 | `orca-plugin.json`、`types/*.d.ts`、自包含 `tsconfig`、`host-methods.ts`、`validate/test/check` 三件套基线、`scripts/check.sh` | `npx tsc -p .` 与三件套全绿；`plugin types` 失败被记录为已知缺陷 |
+| F1 类型与清单 | `orca-plugin.json`、`types/*.d.ts`、自包含 `tsconfig`、`host-methods.ts`、`validate/test/check` 三件套基线、`scripts/check.sh` | `npx tsc -p .` 与三件套全绿；`plugin types` 探针成功则额外检查只作 informational、失败则记录为已知缺陷，两态都不改退出码（§N.3） |
 | F2 存储与迁移 | `db.ts`、`store.ts`、`kv.ts`、`migration.ts`、锁、备份与保留 | `store.test.ts`/`migration.test.ts`/`lock.test.ts` 绿 |
 | F3 HTTP + CLI 骨架 | `http/*`（鉴权/限流/错误映射）、`cli/*`、`bin/superagent.mjs`、`doctor`、`tokens.ts` | `http.test.ts`/`cli-contract.test.ts` 绿；`superagent doctor` 在干净机器上给可读结论 |
 | F4 面板壳 | 导航 7 项、i18n、`protocol.ts`、`state.changed` 推送、空/错/载三态、状态栏 | `plugin check` 全情景 + 两张 shot（浅/深 / 360 px） |
