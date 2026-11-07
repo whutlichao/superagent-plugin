@@ -5,7 +5,9 @@ import { assert, test } from 'orca/testing'
 import {
   barShown,
   changeCount,
+  changedLeafCount,
   draftReducer,
+  groupSaveBar,
   initialDraft,
   saveBar,
   type DraftAction,
@@ -148,6 +150,51 @@ test('discard drops the draft and its notices', () => {
   assert.equal(after([{ type: 'discard' }], saving), saving)
 })
 
+test('the save bar counts changed leaves, not just changed top-level keys', () => {
+  // 一个设置组是一棵有嵌套的对象（规则、准入表、来源配置）；「N 处改动」要按真正的值数，
+  // 否则改了三格的准入表会显示成「1 处改动」。数组按整体算一处（增删一行是一次改动）。
+  const saved = {
+    acceptMode: 'observe',
+    rules: [{ id: 'ship', enabled: true }],
+    sources: { github: { admission: { issues: { listedUnaddressed: 'inferred' } } } }
+  }
+  const drifted = {
+    acceptMode: 'auto',
+    rules: [{ id: 'ship', enabled: true }],
+    sources: { github: { admission: { issues: { listedUnaddressed: 'ignore' } } } }
+  }
+  assert.equal(changedLeafCount(saved, saved), 0, 'the same value changes nothing')
+  assert.equal(changedLeafCount(saved, drifted), 2, 'the mode and the admission cell')
+  assert.equal(changedLeafCount(saved, { ...saved, rules: [] }), 1, 'an edited list is one change')
+  assert.equal(changeCount(saved, drifted), 2, 'top-level counting is still available')
+
+  const state = draftReducer(initialDraft(saved), { type: 'edit', value: drifted, saved, revision: 7 })
+  assert.equal(shown(saveBar('en', state)).status, '2 changes')
+})
+
+test('a group draft made of several settings blocks counts every changed value', () => {
+  // Sources 组一次保存两个实例块；保存栏数的是这些块加起来改了几个值（不是改了两个块）。
+  interface Group {
+    readonly 'source:github': { readonly enabled: boolean; readonly config: { readonly observeIssues: boolean } }
+    readonly 'source:feishu': { readonly enabled: boolean; readonly config: Record<string, never> }
+  }
+  const saved: Group = {
+    'source:github': { enabled: true, config: { observeIssues: false } },
+    'source:feishu': { enabled: false, config: {} }
+  }
+  const value: Group = {
+    'source:github': { enabled: true, config: { observeIssues: true } },
+    'source:feishu': { enabled: true, config: {} }
+  }
+  const state = draftReducer<Group>(initialDraft(saved), { type: 'edit', value, saved, revision: 7 })
+  assert.equal(state.phase, 'editing')
+  assert.equal(shown(saveBar('en', state)).status, '2 changes')
+  // 两个块都改回原值即没有草稿，保存栏不占空间。
+  const back = draftReducer<Group>(state, { type: 'edit', value: saved, saved, revision: 7 })
+  assert.equal(back.phase, 'clean')
+  assert.deepEqual(saveBar('en', back), { visible: false })
+})
+
 test('the save bar speaks both languages', () => {
   const editing = after([edit({ ...SAVED, mode: 'auto' })])
   assert.equal(shown(saveBar('zh-CN', editing)).status, '1 处改动')
@@ -155,4 +202,42 @@ test('the save bar speaks both languages', () => {
   assert.equal(shown(saveBar('zh-CN', saving)).status, '正在保存…')
   const failed = after([{ type: 'refused', notice: { kind: 'failed', error: '离线' } }], saving)
   assert.equal(shown(saveBar('zh-CN', failed)).error, '保存失败：离线')
+})
+
+test('a group bar counts every changed value across its blocks, and shows saving first', () => {
+  // Sources 组一次覆盖多个块（每个实例一个块）：合成后的保存栏仍只有一条。
+  const saved = { observeIssues: false, pollSeconds: 60 }
+  const dirty = draftReducer(initialDraft(saved), {
+    type: 'edit',
+    value: { observeIssues: true, pollSeconds: 120 },
+    saved,
+    revision: 2
+  })
+  const clean = initialDraft(saved)
+  const bar = shown(groupSaveBar('en', [
+    { state: dirty, saved },
+    { state: clean, saved }
+  ]))
+  assert.equal(bar.status, '2 changes')
+  assert.equal(bar.dirty, true)
+  // 全部干净时不占空间。
+  assert.deepEqual(groupSaveBar('en', [{ state: clean, saved }]), { visible: false })
+  // 任一块在保存中，整条栏说「正在保存」。
+  const saving = draftReducer(dirty, { type: 'submit' })
+  const savingBar = shown(
+    groupSaveBar('en', [
+      { state: dirty, saved },
+      { state: saving, saved }
+    ])
+  )
+  assert.equal(savingBar.status, 'Saving…')
+  assert.equal(savingBar.busy, true)
+  // 一条失败 notice 压过计数（人在等这一条），但草稿仍可再保存。
+  const failed = draftReducer(dirty, {
+    type: 'refused',
+    notice: { kind: 'failed', error: 'offline' }
+  })
+  const failedBar = shown(groupSaveBar('en', [{ state: failed, saved }]))
+  assert.equal(failedBar.error, 'Save failed: offline')
+  assert.equal(failedBar.canSave, true)
 })

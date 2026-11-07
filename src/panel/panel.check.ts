@@ -18,6 +18,7 @@ import { deploymentView } from '../worker/app/deployment-view'
 import type {
   AttentionItem,
   DeploymentView,
+  SettingsPageView,
   DoctorView,
   ExecutionFilter,
   HumanSlot,
@@ -560,6 +561,57 @@ const DOCTOR_FIXTURE: DoctorView = {
   note: 'doctor diagnoses this machine (present or missing, never a value); the setup check decides whether the plugin may start: superagent setup check'
 }
 
+/** Settings 页的读数（§M.3）：五组的框架 + 四个可编辑组的默认值（check 只看渲染）。 */
+function settingsFixture(): SettingsPageView {
+  return {
+    revision: 1,
+    sources: { instances: [] },
+    eval: {
+      block: 'policy',
+      revision: 0,
+      saved: null,
+      policyVersion: 'abc123def456',
+      acceptMode: 'observe',
+      model: '',
+      timeoutSeconds: 300,
+      rules: [],
+      sources: []
+    },
+    execution: {
+      block: 'executor',
+      revision: 0,
+      saved: null,
+      value: {
+        agent: 'pi',
+        model: '',
+        effort: '',
+        maxWorkers: 2,
+        baseRepo: 'path:/repos/widgets',
+        baseBranch: 'main',
+        branchPrefix: 'agent/',
+        prepare: '',
+        blockedCommands: [],
+        inlineLimit: 1000,
+        worktreeRetention: 'keep',
+        confirmDelivery: true
+      },
+      repos: [{ value: 'path:/repos/widgets', label: 'widgets (/repos/widgets)' }],
+      variables: ['DSH_SUPERAGENT_DIR', 'DSH_SUPERAGENT_NAME', 'DSH_SUPERAGENT_TICKET']
+    },
+    limits: {
+      block: 'limits',
+      revision: 0,
+      saved: null,
+      value: {
+        promptMaxChars: 200_000,
+        admissionContextMaxPages: 10,
+        admissionContextTimeoutMs: 15_000,
+        retentionDays: 90
+      }
+    }
+  }
+}
+
 /** Deployment 组的情景：读数 + doctor + 三条动作的确定答案。 */
 function deploymentHost(state: PanelState) {
   return {
@@ -570,7 +622,10 @@ function deploymentHost(state: PanelState) {
       doctor: () => DOCTOR_FIXTURE,
       setupCheck: () => ({ checked: true, problems: [] }),
       rotateToken: () => ({ rotated: true, tokenFile: '/var/lib/superagent/api-token' }),
-      restartRouter: () => deploymentFixture().router
+      restartRouter: () => deploymentFixture().router,
+      // Settings 页（#42）：五个组里本情景看到的是 Deployment 组，读数与历史各一条请求。
+      'settings.read': () => settingsFixture(),
+      'settings.history': () => ({ revision: 1, history: [] })
     },
     // 打开面板就停在 Settings：check 渲染的是 Deployment 组本身（keyed atom 读插件存储，
     // 所以用 mockHost 的 `storage` 播种；`persisted` 不喂 `persist: 'storage'` 的 atom）。

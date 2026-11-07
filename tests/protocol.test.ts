@@ -44,10 +44,15 @@ test('the panel declares the state snapshot, the list pages and the Deployment g
     'setupCheck',
     'rotateToken',
     'restartRouter',
+    // Source 页（#41）：卡片读数、开关、名单同步与显示名刷新。
     'sources',
     'source.setEnabled',
     'source.sync',
-    'source.labels'
+    'source.labels',
+    // Settings 页（#42）：四个可编辑组的读数、块保存与版本历史。
+    'settings.read',
+    'settings.save',
+    'settings.history'
   ])
 })
 

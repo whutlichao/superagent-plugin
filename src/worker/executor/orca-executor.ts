@@ -220,11 +220,13 @@ export function resolveExecutorSettings(raw: Readonly<Record<string, unknown>>):
   const executor = block(raw['executor'])
   const model = text(executor['model'])
   const effort = text(executor['effort'])
-  const baseRepo = parseRepoSelector(text(raw['baseRepo']) ?? '')
+  // 面板的 Execution 组写 `executor.baseRepo` / `executor.agent`（§M.3）；Orca Settings 里
+  // 那两项仍在顶层。块里写了的优先，没写才回落到宿主设置（§N.2 的两处不重复但都认）。
+  const baseRepo = parseRepoSelector(text(executor['baseRepo']) ?? text(raw['baseRepo']) ?? '')
   const baseBranch = text(executor['baseBranch'])
   const prepare = text(executor['prepare'])
   return {
-    agent: resolveAgentSetting(raw, 'agent'),
+    agent: text(executor['agent']) ?? resolveAgentSetting(raw, 'agent'),
     maxWorkers: positive(executor['maxWorkers']) ?? DEFAULT_MAX_WORKERS,
     branchPrefix: text(executor['branchPrefix']) ?? 'agent/',
     inlineLimit: nonNegative(executor['inlineLimit']) ?? DEFAULT_INLINE_LIMIT,

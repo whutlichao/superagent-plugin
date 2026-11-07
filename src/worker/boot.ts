@@ -16,8 +16,13 @@ import type {
   DecisionListInput,
   DecisionListPage,
   DeploymentView,
+  ExecutionValues,
   PanelState,
   PanelTerminal,
+  SettingsHistoryView,
+  SettingsPageView,
+  SettingsSaveInput,
+  SettingsSaveOutcome,
   SourcePageView,
   ThreadDetailInput,
   ThreadDetailView,
@@ -44,7 +49,17 @@ import {
   rotateApiToken
 } from './infra/tokens.ts'
 import { deploymentView } from './app/deployment-view.ts'
-import { machineLimits } from './app/limits.ts'
+import { limitsBlockValue, machineLimits, withMachineLimits } from './app/limits.ts'
+import {
+  savedBlockOf,
+  settingsHistoryView,
+  settingsPageView,
+  withSavedSettings
+} from './app/settings-view.ts'
+import type { SettingsSourceInput } from './app/settings-view.ts'
+import { ApiError } from './http/errors.ts'
+import { SETTINGS_HISTORY_LIMIT } from './http/api-types.ts'
+import type { SettingsSaveView } from './http/api-types.ts'
 import { runDoctor } from './app/doctor.ts'
 import type { DoctorOptions } from './app/doctor.ts'
 import type { DoctorResult } from './app/doctor-types.ts'
@@ -52,11 +67,12 @@ import { createRepositories } from './app/repositories.ts'
 import {
   createPolicy,
   DEFAULT_POLICY,
+  policyVersion,
   validatePolicy
 } from './policy/index.ts'
 import type { PolicyBlock, PolicyKindView } from './policy/index.ts'
 import { resolveRoles } from './app/roles.ts'
-import { ROUTER_RESTARTS_KEY, ROUTER_TERMINAL_KEY, ROUTER_WORKSPACE_KEY, PROMPT_REVISION_KEY } from './app/kv.ts'
+import { ROUTER_RESTARTS_KEY, ROUTER_TERMINAL_KEY, ROUTER_WORKSPACE_KEY, PROMPT_REVISION_KEY, settingsVersionKey } from './app/kv.ts'
 import { createDeterministicAssessor } from './app/assessor.ts'
 import { registerAssessmentEffects } from './app/notices.ts'
 import { createRouterTools } from './app/assessment.ts'
@@ -147,7 +163,7 @@ import { DEFAULT_MAX_WORKERS } from './http/state.ts'
 import { createDomainHandlers, withDomainHandlers } from './http/domain.ts'
 import { createSettingsHandlers, withSettingsHandlers } from './http/settings.ts'
 import { runWrite } from './http/idempotency.ts'
-import { parseSettingsBlock, validateSettingsBlock } from './app/settings-blocks.ts'
+import { MACHINE_LIMITS_BLOCK, parseSettingsBlock, validateSettingsBlock } from './app/settings-blocks.ts'
 import { createAssessmentHandlers, withAssessmentHandlers } from './http/assessment.ts'
 import { createEvalHandlers, withEvalHandlers } from './http/eval.ts'
 import { createEvalTools } from './app/eval.ts'
@@ -319,6 +335,12 @@ export interface BootHandle {
   doctor(): Promise<DoctorResult>
   /** 轮换主 token（§D.6、§O）：只回 token 文件路径，绝不回 token 值。 */
   rotateToken(): { readonly rotated: boolean; readonly tokenFile: string }
+  /** Settings 页的读数（§M.3）：Sources / Eval / Execution / Deployment 四个可编辑组。 */
+  settingsView(): Promise<SettingsPageView>
+  /** 面板保存一个设置块（§K.8）：来源恒为 `panel`；账号类字段先跑 setup 检查，不通过不写库。 */
+  settingsSave(input: SettingsSaveInput): Promise<SettingsSaveOutcome>
+  /** 设置版本历史（§K.5）：新→旧，带每一版的值（恢复走同一条保存路径）。 */
+  settingsHistory(): SettingsHistoryView
   shutdown(): Promise<void>
 }
 
@@ -540,6 +562,23 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
           code: 'refused'
         })
       },
+      // follower 不读库：设置的读面/写面都属于拥有者（固定拒绝，不假装成功）。
+      settingsView: async () => {
+        throw Object.assign(new Error('another Superagent instance owns this state directory'), {
+          code: 'unavailable'
+        })
+      },
+      settingsSave: async (input: SettingsSaveInput): Promise<SettingsSaveOutcome> => ({
+        ok: false,
+        reason: 'failed',
+        block: input.block,
+        error: 'another Superagent instance owns this state directory'
+      }),
+      settingsHistory: (): SettingsHistoryView => {
+        throw Object.assign(new Error('another Superagent instance owns this state directory'), {
+          code: 'unavailable'
+        })
+      },
       shutdown: async () => undefined
     }
     return follower
@@ -548,6 +587,12 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
   const lock = lockOutcome.lock
   const logger: Logger = createLogger({ stateDir: resolved, now: () => new Date(nowMs()), mirror: log })
   const store: Store = openStore({ stateDir: resolved, log: logger.sink })
+  /**
+   * 生效的设置快照：宿主设置 + 版本化块里保存过的值（§M.3 Deployment 组、§K.8）。
+   * 机器限额是 `limits` 块（#42）：保存过就以保存的那份为准，其余键仍来自宿主设置。
+   * 启动时读一次，所以改限额仍是「重启后生效」（§H.12）。
+   */
+  const effectiveSettings = withMachineLimits(settings, savedSettingsVersion(store, MACHINE_LIMITS_BLOCK)?.config)
   const board = new HealthBoard()
   const runtimeHealth = board.claim('runtime', { state: 'ready', detail: 'booted' })
   // §N.4、§H.4：`models` 条目恒 ready、明细写「handled by Orca」——模型预算重试是 Orca 的事。
@@ -579,8 +624,8 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
   const githubStored = storedSource(GITHUB_KIND)
   const commandPort: CommandsHost =
     options.commands ?? new Commands({ configuredPrograms: () => [text(settings['githubCli'])] })
-  // 机器限额（§H.12、§H.22）：设置里写了的用写的，没写的用缺省值；启动时读一次。
-  const limits = machineLimits(settings)
+  // 机器限额（§H.12、§H.22）：保存过的块优先，没写的用缺省值；启动时读一次。
+  const limits = machineLimits(effectiveSettings)
   /**
    * `doctor` 的接线（§G.2、§N.4）：HTTP 的 `POST doctor` 与面板的 `doctor` 请求走**同一份**选项，
    * 于是两处读数永远一致。只 stat 文件、不读 secret（§O）。
@@ -800,7 +845,7 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
   }
   // setup 未完成（或没选 base repo）时 Router 保持 paused；`setup check` 之后会重新问这个函数。
   const routerEnabled = (): boolean => !setup.blocked('executor') && executorSettings.baseRepo !== undefined
-  const relayDays = relayRetentionDays(settings)
+  const relayDays = relayRetentionDays(effectiveSettings)
   const routerSupervision = createRouterSupervision({
     runtime: options.runtime,
     health: board,
@@ -1178,7 +1223,7 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
   // Router 的两条评估读命令（§G.2 的 `eval` / `eval-read`）：窗口页数与超时来自部署设置
   // （§H.22），语境经 kind 的 `threadContext`（§I.1），`--path` 只允许 base repo 与 Ticket
   // worktree（§O）。候选、Trigger 与 worktree 都现读，重启后不必重建。
-  const evalAdmission = admissionSettingsOf(settings)
+  const evalAdmission = admissionSettingsOf(effectiveSettings)
   // base repo 的选择器可能只给了 name/id（§E.1）：能解析成路径就解析一次，解析不了就只认
   // Ticket worktree——`--path` 因此仍然 fail closed（§O），而不是猜一个目录。
   const baseRepoPath = await baseRepoPathOf(options.runtime, executorSettings.baseRepo)
@@ -1278,12 +1323,15 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
       'policy',
       'eval',
       'executor',
+      MACHINE_LIMITS_BLOCK,
       ...Object.keys(sourceSettings.sources).map((id) => `source:${id}`)
     ],
     effective: (name) => {
       if (name === 'policy') return effectivePolicy()
       if (name === 'eval') return block(settings['eval'])
       if (name === 'executor') return block(settings['executor'])
+      // 机器限额（§M.3 Deployment 组）：保存过的块优先，缺省填好；四个旋钮一处形状。
+      if (name === MACHINE_LIMITS_BLOCK) return limitsBlockValue(limits)
       const parsed = parseSettingsBlock(name)
       return parsed?.kind === 'source'
         ? (sourceSettings.sources[parsed.id] ?? { enabled: false, config: {} })
@@ -1830,6 +1878,215 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
     runtimeHealth.set({ state: 'paused', detail: 'stopped' })
   }
 
+  // ---- Settings 页（§M.3、§K.8）：读面是版本化块 + kind 的字段表/准入行；写面是上面那一个
+  // `PUT settings/:block` handler（索引 #44 的写前检查），本票不另写入器。
+  /**
+   * 面板的编辑基线：宿主设置 + 保存过的 `limits` / `executor` 块。每次请求现读，"保存后重新
+   * 载入"因此与库存一致；运行中的执行器与限额仍是启动时那份（§H.12，重启生效）。
+   */
+  const liveSettings = (): Readonly<Record<string, unknown>> =>
+    withSavedSettings(settings, {
+      limits: savedSettingsVersion(store, MACHINE_LIMITS_BLOCK)?.config,
+      executor: savedSettingsVersion(store, 'executor')?.config
+    })
+  /** 一个 Source 的编辑值：kind 解析出的缺省值 + 保存过的块（保存过的优先）。 */
+  const liveSource = (instance: {
+    readonly id: string
+    readonly enabled: boolean
+    readonly config: Record<string, unknown>
+  }): { readonly enabled: boolean; readonly config: Record<string, unknown> } => {
+    const saved = savedSettingsVersion(store, `source:${instance.id}`)?.config
+    const record =
+      typeof saved === 'object' && saved !== null ? (saved as Record<string, unknown>) : undefined
+    if (record === undefined) return { enabled: instance.enabled, config: instance.config }
+    const config =
+      typeof record['config'] === 'object' && record['config'] !== null
+        ? (record['config'] as Record<string, unknown>)
+        : {}
+    return {
+      enabled: typeof record['enabled'] === 'boolean' ? record['enabled'] : instance.enabled,
+      config: { ...instance.config, ...config }
+    }
+  }
+  /** 选择器的人读写法（与 `parseRepoSelector` 互逆，面板编辑的就是这一段文本）。 */
+  const selectorText = (selector: { path?: string; name?: string; id?: string } | undefined): string => {
+    if (selector === undefined) return ''
+    if (selector.path !== undefined) return `path:${selector.path}`
+    if (selector.name !== undefined) return `name:${selector.name}`
+    if (selector.id !== undefined) return `id:${selector.id}`
+    return ''
+  }
+  /** base repo 的选择项：`orca repo list` 的镜；读不到时给空表（面板退化成文本框）。 */
+  const repoSuggestions = async (): Promise<readonly { value: string; label: string }[]> => {
+    try {
+      const repos = await options.runtime.listRepos()
+      return repos.map((repo) => ({ value: `path:${repo.path}`, label: `${repo.name} (${repo.path})` }))
+    } catch {
+      return []
+    }
+  }
+  /** Settings 页的一次读数（§M.3）。 */
+  const settingsPage = async (): Promise<SettingsPageView> => {
+    const live = liveSettings()
+    const executor = resolveExecutorSettings(live)
+    const limitsNow = machineLimits(live)
+    const syncable = policySyncable()
+    const instances = registry.instances(sourceSettings)
+    const overview = new Map(registry.overview().map((row) => [row.id, row]))
+    const sources: SettingsSourceInput[] = instances.flatMap((instance) => {
+      const kind = registry.kind(instance.id)
+      const card = overview.get(instance.id)
+      if (card === undefined) return []
+      const value = liveSource(instance)
+      return [
+        {
+          overview: card,
+          description: kind?.description ?? { zh: '', en: '' },
+          enabled: value.enabled,
+          config: value.config,
+          fields: kind?.fields ?? [],
+          facts: kind?.facts?.(deploymentFacts) ?? [],
+          syncable: syncable.includes(instance.id),
+          revision: settingsWriter.blockRevision(`source:${instance.id}`)
+        }
+      ]
+    })
+    const policy = effectivePolicy()
+    const executorValues: ExecutionValues = {
+      agent: executor.agent,
+      model: executor.model ?? '',
+      effort: executor.effort ?? '',
+      maxWorkers: executor.maxWorkers,
+      baseRepo: selectorText(executor.baseRepo),
+      baseBranch: executor.baseBranch ?? '',
+      branchPrefix: executor.branchPrefix,
+      prepare: executor.prepare ?? '',
+      blockedCommands: [...executor.blockedCommands],
+      inlineLimit: executor.inlineLimit,
+      worktreeRetention: executor.worktreeRetention,
+      confirmDelivery: executor.confirmDelivery
+    }
+    return settingsPageView({
+      revision: settingsWriter.revision(),
+      sources,
+      eval: {
+        revision: settingsWriter.blockRevision('policy'),
+        saved: savedBlockOf(settingsWriter.block('policy')),
+        policyVersion: policyVersion(policy),
+        block: policy,
+        sources: instances.flatMap((instance) => {
+          const kind = registry.kind(instance.id)
+          const part = kind?.policy
+          if (part === undefined) return []
+          const config = liveSource(instance).config
+          return [
+            {
+              source: instance.id,
+              title: kind?.title ?? { zh: instance.id, en: instance.id },
+              section: policy.sources[instance.id] ?? { allowed: [], bots: [], admission: {} },
+              fields: part.fields,
+              rows: part.rows?.(config) ?? [],
+              syncable: syncable.includes(instance.id)
+            }
+          ]
+        })
+      },
+      execution: {
+        revision: settingsWriter.blockRevision('executor'),
+        saved: savedBlockOf(settingsWriter.block('executor')),
+        value: executorValues
+      },
+      repos: await repoSuggestions(),
+      variables: [...ENVIRONMENT_VARIABLES],
+      limits: {
+        revision: settingsWriter.blockRevision(MACHINE_LIMITS_BLOCK),
+        saved: savedBlockOf(settingsWriter.block(MACHINE_LIMITS_BLOCK)),
+        value: {
+          promptMaxChars: limitsNow.promptMaxChars,
+          admissionContextMaxPages: limitsNow.admissionContextMaxPages,
+          admissionContextTimeoutMs: limitsNow.admissionContextTimeoutMs,
+          retentionDays: limitsNow.retentionDays
+        }
+      }
+    })
+  }
+  /**
+   * 一次面板保存（§K.8）：走 HTTP 的同一条 `PUT settings/:block`（含 #44 的账号类字段探针），
+   * 来源恒为 `panel`（面板不能选来源），拒绝折成面板能画的结果（字段级 issues / 冲突 / 原因）。
+   */
+  const settingsSave = async (input: SettingsSaveInput): Promise<SettingsSaveOutcome> => {
+    const handler = settingsHandlers.get('PUT settings/:block')
+    if (handler === undefined) {
+      return { ok: false, reason: 'failed', block: input.block, error: 'the settings writer is not wired' }
+    }
+    try {
+      const result = (await handler({
+        params: { block: input.block },
+        query: {},
+        body: { value: input.value, revision: input.revision, origin: 'panel' },
+        caller: { role: 'operator' },
+        at: now(),
+        requestId: null
+      })) as SettingsSaveView
+      return {
+        ok: true,
+        block: result.block,
+        revision: result.revision,
+        changed: result.changed,
+        // §H.12：只有 Policy 是保存即生效的（`effectivePolicy` 现读）；其余块是启动时读的，
+        // 所以告诉面板「重启后生效」，不假装热重载。
+        restarting: result.restarting || result.block !== 'policy',
+        policyChanged: result.policy_changed,
+        origin: result.origin
+      }
+    } catch (error) {
+      if (!(error instanceof ApiError)) {
+        return { ok: false, reason: 'failed', block: input.block, error: stringOf(error) }
+      }
+      if (error.code === 'stale_revision') {
+        return {
+          ok: false,
+          reason: 'conflict',
+          block: input.block,
+          revision: settingsWriter.blockRevision(input.block)
+        }
+      }
+      if (error.code === 'invalid_value' || error.code === 'setup_failed') {
+        return {
+          ok: false,
+          reason: 'invalid',
+          block: input.block,
+          issues: error.issues ?? [{ path: '(root)', message: error.message }]
+        }
+      }
+      return {
+        ok: false,
+        reason: error.code === 'origin_forbidden' ? 'forbidden' : 'failed',
+        block: input.block,
+        error: error.message
+      }
+    }
+  }
+  /** 设置版本历史（§K.5）：每一版的值 + 受影响 Ticket（在 `settings-version:<n>` 快照里）。 */
+  const settingsHistory = (): SettingsHistoryView =>
+    settingsHistoryView(
+      settingsWriter.revision(),
+      settingsWriter.history(SETTINGS_HISTORY_LIMIT).map((record) => {
+        const snapshot = store.kvGet<{ readonly affectedTickets?: readonly string[] }>(
+          settingsVersionKey(record.revision)
+        )
+        return {
+          revision: record.revision,
+          predecessor: record.predecessor,
+          at: record.at,
+          origin: record.origin,
+          block: record.block,
+          policyVersion: record.policyVersion,
+          value: record.config,
+          affectedTickets: snapshot?.affectedTickets ?? []
+        }
+      })
+    )
   const ready = Promise.resolve()
   return {
     mode: 'leader',
@@ -1977,6 +2234,10 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
       const rotated = rotateApiToken(resolved)
       return { rotated: true, tokenFile: rotated.path }
     },
+    // Settings 页（§M.3）：读一次四个可编辑组、保存一个块、读版本历史、手动同步名单。
+    settingsView: settingsPage,
+    settingsSave,
+    settingsHistory,
     shutdown
   }
 }
