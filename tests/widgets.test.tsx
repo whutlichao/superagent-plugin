@@ -301,10 +301,12 @@ test('a state snapshot type keeps the panel and the worker honest', () => {
       error: false,
       paused: false,
       setupMissing: false,
+      sources: { enabled: 0, problems: 0 },
       activity: { received: 0, evaluated: 0, accepted: 0, ignored: 0, ended: 0 },
-      executor: { running: 0, maxWorkers: 4 }
+      executor: { running: 0, maxWorkers: 4, humanSlot: 'free' }
     },
-    attention: { answer: 0, review: 0, problems: 0, items: [] }
+    attention: { answer: 0, review: 0, problems: 0, items: [] },
+    problems: []
   }
   assert.equal(state.booted, true)
 })

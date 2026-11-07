@@ -2,7 +2,7 @@
 //
 // 数据只来自 worker 推送（`state.changed` 带单调修订号），面板不轮询、不自带时钟
 // （时间一律交给宿主的 `RelativeTime`），隐藏时不发请求；冷启动只重试一次。
-// 页面票（#37–#48）填 Overview 以外的页面；本票交付壳与 Overview 的骨架读数。
+// Overview（§M.2 的四块）在本票填实；其余页面由页面票（#38–#48）填充。
 import {
   atom,
   Badge,
@@ -22,17 +22,21 @@ import {
   Tab,
   Tabs,
   Text,
+  Toolbar,
   type PanelContext
 } from 'orca'
 import { GLOSSARY_GROUPS, translate, type CopyKey } from './copy'
-import { markLabel, ticketMark, type MarkTone } from './marks'
+import { markLabel, problemMark, ticketMark, type MarkTone } from './marks'
+import { orderWaiting, problemPage } from './overview'
 import {
   isNavPage,
   NAV_PAGES,
   type AttentionItem,
+  type HumanSlot,
   type NavPage,
   type PanelState,
-  type PanelTicket
+  type PanelTicket,
+  type SystemProblem
 } from './protocol'
 import { TicketRow, type TicketRowData } from './rows'
 import {
@@ -41,6 +45,8 @@ import {
   EmptyStateBlock,
   ErrorState,
   Hint,
+  LoadingState,
+  MarkBadge,
   PageHeader,
   Section
 } from './widgets'
@@ -73,8 +79,20 @@ const reason = atom('')
 /** 当前页展开到第几行（分页）。 */
 const rows = atom(PAGE_ROWS)
 
-/** 动作失败的原因（暂停/恢复）。 */
+/** 动作失败的原因（暂停/恢复、检查、重试、聚焦终端）。 */
 const actionError = atom('')
+
+/** 「检查一次」的读数：检查完给一行结果反馈（不自己计时，不显示时刻）。 */
+const checkResult = atom<{ readonly waiting: number; readonly problems: number } | null>(null)
+
+/** 正在检查（按钮在飞行中不可再按）。 */
+const checking = atom(false)
+
+/**
+ * 从别的页面点过来的对象（§M.2「点行→对应详情页」）：归属页面与要看的那一条。
+ * 详情页（#38–#41）读它来打开对应的那条；本票负责把它写对并切页。
+ */
+const focus = atom<{ readonly page: NavPage; readonly id: string } | null>(null)
 
 /** 面板是否已被卸载：晚到的响应不再改状态。 */
 let disposed = false
@@ -92,6 +110,18 @@ function reasonOf(error: unknown): string {
 }
 
 /**
+ * 采纳一份快照：修订号更旧的响应被丢弃（§M.6 的单调计数），新的一页从第一行开始。
+ * 所有写入都在异步回调里，不在渲染里。
+ */
+function adopt(next: PanelState): void {
+  if (next.revision < read(revision)) return
+  set(snapshot, next)
+  set(revision, next.revision)
+  set(rows, PAGE_ROWS)
+  set(phase, 'ready')
+}
+
+/**
  * 读一份快照并落地。修订号更旧的响应被丢弃；失败时第一次记下「重试中」并安排唯一一次重试，
  * 之后进入错误态（给出原因与重试入口）。所有状态写入都在异步回调里，不在渲染里。
  */
@@ -99,12 +129,7 @@ async function load(): Promise<void> {
   try {
     const next = await plugin.request('state')
     if (disposed) return
-    if (next.revision >= read(revision)) {
-      set(snapshot, next)
-      set(revision, next.revision)
-      set(rows, PAGE_ROWS)
-    }
-    set(phase, 'ready')
+    adopt(next)
     set(reason, '')
     retried = false
   } catch (error) {
@@ -215,50 +240,102 @@ function executionRow(ticket: PanelTicket): TicketRowData {
   return { id: ticket.id, title: ticket.title, at: ticket.at, action: ticket.stage }
 }
 
-/** 一名待人工 Ticket 的行（§M.2 Overview ①）：阶段标记 + 标题 + 相对时间。 */
-function AttentionRow(props: { readonly locale: string; readonly item: AttentionItem }): OrcaElement {
-  const mark = ticketMark({ stage: 'person', action: props.item.action })
+/**
+ * 一名待人工 Ticket 的行（§M.2 Overview ①）：阶段标记 + 标题 + 相对时间 + 直接动作。
+ *
+ * 直接动作与阶段一一对应：「回答」「评审」要人去看那条消息/报告，因此切到详情页；
+ * 「重试」只给卡住或投递失败的工单（与领域 `canRetry` 同一口径，这类工单的进详情页动作
+ * 写作「查看全部」）；「打开终端」只在该 Ticket 有正在跑的终端时出现（面板不能直接聚焦
+ * 终端，请求交给 worker）。
+ *
+ * 为什么是行内按钮而不是「整行可点」：Orca 的组件面拒绝「可点的 ListItem 里再放 Button」
+ * （`a ListItem with onPress cannot contain a Button`），两者只能保一个。这里保直接动作
+ * ——行里的第一个按钮就是原来点行的那个动作。
+ */
+function WaitingRow(props: { readonly locale: string; readonly item: AttentionItem }): OrcaElement {
+  const locale = props.locale
+  const item = props.item
+  const mark = ticketMark({ stage: 'person', action: item.action })
+  const label = markLabel(locale, mark)
+  const retryable = item.action === 'delivery' || item.action === 'blocked' || item.action === 'failed'
+  const terminalId = item.terminalId
+  const openWords = retryable
+    ? words(locale, 'action.details')
+    : words(locale, item.action === 'review' ? 'overview.review' : 'overview.answer')
   return (
-    <ListItem
-      key={props.item.id}
-      title={props.item.title}
-      description={markLabel(props.locale, mark)}
-      icon={mark.icon}
-    >
-      <Row gap="xs" align="center">
-        <Text muted size="xs">
-          {markLabel(props.locale, mark)}
-        </Text>
-        <RelativeTime at={props.item.at} format="short" muted />
+    <ListItem key={item.id} title={item.title} description={label} icon={mark.icon}>
+      <Row gap="xs" align="center" wrap>
+        <MarkBadge label={label} tone={mark.tone} />
+        <RelativeTime at={item.at} format="short" muted />
+        <Button variant="ghost" size="sm" icon="info" onPress={() => openTicket(item.id)}>
+          {openWords}
+        </Button>
+        {retryable ? (
+          <Button variant="ghost" size="sm" icon="refresh" onPress={() => void retryTicket(item.id)}>
+            {words(locale, 'action.retry')}
+          </Button>
+        ) : null}
+        {terminalId === undefined ? null : (
+          <Button variant="ghost" size="sm" icon="play" onPress={() => void focusTerminal(terminalId)}>
+            {words(locale, 'overview.openTerminal')}
+          </Button>
+        )}
       </Row>
     </ListItem>
   )
 }
 
-/** 一个读数：标签 + 值。 */
-function Stat(props: { readonly label: string; readonly value: string; readonly tone?: MarkTone }): OrcaElement {
+/**
+ * 一条系统问题（§M.2 Overview ②）：种类标记 + 出问题的对象 + 原因，点行去归属页。
+ * 回复类没有原因（“发不出去”本身就是事实），用固定措辞说明。
+ */
+function ProblemRow(props: { locale: string; problem: SystemProblem }): OrcaElement {
+  const locale = props.locale
+  const problem = props.problem
+  const mark = problemMark(problem.kind)
+  const label = markLabel(locale, mark)
+  const detail = problem.detail ?? (problem.kind === 'reply' ? words(locale, 'overview.replyFailed') : '')
   return (
-    <Stack gap="none">
-      <Text muted size="xs">
-        {props.label}
-      </Text>
-      <Text size="sm" {...(props.tone === undefined ? {} : { tone: props.tone })}>
-        {props.value}
-      </Text>
-    </Stack>
+    <ListItem
+      key={problem.id}
+      title={problem.name}
+      description={detail === '' ? label : detail}
+      icon={mark.icon}
+      onPress={() => openProblem(problem)}
+    >
+      <Row gap="xs" align="center" wrap>
+        <MarkBadge label={label} tone={mark.tone} />
+        {detail === '' ? null : (
+          <Text muted size="xs">
+            {detail}
+          </Text>
+        )}
+      </Row>
+    </ListItem>
   )
 }
 
-/** Overview 的骨架读数（§M.2 ①–④）：页面票 #37 会补齐行的动作与来源明细。 */
-function Overview(props: { readonly locale: string; readonly state: PanelState }): OrcaElement {
+/** 人类槽的一句措辞（`free` / `used`）。 */
+function humanSlotWords(locale: string, slot: HumanSlot): string {
+  return translate(locale, `overview.humanSlot.${slot}` as CopyKey)
+}
+
+/**
+ * Overview（§M.2 的四块，按顺序回答）：①待人工 Ticket（按阶段排序，每行带直接动作）
+ * ②系统问题（health error、反复失败的回复、未解决的 unavailable）③24 h 流水 ④执行器负载。
+ * 三态在 `PageBody` 里分：加载是骨架，读失败是 danger callout，没有待人工是空态 + Source 概况。
+ */
+function Overview(props: { locale: string; state: PanelState }): OrcaElement {
   const locale = props.locale
   const state = props.state
-  const pending = state.attention.items
+  const pending = orderWaiting(state.attention.items)
   const paused = state.health.paused
   const flow = state.health.activity
   const executor = state.health.executor
-  // 「待人工」已经按动作列出的工单，不在下面重复一遍；其余（工作中/闲置/已结束）在这里
-  // 以同一种行展示（§M.2 Overview 的数据面：Ticket 行来自同一份快照）。
+  const sources = state.health.sources
+  const checked = read(checkResult)
+  const failure = read(actionError)
+  // 「待人工」已经列出的工单不在下面重复一遍；其余（工作中/闲置/已结束）在同一份快照里。
   const shown = new Set(pending.map((item) => item.id))
   const otherTickets = (state.tickets ?? []).filter((ticket) => !shown.has(ticket.id))
   return (
@@ -283,22 +360,53 @@ function Overview(props: { readonly locale: string; readonly state: PanelState }
               locale={locale}
               onConfirm={() => void setPaused(false)}
             />
-            {read(actionError) === '' ? null : (
-              <Text tone="danger" size="xs">
-                {read(actionError)}
-              </Text>
-            )}
           </Stack>
         </Callout>
       ) : null}
 
+      <Toolbar label={words(locale, 'overview.actions')}>
+        {paused ? null : (
+          <ConfirmAction
+            id="pause"
+            label={words(locale, 'action.pause')}
+            action={words(locale, 'action.pause')}
+            locale={locale}
+            onConfirm={() => void setPaused(true)}
+          />
+        )}
+        <Button
+          variant="outline"
+          size="sm"
+          icon="refresh"
+          disabled={read(checking)}
+          onPress={() => void checkNow()}
+        >
+          {words(locale, 'action.refresh')}
+        </Button>
+      </Toolbar>
+
+      {checked === null ? null : <Hint text={translate(locale, 'overview.checked', checked)} />}
+      {failure === '' ? null : (
+        <Text tone="danger" size="xs">
+          {failure}
+        </Text>
+      )}
+
       <Section title={words(locale, 'overview.awaitingYou')} count={pending.length}>
         {pending.length === 0 ? (
-          <EmptyStateBlock title={words(locale, 'overview.nothingNeedsYou')} icon="check" />
+          <Stack gap="sm">
+            <EmptyStateBlock title={words(locale, 'overview.nothingNeedsYou')} icon="check" />
+            <Hint
+              text={translate(locale, 'overview.sources', {
+                enabled: sources.enabled,
+                problems: sources.problems
+              })}
+            />
+          </Stack>
         ) : (
           <List label={words(locale, 'overview.awaitingYou')}>
             {pending.slice(0, read(rows)).map((item) => (
-              <AttentionRow key={item.id} locale={locale} item={item} />
+              <WaitingRow key={item.id} locale={locale} item={item} />
             ))}
           </List>
         )}
@@ -311,23 +419,17 @@ function Overview(props: { readonly locale: string; readonly state: PanelState }
         ) : null}
       </Section>
 
-      {otherTickets.length > 0 ? (
-        <Section title={words(locale, 'overview.otherTickets')} count={otherTickets.length}>
-          <List label={words(locale, 'overview.otherTickets')}>
-            {otherTickets.slice(0, read(rows)).map((ticket) => (
-              <TicketRow key={ticket.id} locale={locale} ticket={executionRow(ticket)} />
+      <Section title={words(locale, 'overview.problems')} count={state.problems.length}>
+        {state.problems.length === 0 ? (
+          <Hint text={words(locale, 'overview.problemsEmpty')} />
+        ) : (
+          <List label={words(locale, 'overview.problems')}>
+            {state.problems.map((problem) => (
+              <ProblemRow key={problem.id} locale={locale} problem={problem} />
             ))}
           </List>
-        </Section>
-      ) : null}
-
-      {state.attention.problems > 0 ? (
-        <Section title={words(locale, 'overview.problems')}>
-          <Text tone="warning" size="sm">
-            {translate(locale, 'overview.problemCount', { count: state.attention.problems })}
-          </Text>
-        </Section>
-      ) : null}
+        )}
+      </Section>
 
       <Section title={words(locale, 'overview.flow')}>
         <Row gap="md" wrap>
@@ -340,15 +442,48 @@ function Overview(props: { readonly locale: string; readonly state: PanelState }
       </Section>
 
       <Section title={words(locale, 'overview.executor')}>
-        <Text size="sm">
-          {translate(locale, 'overview.executorLoad', {
-            running: executor.running,
-            maxWorkers: executor.maxWorkers
-          })}
-        </Text>
+        <Row gap="md" wrap>
+          <Text size="sm">
+            {translate(locale, 'overview.executorLoad', {
+              running: executor.running,
+              maxWorkers: executor.maxWorkers
+            })}
+          </Text>
+          <Text size="sm">
+            {translate(locale, 'overview.executorHuman', {
+              slot: humanSlotWords(locale, executor.humanSlot)
+            })}
+          </Text>
+        </Row>
       </Section>
+
+      {otherTickets.length > 0 ? (
+        <Section title={words(locale, 'overview.otherTickets')} count={otherTickets.length}>
+          <List label={words(locale, 'overview.otherTickets')}>
+            {otherTickets.slice(0, read(rows)).map((ticket) => (
+              <TicketRow key={ticket.id} locale={locale} ticket={executionRow(ticket)} />
+            ))}
+          </List>
+        </Section>
+      ) : null}
     </Stack>
   )
+}
+
+/**
+ * 从 Overview 打开一张工单：记下要看的那一条，再切到 Execution（详情页读 `focus`）。
+ * 「回答」「评审」与点行都是这一个动作——人去看的那条东西就在详情页上。
+ */
+function openTicket(ticketId: string): void {
+  set(focus, { page: 'execution', id: ticketId })
+  set(page, 'execution')
+}
+
+/** 从 Overview 打开一条系统问题的归属页（§M.2「点行→对应详情页」）。 */
+function openProblem(problem: SystemProblem): void {
+  const target = problemPage(problem)
+  set(focus, { page: target, id: problem.id })
+  set(page, target)
 }
 
 /** 暂停或恢复处理（§M.2 的主操作；破坏性，行内二次确认后再发请求）。 */
@@ -357,11 +492,7 @@ async function setPaused(paused: boolean): Promise<void> {
   try {
     const next = await plugin.request('pause', { paused })
     if (disposed) return
-    if (next.revision >= read(revision)) {
-      set(snapshot, next)
-      set(revision, next.revision)
-    }
-    set(phase, 'ready')
+    adopt(next)
   } catch (error) {
     if (disposed) return
     set(actionError, reasonOf(error))
@@ -369,12 +500,73 @@ async function setPaused(paused: boolean): Promise<void> {
 }
 
 /**
+ * 「检查一次」（§M.2 的 Overview 主操作）：让 worker 重跑一遍读模型再回答，
+ * 然后把结果说成一句话（几个待人工、几个系统问题）——不自己计时，也不假装检查了本地缓存。
+ */
+async function checkNow(): Promise<void> {
+  set(actionError, '')
+  set(checking, true)
+  try {
+    const next = await plugin.request('check')
+    if (disposed) return
+    adopt(next)
+    set(checkResult, { waiting: next.attention.items.length, problems: next.problems.length })
+  } catch (error) {
+    if (disposed) return
+    set(actionError, reasonOf(error))
+  } finally {
+    if (!disposed) set(checking, false)
+  }
+}
+
+/** 人的重试（§E.5）：结束卡住的 Assignment，在同一个 worktree 上再起一个。 */
+async function retryTicket(ticketId: string): Promise<void> {
+  set(actionError, '')
+  try {
+    const next = await plugin.request('ticket.retry', { ticketId })
+    if (disposed) return
+    adopt(next)
+  } catch (error) {
+    if (disposed) return
+    set(actionError, reasonOf(error))
+  }
+}
+
+/** 聚焦一台终端（§M.2：面板不能直接做，请求交给 worker 跑 `orca terminal focus`）。 */
+async function focusTerminal(terminalId: string): Promise<void> {
+  set(actionError, '')
+  try {
+    await plugin.request('terminal.focus', { terminalId })
+  } catch (error) {
+    if (disposed) return
+    set(actionError, reasonOf(error))
+  }
+}
+
+/** 一个读数：标签 + 值。 */
+function Stat(props: { readonly label: string; readonly value: string; readonly tone?: MarkTone }): OrcaElement {
+  return (
+    <Stack gap="none">
+      <Text muted size="xs">
+        {props.label}
+      </Text>
+      <Text size="sm" {...(props.tone === undefined ? {} : { tone: props.tone })}>
+        {props.value}
+      </Text>
+    </Stack>
+  )
+}
+
+
+/**
  * Execution 页（§M.2 的 Ticket 列表；详情归 #38）：行来自 worker 快照的 `tickets`，
  * 与 Overview 用同一个 `TicketRow`，因此同一张工单在三个页面上的标记与措辞一致。
+ * 从 Overview 点过来的那一张标成 `current`：人去的那一行就是看得见的那一行。
  */
 function Execution(props: { readonly locale: string; readonly state: PanelState }): OrcaElement {
   const locale = props.locale
   const tickets = props.state.tickets ?? []
+  const focused = read(focus)
   return (
     <Stack gap="md">
       <Section title={translate(locale, 'nav.execution')} count={tickets.length}>
@@ -383,7 +575,14 @@ function Execution(props: { readonly locale: string; readonly state: PanelState 
         ) : (
           <List label={translate(locale, 'nav.execution')}>
             {tickets.slice(0, read(rows)).map((ticket) => (
-              <TicketRow key={ticket.id} locale={locale} ticket={executionRow(ticket)} />
+              <TicketRow
+                key={ticket.id}
+                locale={locale}
+                ticket={{
+                  ...executionRow(ticket),
+                  ...(focused?.page === 'execution' && focused.id === ticket.id ? { current: true } : {})
+                }}
+              />
             ))}
           </List>
         )}
@@ -399,7 +598,7 @@ function Execution(props: { readonly locale: string; readonly state: PanelState 
   )
 }
 
-/** 一页：Overview 与 Execution 有真实读数，其余页面在页面票里填充（本票只交付壳）。 */
+/** 一页：Overview 与 Execution 有真实读数，其余页面在页面票里填充（本票交付壳与 Overview）。 */
 function PageBody(props: { readonly locale: string; readonly current: NavPage }): OrcaElement {
   const locale = props.locale
   const state = read(snapshot)
@@ -409,10 +608,11 @@ function PageBody(props: { readonly locale: string; readonly current: NavPage })
       return <ErrorStateView locale={locale} />
     }
     if (state === null) {
-      return stage === 'starting' ? (
-        <BootingState text={words(locale, 'boot.starting')} />
-      ) : (
+      // 首屏在飞行中是骨架 + 进度（§M.2 的加载态）；「正在启动…」只用于失败后的唯一一次重试。
+      return stage === 'retrying' ? (
         <BootingState text={words(locale, 'boot.retrying')} />
+      ) : (
+        <LoadingState label={words(locale, 'state.loading')} />
       )
     }
     return props.current === 'overview' ? (

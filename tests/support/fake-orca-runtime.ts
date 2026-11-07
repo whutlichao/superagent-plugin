@@ -51,6 +51,7 @@ export interface FakeOrcaScript {
     readonly truncated: boolean
   }>
   closeTerminal?: (terminalId: string) => void | Promise<void>
+  focusTerminal?: (terminalId: string) => void | Promise<void>
   runCommand?: (spec: CommandSpec) => CommandHandle | Promise<CommandHandle>
   listTerminals?: () => readonly TerminalRow[] | Promise<readonly TerminalRow[]>
   listRepos?: () => readonly RepoRow[] | Promise<readonly RepoRow[]>
@@ -65,6 +66,7 @@ export interface FakeOrcaCalls {
   readonly sent: SentText[]
   readonly readTerminal: { readonly terminalId: string; readonly maxLines: number | undefined }[]
   readonly closeTerminal: string[]
+  readonly focusTerminal: string[]
   readonly runCommand: CommandSpec[]
   readonly listWorkspaces: number[]
   readonly listAgents: number[]
@@ -94,6 +96,7 @@ export class FakeOrcaRuntime implements OrcaRuntime {
     sent: [],
     readTerminal: [],
     closeTerminal: [],
+    focusTerminal: [],
     runCommand: [],
     listWorkspaces: [],
     listAgents: [],
@@ -266,6 +269,15 @@ export class FakeOrcaRuntime implements OrcaRuntime {
     this.calls.closeTerminal.push(terminalId)
     if (this.script.closeTerminal) return await this.script.closeTerminal(terminalId)
     this.terminals.delete(terminalId)
+  }
+
+  async focusTerminal(terminalId: string): Promise<void> {
+    this.calls.focusTerminal.push(terminalId)
+    if (this.script.focusTerminal) return await this.script.focusTerminal(terminalId)
+    // 真 CLI 对不存在的终端报错：替身也让「没有这台终端」是一条可注入的失败。
+    if (!this.terminals.has(terminalId)) {
+      throw new OrcaRuntimeError('agent_gone', `terminal ${terminalId} is not running`)
+    }
   }
 
   async runCommand(spec: CommandSpec): Promise<CommandHandle> {

@@ -331,6 +331,11 @@ export function createHostRuntime(orca: OrcaWorkerApi, options: HostRuntimeOptio
       await cli.run(['terminal', 'close', '--terminal', terminalId])
     },
 
+    async focusTerminal(terminalId: string): Promise<void> {
+      // 宿主没有「聚焦终端」的方法，只有 CLI（§M.2）——与关闭终端同一条路。
+      await cli.run(['terminal', 'focus', '--terminal', terminalId])
+    },
+
     async runCommand(spec: CommandSpec, signal?: AbortSignal): Promise<CommandHandle> {
       const marker = `__SUPERAGENT_EXIT_${Date.now().toString(36)}`
       const command = `${spec.command}; printf '\\n${marker}:%s\\n' "$?"`

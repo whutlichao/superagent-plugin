@@ -6,8 +6,9 @@
 //   负载与 Execution 页的行都从同一个库来（§M.2 ①③④、§N.7 的计数）。
 //
 // 依赖纪律（§C.2）：这里只依赖面板的协议类型与注入的读口；不 import `orca`、不 host.call。
-import type { AttentionItem, PanelState, PanelTicket } from '../../panel/protocol'
+import type { AttentionItem, PanelState, PanelTicket, SystemProblem } from '../../panel/protocol'
 import { ticketStage, type Ticket } from '../core/index.ts'
+import type { LoadReadout } from '../executor/slots.ts'
 import { ticketView } from './views.ts'
 
 /** 一份快照的来源：读当前值，改暂停状态。每改一次，修订号加一（§M.6 的单调计数）。 */
@@ -28,10 +29,12 @@ export function emptyState(revision = 1): PanelState {
       error: false,
       paused: false,
       setupMissing: false,
+      sources: { enabled: 0, problems: 0 },
       activity: { received: 0, evaluated: 0, accepted: 0, ignored: 0, ended: 0 },
-      executor: { running: 0, maxWorkers: 4 }
+      executor: { running: 0, maxWorkers: 4, humanSlot: 'free' }
     },
     attention: { answer: 0, review: 0, problems: 0, items: [] },
+    problems: [],
     tickets: []
   }
 }
@@ -82,19 +85,25 @@ export interface WorkerStateInput {
   readonly tickets: () => readonly Ticket[]
   /** 24 h 流水。 */
   readonly activity: () => ActivityCounts
-  /** Executor 负载（running / maxWorkers）。 */
-  readonly load: () => { readonly running: number; readonly maxWorkers: number }
+  /** Executor 负载（§E.6）：运行数 / 上限 / 人类槽，与执行器自己的槽读数是同一份。 */
+  readonly load: () => LoadReadout
   /** 是否有 health error 条目。 */
   readonly hasError: () => boolean
   /** setup 是否缺东西。 */
   readonly setupMissing: () => boolean
   readonly paused: () => boolean
   /**
-   * §J.3 的「系统问题」条数：health error 条目 + 24 h 内未解决且未 dismiss 的 unavailable
-   * （回复连续失败那一项由 outbox 的失败计数补，见 #30）。缺省 0——面板壳的夹具与桩不假装
-   * 有系统问题。
+   * Source 概况：启用的实例数与有问题的实例数（注册表的 `overview()` 读数）。缺省全零——
+   * 面板壳的夹具与桩不假装有 Source。
    */
-  readonly problems?: () => number
+  readonly sources?: () => { readonly enabled: number; readonly problems: number }
+  /**
+   * §J.3 的「系统问题」行：health 的 error 条目 + 24 h 内未解决且未 dismiss 的 unavailable
+   * + 连续失败 3 次的回复（回复那一项由组合根从 outbox 读出）。快照里的 `attention.problems`
+   * 就是这些行的条数，因此状态栏 tooltip 与 Overview 的列表永远说的是同一件事。
+   * 缺省空数组——面板壳的夹具与桩不假装有系统问题。
+   */
+  readonly problems?: () => readonly SystemProblem[]
   /** Execution 页最多几行（§M.4：无虚拟列表，一页 50 条）。 */
   readonly pageSize?: number
 }
@@ -108,8 +117,14 @@ const isPersonAction = (value: string): value is PersonAction =>
 
 /** 一条 Ticket 的 stage 是否在等人（§E.8 的 person 档）。 */
 function personAction(ticket: Ticket): PersonAction | undefined {
-  const stage = ticketStage(ticket)
-  return stage.stage === 'person' && isPersonAction(stage.action) ? stage.action : undefined
+const stage = ticketStage(ticket)
+return stage.stage === 'person' && isPersonAction(stage.action) ? stage.action : undefined
+}
+
+/** 一条 Ticket 正在跑的终端（「Open terminal」那个直接动作用它；没有就不给这个动作）。 */
+function runningTerminal(ticket: Ticket): string | undefined {
+const assignment = ticket.assignments.at(-1)
+return assignment?.state === 'running' ? assignment.terminalId : undefined
 }
 
 /** Ticket 的更新时间（epoch ms；没有可解析时刻时给 0，`RelativeTime` 会显示得很旧）。 */
@@ -142,14 +157,23 @@ export function createWorkerStateSource(input: WorkerStateInput): PanelStateSour
     const tickets = input.tickets()
     const items: AttentionItem[] = tickets.flatMap((ticket) => {
       const action = personAction(ticket)
-      return action === undefined
-        ? []
-        : [{ id: ticket.id, title: ticket.title, action, at: updatedAt(ticket) }]
+      if (action === undefined) return []
+      const terminalId = runningTerminal(ticket)
+      return [
+        {
+          id: ticket.id,
+          title: ticket.title,
+          action,
+          at: updatedAt(ticket),
+          ...(terminalId === undefined ? {} : { terminalId })
+        }
+      ]
     })
     const answer = items.filter((item) => item.action === 'answer').length
     const review = items.filter((item) => item.action === 'review').length
     const load = input.load()
     const activity = input.activity()
+    const problems = input.problems?.() ?? []
     const pageSize = input.pageSize ?? 50
     return {
       revision,
@@ -158,15 +182,17 @@ export function createWorkerStateSource(input: WorkerStateInput): PanelStateSour
         error: input.hasError(),
         paused: input.paused(),
         setupMissing: input.setupMissing(),
+        sources: input.sources?.() ?? { enabled: 0, problems: 0 },
         activity,
         executor: load
       },
       attention: {
         answer,
         review,
-        problems: input.problems?.() ?? 0,
+        problems: problems.length,
         items: items.sort((left, right) => right.at - left.at)
       },
+      problems,
       tickets: tickets.slice(0, pageSize).map(panelTicket)
     }
   }

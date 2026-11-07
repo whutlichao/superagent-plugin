@@ -27,15 +27,17 @@ function state(overrides: {
       error: overrides.error ?? false,
       paused: overrides.paused ?? false,
       setupMissing: false,
+      sources: { enabled: 0, problems: 0 },
       activity: { received: 0, evaluated: 0, accepted: 0, ignored: 0, ended: 0 },
-      executor: { running: 0, maxWorkers: 4 }
+      executor: { running: 0, maxWorkers: 4, humanSlot: 'free' }
     },
     attention: {
       answer: overrides.answer ?? 0,
       review: overrides.review ?? 0,
       problems: overrides.problems ?? 0,
       items: []
-    }
+    },
+    problems: []
   }
 }
 
