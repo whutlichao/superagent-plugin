@@ -28,6 +28,20 @@ import { isBot, reviewText } from './translate.ts'
 /** 一页资源读的条数（§I.2「资源读取」行与「线程上下文」行：每页 20 条）。 */
 export const GITHUB_READ_PAGE_SIZE = 20
 
+/**
+ * 资源名不是 §I.2 列出的写法（或该写法与这个编号的 Issue/PR 不匹配）：调用方据此回
+ * `unknown_resource`，而不是把它当成可重试的远端失败（§G.2 的 read 行）。
+ */
+export class GithubResourceError extends Error {
+  readonly resource: string
+
+  constructor(message: string, resource: string) {
+    super(message)
+    this.name = 'GithubResourceError'
+    this.resource = resource
+  }
+}
+
 /** GitHub 的 Thread key：Issue/PR 号（§I.2 Thread 行）。 */
 const threadKeyOf = (number: string): string => `github:${number}`
 
@@ -458,23 +472,31 @@ export async function githubRead(request: GithubReadRequest): Promise<GithubReso
   const commit = COMMIT_CHECKS.exec(resource)
   if (commit !== null) return readChecks(api, request, commit[1] as string)
   const match = RESOURCE.exec(resource)
-  if (match === null) throw new Error(`Unknown GitHub resource ${resource}; use ${RESOURCE_FORMS}`)
+  if (match === null) {
+    throw new GithubResourceError(`Unknown GitHub resource ${resource}; use ${RESOURCE_FORMS}`, resource)
+  }
   const [, kindText, number, sectionText, page] = match
   const kind: 'issues' | 'pulls' = kindText === 'pulls' ? 'pulls' : 'issues'
   const issue = Number(number)
   const isPull = kind === 'pulls'
   if (sectionText === undefined) return readDescription(api, request, issue, isPull)
   if (!isPull && sectionText !== 'comments') {
-    throw new Error(`Reviews, review threads and checks require a pull request: ${resource}`)
+    throw new GithubResourceError(
+      `Reviews, review threads and checks require a pull request: ${resource}`,
+      resource
+    )
   }
   if (sectionText === 'checks') {
-    if (page !== undefined) throw new Error(`Checks do not take a page number: ${resource}`)
+    if (page !== undefined) {
+      throw new GithubResourceError(`Checks do not take a page number: ${resource}`, resource)
+    }
     return readPullChecks(api, request, issue)
   }
   if (sectionText === 'thread') {
     if (page === undefined) {
-      throw new Error(
-        `Name the review thread by one of its comments: github/pulls/${number}/thread/<comment-id>`
+      throw new GithubResourceError(
+        `Name the review thread by one of its comments: github/pulls/${number}/thread/<comment-id>`,
+        resource
       )
     }
     return readReviewThread(api, request, issue, Number(page))
