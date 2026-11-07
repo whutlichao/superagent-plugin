@@ -1,2 +1,6 @@
 node_modules/
 .orca/
+
+# Orca 的 setup 钩子会在插件根创建 codegraph 的守护进程目录；它既不该提交，也会让
+# `orca plugin inspect` / 安装扫描把 `daemon.sock` 当成不支持的插件条目（README「安装」第 3 步）。
+.codegraph/
