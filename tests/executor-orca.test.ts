@@ -1237,7 +1237,10 @@ test('a human stop sends the closing notice, closes the terminal, keeps the work
 
 test('a retry ends the assignment, closes its terminal and relaunches on the same worktree with the recovery note', async () => {
   const h = harness()
-  const pending = ticket({ assignments: [assignment('a-1', 'pending')] })
+  const pending = ticket({
+    follows: [{ thread: 'github:9', own: true }],
+    assignments: [assignment('a-1', 'pending')]
+  })
   h.seed(pending)
   h.seedTrigger(trigger())
   h.executor.start(pending, pending.assignments[0]!)
@@ -1259,6 +1262,7 @@ test('a retry ends the assignment, closes its terminal and relaunches on the sam
   assert.equal(retried.assignments[1]?.terminalId, 'term_2')
   assert.equal(retried.execution?.directory, first.execution?.directory, 'same directory')
   assert.equal(retried.execution?.name, first.execution?.name, 'same branch short name')
+  assert.deepEqual(retried.follows, [{ thread: 'github:9', own: true }], 'the same pull request stays followed')
 
   const note = retried.inputs.find(
     (input) => input.kind === 'text' && input.text.includes('git history and GitHub')
