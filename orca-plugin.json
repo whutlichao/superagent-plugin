@@ -39,14 +39,14 @@
         "key": "agent",
         "title": "Worker agent",
         "type": "string",
-        "default": "claude",
+        "default": "pi",
         "description": "Orca agent id used for ticket workers."
       },
       {
         "key": "routerAgent",
         "title": "Router agent",
         "type": "string",
-        "default": "claude",
+        "default": "pi",
         "description": "Orca agent id used for the long-lived router session."
       },
       {

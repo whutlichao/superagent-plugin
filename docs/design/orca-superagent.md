@@ -566,7 +566,7 @@ CREATE TABLE kv (
 | --- | --- |
 | 首选路径 | `orca agent launch --agent <id> --worktree path:<ticketPath> --model <m> --effort <e> --surface terminal --prompt <开播语> --json`。**必须 `--surface terminal`**：插件需要 `terminalId` 才能投递与停止；chat 面没有可写的终端 `[probe]`(`--surface` 的说明) |
 | 回落路径 | 未配 `model`/`effort` 且 CLI 不可用 → `host.call('agent.launch', { workspaceId, agent, prompt })` `[skill]` |
-| agent id | 设置 `executor.agent`（如 `claude`、`codex`），setup 检查校验非空；不猜测 |
+| agent id | 设置 `executor.agent`（缺省 `pi`，可覆盖为 `claude`、`codex` 等任一已装的 Orca agent id），setup 检查校验非空；不猜测 |
 | model / effort | 设置 `executor.model` / `executor.effort`，透传给 CLI；两个角色各自独立的模型设置在 `eval.model` 与 `executor.model` |
 | 开播语 | 短（≤ 400 字符）：角色声明 + Ticket id/短名 + 目录 + **CLI 绝对路径与 token 文件路径** + 「先读 `inbox/0.md`」。长正文一律写文件，不让终端吞长文本（§附录 C S1） |
 | 回执 | CLI 的 `result` 里取 terminal 句柄；取不到就用 `workspaceId` 在 `agents.list()` 里按 workspace 反查（最多 10 s，200 ms 间隔）。仍取不到 → `agent_gone` → 重试一次 → `failed` |
@@ -1444,7 +1444,7 @@ interface AdmissionCells {
 
 ### N.2 设置项（`contributes.settings` vs 面板）
 
-只有需要用户**在 Orca Settings 里**改的少量项进 manifest（`settings:own`，最多 64 项），其余全在面板：`stateDir`、`agent`、`baseRepo`（这三项决定插件能否启动，值得在 Orca 设置里可见）、`routerAgent`。其余（模型、并发、prepare、blocked commands、CLI 路径、端口、保留策略）都在面板 Deployment/Execution 组里改，存库即生效。
+只有需要用户**在 Orca Settings 里**改的少量项进 manifest（`settings:own`，最多 64 项），其余全在面板：`stateDir`、`agent`、`baseRepo`（这三项决定插件能否启动，值得在 Orca 设置里可见）、`routerAgent`。其余（模型、并发、prepare、blocked commands、CLI 路径、端口、保留策略）都在面板 Deployment/Execution 组里改，存库即生效。两个 agent 设置项的默认值都是 `pi`（#51 的产品决定）：清单的 `default` 是用户在 Orca Settings 看到的初值，`src/worker/app/agent-defaults.ts` 是设置缺失或为空时的代码回落值，两者必须同值；用户可随时在 Orca Settings 覆盖。
 
 manifest 声明（对齐 `[skill] manifest.md`）：
 
@@ -1472,8 +1472,8 @@ manifest 声明（对齐 `[skill] manifest.md`）：
     "hooks": [{ "event": "agent.launch.before", "onError": "pass" }],
     "settings": [
       { "key": "stateDir", "title": "State directory", "type": "string", "description": "Absolute path for the database, logs and tokens.", "multiline": false },
-      { "key": "agent", "title": "Worker agent", "type": "string", "default": "claude", "description": "Orca agent id used for ticket workers." },
-      { "key": "routerAgent", "title": "Router agent", "type": "string", "default": "claude", "description": "Orca agent id used for the long-lived router session." },
+      { "key": "agent", "title": "Worker agent", "type": "string", "default": "pi", "description": "Orca agent id used for ticket workers." },
+      { "key": "routerAgent", "title": "Router agent", "type": "string", "default": "pi", "description": "Orca agent id used for the long-lived router session." },
       { "key": "baseRepo", "title": "Base repository", "type": "string", "description": "Repo selector (path:<p>, name:<n> or id:<id>) that ticket worktrees are created from." }
     ],
     "statusBarItems": [{ "id": "superagent", "text": "Superagent", "icon": "bot", "tone": "neutral", "tooltip": "Superagent", "command": "superagent.pause" }]
