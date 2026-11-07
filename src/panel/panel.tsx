@@ -1078,15 +1078,17 @@ function TicketDetailPage(props: { readonly locale: string; readonly ticketId: s
             {words(locale, 'action.retry')}
           </Button>
         ) : null}
-        <ConfirmAction
-          id={`stop:${shown.id}`}
-          label={words(locale, 'action.stop')}
-          action={words(locale, 'action.stop')}
-          target={shown.title}
-          locale={locale}
-          icon="stop"
-          onConfirm={() => void stopTicket(shown.id)}
-        />
+        {shown.ended === undefined ? (
+          <ConfirmAction
+            id={`stop:${shown.id}`}
+            label={words(locale, 'action.stop')}
+            action={words(locale, 'action.stop')}
+            target={shown.title}
+            locale={locale}
+            icon="stop"
+            onConfirm={() => void stopTicket(shown.id)}
+          />
+        ) : null}
         <Button
           variant="outline"
           size="sm"
@@ -1133,27 +1135,31 @@ function TicketDetailPage(props: { readonly locale: string; readonly ticketId: s
         <Hint text={words(locale, asked ? 'execution.asked' : 'execution.notAsked')} />
       )}
 
-      <Field label={words(locale, 'execution.note')}>
-        <Textarea
-          label={words(locale, 'execution.note')}
-          labelHidden
-          value={draft}
-          placeholder={words(locale, 'execution.notePlaceholder')}
-          rows={2}
-          onChange={(next) => set(noteDraft, next)}
-        />
-      </Field>
-      <Row justify="end">
-        <Button
-          variant="outline"
-          size="sm"
-          icon="download"
-          disabled={busy || draft.trim() === ''}
-          onPress={() => void sendTicketNote(shown.id)}
-        >
-          {words(locale, 'execution.noteSend')}
-        </Button>
-      </Row>
+      {shown.ended === undefined ? (
+        <Stack gap="xs">
+          <Field label={words(locale, 'execution.note')}>
+            <Textarea
+              label={words(locale, 'execution.note')}
+              labelHidden
+              value={draft}
+              placeholder={words(locale, 'execution.notePlaceholder')}
+              rows={2}
+              onChange={(next) => set(noteDraft, next)}
+            />
+          </Field>
+          <Row justify="end">
+            <Button
+              variant="outline"
+              size="sm"
+              icon="download"
+              disabled={busy || draft.trim() === ''}
+              onPress={() => void sendTicketNote(shown.id)}
+            >
+              {words(locale, 'execution.noteSend')}
+            </Button>
+          </Row>
+        </Stack>
+      ) : null}
     </Stack>
   )
 }

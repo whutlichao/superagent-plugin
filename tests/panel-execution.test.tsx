@@ -425,6 +425,9 @@ test('an ended ticket shows its outcome and stops offering worktree actions when
   assert.ok(mounted.find({ text: /wrong direction/ }))
   assert.equal(mounted.find({ text: COPY['execution.openWorktree'].en }), null)
   assert.equal(mounted.find({ text: COPY['execution.removeWorktree'].en }), null)
+  // 已结束的工单不再提供停止与 note：它们对结束了的 Ticket 只会拒绝（§E.5、§G.2）。
+  assert.equal(mounted.find({ text: COPY['action.stop'].en }), null)
+  assert.equal(mounted.find({ text: COPY['execution.noteSend'].en }), null)
   assert.deepEqual(mounted.refusals, [])
   await mounted.unmount()
   panel = undefined
