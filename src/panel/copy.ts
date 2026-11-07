@@ -298,7 +298,7 @@ export const COPY = {
   'thread.unsubscribed': { zh: '未订阅', en: 'Unsubscribed' },
   'source.ready': { zh: '运行中', en: 'Ready' },
   'source.starting': { zh: '启动中', en: 'Starting' },
-  'source.paused': { zh: '待处理', en: 'Paused' },
+  'source.paused': { zh: '已暂停', en: 'Paused' },
   'source.error': { zh: '出错', en: 'Error' },
   'source.setup': { zh: '等待部署检查', en: 'Waiting for setup' },
   'source.off': { zh: '已关闭', en: 'Off' },
