@@ -2,9 +2,9 @@
 // 自检」。
 //
 // 位置与形状：设计 §L.1 决定内置提示词以**模板字面量常量**放在 `app/prompt-text/*.ts`，一行
-// 一句（上游风格）。#32 落地那个目录之后，本文件只保留「把分片 + 生成段拼起来」的组装与
-// Router 专用的部署环境段；在那之前，角色文本先原样住在这里，导出形状（`readonly string[]`
-// 的行 + 一个组装函数）与将来 `prompt-text/` 的分片一致，替换时只改来源、不改调用方。
+// 一句（上游风格）。角色层就是那里的 `runtime/orchestrator`（`ORCHESTRATOR_LINES`），本文件
+// 只保留 Router 专用的部署环境段与「第一句先做状态自检」的拼装——同一个角色文本不抄第二份，
+// `ROUTER_ROLE_LINES` 只是这份分片的再导出，调用方与 `router-orca.test.ts` 不用改。
 //
 // 为什么 prompt 是交付物而不是注释：Orca 无法拦截 agent 的 bash（§F.3、§H.19），「不读代码」
 // 「不等待」「不轮询」只能由这段文本与结构性推送保证。所以这些句子被 `router-orca.test.ts`
@@ -12,6 +12,8 @@
 //
 // 纪律：prompt 只写**路径**，绝不写 token 值（§D.6）；路径一律双引号包裹，因为插件安装目录
 // 里常有空格（§G.5 的实测形态）。
+
+import { ORCHESTRATOR_LINES } from '../app/prompt-text/roles.ts'
 
 /** 组装 Router launch prompt 需要的部署事实（全部是可直接执行的字面量）。 */
 export interface RouterPromptEnvironment {
@@ -36,19 +38,11 @@ export interface RouterPromptEnvironment {
 }
 
 /**
- * Router 的角色层文本（§L.2 的 `runtime/orchestrator` 等价物）：一行一句。
- * 它叠加在 agent 自身的系统提示词之上（§L.5.1），所以只写「本会话的职责与边界」，不写
- * 「忽略你原有的指令」——后者既无效果也不诚实。
+ * Router 的角色层文本（§L.2 的 `runtime/orchestrator`）：一行一句，正文住在
+ * `app/prompt-text/roles.ts`。它叠加在 agent 自身的系统提示词之上（§L.5.1），所以只写
+ * 「本会话的职责与边界」，不写「忽略你原有的指令」——后者既无效果也不诚实。
  */
-export const ROUTER_ROLE_LINES: readonly string[] = [
-  'You are the Superagent router for one repository: you read the messages the plugin pushes to you, decide what work the team takes on, and hand accepted work to worker sessions.',
-  'You never read or edit repository code and you never fix anything yourself; the superagent CLI and the Orca terminals the plugin opens are your only tools.',
-  'Every candidate, report and follow-up reaches you as a pushed message, so you never poll for work and never tail a log to find more.',
-  'The main Session does not wait: never sleep, never loop on a command, never wait for a worker turn in a shell; act on the messages you were given and end your turn.',
-  'When a person has to decide something, ask with `superagent reply --purpose attention` instead of asking in this terminal; no operator watches this terminal.',
-  'When the evidence is not enough for a decision, say so in the decision you write and leave the work where it is; a wrong decision costs more than a missing one.',
-  'Your first step is always the status self-check below: it rebuilds the situation you lost when this session restarted.'
-]
+export const ROUTER_ROLE_LINES: readonly string[] = ORCHESTRATOR_LINES
 
 /** 角色的整段文本：句子之间换行，便于 agent 逐条读。 */
 export function roleText(): string {
