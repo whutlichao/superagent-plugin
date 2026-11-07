@@ -37,6 +37,7 @@ import type { PolicyBlock, PolicyKindView } from './policy/index.ts'
 import { resolveRoles } from './app/roles.ts'
 import { ROUTER_RESTARTS_KEY, ROUTER_TERMINAL_KEY, ROUTER_WORKSPACE_KEY, PROMPT_REVISION_KEY } from './app/kv.ts'
 import { createDeterministicAssessor } from './app/assessor.ts'
+import { registerAssessmentEffects } from './app/notices.ts'
 import { createRouterTools } from './app/assessment.ts'
 import { createOutbox, registerReplyEffects } from './app/outbox.ts'
 import { createPausedState } from './app/pause.ts'
@@ -578,6 +579,13 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
 
   const assessor = createDeterministicAssessor({
     decide: (triggerId, outcome) => engine.decide(triggerId, outcome),
+    // 本评估器不决定的主动候选：排一条 `assessment`，由 Router 读卡并评估（§K.4、§J.2）。
+    relayCandidate: (candidate) => {
+      const primary = candidate.triggers[0]
+      if (primary !== undefined) {
+        effects.enqueue('assessment', candidate.evalId, { triggerId: primary.id })
+      }
+    },
     onError: (error, evalId) => logger.warn(`the assessment of ${evalId} could not be decided`, { error: stringOf(error) })
   })
   const executor = new OrcaExecutor({ effects, runtime: options.runtime, log: (message) => logger.info(message) })
@@ -588,6 +596,10 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
     assessor,
     executor,
     outbox,
+    // §J.2 的 `return`：把人的消息交回 Eval 是持久意图——领域事务里只写 disposition 与一行
+    // effect，提交后才由下面的 handler 经 `Engine.returnToEval` 重排（候选因此出现在下一次
+    // pass，而不是命令返回时）。
+    returns: { enqueue: (triggerId) => effects.enqueue('return', triggerId, { triggerKey: triggerId }) },
     now,
     prepareTicket: (ticket, outcome) => {
       const name = outcome.name
@@ -603,6 +615,24 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
       if (event.type === 'decision.recorded') routerSupervision.noteDecision()
     }
   })
+  // 候选卡送到 Router 之后才起算 Eval 的截止时间（§K.7）；送达与 relay/notice 共用同一条
+  // 串行写手，失败按 assessment 的退避重试（§J.2）。
+  registerAssessmentEffects({
+    effects,
+    candidate: (triggerId) => engine.candidate(triggerId),
+    delivered: (evalId) => engine.candidateDelivered(evalId),
+    deliver: relayHandlers.card,
+    now: nowMs,
+    log: (message) => logger.info(message)
+  })
+  // `return`（§J.2）：人的消息交回 Eval 的持久意图。handler 只经 Engine 的幂等方法重排，
+  // 于是 Thread 的写者仍然只有 Engine（§D.4），core 也不 import app（§C.2）。
+  effects.handle('return', async (payload) => {
+    if (!engine.returnToEval(payload.triggerKey)) {
+      logger.info(`the returned follow-up ${payload.triggerKey} needs no new Eval`)
+    }
+  })
+
   let refreshQueued = false
   const scheduleRefresh = (): void => {
     if (refreshQueued) return

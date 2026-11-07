@@ -2,7 +2,7 @@
 // Decision 的唯一写者在这里）。
 import { UserError } from './errors.ts'
 import { key } from './ids.ts'
-import { liveTicket, threadKey } from './model.ts'
+import { liveTicket, settled, threadKey } from './model.ts'
 import type {
   Decision,
   DecisionKind,
@@ -309,6 +309,30 @@ export class Evals extends EnginePart {
       throw new UserError('handedBack')
     }
     return this.handBack(ticketId, this.repo.triggers.get(triggerId)!, reason)
+  }
+
+  /**
+   * 把人 follow-up 交回 Eval（`return` effect 的领域入口，§J.2 的 `return` 行）。
+   *
+   * 幂等：Trigger 已经不在、已经有 Ticket 接手它、或者它的事已有已了结的 Decision 时什么
+   * 都不做。`{queued:true}` 的命令返回只说明「会进入 Eval」；真正排队的是这一条 effect，
+   * 它在命令提交之后才跑（所以候选出现在下一次 pass，而不是命令返回时）。
+   *
+   * @returns 是否排进了 Eval。
+   */
+  returnToEval(triggerId: string): boolean {
+    const trigger = this.repo.triggers.get(triggerId)
+    if (!trigger) return false
+    const disposition = this.repo.triggers.disposition(triggerId)
+    // 某个 Ticket 的 worker 已经接手（确认或回答）了它：它的事在有 Ticket 的地方。
+    if (disposition?.acked?.length) return false
+    const decision = disposition?.decisionId
+      ? this.repo.decisions.get(disposition.decisionId)
+      : undefined
+    // 已了结的 Decision（accept/ignore，或撤回的 stop）说明这条消息的事已经有人管了。
+    if (decision && settled(decision)) return false
+    if (this.owners(trigger).length) return false
+    return this.queueForEval(trigger)
   }
 
   /**

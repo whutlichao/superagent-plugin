@@ -67,7 +67,10 @@ function trigger(id: string, overrides: Partial<Trigger> = {}): Trigger {
 }
 
 /** 测试夹具：内存仓储 + 记录型端口 + 虚拟时钟。 */
-function harness(policyOverrides: Partial<Policy> = {}) {
+function harness(
+  policyOverrides: Partial<Policy> = {},
+  extra: { returns?: { enqueue(triggerId: string): void } } = {}
+) {
   const opened = new MemoryRepositories()
   const repo = opened.claimWriter()
   const outbox: Outbox['send'] extends (message: infer M) => void ? M[] : never = []
@@ -147,6 +150,7 @@ function harness(policyOverrides: Partial<Policy> = {}) {
     assessor,
     executor,
     outbox: queue,
+    ...(extra.returns === undefined ? {} : { returns: extra.returns }),
     now: () => new Date(Date.UTC(2026, 8, 23, 0, 0, clock)).toISOString()
   })
   /** 模拟执行器启动排队的 Assignment、投递等待中的 Input（`launch: false` 时都不做）。 */
@@ -918,6 +922,29 @@ describe('hand-back and release', () => {
       () => h.engine.handback(ticketId, '9', 'never mine'),
       (error: unknown) => error instanceof UserError && error.code === 'notReached'
     )
+  })
+
+  test('a hand-back writes only the return intent; the message reaches Eval when the return effect runs', () => {
+    const returns: string[] = []
+    const h = harness({}, { returns: { enqueue: (triggerId) => returns.push(triggerId) } })
+    const ticketId = accepted(h).ticketId!
+    h.engine.receive(trigger('2', { actor: guest }))
+    h.settle()
+    // 交回只写 disposition 与一条 `return` 意图（§J.2）：命令返回时 Thread 没有变化，
+    // 候选因此还在后面——`queued:true` 的含义是「会进入 Eval」，不是「已经进了」。
+    const requestsBefore = h.requests.length
+    assert.equal(h.engine.handback(ticketId, '2', 'It asks for another repository'), true)
+    assert.deepEqual(returns, ['2'], 'the intent is keyed by the trigger')
+    assert.deepEqual(h.opened.threads.get('chat:t1')?.pending, [], 'nothing was queued inside the transaction')
+    assert.equal(h.requests.length, requestsBefore, 'no Eval started inside the transaction')
+
+    // effect 跑过之后才重排；同一条再跑一次是幂等的空操作。
+    assert.equal(h.engine.returnToEval('2'), true)
+    assert.deepEqual(h.opened.threads.get('chat:t1')?.pending, ['2'])
+    assert.equal(h.engine.returnToEval('2'), false, 'already waiting for its Eval')
+    assert.equal(h.engine.returnToEval('never-seen'), false)
+    h.pump()
+    assert.deepEqual(h.requests.at(-1)?.triggers.map((item) => item.id), ['2'])
   })
 
   test('records a hand-back without queueing again a message the ticket never decided, such as one it read for context', () => {

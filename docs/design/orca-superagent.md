@@ -1128,6 +1128,8 @@ kind 清单：
 
 > 与上游的一处合并：上游 `relay` 与 `notice` 是两个 kind；这里保留两个 kind，但**共用同一串行队列**（都是 Router 终端），实现上用一个 `routerQueue` 互斥即可，语义上仍是「失败挡住后来的同种」。
 
+> `return` 的入队点与语义（#31）：`trigger handback`、`thread unrelated` 与 Ticket 结束时的释放（`letGo`）在**同一个事务里只写 disposition 与一行 `return`**（key 是该 Trigger 的 id），handler 经 `Engine.returnToEval` 幂等重排，提交之后才执行。上游在这三处是同步入队；这里改成持久意图，崩溃后「它该回到 Eval」这件事不会丢。因此 `{queued:true}` 的含义是「**会**进入 Eval」，候选出现在 `return` 跑过之后，而不是命令的事务里（实现上它在提交后的微任务里就跑了，所以调用方几乎立刻能看到候选）。
+
 ### J.3 与健康看板的关系
 
 - 每个 effect kind 一个 health 条目，`state ∈ starting|ready|paused|error`，`detail` 写计数（如 `waiting 2, failed 1`）。

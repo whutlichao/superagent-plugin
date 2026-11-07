@@ -501,7 +501,8 @@ export class Tickets extends EnginePart {
         decision?.kind === 'stop' && decision.ticketId === ticketId && !disposition?.handbacks?.length
       const decided = !!decision && (settled(decision) || stopped)
       if (!this.owners(trigger).length && !disposition?.acked?.length && !decided) {
-        this.queueForEval(trigger)
+        // 回到 Eval 是一条 `return` effect（§J.2）：事务里只写意图，提交后才入队。
+        this.enqueueReturn(trigger)
       }
     }
   }
