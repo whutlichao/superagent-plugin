@@ -309,6 +309,8 @@ declare function setTimeout(handler: () => void, milliseconds: number): TimerHan
 /** 面板与状态栏用 `Number(handle)` 把句柄收成数字再交回（注入的节流器只认不透明句柄）。 */
 declare function clearTimeout(handle: TimerHandle | number): void
 declare function setImmediate(handler: (...args: readonly unknown[]) => void): void
+/** 微任务：效果队列用它把派发推迟到当前事务提交之后（§J.2 执行行）。 */
+declare function queueMicrotask(callback: () => void): void
 
 /** Node 定时器句柄：`unref()` 让它不拖住进程退出。 */
 interface TimerHandle {
