@@ -11,8 +11,8 @@ import { statSync } from 'node:fs'
 import { join } from 'node:path'
 import type { LogLine, LogSink } from '../infra/log-line.ts'
 import { SILENT_LOG } from '../infra/log-line.ts'
-import { migrate, readSchemaVersion } from './migration.ts'
-import { SCHEMA_VERSION } from './schema.ts'
+import { migrate, MigrationError, readSchemaVersion, restoreFromBackup } from './migration.ts'
+import { SCHEMA_VERSION, type MigrationStep } from './schema.ts'
 import {
   readAssignmentCounts,
   readTimeline,
@@ -70,6 +70,11 @@ export interface StoreOptions {
   readonly keepBackups?: number
   /** 迁移前备份的时钟（测试注入固定时刻）。 */
   readonly now?: () => Date
+  /**
+   * 迁移步骤（缺省 `MIGRATIONS`）。只为「迁移失败演练」注入失败步骤（§P.2 的 R12）；
+   * 生产路径永远用内置的那一条链。
+   */
+  readonly migrationSteps?: readonly MigrationStep[]
   /** 迁移/拒绝启动的日志出口（§N.6：拒绝启动时要留下可读日志）。 */
   readonly log?: LogSink
 }
@@ -242,14 +247,44 @@ export function openStore(options: StoreOptions): Store {
 
   const backupDir = options.backupDir ?? join(options.stateDir, 'backups')
   if (readSchemaVersion(db) !== SCHEMA_VERSION) {
-    migrate(db, {
-      databasePath: path,
-      backupDir,
-      keepBackups: options.keepBackups ?? 5,
-      targetVersion: SCHEMA_VERSION,
-      now: options.now ?? (() => new Date()),
-      log: options.log
-    })
+    try {
+      migrate(db, {
+        databasePath: path,
+        backupDir,
+        keepBackups: options.keepBackups ?? 5,
+        targetVersion: SCHEMA_VERSION,
+        ...(options.migrationSteps === undefined ? {} : { steps: options.migrationSteps }),
+        now: options.now ?? (() => new Date()),
+        log: options.log
+      })
+    } catch (error) {
+      // §N.6 第 2 条：失败就从备份恢复，**不带着半迁移库启动**。
+      // 恢复要先把句柄关掉再整文件复制（`-wal`/`-shm` 一并清掉），然后照原样把失败报给调用方。
+      if (
+        error instanceof MigrationError &&
+        error.code === 'migration_failed' &&
+        error.backupPath !== undefined
+      ) {
+        db.close()
+        try {
+          restoreFromBackup({
+            databasePath: path,
+            backupPath: error.backupPath,
+            now: options.now ?? (() => new Date()),
+            log: options.log ?? SILENT_LOG
+          })
+        } catch (restoreError) {
+          const reason = restoreError instanceof Error ? restoreError.message : String(restoreError)
+          throw new MigrationError('migration_failed', `${error.message}; restoring from ${error.backupPath} failed: ${reason}`, {
+            databaseVersion: error.databaseVersion,
+            pluginVersion: error.pluginVersion,
+            backupPath: error.backupPath,
+            cause: restoreError
+          })
+        }
+      }
+      throw error
+    }
   }
   db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`)
 

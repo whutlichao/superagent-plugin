@@ -7,6 +7,7 @@
 /** 键字面量（精确键与族前缀）。前缀以 `:` 结尾，构造函数在其后接参数。 */
 export const KV_KEY_LITERALS = {
   schemaVersion: 'schema-version',
+  pluginVersion: 'plugin-version',
   settingsRevision: 'settings-revision',
   settingsVersionPrefix: 'settings-version:',
   settingsBlockRevisionPrefix: 'settings-block-revision:',
@@ -33,6 +34,9 @@ export const KV_KEY_LITERALS = {
 
 /** schema 版本（唯一版本源，§D.2 要点 3）。 */
 export const SCHEMA_VERSION_KEY = KV_KEY_LITERALS.schemaVersion
+
+/** 上一次运行的插件版本（§N.6 第 5 条：版本变了就把在跑的 Assignment 当作中断）。 */
+export const PLUGIN_VERSION_KEY = KV_KEY_LITERALS.pluginVersion
 
 /** 设置版本族（§D.3「设置版本」行）。 */
 export const SETTINGS_REVISION_KEY = KV_KEY_LITERALS.settingsRevision

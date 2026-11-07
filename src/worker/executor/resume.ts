@@ -30,6 +30,11 @@ export interface ResumeOptions {
   readonly engine: EngineForExecutor
   readonly records: ResumeRecords
   readonly log?: (message: string) => void
+  /**
+   * 不认领任何活终端：所有运行中的 Assignment 都按中断处理并重建（插件版本升级，§N.6 第 5 条）。
+   * 缺省 false——崩溃/重启恢复仍然先看终端还在不在（§E.10）。
+   */
+  readonly forceInterrupted?: boolean
 }
 
 /** 一个运行中 Assignment 的恢复结局。 */
@@ -95,13 +100,14 @@ export function belongsToTicket(
  */
 export async function resumeAssignments(options: ResumeOptions): Promise<ResumeReport> {
   const log = options.log ?? (() => undefined)
+  const forced = options.forceInterrupted === true
   const running = runningAssignments(options.records)
   if (running.length === 0) return { assignments: [] }
 
-  const [terminals, workspaces] = await Promise.all([
-    options.runtime.listTerminals(),
-    options.runtime.listWorkspaces()
-  ])
+  // 正常恢复先枚举全机的终端与工作区；版本升级时一台也不认领，这两个读面就不必碰。
+  const [terminals, workspaces] = forced
+    ? [[], []]
+    : await Promise.all([options.runtime.listTerminals(), options.runtime.listWorkspaces()])
   const byHandle = new Map(terminals.map((terminal) => [terminal.handle, terminal]))
   const resumed: ResumedAssignment[] = []
 
@@ -109,6 +115,7 @@ export async function resumeAssignments(options: ResumeOptions): Promise<ResumeR
     const terminalId = assignment.terminalId ?? null
     const terminal = terminalId === null ? undefined : byHandle.get(terminalId)
     const adopted =
+      !forced &&
       terminal !== undefined &&
       terminal.connected &&
       !terminal.orphaned &&
@@ -125,7 +132,11 @@ export async function resumeAssignments(options: ResumeOptions): Promise<ResumeR
       continue
     }
     options.engine.assignmentLost(ticket.id, assignment.id)
-    log(`interrupted ${ticket.id} (${terminalId ?? 'no terminal'})`)
+    log(
+      forced
+        ? `interrupted ${ticket.id} after a plugin upgrade`
+        : `interrupted ${ticket.id} (${terminalId ?? 'no terminal'})`
+    )
     resumed.push({
       ticketId: ticket.id,
       assignmentId: assignment.id,
@@ -134,4 +145,14 @@ export async function resumeAssignments(options: ResumeOptions): Promise<ResumeR
     })
   }
   return { assignments: resumed }
+}
+
+/**
+ * 插件版本升级后的恢复（§N.6 第 5 条）：与 §E.10 同一条路径，只是不认领任何旧终端。
+ * 组合根在 `notePluginVersion` 报 `upgraded: true` 时调它，之后的启动流程与正常重启一致。
+ */
+export async function resumeAfterUpgrade(
+  options: Omit<ResumeOptions, 'forceInterrupted'>
+): Promise<ResumeReport> {
+  return resumeAssignments({ ...options, forceInterrupted: true })
 }
