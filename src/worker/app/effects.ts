@@ -29,7 +29,7 @@ export const GLOBAL_CONCURRENCY = 4
 /** `Later` 的重试间隔：设计写死 5 s，不随 kind 的退避变化（§J.2 `Later` 行）。 */
 export const LATER_DELAY_MS = 5000
 
-/** `effect` 表的七种 kind（§J.2 的 kind 清单，逐行）。 */
+/** `effect` 表的八种 kind（§J.2 的 kind 清单，逐行）。 */
 export type EffectKind =
   | 'assessment'
   | 'launch'
@@ -38,6 +38,7 @@ export type EffectKind =
   | 'notice'
   | 'reply'
   | 'return'
+  | 'backup'
 
 /** kind 的稳定顺序（健康条目、`EFFECT_RULES` 与测试都按它读）。 */
 export const EFFECT_KINDS: readonly EffectKind[] = [
@@ -47,7 +48,8 @@ export const EFFECT_KINDS: readonly EffectKind[] = [
   'relay',
   'notice',
   'reply',
-  'return'
+  'return',
+  'backup'
 ]
 
 /** 每种 kind 的 payload 形状；key 的形状见下面的 `EFFECT_KEY_SHAPES`（§J.2 的 kind 表）。 */
@@ -71,6 +73,11 @@ export interface EffectPayloads {
   readonly reply: { readonly messageId: string }
   /** 人 follow-up 回到 Eval（handback 后）。 */
   readonly return: { readonly triggerKey: string }
+  /**
+   * 一次手工备份（§G.2 的 `admin backup`、§O「长活进 effect」）：`at` 是这次备份的时刻，文件名
+   * 由它与库版本决定（`app/backup.ts` 的 `backupPath`），于是命令在入队时就知道它将要落到的路径。
+   */
+  readonly backup: { readonly at: string }
 }
 
 /** 一个 handler：拿到 payload 与 key；抛 `Later` 表示「现在做不了」，抛别的表示失败。 */
@@ -176,6 +183,17 @@ export const EFFECT_RULES: Readonly<Record<EffectKind, EffectKindRule>> = {
     quiet: false,
     router: false,
     heldWhilePaused: false
+  },
+  backup: {
+    // VACUUM 是整个库的串行活：一次只跑一份（两份同时写 backups/ 没有意义），失败退避重试。
+    // 与暂停无关（它是运维动作，不是处理逻辑）：人要求的备份不该被 `paused` 挡住。
+    limit: () => 1,
+    retry: [2000, 60_000],
+    maxAttempts: Number.POSITIVE_INFINITY,
+    ordered: false,
+    quiet: false,
+    router: false,
+    heldWhilePaused: false
   }
 }
 
@@ -197,7 +215,9 @@ export const EFFECT_KEY_SHAPES: Readonly<Record<EffectKind, string>> = {
   /** messageId：一条 outbox 消息一个 receipt，重复入队不重发。 */
   reply: 'messageId',
   /** triggerKey：一条人 follow-up 回到 Eval。 */
-  return: 'triggerKey'
+  return: 'triggerKey',
+  /** at：一次手工备份（同一时刻只入队一份）。 */
+  backup: 'at'
 }
 
 /** `relay` 与 `notice` 共用的那一行 key（§J.2 末注：都是 Router 终端）。 */

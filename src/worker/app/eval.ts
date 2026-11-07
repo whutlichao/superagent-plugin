@@ -236,8 +236,17 @@ export interface EvalToolHost {
 
 /** HTTP 与 CLI 共用的两条读命令。 */
 export interface EvalTools {
-  window(triggerId: string): Promise<EvalWindowResult>
-  read(triggerId: string, request: EvalReadRequest): Promise<EvalReadResult>
+  window(triggerId: string, options?: EvalReadOptions): Promise<EvalWindowResult>
+  read(triggerId: string, request: EvalReadRequest, options?: EvalReadOptions): Promise<EvalReadResult>
+}
+
+/**
+ * 一次读的取消线（§O）：HTTP handler 的预算到点就取消它，`contextOf` / `source.read` /
+ * `source.image` 的每一次 CLI 读取都把同一个信号交给 `CommandsHost`（子进程因此被 SIGTERM）。
+ * 不给就是 CLI 与启动路径的老行为（一次读照旧有 `admissionContextTimeoutMs` 的单次上限）。
+ */
+export interface EvalReadOptions {
+  readonly signal?: AbortSignal
 }
 
 /** 截断一段正文：短的原样、长的切到 `limit` 并带全文长度（上游 `cut` 同义）。 */
@@ -552,9 +561,15 @@ export function createEvalTools(host: EvalToolHost): EvalTools {
   }
 
   /** 加载一次有界语境（同一次评估里只读一次；失败不缓存，重试可能成功）。 */
-  const contextOf = async (reads: Reads, source: TriggerContext): Promise<AdmissionContext> => {
+  const contextOf = async (
+    reads: Reads,
+    source: TriggerContext,
+    commands: CommandsHost
+  ): Promise<AdmissionContext> => {
     if (reads.context !== undefined) return reads.context
-    reads.loading ??= admissionContext(source, host.commands, host.admission())
+    // `commands` 已经绑好这次读的取消线（调用方按 `options.signal` 绑的）：语境读取的每一次
+    // CLI 调用都带着它。
+    reads.loading ??= admissionContext(source, commands, host.admission())
       .then((context) => {
         reads.context = context
         for (const message of context.messages) {
@@ -585,7 +600,9 @@ export function createEvalTools(host: EvalToolHost): EvalTools {
     reads: Reads,
     source: TriggerContext,
     trigger: Trigger,
-    imageId: string
+    imageId: string,
+    commands: CommandsHost,
+    signal: AbortSignal
   ): Promise<EvalReadResult> => {
     const slash = imageId.indexOf('/')
     if (slash <= 0 || slash === imageId.length - 1) {
@@ -598,7 +615,7 @@ export function createEvalTools(host: EvalToolHost): EvalTools {
     let message = reads.messages.get(messageId)
     if (message === undefined) {
       try {
-        await contextOf(reads, source)
+        await contextOf(reads, source, commands)
       } catch (error) {
         return unavailable('image', error)
       }
@@ -611,7 +628,7 @@ export function createEvalTools(host: EvalToolHost): EvalTools {
       })
     }
     try {
-      const image = await source.image(host.commands, imageId, new AbortController().signal)
+      const image = await source.image(commands, imageId, signal)
       return { ok: true, result: { image: { path: image.path, alt: image.alt } } }
     } catch (error) {
       host.log?.(`eval-read image ${imageId} failed: ${String(error)}`)
@@ -622,7 +639,9 @@ export function createEvalTools(host: EvalToolHost): EvalTools {
   }
 
   return {
-    async window(triggerId: string): Promise<EvalWindowResult> {
+    async window(triggerId: string, options?: EvalReadOptions): Promise<EvalWindowResult> {
+      const signal = options?.signal
+      const commands = signal === undefined ? host.commands : host.commands.withSignal(signal)
       const found = live(triggerId)
       if (!found.ok) return found
       const { candidate, trigger } = found
@@ -634,7 +653,7 @@ export function createEvalTools(host: EvalToolHost): EvalTools {
       }
       const reads = readsFor(candidate, trigger, source)
       try {
-        const context = await contextOf(reads, source)
+        const context = await contextOf(reads, source, commands)
         return {
           ok: true,
           window: evalWindowOf({
@@ -660,7 +679,15 @@ export function createEvalTools(host: EvalToolHost): EvalTools {
       }
     },
 
-    async read(triggerId: string, request: EvalReadRequest): Promise<EvalReadResult> {
+    async read(
+      triggerId: string,
+      request: EvalReadRequest,
+      options?: EvalReadOptions
+    ): Promise<EvalReadResult> {
+      const signal = options?.signal
+      const commands = signal === undefined ? host.commands : host.commands.withSignal(signal)
+      // `source.image` 要一个必填的信号：没给预算时就是一条不会被取消的线（与 #65 之前一致）。
+      const readSignal = signal ?? new AbortController().signal
       const invalid = validateEvalRead(request)
       if (invalid !== undefined) return invalid
       const found = live(triggerId)
@@ -698,12 +725,14 @@ export function createEvalTools(host: EvalToolHost): EvalTools {
         })
       }
       const reads = readsFor(candidate, trigger, source)
-      if (request.imageId !== undefined) return imageRead(reads, source, trigger, request.imageId)
+      if (request.imageId !== undefined) {
+        return imageRead(reads, source, trigger, request.imageId, commands, readSignal)
+      }
       if (request.messageId !== undefined) {
         let message = reads.messages.get(request.messageId)
         if (message === undefined) {
           try {
-            await contextOf(reads, source)
+            await contextOf(reads, source, commands)
           } catch (error) {
             return unavailable('message', error)
           }
@@ -735,7 +764,7 @@ export function createEvalTools(host: EvalToolHost): EvalTools {
         )
       }
       try {
-        const page = await source.read(host.commands, part, cursor, new AbortController().signal)
+        const page = await source.read(commands, part, cursor, readSignal)
         const chars = page.messages.reduce((total, message) => total + message.text.length, 0)
         if (chars > REPO_READ_MAX_BYTES) {
           return refuse('too_large', `The page is larger than ${REPO_READ_MAX_BYTES} bytes`, {

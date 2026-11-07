@@ -14,7 +14,9 @@
 // 依赖纪律（§C.2）：本文件在 `http/`，只 import core 的类型、`app/views` 与同目录的
 // `ApiError`/`values.ts`；领域写入经注入的 Engine 端口，存储经注入的读口。
 import { ApiError, ERROR_CODES } from './errors.ts'
+import { refuseOnDeadline } from './budget.ts'
 import { bodyObject } from './values.ts'
+import { withDeadline, type HandlerBudget, type ProbeOptions } from '../infra/deadline.ts'
 import { IM_WORDS, wordCount } from '../infra/text.ts'
 import { REPORT_STATES, threadKey } from '../core/index.ts'
 import type {
@@ -36,6 +38,16 @@ export const REPLY_PURPOSES = ['answer', 'result', 'attention'] as const
 export const REPLY_WORD_LIMIT = IM_WORDS
 /** `report --summary` 的字符上限（§G.2：600 字符）。 */
 export const SUMMARY_LIMIT = 600
+
+/**
+ * `POST report` 的时间预算（§O「超时」行）：一条 PR 读 2 s、整次 5 s。
+ *
+ * 报告本身是本地写（一个事务）；慢的是 `--pr-number` 那一步：写之前先读那条 PR、判它是不是这张
+ * Ticket 的（§I.2 的「PR 规则」行），那是一次 `gh api` 读。到点先取消（信号进 `execFile`，子进程
+ * 被 SIGTERM）再返回固定码 `unavailable` + 「稍后重试」——**报告不写、PR 不绑**（写与绑定都在
+ * 读成功之后，所以超时没有部分状态）。总预算在 §O 的 10 s 天花板之下。
+ */
+export const REPORT_BUDGET: HandlerBudget = { probeMs: 2_000, totalMs: 5_000 }
 
 /** 写命令的幂等端口（§G.1 幂等行）：拿到请求（token/requestId/at）与要跑的工作。 */
 export type WriteIdempotency = (
@@ -109,11 +121,17 @@ export interface DomainHandlerOptions {
    * `report --pr-number` 的绑定（§I.2 的「PR 规则」行、§G.2 的 `pr_mismatch`）：组合根读那条
    * PR、判它是不是这张 Ticket 的、并把它绑给 Ticket；返回拒绝原因时这条报告不写，信封里落成
    * `pr_mismatch`。缺省不绑（没有 GitHub Source 的接线与单元测试都不读网络）。
+   *
+   * `options` 是这次读的预算（§O）：`signal` 到点就取消（组合根把它绑到 `gh` 的 `execFile` 上），
+   * `timeoutMs` 是同一条上限的兜底。
    */
   readonly claimPull?: (
     ticketId: string,
-    pull: { readonly number: number }
+    pull: { readonly number: number },
+    options?: ProbeOptions
   ) => Promise<string | undefined> | string | undefined
+  /** `POST report` 的预算（§O）；缺省 `REPORT_BUDGET`，测试注入小预算。 */
+  readonly reportBudget?: HandlerBudget
   /**
    * 写命令的幂等端口（组合根用真库实现 `runWrite`）；缺省直接执行一次。`--request-id`
    * 一小时内重试返回首次结果（§G.1）：本票接线的四条写命令都过这一个口。
@@ -234,6 +252,8 @@ export interface TicketsResult {
  */
 export function createDomainHandlers(options: DomainHandlerOptions): ReadonlyMap<string, RouteHandler> {
   const handlers = new Map<string, RouteHandler>()
+  /** §O：`report --pr-number` 的那次 PR 读在预算内跑（缺省 2 s/条、5 s 整次）。 */
+  const reportBudget = options.reportBudget ?? REPORT_BUDGET
   /** 写命令的幂等（§G.1）：组合根给端口时同 id 一小时内返回首次结果，否则照常跑一次。 */
   const write = options.idempotent ?? ((_input, work) => Promise.resolve(work()))
   /** 一条 Ticket 的读模型（列表与详情同一份，含仍归它的人 follow-up 标记）。 */
@@ -321,7 +341,25 @@ export function createDomainHandlers(options: DomainHandlerOptions): ReadonlyMap
     // PR 号只当作**绑定**的输入（§I.2）：先读 PR、判归属，再写报告——拒绝时整条命令不写任何东西。
     const pull = pullNumberOf(body)
     if (pull !== undefined && options.claimPull !== undefined) {
-      const refused = await options.claimPull(ticketId, { number: pull })
+      // §O：这次读在预算内跑；到点先取消读，再回 `unavailable`（报告不写、PR 不绑）。
+      const claimed = options.claimPull
+      const refused = await refuseOnDeadline(
+        withDeadline(
+          (signal) =>
+            Promise.resolve(
+              claimed(
+                ticketId,
+                { number: pull },
+                {
+                  signal,
+                  ...(reportBudget.probeMs === undefined ? {} : { timeoutMs: reportBudget.probeMs })
+                }
+              )
+            ),
+          { ms: reportBudget.totalMs, what: `the PR #${pull} read` }
+        ),
+        { ticket: ticketId, pr: String(pull), reason: 'timeout' }
+      )
       if (refused !== undefined) {
         throw new ApiError(ERROR_CODES.prMismatch, refused, {
           ticket: ticketId,

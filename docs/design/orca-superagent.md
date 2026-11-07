@@ -920,7 +920,7 @@ Router/Worker 用的命令（等价上游 `orchestrator_*` 工具）：
 | `superagent pause` / `resume` | 处理暂停（`paused=true/false`），写 `settings` 的 `paused`，origin=`operator` |
 | `superagent setup check` | 重跑 setup（会重启 worker 内的 loops，不重启 Orca）；`setup` 已无问题时拒绝 |
 | `superagent source labels <id>` | 刷新显示名（一次外部读取，有 §O 的预算：超预算 → `unavailable` + 「稍后重试」，不写库、不返回半份成功） |
-| `superagent admin backup` | 立即备份（供升级前手工调用） |
+| `superagent admin backup` | 入队一次备份（供升级前手工调用）：入队一行 `backup` effect 并回 `{queued:true, path, at}`——VACUUM 不在 HTTP handler 里跑（§O），`path` 就是它将要落到的位置；命令返回不等文件写完 |
 | `superagent admin rotate-token` | 轮换主 token（破坏性，需确认） |
 | `superagent doctor` | 本地诊断：token/端口/锁/库迁移/CLI 路径/gh 登录/lark-cli 配置，逐项 `ok\|warn\|timeout\|fail`（`timeout` = 那条探针在自己的预算内没回来，既不是 ok 也不是 fail；见 §O 的超时行） |
 
@@ -935,7 +935,7 @@ Router/Worker 用的命令（等价上游 `orchestrator_*` 工具）：
 | `GET threads?filter=&offset=&limit=`、`GET threads/:key?before=&around=&limit=` | `read threads`、`read thread/<key>` | |
 | `GET decisions?kind=&window=24h&offset=` | `read decisions` | |
 | `GET tickets?state=&offset=`、`GET tickets/:id` | `read tickets`、`read ticket/<id>` | |
-| `GET settings`、`PUT settings/:block` | `settings get/save` | body `{value, revision}` |
+| `GET settings`、`PUT settings/:block` | `settings get/save` | body `{value, revision}`；账号类字段（`cli`/`repository`）变更时写前先跑 setup 探针，超预算（§O）→ `unavailable` 且**什么都不写**（没有设置版本、没有幂等记录） |
 | `GET prompts?revision=&offset=`、`PUT prompts`、`POST prompts/preview` | `prompts …` | |
 | `GET policy/history` | 设置历史 | |
 | `POST policy-sync/:id` | `policy sync` | |
@@ -947,17 +947,17 @@ Router/Worker 用的命令（等价上游 `orchestrator_*` 工具）：
 | `POST threads/:key/follow`、`POST threads/:key/unrelated` | `thread follow` / `thread unrelated` | 同样是 worker 的命令（Ticket 来自 token）；`own_thread`/`not_followed`/`unrelated_required` |
 | `POST tickets/:id/retry`、`POST tickets/:id/stop`、`POST tickets/:id/note` | 同名 | stop 是破坏性动作：body `{confirm:true}`（CLI `--yes`）；错误码 `already_ended`/`not_retryable`/`missing` |
 | `POST tickets/:id/request-status` | 同名 | |
-| `POST report`、`POST reply`、`POST ack` | `report` / `reply` / `ack` | §G.2 的三条 worker 命令；Ticket 来自 assignment token，不是 body |
+| `POST report`、`POST reply`、`POST ack` | `report` / `reply` / `ack` | §G.2 的三条 worker 命令；Ticket 来自 assignment token，不是 body；`report --pr-number` 的那次 PR 读有 §O 预算（2 s/条、5 s 整次）：超预算 → `unavailable`，报告不写、PR 不绑 |
 | `POST eval-decide/:id` | `eval-decide` | body 是 `{assessment}`；角色 ≥ router |
 | `POST executor/pause` | `pause/resume` | body `{paused}` |
 | `POST setup/check` | `setup check` | |
 | `POST router/restart` | Router 重启（面板动作） | |
 | `POST workspaces/:id/open` | `host.call('workspace.open')` | 面板无此 Host 方法，必须走 worker |
 | `GET models` | 可用模型清单（来自 Orca 启动时的模型参数与设置） | 见 §H.17 |
-| `GET read/:resource` | `read <resource>` | 资源名整段（百分号编码，`/` 不改变分段）：`github/…`/`feishu/…`（#57）由 `app/read.ts` 路由到 kind 的读模块。**`read` 的视图名走各自的路由**（`overview`/`sources`/`search`/`threads`/`thread/<key>`/`decisions`/`tickets`/`ticket/<id>`/`settings`/`prompts`/`models`，`cli/commands.ts` 的 `readPath`，§G.2），不经过这条；资源名在 `READ_SOURCE_RESOURCES` 之外时拒绝并列出可用写法（`unknown_resource`）。角色在 handler 里细化（assignment 只读自己 Ticket 相关的资源，§O） |
-| `GET eval/:id`、`GET eval-read/:id` | `eval`、`eval-read` | `eval-read` 的四种读法是查询串：`message-id`、`image-id`、`part`（+`cursor`）、`path`；角色 ≥ router |
+| `GET read/:resource` | `read <resource>` | 资源名整段（百分号编码，`/` 不改变分段）：`github/…`/`feishu/…`（#57）由 `app/read.ts` 路由到 kind 的读模块。**`read` 的视图名走各自的路由**（`overview`/`sources`/`search`/`threads`/`thread/<key>`/`decisions`/`tickets`/`ticket/<id>`/`settings`/`prompts`/`models`，`cli/commands.ts` 的 `readPath`，§G.2），不经过这条；资源名在 `READ_SOURCE_RESOURCES` 之外时拒绝并列出可用写法（`unknown_resource`）。角色在 handler 里细化（assignment 只读自己 Ticket 相关的资源，§O）。整次 9 s 预算（§O）：超预算先取消读，回 `unavailable` |
+| `GET eval/:id`、`GET eval-read/:id` | `eval`、`eval-read` | `eval-read` 的四种读法是查询串：`message-id`、`image-id`、`part`（+`cursor`）、`path`；角色 ≥ router。整次 9 s 预算（§O）：超预算先取消语境/分页读，回 `unavailable` |
 | `POST doctor` | `doctor` | 单条 CLI 探针超预算 → 该项 `state:timeout`（200，其余项照常）；整次超预算 → `unavailable`（503，不留半份结果） |
-| `POST admin/backup`、`POST admin/rotate-token` | `admin backup` / `admin rotate-token` | 运维动作，operator only；`rotate-token` 破坏性，handler 要求确认 |
+| `POST admin/backup`、`POST admin/rotate-token` | `admin backup` / `admin rotate-token` | 运维动作，operator only；`rotate-token` 破坏性，handler 要求确认。`admin backup` 只入队一行 `backup` effect 并回 `{queued:true, path, at}`（VACUUM 不在 handler 里跑，§O） |
 
 **没有 GET 的两个 `read` 名字**：`read triggers` 与 `read trigger/<id>` 是合法资源名（`READ_RESOURCES`
 里有），但 §G.3 没有对应的 `GET triggers`/`GET triggers/:id` 路由，于是服务端回 `missing`、
@@ -1221,6 +1221,7 @@ kind 清单：
 | `notice` | `'router'` | 不唤醒语义的通知（结束、设置已存、prompt 更新） | 1（FIFO） | 2 s→60 s |
 | `reply` | messageId | 经 Channel 发一条 outbox 消息 | 1 | 5 s→300 s |
 | `return` | triggerKey | 人 follow-up 回到 Eval（handback 后） | 1 | 2 s→60 s |
+| `backup` | at | 手工备份（`admin backup`）：`VACUUM INTO` + 保留 5 份（§G.2、§O） | 1 | 2 s→60 s |
 
 > 与上游的一处合并：上游 `relay` 与 `notice` 是两个 kind；这里保留两个 kind，但**共用同一串行队列**（都是 Router 终端），实现上用一个 `routerQueue` 互斥即可，语义上仍是「失败挡住后来的同种」。
 
@@ -1679,7 +1680,7 @@ ENOENT: no such file or directory, open
 | `passes` | passes | 上一轮 pass 是否失败（连续 3 次 → error） |
 | `models` | sessions 等价物 | 恒 `ready`，detail「handled by Orca」(§H.4) |
 | `evals` | passes | 1 h 内未解决的 unavailable Decision 数 |
-| `assessment` `launch` `delivery` `relay` `notice` `reply` `return` | effects | 各自连续失败 3 次的计数与最后错误（`delivery` 不上报，写 Ticket） |
+| `assessment` `launch` `delivery` `relay` `notice` `reply` `return` `backup` | effects | 各自连续失败 3 次的计数与最后错误（`delivery` 不上报，写 Ticket） |
 | `worker` | executor | agent 事件处理失败；首次失败才出现 |
 | `router` | router/supervision | 重启次数与最后错误 |
 | `github` `feishu` | 各 Source kind | 轮询/事件流转；连续 3 次失败 → error |
@@ -1743,7 +1744,7 @@ ENOENT: no such file or directory, open
 | CLI 凭证 | 由机器上的 `gh` / `lark-cli` 持有；插件**不存** GitHub token、不存 Feishu app secret；`secrets` 只用于可选的自定义（如私有镜像口令），且有 `protection()==='unavailable'` 时的降级说明 |
 | 破坏性操作 | 面板二次确认（§M.2）；CLI 侧 `ticket stop` / `worktree rm` / `rotate-token` 要求 `--yes`（或 `--request-id` 幂等 + `--confirm`） |
 | 命令注入 | 所有子进程用 **argv 数组** + `shell:false`；程序名白名单（`gh`/`lark-cli`/`git`/`orca`/`sh`），路径必须是设置里给的绝对值；`prepare` 命令里只允许 `${DSH_SUPERAGENT_*}` 白名单变量，替换时逐值单引号转义；**绝不**把消息正文拼进 shell |
-| 超时 | CLI 60 s（`prepare` 10 min，`worktree create` 120 s）；HTTP handler 内不做超过 10 s 的同步等待（长活进 effect）。四条会同步等外部 CLI 的路由因此各有预算：`POST setup/check` 单条探针 2 s、整次 9 s（`src/worker/http/ops.ts` 的 `SETUP_CHECK_BUDGET`），`POST policy-sync/:id` 整次 8 s（`http/settings.ts` 的 `POLICY_SYNC_BUDGET`），`POST doctor` 单条 CLI 探针 2 s、整次 9 s（`ops.ts` 的 `DOCTOR_BUDGET`），`POST sources/:id/labels` 单条探针 2 s、整次 5 s（`ops.ts` 的 `SOURCE_LABELS_BUDGET`）。到点先取消（信号进 `execFile`，子进程被 SIGTERM 掐掉）再定结论：`doctor` 是逐项读数，单条探针到点只把**那一项**标成 `timeout`（200，其余项照常；不伪装 ok），整次到点才 `unavailable`；其余三条是一次**动作**，到点即返回固定码 `unavailable` + 「稍后重试」，半个结论/名单都不落库（`infra/deadline.ts` 的 `withDeadline` / `probeRunner` / `withinBudget`） |
+| 超时 | CLI 60 s（`prepare` 10 min，`worktree create` 120 s）；HTTP handler 内不做超过 10 s 的同步等待（长活进 effect）。**每一条会同步等外部 CLI/探针的路由各有一条预算**（都在 10 s 天花板之下）：`POST setup/check` 单条探针 2 s、整次 9 s（`src/worker/http/ops.ts` 的 `SETUP_CHECK_BUDGET`），`POST policy-sync/:id` 整次 8 s（`http/settings.ts` 的 `POLICY_SYNC_BUDGET`），`POST doctor` 单条 CLI 探针 2 s、整次 9 s（`ops.ts` 的 `DOCTOR_BUDGET`），`POST sources/:id/labels` 单条探针 2 s、整次 5 s（`ops.ts` 的 `SOURCE_LABELS_BUDGET`），`PUT settings/:block` 的账号探针单条 2 s、整次 9 s（`settings.ts` 的 `SETTINGS_SAVE_BUDGET`），`POST report --pr-number` 的 PR 读单条 2 s、整次 5 s（`http/domain.ts` 的 `REPORT_BUDGET`），`GET eval/:id` / `GET eval-read/:id` 与 `GET read/:resource` 整次 9 s（`http/eval.ts` 的 `EVAL_READ_BUDGET`、`http/read.ts` 的 `READ_BUDGET`）。到点先取消（信号进 `execFile`，子进程被 SIGTERM 掐掉）再定结论：`doctor` 是逐项读数，单条探针到点只把**那一项**标成 `timeout`（200，其余项照常；不伪装 ok），整次到点才 `unavailable`；其余是一次**动作**，到点即返回固定码 `unavailable` + 「稍后重试」，半个结论/名单/设置都不落库（`infra/deadline.ts` 的 `withDeadline` / `probeRunner` / `withinBudget`，折码只有 `http/budget.ts` 的 `refuseOnDeadline` 一处）。面板的 host 方法（`checkSetup`/`doctor`/`refreshSourceLabels`/`syncSource`/`settingsSave`）与 HTTP 走**同一份预算**：面板请求同样不能占住 worker。`POST admin/backup` 的 `VACUUM` 是同步的，所以它不进 handler：命令只入队一行 `backup` effect（§J.2）并回 `{queued:true, path}`；effect 先让出一拍（`setImmediate`）好让那个响应写出去，然后 `VACUUM` **仍然在 worker 自己的事件循环上同步跑完**。诚实边界：这里的保证是「这个 HTTP handler 不阻塞、响应已经先写出去」，**不是**「整个 worker 在备份期间非阻塞」——备份期间同一条事件循环同样被按住，`VACUUM` 的时长就是按住的时长。备份先写同目录的临时文件再原子改名到目标（`VACUUM INTO` 不覆盖已存在的文件，直接写目标会让重试永远失败；目标已存在只是被替换，崩溃留下的临时文件在下次动手前清掉，§N.6） |
 | 路径 | `stateDir` 必须是绝对路径且可写；`inbox/relay/skills/backups` 都在其后代内；任何用户提供的路径（`eval-read --path`）必须 realpath 后落在 base repo 或 ticket worktree 之内，否则 `refused` |
 | 审批面 | manifest 的 10 个 capability 就是用户看到并批准的清单；插件不请求 `appearance:write`，也不注册 hook 之外的拦截点（不用 `terminal.send`/`agent.tool.before` 做「安全网关」，避免把可靠性问题变成安全断言） |
 | 供应链 | 零运行时 npm 依赖（只用 Node 内置：`node:sqlite`、`node:fs`、`node:crypto`、`node:child_process`、`node:http`）；若必须引入 zod，以 MIT 单文件内置（`src/worker/infra/schema.ts` 的最小校验器），避免 `node_modules`（插件不允许提交 `node_modules`，也不做打包） |
@@ -1765,7 +1766,7 @@ ENOENT: no such file or directory, open
 
 ### P.2 测试套件（`orca plugin test .` 会跑所有 `*.test.ts(x)`）
 
-快照（本机 Orca 1.4.251、Node 25；截至 #64 合并，`scripts/check.sh` 的实测读数）：**89 个文件、1576 条测试、170 个 suite、fail 0**。下表按模块
+快照（本机 Orca 1.4.251、Node 25；截至 #68 合并，`scripts/check.sh` 的实测读数）：**89 个文件、1606 条测试、173 个 suite、fail 0**。下表按模块
 分组，每行都是 `tests/` 下的真实文件；「对应上游」写上游同名测试面，合并与改名的地方直接写出
 去向（§R.2 是同一件事的反向对照）。**没有落地的一项**单独列在表末。
 
@@ -1811,15 +1812,15 @@ ENOENT: no such file or directory, open
 | `store.test.ts` / `repositories.test.ts` / `memory.test.ts` | 真库与四条 PRAGMA、kv 键只在 `kv.ts`、仓储映射与生成列、确定性读序；内存仓储的克隆/回滚 | `store.spec.ts` |
 | `migration.test.ts` / `retention.test.ts` / `lock.test.ts` | 迁移与备份、保留阈值、单实例锁与陈旧锁回收 | `migration.spec.ts` |
 | `health.test.ts` / `health-states.test.ts` | 每条目一个写者、release 语义；四档状态集合（`starting/ready/paused/error`） | `health.spec.ts` |
-| `http.test.ts` | §G.3 的 1–9 条边界、错误码 → 状态码、三角色拒绝面、`GET state` 形状、端口选择；§O 的 handler 预算（挂住的端口在预算内返回固定码、信号取消、不写库） | `http.spec.ts` |
+| `http.test.ts` | §G.3 的 1–9 条边界、错误码 → 状态码、三角色拒绝面、`GET state` 形状、端口选择；§O 的 handler 预算（挂住的端口在预算内返回固定码、信号取消、不写库；`setup`/`doctor`/`labels`/`policy sync`/`settings save`/`report`/`eval`/`read` 各有用例，且每条预算都在 10 s 之下） | `http.spec.ts` |
 | `read-views.test.ts` | 视图读面（overview/sources/search/threads/thread/decisions/models）、筛选、`(at, triggerId)` 游标、assignment 边界；**上游 `views`/`timeline` 的断言在这里** | `views.spec.ts`、`timeline.spec.ts`（合并） |
-| `eval-tools.test.ts` | `eval` / `eval-read` 的窗口与四种读法 | `tools.spec.ts` |
+| `eval-tools.test.ts` | `eval` / `eval-read` 的窗口与四种读法；两端的 §O 预算（挂住的读在预算内返回 `unavailable`、信号取消） | `tools.spec.ts` |
 | `cli-contract.test.ts` / `tools.test.ts` | 表驱动：每条命令一条成功 + 一条固定拒绝（断言 `error.code`）；入参/出参、请求幂等 | `tools.spec.ts` |
 | `cli-status.test.ts` / `cli-doctor.test.ts` / `cli-entry.test.ts` | `status` 的 0/1/2/3、`doctor` 的四档结论（含单条探针到点 → `timeout`、其余项照常）、可执行入口的端到端（真子进程） | `service-script.spec.ts` |
-| `settings.test.ts` / `settings-view.test.ts` / `settings-limits.test.ts` | 保存与 origin、写前校验、版本记账；Settings 页的 worker 面；四个机器限额 | `settings.spec.ts` |
+| `settings.test.ts` / `settings-view.test.ts` / `settings-limits.test.ts` | 保存与 origin、写前校验、版本记账、账号探针的 §O 预算（挂住的探针 → `unavailable` 且不写库）；Settings 页的 worker 面；四个机器限额 | `settings.spec.ts` |
 | `prompts.test.ts` / `cards.test.ts` / `panel-prompts.test.tsx` / `diff.test.ts` | 分片清单、占位符、组装顺序、版本与 default-changed；每个分片必须声明的规则；prompt 配置分区与行 diff（上游 `prompt-config`） | `prompts.spec.ts`、`cards.spec.ts`、`prompt-config.spec.ts`（合并） |
 | `model-surface.test.ts` | 模型能读到的一切（帮助、prompt、skills、Input）与命令表/变量表/术语表一致，且有体量预算 | `model-surface.spec.ts` |
-| `deployment.test.ts` / `agent-defaults.test.ts` / `gitconfig.test.ts` / `main.test.ts` | setup 探针；两个 agent 默认值同源；`worker-gitconfig` 的内容与注入姿态；`activate` 的登记与越权 | `deployment.spec.ts`、`index.spec.ts` |
+| `deployment.test.ts` / `agent-defaults.test.ts` / `gitconfig.test.ts` / `main.test.ts` | setup 探针；两个 agent 默认值同源；`worker-gitconfig` 的内容与注入姿态；`activate` 的登记与越权；§O 的面板 host 方法预算（`checkSetup`/`doctor`/`refreshSourceLabels`/`syncSource`/`settingsSave` 与 HTTP 同一份）与 `admin backup` 的入队（`{queued:true}` + effect 落盘） | `deployment.spec.ts`、`index.spec.ts` |
 | `panel-overview.test.tsx` / `panel-source.test.tsx` / `panel-trigger.test.tsx` / `panel-eval.test.tsx` / `panel-execution.test.tsx` / `panel-settings.test.tsx` / `panel-prompts.test.tsx` / `panel-deployment.test.tsx` / `panel-search.test.tsx` / `panel-navigation.test.tsx` | 每页的行数、三态、危险操作确认、路由记忆、`panel.refusals` 为空 | `panel-*.spec.tsx`、`client.spec.ts`、`navigation.spec.ts` |
 | `widgets.test.tsx` / `draft.test.ts` / `markdown.test.ts` / `marks.test.ts` / `terms.test.ts` / `protocol.test.ts` | 组件契约、草稿状态机与保存栏、Markdown 子集、状态标记、码表与文案键一一对应、面板↔worker 协议形状 | `client.spec.ts`、`controls.spec.ts`（删除：Orca 提供控件） |
 | `locales.test.ts` / `styles.test.ts` | 双语 key 集合与非空；只用主题变量（无 `style`/`className`） | `locales.spec.ts`、`styles.spec.ts` |

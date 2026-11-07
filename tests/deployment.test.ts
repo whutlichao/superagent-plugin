@@ -16,7 +16,7 @@ import { runDoctor } from '../src/worker/app/doctor'
 import { GITCONFIG_MODE, workerGitConfigPath } from '../src/worker/infra/gitconfig'
 import { bootPlugin } from '../src/worker/boot'
 import { dispatch } from '../src/worker/cli/commands'
-import { parseArgs } from '../src/worker/cli/io'
+import { parseArgs, render } from '../src/worker/cli/io'
 import { readApiToken } from '../src/worker/infra/tokens'
 import { openBoot, settingsOf } from './support/boot'
 import { openStore } from '../src/worker/app/store'
@@ -902,7 +902,7 @@ describe('doctor and the setup check are different questions', () => {
           if (program === 'gh') return 'Logged in to github.com as acme-agent (oauth_token=ghp_live_value)'
           return JSON.stringify({
             identities: { bot: { status: 'ready', appSecret: 'lark-app-secret' } },
-            appId: 'cli_app_123'
+            appId: 'cli_app123'
           })
         }
       })
@@ -1067,6 +1067,294 @@ describe('the deployment read the panel renders', () => {
       assert.equal(JSON.stringify(result).includes(readApiToken(boot.stateDir) as string), false, 'doctor never prints the token')
     } finally {
       await boot.cleanup()
+    }
+  })
+})
+
+// ---------------------------------------------------------------------------
+// 面板 host 方法的 §O 预算（§O「超时」行）：面板请求同样不能占住 worker。四条方法与
+// 它们的 HTTP 路由共用同一份接线与同一条预算；用例注入小预算并让依赖挂住。
+// ---------------------------------------------------------------------------
+
+/** 一个拒绝的形状：面板 host 方法的错误带 `code`（面板按码翻译）。 */
+function refusalCode(error: unknown): string | undefined {
+  return typeof error === 'object' && error !== null ? (error as { code?: string }).code : undefined
+}
+
+describe('the panel host methods carry the same §O budgets as the HTTP routes', () => {
+  test('a hanging setup probe on the panel check returns unavailable and applies nothing', async () => {
+    // boot 时 `gh api user` 失败一次 → setup 有待查的问题；之后同一条探针挂住（§O 的超时用例）。
+    const h = await openBoot({
+      budgets: { setupCheck: { probeMs: 10, totalMs: 40 } },
+      scripts: (commands) => {
+        commands.fail(
+          'gh',
+          ['api', 'user'],
+          Object.assign(new Error('gh auth status exited with code 1'), { code: 1 }),
+          { once: true }
+        )
+      }
+    })
+    try {
+      const before = h.handle.deployment().setup
+      assert.equal(before.length > 0, true, 'the boot left a setup problem behind')
+      h.commands.hang('gh', ['api', 'user'])
+      const started = Date.now()
+      let refusal: unknown
+      try {
+        await h.handle.checkSetup()
+      } catch (error) {
+        refusal = error
+      }
+      const elapsed = Date.now() - started
+      // 固定码：这不是一条编出来的 setup 结论，也不是内部错误。
+      assert.equal(refusalCode(refusal), 'unavailable', String(refusal))
+      assert.ok(String((refusal as Error).message).includes('retry later'), String(refusal))
+      assert.ok(elapsed < 1_000, `the panel call returned after ${elapsed} ms`)
+      // 超时的检查一半都没落地：`deployment().setup` 还是 boot 时那一条。
+      assert.deepEqual(h.handle.deployment().setup, before)
+    } finally {
+      await h.cleanup()
+    }
+  })
+
+  test('a hanging doctor probe on the panel is a timeout on that item, inside the budget', async () => {
+    const h = await openBoot({ budgets: { doctor: { probeMs: 10, totalMs: 500 } } })
+    try {
+      const written = h.commands.calls.length
+      // 一个永不返回的子进程（真实现里信号进 `execFile`，子进程被 SIGTERM 掐掉）。
+      h.commands.hang('gh', ['auth', 'status'])
+      const started = Date.now()
+      const result = await h.handle.doctor()
+      const elapsed = Date.now() - started
+      // 单条探针到点只把那一项标 `timeout`：面板仍拿到一份完整读数，不是一个报错。
+      const gh = result.checks.find((check) => check.name === 'gh')
+      assert.equal(gh?.state, 'timeout', JSON.stringify(result.summary))
+      assert.equal(String(gh?.detail).includes('10 ms'), true, String(gh?.detail))
+      assert.ok(elapsed < 1_000, `the panel call returned after ${elapsed} ms`)
+      const hung = h.commands.calls.slice(written).find((call) => call.program === 'gh')
+      assert.equal(hung?.options.signal?.aborted, true, 'the budget signal is aborted')
+      assert.equal(hung?.options.timeoutMs, 10, 'the probe gets the same cap')
+    } finally {
+      await h.cleanup()
+    }
+  })
+
+  test('a panel doctor call that blows the whole budget fails with unavailable', async () => {
+    // 总预算比探针上限更紧：整次到点 → 固定码 `unavailable`（不是一份没跑完的读数）。
+    const h = await openBoot({ budgets: { doctor: { probeMs: 2_000, totalMs: 10 } } })
+    try {
+      h.commands.hang('gh', ['auth', 'status'])
+      const started = Date.now()
+      let refusal: unknown
+      try {
+        await h.handle.doctor()
+      } catch (error) {
+        refusal = error
+      }
+      const elapsed = Date.now() - started
+      assert.equal(refusalCode(refusal), 'unavailable', String(refusal))
+      assert.ok(String((refusal as Error).message).includes('retry later'), String(refusal))
+      assert.ok(elapsed < 1_000, `the panel call returned after ${elapsed} ms`)
+    } finally {
+      await h.cleanup()
+    }
+  })
+
+  test('a hanging label read on the panel returns unavailable and keeps the old labels', async () => {
+    const stateDir = tempStateDir()
+    const h = await openBoot({
+      stateDir,
+      settings: {
+        ...settingsOf(stateDir),
+        sources: {
+          github: { enabled: true, config: { repository: 'acme/widgets', cli: 'gh', pollSeconds: 60 } },
+          feishu: { enabled: false, config: { cli: 'lark-cli' } }
+        }
+      },
+      scripts: (commands) => {
+        commands.script(['im', '+chat-list', '--as', 'bot'], () =>
+          JSON.stringify({ chats: [{ chat_id: 'oc_all', name: 'Build alerts', chat_mode: 'group' }] })
+        )
+      },
+      budgets: { sourceLabels: { probeMs: 10, totalMs: 40 } }
+    })
+    const store = openStore({ stateDir })
+    try {
+      // 先成功一次：名单写进 kv（证明超时之后这份名单没有被覆盖成空表）。
+      const first = await h.handle.refreshSourceLabels('feishu')
+      assert.equal(first.total, 1)
+      assert.deepEqual(store.kvGet('source-labels:feishu'), { oc_all: 'Build alerts' })
+
+      h.commands.hang('lark-cli', ['im', '+chat-list'])
+      const written = h.commands.calls.length
+      const started = Date.now()
+      let refusal: unknown
+      try {
+        await h.handle.refreshSourceLabels('feishu')
+      } catch (error) {
+        refusal = error
+      }
+      const elapsed = Date.now() - started
+      // 面板按 `code` 翻译；预算到点不是「参数不对」（`invalid_params`）。
+      assert.equal(refusalCode(refusal), 'unavailable', String(refusal))
+      assert.ok(String((refusal as Error).message).includes('retry later'), String(refusal))
+      assert.ok(elapsed < 1_000, `the panel call returned after ${elapsed} ms`)
+      const hung = h.commands.calls.slice(written).find((call) => call.program === 'lark-cli')
+      assert.equal(hung?.options.signal?.aborted, true, 'the read signal is aborted')
+      // 名单没被覆盖：上一次那份原样留着。
+      assert.deepEqual(store.kvGet('source-labels:feishu'), { oc_all: 'Build alerts' })
+    } finally {
+      store.close()
+      await h.cleanup()
+      rmSync(stateDir, { recursive: true, force: true })
+    }
+  })
+
+  test('a hanging list sync on the panel returns unavailable inside the budget and saves nothing', async () => {
+    const stateDir = tempStateDir()
+    const h = await openBoot({
+      stateDir,
+      settings: {
+        ...settingsOf(stateDir),
+        sources: {
+          github: { enabled: true, config: { repository: 'acme/widgets', cli: 'gh', pollSeconds: 60 } },
+          feishu: { enabled: true, config: { cli: 'lark-cli' } }
+        },
+        policy: {
+          sources: {
+            github: { allowed: [{ id: 'alice' }] },
+            feishu: { allowed: [], syncChat: 'oc_all' }
+          }
+        }
+      },
+      scripts: (commands) => {
+        // 机器人的身份探针（§I.3 配置行）：可同步的前提是 setup 认为它可用。
+        commands.script(['auth', 'status'], () =>
+          JSON.stringify({ appId: 'cli_app123', identities: { bot: { status: 'ready' } } })
+        )
+        commands.script(['api', 'GET', '/open-apis/bot/v3/info', '--as', 'bot'], () =>
+          JSON.stringify({ bot: { open_id: 'ou_bot1' } })
+        )
+        commands.script(['im', '+chat-members-list'], () =>
+          JSON.stringify({ members: [{ id: 'ou_all', name: 'Alice' }] })
+        )
+      },
+      budgets: { policySync: { totalMs: 40 } }
+    })
+    const store = openStore({ stateDir })
+    try {
+      // 启动时那一轮同步照常完成（不然下面挂住的是它，不是「立即同步」）。
+      await h.handle.policySync()
+      const before = [...store.kvKeys()]
+
+      h.commands.hang('lark-cli', ['im', '+chat-members-list'])
+      const written = h.commands.calls.length
+      const started = Date.now()
+      let refusal: unknown
+      try {
+        await h.handle.syncSource('feishu')
+      } catch (error) {
+        refusal = error
+      }
+      const elapsed = Date.now() - started
+      assert.equal(refusalCode(refusal), 'unavailable', String(refusal))
+      assert.ok(String((refusal as Error).message).includes('retry later'), String(refusal))
+      assert.ok(elapsed < 1_000, `the panel call returned after ${elapsed} ms`)
+      // 取消传到了读取（信号经驱动器的退避链进 `lark-cli`）。
+      const hung = h.commands.calls.slice(written).find((call) => call.program === 'lark-cli')
+      assert.equal(hung?.options.signal?.aborted, true, 'the sync read signal is aborted')
+      // 没有新名单落库：这次同步什么都没写（`kv` 的键一字不差；Policy 没有新版本）。
+      assert.deepEqual([...store.kvKeys()], before)
+    } finally {
+      store.close()
+      await h.cleanup()
+      rmSync(stateDir, { recursive: true, force: true })
+    }
+  })
+
+  test('a hanging account probe on a panel save fails with unavailable and writes nothing', async () => {
+    const stateDir = tempStateDir()
+    const h = await openBoot({ stateDir, budgets: { settingsSave: { probeMs: 10, totalMs: 40 } } })
+    const store = openStore({ stateDir })
+    try {
+      const before = [...store.kvKeys()]
+      // 换掉账号类字段（`repository`）才会跑写前检查；`gh api user` 是那个探针。
+      h.commands.hang('gh', ['api', 'user'])
+      const started = Date.now()
+      const outcome = await h.handle.settingsSave({
+        block: 'source:github',
+        revision: 0,
+        value: { enabled: true, config: { repository: 'acme/other', cli: 'gh', pollSeconds: 60 } }
+      })
+      const elapsed = Date.now() - started
+      // 面板拿到的是一次固定拒绝：不是保存成功，也不是「校验不通过」（`invalid`）。
+      assert.equal(outcome.ok, false)
+      assert.equal(outcome.ok === false ? outcome.reason : 'ok', 'failed')
+      const failure = outcome.ok === false && 'error' in outcome ? outcome.error : ''
+      // 具体文案原样交给面板：挂住的是哪条探针、多少毫秒、稍后重试（不是泛泛的 failed）。
+      // 探针自己的 10 ms 上限先到，所以消息点名的是那条 CLI 探针，而不是外层的整次检查。
+      assert.match(failure, /^The GitHub CLI probe did not finish within \d+ ms; retry later$/)
+      assert.ok(elapsed < 1_000, `the panel call returned after ${elapsed} ms`)
+      // 什么都没写：没有设置版本、没有块修订号。
+      assert.deepEqual([...store.kvKeys()], before)
+      assert.equal(store.kvGet('settings:revision'), null)
+    } finally {
+      store.close()
+      await h.cleanup()
+      rmSync(stateDir, { recursive: true, force: true })
+    }
+  })
+})
+
+// ---------------------------------------------------------------------------
+// `admin backup`：VACUUM 不进 handler（§O「长活进 effect」）。
+// ---------------------------------------------------------------------------
+
+describe('admin backup runs the VACUUM off the request', () => {
+  test('the command queues the backup, returns the path it will land in, and the queue finishes it', async () => {
+    const h = await openBoot()
+    try {
+      const port = h.handle.port() as number
+      const called = await runCli(h.stateDir, port, ['admin', 'backup'])
+      assert.equal(called.exit, 0, JSON.stringify(called.envelope))
+      const result = (called.envelope as { ok: true; result: Record<string, unknown> }).result
+      // 入队返回：handler 没有做 VACUUM（`queued` 与「没有 bytes」同时成立）。
+      assert.equal(result['queued'], true)
+      assert.equal(result['bytes'], undefined, 'the file is not written yet')
+      const path = String(result['path'])
+      assert.equal(path.startsWith(join(h.stateDir, 'backups')), true, path)
+      assert.equal(path.endsWith('.sqlite'), true, path)
+
+      // 队列跑完：文件真的在那里，大小也读得到（与自动备份同一份 `backupNow`）。
+      await h.handle.passOnce()
+      assert.equal(existsSync(path), true, 'the queued VACUUM wrote the backup')
+      assert.ok(statSync(path).size > 0, 'the backup has bytes')
+
+      // 同一份 `at` 再入队只会合并成一行（key 是备份时刻）：再跑一轮不会多出一个文件。
+      const again = await runCli(h.stateDir, port, ['admin', 'backup'])
+      assert.equal(again.exit, 0)
+      await h.handle.passOnce()
+    } finally {
+      await h.cleanup()
+    }
+  })
+
+  test('the `--text` reply is `queued` plus the path it will land in, never a finished copy', async () => {
+    const h = await openBoot()
+    try {
+      const called = await runCli(h.stateDir, h.handle.port() as number, ['admin', 'backup', '--text'])
+      assert.equal(called.exit, 0, JSON.stringify(called.envelope))
+      const text = render(called.envelope, { text: true })
+      // 人读的三行：先「入队了」，再给它将落到的路径（§O：VACUUM 还没跑）。
+      assert.ok(text.includes('queued: true'), text)
+      assert.ok(text.includes('path: '), text)
+      assert.ok(text.includes('at: '), text)
+      // 文件还没写：不出现 bytes/kept，也不把入队说成完成。
+      assert.equal(text.includes('bytes:'), false, text)
+      assert.equal(text.includes('kept:'), false, text)
+    } finally {
+      await h.cleanup()
     }
   })
 })

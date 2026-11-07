@@ -31,6 +31,7 @@ export const HEALTH_ENTRIES = [
   'notice',
   'reply',
   'return',
+  'backup',
   'worker',
   'router',
   'github',

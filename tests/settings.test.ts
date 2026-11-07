@@ -265,6 +265,7 @@ function surface(
     readonly checkAccount?: Parameters<typeof createSettingsHandlers>[0]['checkAccount']
     readonly policySync?: Parameters<typeof createSettingsHandlers>[0]['policySync']
     readonly policySyncBudget?: Parameters<typeof createSettingsHandlers>[0]['policySyncBudget']
+    readonly settingsSaveBudget?: Parameters<typeof createSettingsHandlers>[0]['settingsSaveBudget']
   } = {}
 ) {
   const { store, cleanup } = openTempStore()
@@ -415,6 +416,51 @@ describe('settings save over the command surface (§K.8)', () => {
       )
       assert.equal(refused.code, 'origin_forbidden')
       assert.equal(refused.status, 403)
+      assert.equal(h.store.settingsVersions.latest(), null)
+    } finally {
+      h.cleanup()
+    }
+  })
+
+  test('a hanging account probe returns unavailable inside the budget, cancels the probe and writes nothing', async () => {
+    // §O：写前检查串行跑几条 CLI 探针（`gh auth status`、`gh api user`…），一条挂住就能把
+    // 面板的 Save 按在那里。用例把预算压到 10 ms/条 + 40 ms 整次，断言的是「到点就返回」。
+    let handed: { readonly signal?: AbortSignal; readonly probeMs?: number } | undefined
+    const h = surface({
+      settingsSaveBudget: { probeMs: 10, totalMs: 40 },
+      checkAccount: (_candidate, budget) => {
+        handed = { probeMs: budget?.probeMs, ...(budget?.signal === undefined ? {} : { signal: budget.signal }) }
+        return new Promise(() => undefined)
+      }
+    })
+    try {
+      const before = [...h.store.kvKeys()]
+      const started = Date.now()
+      const failed = await apiRefusal(
+        h.call('PUT settings/:block', {
+          params: { block: 'source:github' },
+          body: {
+            value: { enabled: true, config: { repository: 'acme/widgets', cli: 'gh-agent' } },
+            revision: 0,
+            origin: 'panel'
+          }
+        })
+      )
+      const elapsed = Date.now() - started
+      // 没做完不是「检查不通过」（`setup_failed`），也不是内部错误：可重试的固定码。
+      assert.equal(failed.code, 'unavailable')
+      assert.equal(failed.status, 503)
+      assert.ok(failed.message.includes('retry later'), failed.message)
+      // `values.reason` 是面板与脚本可判定的原因（`failed` 仍是面板结果里的那一个）。
+      assert.equal(failed.values?.['reason'], 'timeout')
+      assert.equal(failed.values?.['block'], 'source:github')
+      assert.match(failed.message, /^The source:github account check did not finish within \d+ ms; retry later$/)
+      assert.ok(elapsed < 1_000, `the handler returned after ${elapsed} ms`)
+      // 预算两条线都交给了端口：探针上限 10 ms、信号已取消（真实现把它交给 `execFile`）。
+      assert.equal(handed?.probeMs, 10)
+      assert.equal(handed?.signal?.aborted, true, 'the budget signal is aborted')
+      // 超时的保存什么都不写：没有设置版本、没有块修订号、没有幂等记录。
+      assert.deepEqual([...h.store.kvKeys()], before)
       assert.equal(h.store.settingsVersions.latest(), null)
     } finally {
       h.cleanup()

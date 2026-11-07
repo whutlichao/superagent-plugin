@@ -14,10 +14,11 @@
 // 类型）、同目录的 `ApiError`/`values.ts` 与 `api-types`；不读存储、不跑子进程——账号探针与同步驱动器
 // 都由组合根以端口注入，缺哪个端口该路由就固定 `unavailable`。
 import { ApiError, ERROR_CODES, type ErrorIssue } from './errors.ts'
+import { refuseOnDeadline } from './budget.ts'
 import { bodyObject } from './values.ts'
 import type { RouteDefinition, RouteHandler } from './routes.ts'
 import type { WriteIdempotency } from './domain.ts'
-import { DeadlineError, withDeadline, type HandlerBudget } from '../infra/deadline.ts'
+import { withDeadline, type HandlerBudget } from '../infra/deadline.ts'
 import {
   accountCandidatesIn,
   RESTART_SETUP_FIELDS,
@@ -28,7 +29,7 @@ import {
 import { parseSettingsBlock } from '../app/settings-blocks.ts'
 import { SettingsError, type Settings } from '../app/settings.ts'
 import type { AccountCandidates } from '../app/settings-blocks.ts'
-import type { SetupIssue } from '../app/setup-types.ts'
+import type { SetupBudget, SetupIssue } from '../app/setup-types.ts'
 import {
   SETTINGS_HISTORY_LIMIT,
   type PolicySyncResult,
@@ -42,8 +43,11 @@ import {
 /** 四个设置来源（§K.8）；CLI 恒为 `tool`，面板给 `panel`。 */
 export const SETTINGS_ORIGINS = ['panel', 'tool', 'sync', 'operator'] as const
 
-/** 账号类字段的写前 setup 检查（#44 的探针，按候选值跑）。 */
-export type AccountCheckPort = (candidate: AccountCandidates) => Promise<readonly SetupIssue[]>
+/** 账号类字段的写前 setup 检查（#44 的探针，按候选值跑）。`budget` 是 §O 的探针上限与取消线。 */
+export type AccountCheckPort = (
+  candidate: AccountCandidates,
+  budget?: SetupBudget
+) => Promise<readonly SetupIssue[]>
 
 /**
  * 名单同步的端口（#23 的驱动器）：`sync` 就是 `BootHandle.syncPolicy`，健康条目与
@@ -74,6 +78,17 @@ export interface PolicySyncPort {
  */
 export const POLICY_SYNC_BUDGET: HandlerBudget = { totalMs: 8_000 }
 
+/**
+ * `PUT settings/:block` 的时间预算（§O「超时」行）：整次 9 s，每条探针 2 s。
+ *
+ * 保存本身是本地事务（一次校验 + 一次写）；**慢的那一半**是账号类字段（`cli` / `repository`）
+ * 变更时的写前 setup 检查：它串行跑几条 CLI 探针（`gh auth status`、`gh api user`…），一条挂住
+ * 就能把面板的「Save」按在那里。预算与 `setup check` 同形（一条 2 s、整次 9 s，都在 §O 的 10 s
+ * 天花板之下）；到点先取消探针，再返回固定码 `unavailable` + 「稍后重试」——一条校验都没通过
+ * 时**什么也不写**（全有或全无，§K.8）：没有设置版本、没有 kv 记账、没有幂等结果。
+ */
+export const SETTINGS_SAVE_BUDGET: HandlerBudget = { probeMs: 2_000, totalMs: 9_000 }
+
 /** handler 的接线：设置写入器（#20）+ 端口（账号检查 #44、名单同步 #23）。 */
 export interface SettingsHandlerOptions {
   readonly settings: Settings
@@ -92,6 +107,11 @@ export interface SettingsHandlerOptions {
   readonly policySync?: PolicySyncPort
   /** `POST policy-sync/:id` 的时间预算（§O）；缺省 `POLICY_SYNC_BUDGET`，测试注入小预算。 */
   readonly policySyncBudget?: HandlerBudget
+  /**
+   * `PUT settings/:block` 的账号探针预算（§O）；缺省 `SETTINGS_SAVE_BUDGET`，测试注入小预算。
+   * 面板的「保存」也走这条 handler（`BootHandle.settingsSave`），所以面板请求同样被它兜住。
+   */
+  readonly settingsSaveBudget?: HandlerBudget
   /** 写成功后的刷新钩子（面板 `state.changed`）。 */
   readonly afterWrite?: () => void
   /**
@@ -225,6 +245,7 @@ export function createSettingsHandlers(
 ): ReadonlyMap<string, RouteHandler> {
   const handlers = new Map<string, RouteHandler>()
   const write = options.idempotent ?? ((_input, work) => Promise.resolve(work()))
+  const saveBudget = options.settingsSaveBudget ?? SETTINGS_SAVE_BUDGET
 
   // ---- GET settings：一个块（`--block`）或全部；值来自保存过的版本，否则是运行时那份。
   handlers.set('GET settings', ({ query }) => {
@@ -292,7 +313,21 @@ export function createSettingsHandlers(
         (candidates.cli !== undefined && candidates.cli !== current.cli) ||
         (candidates.repository !== undefined && candidates.repository !== current.repository)
       if (accountChanged && options.checkAccount !== undefined) {
-        const issues = await options.checkAccount(candidates)
+        // §O：写前检查在预算内跑；到点先取消探针再回 `unavailable`，一行都不写。
+        const probeMs = saveBudget.probeMs
+        const issues = await refuseOnDeadline(
+          withDeadline(
+            (signal) =>
+              options.checkAccount === undefined
+                ? Promise.resolve([])
+                : options.checkAccount(candidates, {
+                    signal,
+                    ...(probeMs === undefined ? {} : { probeMs })
+                  }),
+            { ms: saveBudget.totalMs, what: `the ${name} account check` }
+          ),
+          { block: name, reason: 'timeout' }
+        )
         if (issues.length > 0) {
           throw new ApiError(
             ERROR_CODES.setupFailed,
@@ -348,19 +383,16 @@ export function createSettingsHandlers(
         const before = policySync.allowed(id)
         let part: Record<string, unknown>
         try {
-          part = await withDeadline((signal) => policySync.sync(id, signal), {
-            ms: syncBudget.totalMs,
-            what: `the ${id} policy sync`
-          })
+          part = await refuseOnDeadline(
+            withDeadline((signal) => policySync.sync(id, signal), {
+              ms: syncBudget.totalMs,
+              what: `the ${id} policy sync`
+            }),
+            { source: id, reason: 'timeout' }
+          )
         } catch (error) {
-          if (error instanceof DeadlineError) {
-            throw new ApiError(
-              ERROR_CODES.unavailable,
-              `The ${id} policy sync did not finish within ${syncBudget.totalMs} ms; retry later`,
-              { source: id, reason: 'timeout' }
-            )
-          }
           // 驱动器的错误原文只进日志与健康条目（§N.5）：信封里只给固定码与 Source。
+          if (error instanceof ApiError) throw error
           throw new ApiError(ERROR_CODES.syncFailed, `The ${id} policy sync failed`, { source: id })
         }
         const allowed = Array.isArray(part['allowed']) ? (part['allowed'] as unknown[]) : []

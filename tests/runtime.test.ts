@@ -263,7 +263,7 @@ test('the composition root wires a handler for every effect kind, and each repor
     const health = (
       read.envelope as { result: { health: Record<string, { state: string; detail?: string }> } }
     ).result.health
-    // §J.2 的七行各有自己的 handler（注册过就会报告一次，因此不会停在 `starting`），
+    // §J.2 的八行各有自己的 handler（注册过就会报告一次，因此不会停在 `starting`），
     // §J.3 的 detail 写的就是计数——两句合起来证明「每个 kind 接上了真实的 handler」。
     for (const kind of EFFECT_KINDS) {
       assert.ok(health[kind] !== undefined, `${kind} has a health entry`)

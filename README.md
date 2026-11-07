@@ -165,7 +165,7 @@ stateDir 解析顺序 `--state-dir` ＞ `$ORCA_SUPERAGENT_STATE_DIR` ＞ 默认�
 | `superagent pause` / `resume` | 暂停/恢复处理（写设置里的 `paused`，origin=`operator`） |
 | `superagent setup check` | 重跑 setup（会重启 worker 内的 loops，不重启 Orca）；已经没有 setup 问题时**拒绝**（`nothing_to_check`，exit 2） |
 | `superagent doctor` | 本机诊断八项，逐项 `ok`/`warn`/`fail`；有 `fail` 退出 1，否则 0 |
-| `superagent admin backup` | 立即备份（升级前手工调用） |
+| `superagent admin backup` | 入队一次备份（升级前手工调用）：命令回 `{queued:true, path}`，文件由 `backup` effect 稍后写入 |
 | `superagent admin rotate-token` | 轮换主 token（破坏性，要 `--yes`；面板里要二次确认） |
 | `superagent source labels <id>` | 刷新来源的显示名 |
 

@@ -8,15 +8,30 @@
 // 依赖纪律（§C.2）：本文件在 `http/`，只 import 同目录的 `ApiError` 与 `app/eval.ts` 的
 // 类型与校验器；不读存储、不做 I/O、不 spawn。
 import { ApiError, ERROR_CODES } from './errors.ts'
+import { refuseOnDeadline } from './budget.ts'
 import type { RouteDefinition, RouteHandler, RouteInput } from './routes.ts'
 import { EVAL_READ_PARTS } from './api-types.ts'
+import { withDeadline, type HandlerBudget } from '../infra/deadline.ts'
 import { validateEvalRead, type EvalReadRequest, type EvalTools } from '../app/eval.ts'
 import type { ContextPartName } from '../sources/admission-context.ts'
+
+/**
+ * 两条评估读命令的时间预算（§O「超时」行）：整次 9 s。
+ *
+ * 一次 `eval` 先在语境里读一次 Thread（单次读取自己有 `admissionContextTimeoutMs` 的上限），
+ * `eval-read` 还可能再读一次（消息、图片、`--part`）——`--path` 是本地文件读（不在预算之外）。
+ * 所以这里只给一条**总**线：到点先取消（信号经 `CommandsHost.withSignal` 进 `execFile`，`gh` /
+ * `lark-cli` 被 SIGTERM），再返回固定码 `unavailable` + 「稍后重试」；读缓存不会留下半个结果
+ * （`contextOf` 只在读完后写缓存）。总预算在 §O 的 10 s 天花板之下。
+ */
+export const EVAL_READ_BUDGET: HandlerBudget = { totalMs: 9_000 }
 
 /** handler 的接线：两条读命令 + 写成功后的刷新（这两条是读，钩子留给面板将来用）。 */
 export interface EvalHandlerOptions {
   readonly tools: EvalTools
   readonly afterWrite?: () => void
+  /** 两条读的预算（§O）；缺省 `EVAL_READ_BUDGET`，测试注入小预算。 */
+  readonly budget?: HandlerBudget
 }
 
 /** 编译期对齐：`--part` 的取值与 `ContextPartName` 是同一组三个词。 */
@@ -78,10 +93,18 @@ function triggerId(input: RouteInput, command: string): string {
  */
 export function createEvalHandlers(options: EvalHandlerOptions): ReadonlyMap<string, RouteHandler> {
   const handlers = new Map<string, RouteHandler>()
+  const budget = options.budget ?? EVAL_READ_BUDGET
 
   // ---- eval：路径参数是 trigger id，返回候选窗口（§G.2 的七个字段）。
   handlers.set('GET eval/:id', async (input) => {
-    const result = await options.tools.window(triggerId(input, 'eval'))
+    const id = triggerId(input, 'eval')
+    const result = await refuseOnDeadline(
+      withDeadline((signal) => options.tools.window(id, { signal }), {
+        ms: budget.totalMs,
+        what: `the ${id} eval window`
+      }),
+      { trigger: id, reason: 'timeout' }
+    )
     if (!result.ok) refuse(result)
     options.afterWrite?.()
     return result.window
@@ -90,7 +113,14 @@ export function createEvalHandlers(options: EvalHandlerOptions): ReadonlyMap<str
   // ---- eval-read：路径参数是 trigger id，查询串是四种读法之一。
   handlers.set('GET eval-read/:id', async (input) => {
     const request = evalReadRequest(input)
-    const result = await options.tools.read(triggerId(input, 'eval-read'), request)
+    const id = triggerId(input, 'eval-read')
+    const result = await refuseOnDeadline(
+      withDeadline((signal) => options.tools.read(id, request, { signal }), {
+        ms: budget.totalMs,
+        what: `the ${id} eval read`
+      }),
+      { trigger: id, reason: 'timeout' }
+    )
     if (!result.ok) refuse(result)
     options.afterWrite?.()
     return result.result

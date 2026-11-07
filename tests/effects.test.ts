@@ -432,7 +432,8 @@ test('the effect kind table is the one the design names, row by row', () => {
     'relay',
     'notice',
     'reply',
-    'return'
+    'return',
+    'backup'
   ])
   // key 形状（§J.2 的 key 列）：relay/notice 共用 `'router'`，其余各按自己的聚合 id。
   assert.deepEqual(EFFECT_KEY_SHAPES, {
@@ -442,7 +443,8 @@ test('the effect kind table is the one the design names, row by row', () => {
     relay: "'router'",
     notice: "'router'",
     reply: 'messageId',
-    return: 'triggerKey'
+    return: 'triggerKey',
+    backup: 'at'
   })
   assert.equal(ROUTER_EFFECT_KEY, 'router')
   const row = (kind: EffectKind) => EFFECT_RULES[kind]
@@ -476,6 +478,12 @@ test('the effect kind table is the one the design names, row by row', () => {
   // return：1，2 s→60 s。
   assert.equal(row('return').limit(running), 1)
   assert.deepEqual(row('return').retry, [2000, 60_000])
+  // backup（§O 的「长活进 effect」）：1（VACUUM 是串行活），2 s→60 s，不受暂停影响。
+  assert.equal(row('backup').limit(running), 1)
+  assert.equal(row('backup').limit({ paused: true, slots: 3 }), 1)
+  assert.deepEqual(row('backup').retry, [2000, 60_000])
+  assert.equal(row('backup').ordered, false)
+  assert.equal(row('backup').router, false)
   // 暂停只挡四种（§J.2 暂停行）：relay/notice/return 不在名单里。
   assert.deepEqual(
     EFFECT_KINDS.filter((kind) => row(kind).heldWhilePaused),
@@ -928,10 +936,22 @@ const MATRIX: readonly MatrixRow[] = [
     retry: 2000,
     concurrent: 1,
     enqueue: (h, key) => h.effects.enqueue('return', key ?? 'trigger-1', { triggerKey: key ?? 'trigger-1' })
+  },
+  {
+    kind: 'backup',
+    key: '2026-11-07T03:26:00.000Z',
+    payload: { at: '2026-11-07T03:26:00.000Z' },
+    retry: 2000,
+    // VACUUM 是整个库的串行活：一次只跑一份。
+    concurrent: 1,
+    enqueue: (h, key) =>
+      h.effects.enqueue('backup', key ?? '2026-11-07T03:26:00.000Z', {
+        at: '2026-11-07T03:26:00.000Z'
+      })
   }
 ]
 
-test('the kind matrix covers the seven kinds of the design table, once each, in order', () => {
+test('the kind matrix covers the eight kinds of the design table, once each, in order', () => {
   assert.deepEqual(
     MATRIX.map((row) => row.kind),
     [...EFFECT_KINDS]
