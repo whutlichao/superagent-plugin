@@ -379,6 +379,8 @@ function openSupervision(
   const state = memoryRouterState()
   const notices: string[] = []
   const tokens: string[] = []
+  /** `start()` 交给调度器的周期（毫秒）：钉住「3 s 一跳」（§F.1）。 */
+  const ticks: number[] = []
   const supervisor = createRouterSupervision({
     runtime,
     health: board,
@@ -409,10 +411,13 @@ function openSupervision(
     enabled: options.enabled ?? true,
     ...(options.undecidedCandidates === undefined ? {} : { undecidedCandidates: options.undecidedCandidates }),
     now: () => clock.now(),
-    schedule: () => 0,
+    schedule: (_run, milliseconds) => {
+      ticks.push(milliseconds)
+      return ticks.length
+    },
     cancel: () => undefined
   })
-  return { runtime, board, clock, state, notices, tokens, supervisor }
+  return { runtime, board, clock, state, notices, tokens, ticks, supervisor }
 }
 
 describe('router supervision', () => {
@@ -446,6 +451,7 @@ describe('router supervision', () => {
     assert.equal(h.state.terminal()?.terminalId, 'term_1')
     assert.equal(h.state.workspace()?.path, '/tmp/superagent-worktrees/superagent-router')
     assert.equal(h.supervisor.terminalId(), 'term_1')
+    assert.deepEqual(h.ticks, [3000], 'the keepalive is a 3 s tick (§F.1)')
   })
 
   test('a terminal that is still alive is adopted instead of launching a second session', async () => {
