@@ -4,7 +4,7 @@ import { isoTime, liveTicket } from './model.ts'
 import type { Decision, PolicyEffect, ThreadRef, Ticket, Trigger } from './model.ts'
 import type { Candidate, Repositories } from './ports.ts'
 import type { EngineOptions } from './part.ts'
-import { Assignments, type WorkerReport } from './assignments.ts'
+import { Assignments, type AssignmentLaunch, type WorkerReport } from './assignments.ts'
 import { Evals, type Outcome } from './evals.ts'
 import { Intake } from './intake.ts'
 import type { ReceiveResult } from './ports.ts'
@@ -12,7 +12,7 @@ import { Replies, type Reply, type ReplyRequest } from './replies.ts'
 import { Tickets } from './tickets.ts'
 
 export type { EngineOptions } from './part.ts'
-export type { WorkerReport } from './assignments.ts'
+export type { AssignmentLaunch, WorkerReport } from './assignments.ts'
 export type { Outcome } from './evals.ts'
 export type { ReceiveResult } from './ports.ts'
 export type { Reply, ReplyRequest } from './replies.ts'
@@ -217,9 +217,9 @@ export class Engine {
    * 执行器报告一个 Assignment 运行起来了；等它的 Input 随之投递。
    * @throws UserError Ticket 未知。
    */
-  assignmentStarted(ticketId: string, assignmentId: string): void {
+  assignmentStarted(ticketId: string, assignmentId: string, launch?: AssignmentLaunch): void {
     this.repo.atomic(() => {
-      this.assignments.started(ticketId, assignmentId)
+      this.assignments.started(ticketId, assignmentId, launch)
     })
   }
 
