@@ -8,6 +8,7 @@
 // 时间只有一种形态（§D.2 要点 1）：库里的 `due_at` 是 ISO 文本；队列内部拿毫秒数比较与
 // 计算退避，落库时才格式化。时钟是注入的，测试用虚拟时间推进，绝不 sleep（§P.1）。
 import type { HealthBoardLike, HealthEntryHandle } from '../infra/health'
+import { FAILURES_BEFORE_ERROR } from '../infra/health'
 import type { EffectRecord } from './records'
 import type { EffectRepository } from './store'
 
@@ -21,9 +22,6 @@ export class Later extends Error {
     this.name = 'Later'
   }
 }
-
-/** 同一 kind 连续失败多少次才把健康项标成 error（§J.2「失败即问题」）。 */
-export const FAILURES_BEFORE_ERROR = 3
 
 /** effect 全局并发上限（§J.2 并发行）。 */
 export const GLOBAL_CONCURRENCY = 4

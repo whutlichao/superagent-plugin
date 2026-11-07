@@ -13,6 +13,7 @@
 // 不 import `orca`、不 import `app/`（CLI 是独立进程，只能经 HTTP 碰数据）。
 
 import { ApiError, ERROR_CODES, type ErrorCode, type ErrorPayload } from '../http/errors.ts'
+import { statusCode } from '../http/state.ts'
 import { REQUEST_ID_HEADER } from '../http/idempotency.ts'
 import type { CliResponse } from './transport.ts'
 import { requestJson } from './transport.ts'
@@ -752,36 +753,12 @@ export function fromResponse(command: CommandDefinition, response: CliResponse):
 }
 
 /**
- * `status` 的退出码（§N.4，与上游 `scripts/dsh-superagent status` 对齐；#8 补「暂停」一档）：
- *   1 runtime 不是 ready/paused —— 没跑 / 不响应 / 运行时错误（starting 也算「还没跑起来」，
- *     与上游 `runtime_up()` 的判定一致）；
- *   3 等 setup（`setup.problem` 非空）—— 重启不修，要人补配置；
- *   3 已暂停（`paused: true`）—— 不是故障，但「不在处理」，所以是未就绪；
- *   2 非 runtime 的 health 条目报错 —— 重启不修，要人看；
- *   0 其余。
- *
- * 顺序即优先级，与上游 `outcome()` 的骨架一致（runtime 先、setup 次、部件错误最后）：
- * 「人为停下来的两种状态」（等 setup、已暂停）排在部件错误之前——它们解释了「为什么现在
- * 什么都没有发生」，而部件错误是恢复处理之后才会被消费的事实。
+ * `status` 的退出码（§N.4，与上游 `scripts/dsh-superagent status` 对齐；#8 补「暂停」一档）。
+ * 判定本身在 `http/state.ts` 的 `statusCode()`：`status` 与面板读同一个 `StateView`，
+ * 两处不能各判一次。这里只把 0/1/2/3 换成 CLI 自己的 `ExitCode`。
  */
 export function statusExitCode(view: unknown): ExitCode {
-  if (typeof view !== 'object' || view === null) return EXIT.internal
-  const state = view as {
-    readonly health?: Readonly<Record<string, { readonly state?: unknown } | undefined>>
-    readonly setup?: { readonly problem?: unknown } | null
-    readonly paused?: unknown
-  }
-  const health = state.health ?? {}
-  const runtime = health['runtime']?.state
-  if (runtime !== 'ready' && runtime !== 'paused') return EXIT.internal
-  if (state.setup !== null && state.setup !== undefined && state.setup.problem !== null && state.setup.problem !== undefined) {
-    return EXIT.notReady
-  }
-  if (state.paused === true) return EXIT.notReady
-  const partError = Object.entries(health).some(
-    ([name, entry]) => name !== 'runtime' && entry?.state === 'error'
-  )
-  return partError ? EXIT.refused : EXIT.ok
+  return statusCode(view)
 }
 
 /** 全部命令名（`--help` 与契约测试用）。 */

@@ -15,8 +15,11 @@ import { EXIT, exitForCode, NOT_READY_CODE } from '../src/worker/cli/io'
 import { statusExitCode } from '../src/worker/cli/commands'
 import { dispatch } from '../src/worker/cli/commands'
 import { parseArgs } from '../src/worker/cli/io'
+import { healthProblems, healthSummary, stateView, statusCode } from '../src/worker/http/state'
 import type { HealthEntry } from '../src/worker/http/state'
+import { HealthBoard } from '../src/worker/infra/health'
 import { startTestServer } from './support/cli-server'
+import { AT, openTempStore } from './support/state'
 
 /** 一份最简的 `GET state` 形状（只列退出码判定要用的字段）。 */
 function stateOf(input: {
@@ -253,5 +256,130 @@ test('health prints only the health entries and exits 0 on a successful read', a
     assert.deepEqual(Object.keys(view['health'] as object).sort(), ['github', 'runtime'])
   } finally {
     server.close()
+  }
+})
+
+// ---------------------------------------------------------------- 与面板同一份读数
+
+/**
+ * 用**真库 + 真健康板**组装一份 `GET state` 的读数，再同时问两件事：`status` 的退出码与
+ * 面板的 health 摘要。两者读的是同一个 `StateView`，所以「面板看不到的问题却让 CLI 退出 2」
+ * 这类分叉在测试里就会先炸。
+ */
+function viewOf(options: {
+  readonly runtime?: 'starting' | 'ready' | 'paused' | 'error' | null
+  readonly parts?: Readonly<Record<string, 'starting' | 'ready' | 'paused' | 'error'>>
+  readonly setup?: boolean
+  readonly paused?: boolean
+}): { readonly view: unknown; readonly cleanup: () => void } {
+  const { store, stateDir, cleanup } = openTempStore()
+  const board = new HealthBoard()
+  if (options.runtime !== null) {
+    board.claim('runtime', {
+      state: options.runtime ?? 'ready',
+      detail: options.runtime === 'error' ? 'database unreadable' : 'loopback api on 127.0.0.1:3847'
+    })
+  }
+  for (const [name, state] of Object.entries(options.parts ?? {})) {
+    board.claim(name, { state, detail: `${name} reported ${state}` })
+  }
+  const view = stateView(
+    {
+      store,
+      stateDir,
+      health: () =>
+        Object.fromEntries(
+          Object.entries(board.all()).map(([name, entry]) => [name, { ...entry, at: AT }])
+        ),
+      setup: () => ({
+        problem: options.setup === true ? { place: 'github', code: 'agentCliSignedOut' } : null
+      }),
+      paused: () => options.paused ?? false
+    },
+    { host: '127.0.0.1', port: 3847, requests: 1 },
+    AT
+  )
+  return { view, cleanup }
+}
+
+test('the 0/1/2/3 matrix holds on the real state view the panel reads', () => {
+  const cases: readonly {
+    readonly name: string
+    readonly options: Parameters<typeof viewOf>[0]
+    readonly code: number
+    readonly error: boolean
+    readonly problems: number
+  }[] = [
+    { name: 'healthy', options: {}, code: 0, error: false, problems: 0 },
+    { name: 'runtime error', options: { runtime: 'error' }, code: 1, error: true, problems: 1 },
+    { name: 'runtime starting', options: { runtime: 'starting' }, code: 1, error: false, problems: 0 },
+    { name: 'runtime missing', options: { runtime: null }, code: 1, error: false, problems: 0 },
+    {
+      name: 'setup waiting',
+      options: { setup: true },
+      code: 3,
+      error: false,
+      problems: 0
+    },
+    { name: 'paused', options: { paused: true }, code: 3, error: false, problems: 0 },
+    {
+      name: 'one part error',
+      options: { parts: { github: 'error' } },
+      code: 2,
+      error: true,
+      problems: 1
+    },
+    {
+      name: 'several part errors',
+      options: { parts: { github: 'error', feishu: 'error', router: 'ready' } },
+      code: 2,
+      error: true,
+      problems: 2
+    },
+    {
+      name: 'paused with a part error',
+      options: { paused: true, parts: { github: 'error' } },
+      code: 3,
+      error: true,
+      problems: 1
+    },
+    {
+      name: 'setup with a runtime error',
+      options: { runtime: 'error', setup: true },
+      code: 1,
+      error: true,
+      problems: 1
+    }
+  ]
+  for (const row of cases) {
+    const { view, cleanup } = viewOf(row.options)
+    try {
+      assert.equal(statusExitCode(view), row.code, `${row.name}: exit code`)
+      assert.equal(statusCode(view), row.code, `${row.name}: the panel read model says the same number`)
+      const summary = healthSummary(
+        (view as { readonly health: Readonly<Record<string, HealthEntry>> }).health
+      )
+      assert.equal(summary.error, row.error, `${row.name}: the panel's error flag`)
+      assert.equal(summary.problems, row.problems, `${row.name}: the problem count`)
+    } finally {
+      cleanup()
+    }
+  }
+})
+
+test('a non-runtime part error is a problem for the panel even while the runtime is fine', () => {
+  const { view, cleanup } = viewOf({ parts: { reply: 'error', relay: 'paused' } })
+  try {
+    assert.equal(statusExitCode(view), 2)
+    const problems = healthProblems(
+      (view as { readonly health: Readonly<Record<string, HealthEntry>> }).health
+    )
+    assert.deepEqual(
+      problems.map((problem) => problem.name),
+      ['reply'],
+      'only error entries are problems; paused/ready/starting are not'
+    )
+  } finally {
+    cleanup()
   }
 })
