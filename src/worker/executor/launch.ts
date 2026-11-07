@@ -10,6 +10,7 @@
 import { isOrcaRuntimeError } from '../runtime/orca-runtime.ts'
 import type { AgentHandle, AgentSpec, OrcaRuntime, WorkspaceHandle } from '../runtime/orca-runtime.ts'
 import type { Ticket } from '../core/model.ts'
+import type { LaunchHook } from './launch-hook.ts'
 
 /** 开播语上限（§E.2：≤ 400 字符，长正文一律写文件）。 */
 export const SEED_PROMPT_MAX = 400
@@ -57,6 +58,13 @@ export interface LaunchAgentOptions {
   readonly cliPath: string
   readonly tokenFile: string
   readonly inboxPath: string
+  /**
+   * 这次 launch 要注入的环境（§E.11 + PATH/GIT_CONFIG_GLOBAL）：启动之前在钩子上登记，
+   * 由 `agent.launch.before` 在宿主真正起进程时合并（§H.11）。
+   */
+  readonly environment?: Readonly<Record<string, string>>
+  /** 钩子注册表：与 `main.ts` 注册的那个是同一个实例；缺省不登记（不注入）。 */
+  readonly launches?: LaunchHook
   /** 等待实现的注入点：测试用即时返回并记录间隔的等待，绝不 sleep（§P.1）。 */
   readonly wait?: (milliseconds: number) => Promise<void>
   readonly lookup?: LookupOptions
@@ -107,6 +115,11 @@ async function attempt(
   spec: AgentSpec,
   options: LaunchAgentOptions
 ): Promise<AgentHandle> {
+  // 只把「本插件发起的这次 launch」告诉钩子；无论成功、失败还是钩子根本没来，都要释放。
+  const release = options.launches?.expect({
+    workspaceId: spec.workspace.workspaceId,
+    environment: options.environment ?? {}
+  })
   try {
     return await runtime.launchAgent(spec)
   } catch (error) {
@@ -114,6 +127,8 @@ async function attempt(
     const found = await lookup(runtime, spec.workspace.workspaceId, options)
     if (found) return found
     throw error
+  } finally {
+    release?.()
   }
 }
 

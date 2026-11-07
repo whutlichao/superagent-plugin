@@ -65,6 +65,12 @@ declare module 'node:fs' {
   }
   export function readFileSync(path: string, encoding: 'utf8'): string
   export function writeFileSync(path: string, data: string, encoding?: 'utf8'): void
+  /** 带权限位的写入：可执行的 shim（§H.11）需要 `mode`。 */
+  export function writeFileSync(
+    path: string,
+    data: string,
+    options: { readonly encoding: 'utf8'; readonly mode: number }
+  ): void
   export function appendFileSync(path: string, data: string, encoding: 'utf8'): void
   export function readdirSync(
     path: string,
