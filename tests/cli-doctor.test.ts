@@ -16,6 +16,7 @@ import { acquireLock } from '../src/worker/infra/lock'
 import { ensureApiToken, TOKEN_MODE } from '../src/worker/infra/tokens'
 import { DEFAULT_PORT, PORT_FILE } from '../src/worker/http/port-file'
 import { tempStateDir } from './support/state'
+import { closedPort } from './support/ports'
 
 /** 固定的测试时刻（doctor 的 `at` 与锁的年龄都按它算）。 */
 const AT = '2026-11-07T03:26:00.000Z'
@@ -323,12 +324,8 @@ test('the gitconfig check reads existence and mode, never the contents', async (
 })
 
 test('the port probe times out instead of hanging when nothing answers', async () => {
-  // 一个刚关掉的真实端口：探测立即失败（不挂起、不 sleep）。
-  const { createServer } = await import('node:http')
-  const probe = createServer(() => undefined)
-  await new Promise<void>((resolve) => probe.listen(0, '127.0.0.1', () => resolve()))
-  const address = probe.address()
-  const port = typeof address === 'object' && address !== null ? address.port : 0
-  await new Promise<void>((resolve) => probe.close(() => resolve()))
+  // 一个刚放掉的真实端口：探测立即失败（不挂起、不 sleep）。端口取自内核临时区间之外的窄带
+  // （#53），所以并行的另一个测试文件 `listen(0)` 也拿不到它，无需探测后重绑。
+  const port = await closedPort()
   assert.equal(await defaultPortProbe(port), false)
 })
