@@ -294,6 +294,29 @@ export const COPY = {
   // ---- Settings 的分组（§M.3：五组 + Prompts 的四个子页）----
   // 组名只有一处：`settings.group.*`（在 #42 的 Settings 段里）。
 
+  // ---- Search 页（§M.1 的第 7 项、§M.2 的 Search 行）----
+  'search.label': { zh: '搜索', en: 'Search' },
+  'search.placeholder': {
+    zh: '触发文本、消息 id、#12 或链接',
+    en: 'Trigger text, a message id, #12 or a link'
+  },
+  'search.submit': { zh: '搜索', en: 'Search' },
+  'search.idle': {
+    zh: '输入触发文本、消息 id、线程的 #12 或链接、工单标题。',
+    en: 'Type trigger text, a message id, a thread’s #12 or a link, or a ticket title.'
+  },
+  'search.searching': { zh: '正在搜索…', en: 'Searching…' },
+  'search.noMatches': { zh: '没有匹配。', en: 'No matches.' },
+  'search.group.triggers': { zh: '触发', en: 'Triggers' },
+  'search.group.threads': { zh: '线程', en: 'Threads' },
+  'search.group.tickets': { zh: '工单', en: 'Tickets' },
+  'search.triggerFrom': { zh: '来自 {actor}', en: 'from {actor}' },
+  'search.terms': { zh: '命中词：{terms}', en: 'Matched on: {terms}' },
+  'search.truncated': {
+    zh: '只显示前 {count} 条。缩小范围能看到更多。',
+    en: 'Showing the first {count}. Narrow the search to see more.'
+  },
+
   // ---- Deployment 组（§M.3 Deployment）：部署读数、限额与诊断 ----
   'deployment.title': { zh: '部署', en: 'Deployment' },
   'deployment.intro': {

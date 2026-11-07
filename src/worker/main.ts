@@ -535,6 +535,20 @@ export default function activate(orca: OrcaWorkerApi): void {
     })
   })
   host.handleRequest('settings.history', async () => (await ready()).settingsHistory())
+  // Search 页（§M.2 的 Search 行）：查询原文原样交给 worker 的搜索处理（`#12`、链接、消息 id
+  // 与普通文字都不在这里解释）；空查询与形状不对是 `invalid_params`，不是空结果。
+  host.handleRequest('search', async (input) => {
+    const query = (input as { query?: unknown } | null)?.query
+    if (typeof query !== 'string') {
+      throw invalidParams('search needs { query: string }')
+    }
+    const booted = await ready()
+    try {
+      return booted.search({ query })
+    } catch (error) {
+      throw Object.assign(new Error(messageOf(error)), { code: codeOf(error, 'invalid_params') })
+    }
+  })
 
   host.register(COMMANDS.pause, () => {
     eventually((booted) => booted.setPaused(true), (message) => host.log(message))
