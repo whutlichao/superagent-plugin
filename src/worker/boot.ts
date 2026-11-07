@@ -19,6 +19,8 @@ import type {
   ExecutionValues,
   PanelState,
   PanelTerminal,
+  SearchPageView,
+  SearchViewInput,
   SettingsHistoryView,
   SettingsPageView,
   SettingsSaveInput,
@@ -105,10 +107,12 @@ import { deliveredFollowups, ticketDetail } from './app/views.ts'
 import { sourcePage, type SourceViewHost } from './app/views/sources.ts'
 import { decisionDetail, decisionPage } from './app/views/decisions.ts'
 import { threadDetailView, threadListPage, threadRecordsOf } from './app/views/threads.ts'
+import { searchPage } from './app/views/search.ts'
 import {
   followupOwners,
   latestAssignment,
   runningAssignment,
+  threadKey,
   UserError,
   type Ticket
 } from './core/index.ts'
@@ -341,6 +345,11 @@ export interface BootHandle {
   settingsSave(input: SettingsSaveInput): Promise<SettingsSaveOutcome>
   /** 设置版本历史（§K.5）：新→旧，带每一版的值（恢复走同一条保存路径）。 */
   settingsHistory(): SettingsHistoryView
+  /**
+   * Search 页的一次查询（§M.2 的 Search 行）：分组与命中由 `read search` 的读模型回答，
+   * 这里只换成面板的形状。空查询抛 `invalid_params`（面板也不会发）。
+   */
+  search(input: SearchViewInput): SearchPageView
   shutdown(): Promise<void>
 }
 
@@ -575,6 +584,12 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
         error: 'another Superagent instance owns this state directory'
       }),
       settingsHistory: (): SettingsHistoryView => {
+        throw Object.assign(new Error('another Superagent instance owns this state directory'), {
+          code: 'unavailable'
+        })
+      },
+      // follower 不读库：搜索的命中属于拥有者（固定拒绝，不假装是空结果）。
+      search: () => {
         throw Object.assign(new Error('another Superagent instance owns this state directory'), {
           code: 'unavailable'
         })
@@ -2087,6 +2102,23 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
         }
       })
     )
+  /**
+   * Search 页的读数（§M.2 的 Search 行）：`read search` 的同一份命中 + 面板要的归属 Thread。
+   * 空查询是 `invalid_params`，不是空结果（与 `read search` 的固定拒绝同一口径）。
+   */
+  const panelSearch = (input: SearchViewInput): SearchPageView => {
+    const view = viewReadTools.search({ query: input.query })
+    if ('ok' in view) {
+      throw Object.assign(new Error(view.message), { code: 'invalid_params' })
+    }
+    return searchPage(view, {
+      threadOfTrigger: (triggerId) => {
+        const trigger = repo.triggers.get(triggerId)
+        const first = trigger?.threads[0]
+        return first === undefined ? undefined : threadKey(first)
+      }
+    })
+  }
   const ready = Promise.resolve()
   return {
     mode: 'leader',
@@ -2238,6 +2270,8 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
     settingsView: settingsPage,
     settingsSave,
     settingsHistory,
+    // Search 页（§M.2）：一次查询，三组命中（与 `read search` 同一份读模型）。
+    search: panelSearch,
     shutdown
   }
 }

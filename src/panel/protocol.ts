@@ -420,6 +420,66 @@ export interface UnsubscribeOutcome {
   readonly removed: boolean
 }
 
+// ---------------------------------------------------------------------------
+// Search 页（§M.1 的第 7 项、§M.2 的 Search 行）：一次查询原样交给 worker 的
+// `find`/搜索处理，回来的是三组命中；面板只画、只跳转。
+// ---------------------------------------------------------------------------
+
+/** 一次搜索请求（§M.2）：查询原文——`#12`、链接、消息 id 与普通文字都不在面板里解释。 */
+export interface SearchViewInput {
+  readonly query: string
+}
+
+/** 一组命中；`truncated` 为真表示 worker 只给了前几条（如实说明，不假装是全部）。 */
+export interface SearchGroup<T> {
+  readonly items: readonly T[]
+  readonly truncated: boolean
+}
+
+/** 一条命中的 Trigger（§M.2 的 Triggers 组）：原话预览、来源者与它所属的 Thread。 */
+export interface PanelSearchTrigger {
+  readonly id: string
+  readonly source: string
+  /** 触发时刻（epoch ms）；页面交给 `RelativeTime`。 */
+  readonly at: number
+  /** 谁说的（`<source>:<id>`）。 */
+  readonly from: string
+  readonly human: boolean
+  /** 原话预览（读模型按上限截断）。 */
+  readonly text: string
+  /** 被截断时的全文长度（字符）。 */
+  readonly chars?: number
+  readonly truncated?: true
+  readonly url?: string
+  /**
+   * 它所属的 Thread（`Trigger.threads` 的第一条）：点 Trigger 结果去那条 Thread 的详情。
+   * 没有归属 Thread 的触发（理论上不存在）只显示、不跳转。
+   */
+  readonly thread?: string
+}
+
+/** 一条命中的 Thread（§M.2 的 Threads 组）。 */
+export interface PanelSearchThread {
+  readonly key: string
+  readonly source: string
+  /** 人读的名字（Source 给的 label）；没有就是 key。 */
+  readonly title: string
+  readonly url?: string
+  /** 最近一条触发的时刻（epoch ms）；没有触发时省略。 */
+  readonly lastAt?: number
+}
+
+/** Search 页的一次读数（§M.2）：查询原文、命中词与三组结果。 */
+export interface SearchPageView {
+  readonly query: string
+  /** Source 的 `find` 给出的搜索词（原样，用于解释为什么命中）。 */
+  readonly terms: readonly string[]
+  readonly triggers: SearchGroup<PanelSearchTrigger>
+  readonly threads: SearchGroup<PanelSearchThread>
+  /** 命中的 Ticket 与 Execution 页同一形状（标记因此在两页一致）。 */
+  readonly tickets: SearchGroup<PanelTicket>
+}
+
 /** 一份 Report 的面板面（§E.8）：状态 + 摘要 + 时刻。 */
 export interface PanelReport {
   readonly state: 'progress' | 'waiting' | 'ready' | 'blocked' | 'failed' | 'dropped'
@@ -1160,7 +1220,9 @@ export const PLUGIN_REQUESTS = [
   'source.labels',
   'settings.read',
   'settings.save',
-  'settings.history'
+  'settings.history',
+  // Search 页（#48）：一次查询，三组命中。
+  'search'
 ] as const
 
 /** 本票声明的推送名（运行时值），与 `PluginPanelEvents` 的键一致。 */
@@ -1293,6 +1355,12 @@ declare module 'orca' {
      * 写进 `source-labels:<kind>` 并报告新增条数；kind 没有这个能力时按 `invalid_params` 拒绝。
      */
     'source.labels': { input: SourceInput; output: SourceLabelsOutcome }
+    /**
+     * 一次搜索（§M.2 的 Search 行）：查询原文交给 worker 的 `find`/搜索处理（GitHub 的 `#12`、
+     * Issue/PR 与评论链接，Feishu 的 `om_…`/`oc_…`/链接，以及三处文本），回来三组命中。
+     * 空查询按 `invalid_params` 拒绝（面板也不会发）。
+     */
+    search: { input: SearchViewInput; output: SearchPageView }
   }
 
   interface PluginPanelEvents {

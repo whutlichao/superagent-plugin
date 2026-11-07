@@ -81,6 +81,7 @@ import {
 } from './protocol'
 import { TicketRow } from './rows'
 import { loadSources, openSources, resetSources, SourcePage } from './source-page'
+import { openSearch, resetSearch, SearchPage } from './search-page'
 import { filterLabelKey, threadCells, threadColumns } from './trigger'
 import {
   BootingState,
@@ -273,6 +274,8 @@ export function setup(ctx: PanelContext): () => void {
   set(decisionActing, false)
   // Source 页同理：上一份读数与各卡的动作状态都不带进这一次。
   resetSources()
+  // Search 页同理：上一次的查询、结果与错误不带进这一次（只在人提交时读，不在 setup 里搜）。
+  resetSearch()
   // 上一次挂载还在飞行的列表/详情请求作废（它们的答案不该画进这一次）。
   listRequest += 1
   decisionRequest += 1
@@ -337,6 +340,8 @@ export function setup(ctx: PanelContext): () => void {
     if (startPage === 'source') void openSources()
     // 停在 Trigger：焦点指向一条 Thread 就是详情，否则是当前筛选的列表。
     if (startPage === 'trigger') enterTriggers()
+    // 停在 Search：页面打开着但还没搜过，等一次提交（不替人发一个空查询）。
+    if (startPage === 'search') openSearch()
   } else set(phase, 'starting')
   return () => {
     disposed = true
@@ -2373,6 +2378,19 @@ function PageBody(props: {
     // 重试），因此它不借用快照的首屏骨架——但 worker 完全不应答时仍是整页的错误态。
     return stage === 'error' ? <ErrorStateView locale={locale} /> : <TriggerPage locale={locale} />
   }
+  if (props.current === 'search') {
+    // Search 页自己管查询与三态（结果骨架、无命中、读失败 + 重试）；worker 完全不应答时
+    // 仍是整页的错误态。跳转与别的页面一样落在 `focus` 上。
+    return stage === 'error' ? (
+      <ErrorStateView locale={locale} />
+    ) : (
+      <SearchPage
+        locale={locale}
+        onOpenThread={(threadKey) => openThreadFromElsewhere(threadKey)}
+        onOpenTicket={(ticketId) => openTicket(ticketId)}
+      />
+    )
+  }
   if (props.current === 'overview' || props.current === 'eval' || props.current === 'execution') {
     if (stage === 'error') {
       return <ErrorStateView locale={locale} />
@@ -2477,6 +2495,7 @@ export default function Panel(): OrcaElement {
           if (next === 'eval') enterEval()
           if (next === 'source') void openSources()
           if (next === 'trigger') enterTriggers()
+          if (next === 'search') openSearch()
         }}
       >
         {NAV_PAGES.map((item) => (

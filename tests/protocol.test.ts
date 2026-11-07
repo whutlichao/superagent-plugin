@@ -52,7 +52,9 @@ test('the panel declares the state snapshot, the list pages and the Deployment g
     // Settings 页（#42）：四个可编辑组的读数、块保存与版本历史。
     'settings.read',
     'settings.save',
-    'settings.history'
+    'settings.history',
+    // Search 页（#48）：一次查询，三组命中。
+    'search'
   ])
 })
 
