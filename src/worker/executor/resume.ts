@@ -5,6 +5,10 @@
 // 是否还在）。`agents.list()` 只投影当前聚焦的工作区（附录 C S2），拿它枚举会把别的工单
 // 当成不存在——这条纪律由测试断言（`calls.listAgents` 恒空）。
 //
+// **判活只有 `connected` 一格**，与 `OrcaRuntime.findAgent` 同一口径：`orphaned: true` 只表示
+// 这个 pty 没有挂载到可见 pane（附录 C S2/S7 的实测），不是死亡。后台跑着、UI 里没开的
+// worker 因此照样认领；真正断开或从枚举里消失的才按 §E.10 标 `interrupted` 并重建。
+//
 // 认领不新建 Assignment：worker 的会话还在跑，投一条「已恢复，继续」即可。中断则走
 // `Engine.assignmentLost`（core 的唯一写者）：结束旧 Assignment、把没取走的 Input 放回队首、
 // 带恢复说明新建一个并排队 launch。按最旧优先重建，重启后的 launch 因此保持接受顺序。
@@ -75,9 +79,9 @@ function runningAssignments(records: ResumeRecords): { ticket: Ticket; assignmen
 }
 
 /**
- * 终端属于这张 Ticket 的 worktree 吗？三条判据：终端还连着、没被标为 orphaned，且它的
- * worktree（路径或工作区 id）就是 Ticket 记录下来的目录。对不上就不认领——宁可重建，也不
- * 把别人的会话当成自己的。
+ * 终端属于这张 Ticket 的 worktree 吗？判据是它的 worktree（路径或工作区 id）就是 Ticket
+ * 记录下来的目录。对不上就不认领——宁可重建，也不把别人的会话当成自己的。`orphaned` 不作
+ * 判据：那只是没有可见 pane（附录 C S2/S7），生死由调用方的 `connected` 定。
  */
 export function belongsToTicket(
   terminal: TerminalRow,
@@ -114,12 +118,9 @@ export async function resumeAssignments(options: ResumeOptions): Promise<ResumeR
   for (const { ticket, assignment } of running) {
     const terminalId = assignment.terminalId ?? null
     const terminal = terminalId === null ? undefined : byHandle.get(terminalId)
-    const adopted =
-      !forced &&
-      terminal !== undefined &&
-      terminal.connected &&
-      !terminal.orphaned &&
-      belongsToTicket(terminal, ticket, workspaces)
+    // 判活只有 `connected` 一格（附录 C S2/S7）：`orphaned: true` 只是没有可见 pane，不是死亡。
+    const live = !forced && terminal !== undefined && terminal.connected
+    const adopted = live && belongsToTicket(terminal, ticket, workspaces)
     if (adopted) {
       try {
         await options.runtime.sendText(terminal.handle, RESTORED_INSTRUCTION, { enter: true })
