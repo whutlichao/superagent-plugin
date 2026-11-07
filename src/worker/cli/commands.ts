@@ -280,7 +280,7 @@ export const CLI_COMMANDS: readonly CommandDefinition[] = [
   {
     name: ['ticket', 'note'],
     summary: 'send a person note to a running worker (at most 100 words)',
-    flags: [{ name: 'text', kind: 'value', hint: 'the note', required: true }, REQUEST_ID_FLAG],
+    flags: [{ name: 'text', kind: 'value', hint: 'the note (at most 100 words)', required: true }, REQUEST_ID_FLAG],
     positionals: [{ name: 'ticket_id', required: true }],
     write: true,
     available: false
