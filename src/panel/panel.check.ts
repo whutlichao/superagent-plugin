@@ -860,6 +860,14 @@ export default defineCheck({
     ),
     storage: { 'panel.page': 'trigger', 'panel.threadFilter': 'subscribed' }
   },
+  /**
+   * Search 页本身：打开就停在这一页。页面只在人提交查询时读（§M.6），所以这一情景看到的是
+   * 输入框与那句提示；三组结果与三态由 `tests/panel-search.test.tsx` 提交真实查询后断言。
+   */
+  search: {
+    ...hostFor(snapshot({ sources: { enabled: 1, problems: 0 } })),
+    storage: { 'panel.page': 'search' }
+  },
   /** 浅色主题下的待人工页面（`theme` 是 check 能区分的维度；`locale` 见文件头）。 */
   zh: {
     ...hostFor(
