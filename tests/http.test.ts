@@ -58,7 +58,11 @@ import { runIdempotent } from '../src/worker/http/idempotency'
 import { createDecisionHandlers, withDecisionHandlers } from '../src/worker/http/decisions'
 import { createSettingsHandlers, withSettingsHandlers } from '../src/worker/http/settings'
 import { createSettings } from '../src/worker/app/settings'
-import type { Decision } from '../src/worker/core/model'
+import type { Decision, Ticket } from '../src/worker/core/model'
+import type { Trigger } from '../src/worker/core/model'
+import { createReadHandlers, withReadHandlers } from '../src/worker/http/read'
+import { createReadTools } from '../src/worker/app/read'
+import { FakeCommands, cliFailure } from './support/fake-commands'
 import { tempStateDir } from './support/state'
 import { holdPortBlock } from './support/ports'
 
@@ -75,6 +79,8 @@ test('every error-code family maps to the status §G.3 item 8 fixes', () => {
     ['too_late', 400],
     ['too_many_items', 400],
     ['refused', 400],
+    // `read <resource>` 的未知资源名（§G.2 的 read 行）：不可重试的固定拒绝，不是 `missing`。
+    ['unknown_resource', 400],
     ['stale_revision', 400],
     ['too_long', 400],
     // 命令级的固定拒绝（§G.2 的「主要错误码」）与 `refused` 同为 400。
@@ -778,6 +784,7 @@ test('the route table carries every row §G.3 names', () => {
     'GET overview',
     'GET policy/history',
     'GET prompts',
+    'GET read/:resource',
     'GET search',
     'GET settings',
     'GET sources',
@@ -1070,6 +1077,192 @@ test('every route refuses a role below its minimum with not_permitted_role', asy
     }
     // 42 条路由：34 条高于 assignment（8 条是 assignment 档），13 条是 operator → 47 次拒绝。
     assert.equal(checked, 47, 'every route above assignment refuses it, and every operator route refuses router')
+  } finally {
+    harness.close()
+  }
+})
+
+// ---------------------------------------------------------------- Source 资源读面（#57）
+
+/** 一张 Ticket：来源是一条 GitHub 评论（Thread 12），跟随 PR 45。 */
+function readTicket(): Ticket {
+  return {
+    id: 'ticket-own',
+    title: 'Fix the login redirect',
+    decisionId: 'decision-1',
+    mandate: {
+      strength: 'explicit',
+      policyVersion: 'v1',
+      basis: { via: 'addressed', addressed: 'mention' },
+      actor: { source: 'github', id: 'alice' },
+      scope: 'ticket'
+    },
+    channels: [],
+    assignments: [{ id: 'assignment-1', state: 'running', createdAt: STARTED_AT, startedAt: STARTED_AT }],
+    inputs: [],
+    undelivered: [],
+    createdAt: STARTED_AT,
+    updatedAt: STARTED_AT,
+    origin: { triggerId: 'trigger-gh', triggerIds: ['trigger-gh'] },
+    follows: [{ thread: 'github:45', own: true }]
+  }
+}
+
+/** 一张别人的 Ticket：Thread 77。 */
+function otherReadTicket(): Ticket {
+  return {
+    ...readTicket(),
+    id: 'ticket-other',
+    origin: { triggerId: 'trigger-other', triggerIds: ['trigger-other'] },
+    follows: [{ thread: 'github:77', own: true }]
+  }
+}
+
+/** 一张 Issue（`gh api repos/acme/widgets/issues/12`）。 */
+function readIssueJson(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    number: 12,
+    title: 'Login redirect loops',
+    state: 'open',
+    body: 'Signing in bounces back to /login.',
+    html_url: 'https://github.com/acme/widgets/issues/12',
+    created_at: '2026-11-07T03:20:00Z',
+    updated_at: '2026-11-07T03:21:00Z',
+    user: { login: 'alice', type: 'User' },
+    ...overrides
+  }
+}
+
+/**
+ * 一个接了 read 路由的测试服务器：GitHub 的 `gh` 调用经 `FakeCommands`，Trigger/Ticket 由本用例
+ * 给；资源名整段百分号编码进 `read/:resource`（与 CLI 的 `readPath` 同一写法）。
+ */
+async function startReadHarness(options: {
+  readonly body?: string
+  readonly tickets?: readonly Ticket[]
+} = {}): Promise<{ readonly harness: Harness; readonly commands: FakeCommands }> {
+  const commands = new FakeCommands()
+  const body = options.body ?? JSON.stringify(readIssueJson())
+  commands.script(['api', 'repos/acme/widgets/issues/12'], () => body)
+  // 别人的 Issue 77：远端说找不到（404 是状态，不是 500）。
+  commands.fail('gh', ['api', 'repos/acme/widgets/issues/77'], cliFailure('gh', { code: 404 }))
+  const trigger: Trigger = {
+    id: 'trigger-gh',
+    source: 'github',
+    threads: [{ source: 'github', id: '12' }],
+    actor: { source: 'github', id: 'alice' },
+    human: true,
+    addressed: 'mention',
+    at: STARTED_AT,
+    text: 'please fix this',
+    meta: { kind: 'comment', repository: 'acme/widgets', issue: 12, commentId: 9001, updatedAt: STARTED_AT }
+  }
+  const tools = createReadTools({
+    commands,
+    sourceConfig: (kind) =>
+      kind === 'github'
+        ? { repository: 'acme/widgets', cli: 'gh' }
+        : kind === 'feishu'
+          ? { cli: 'lark-cli' }
+          : undefined,
+    trigger: (id) => (id === trigger.id ? trigger : undefined),
+    tickets: () => options.tickets ?? [readTicket(), otherReadTicket()]
+  })
+  const harness = await startHarness({
+    routes: withReadHandlers(ROUTE_TABLE, createReadHandlers({ tools }))
+  })
+  return { harness, commands }
+}
+
+/** `read/<resource>` 的路径（资源名整段编码）。 */
+const readPathOf = (resource: string): string => `/superagent/api/read/${encodeURIComponent(resource)}`
+
+test('GET read/:resource serves a Source resource through the same handler the CLI calls', async () => {
+  const { harness } = await startReadHarness()
+  try {
+    const response = await harness.call(readPathOf('github/issues/12'))
+    assert.equal(response.status, 200)
+    const view = resultOf(response) as Record<string, unknown>
+    assert.deepEqual(Object.keys(view).sort(), [
+      'body',
+      'items',
+      'kind',
+      'next',
+      'next_offset',
+      'resource',
+      'status'
+    ])
+    assert.equal(view['status'], 'available')
+    assert.equal(view['resource'], 'github/issues/12')
+    assert.equal((view['items'] as readonly unknown[]).length, 1)
+  } finally {
+    harness.close()
+  }
+})
+
+test('the read route refuses unknown resources and over-limit paging with §G.2 codes', async () => {
+  const { harness } = await startReadHarness()
+  try {
+    const unknown = await harness.call(readPathOf('github/labels/12'))
+    assert.equal(unknown.status, 400)
+    assert.equal(failureOf(unknown).code, 'unknown_resource')
+    // `--offset` 的形状在 handler 里判（负数不是分页）。
+    const badOffset = await harness.call(`${readPathOf('github/issues/12')}?offset=-1`)
+    assert.equal(badOffset.status, 400)
+    assert.equal(failureOf(badOffset).code, 'invalid_value')
+    // 列表页的 `--limit` 上限是 50（文本页才是 8000）。
+    const tooWide = await harness.call(`${readPathOf('github/issues/12/comments/1')}?limit=51`)
+    assert.equal(tooWide.status, 400)
+    assert.equal(failureOf(tooWide).code, 'invalid_value')
+    // Feishu 资源名锚定一条 Trigger：没有它就是 `missing`（不是空页）。
+    const missing = await harness.call(readPathOf('feishu/om_unknown/message'))
+    assert.equal(missing.status, 404)
+    assert.equal(failureOf(missing).code, 'missing')
+  } finally {
+    harness.close()
+  }
+})
+
+test('a resource bigger than one response carries is too_large (413), not a silent cut', async () => {
+  const { harness } = await startReadHarness({
+    body: JSON.stringify(readIssueJson({ title: '', body: 'a'.repeat(1024 * 1024 + 1) }))
+  })
+  try {
+    const response = await harness.call(readPathOf('github/issues/12'))
+    assert.equal(response.status, 413)
+    assert.equal(failureOf(response).code, 'too_large')
+  } finally {
+    harness.close()
+  }
+})
+
+test('an assignment token reads its own resources and is refused for any other (403/400)', async () => {
+  const { harness } = await startReadHarness()
+  try {
+    const { token } = issueAssignmentToken({
+      store: harness.store,
+      stateDir: harness.stateDir,
+      ticketId: 'ticket-own',
+      assignmentId: 'assignment-1',
+      expiresAt: '2026-11-08T03:26:00.000Z'
+    })
+    const own = await harness.call(readPathOf('github/issues/12'), { token })
+    assert.equal(own.status, 200)
+    assert.equal((resultOf(own) as Record<string, unknown>)['status'], 'available')
+    // 别人的 Ticket：越权（403）。
+    const other = await harness.call(readPathOf('github/issues/77'), { token })
+    assert.equal(other.status, 403)
+    assert.equal(failureOf(other).code, 'not_permitted_role')
+    // 没有任何 Ticket 认领它：这个角色的读面就没有它（400）。
+    const unowned = await harness.call(readPathOf('github/issues/999'), { token })
+    assert.equal(unowned.status, 400)
+    assert.equal(failureOf(unowned).code, 'refused')
+    // router/operator 读得到同一个资源（角色阶梯的正面）：远端 404 是 200 + 状态 `missing`。
+    const router = await harness.call(readPathOf('github/issues/77'), {
+      token: issueRouterToken({ store: harness.store, stateDir: harness.stateDir }).token
+    })
+    assert.equal(router.status, 200)
+    assert.equal((resultOf(router) as Record<string, unknown>)['status'], 'missing')
   } finally {
     harness.close()
   }

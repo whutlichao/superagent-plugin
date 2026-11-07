@@ -155,9 +155,22 @@ export interface PromptSaveView extends PromptVersionSummary {
 // HTTP handler 的校验读同一份；与 `sources/admission-context.ts` 的 `ContextPartName` 同值。
 export const EVAL_READ_PARTS = ['root', 'parent', 'thread'] as const
 
-/** `read <resource>` 的分页默认与上限（§G.2 的 read 行：默认 20、上限 50）。 */
-export const READ_DEFAULT_LIMIT = 20
-export const READ_MAX_LIMIT = 50
+/**
+ * `read <resource>` 的分页默认与上限（§G.2 的 read 行：列表页默认 20、上限 50；文本页默认
+ * 4000 字符、上限 8000）。定义在 `app/read.ts`（分页在那里判），这里只原样转出给 CLI。
+ */
+export {
+  READ_DEFAULT_LIMIT,
+  READ_MAX_LIMIT,
+  READ_TEXT_DEFAULT_CHARS,
+  READ_TEXT_MAX_CHARS
+} from '../app/read.ts'
+
+/**
+ * Source 资源读面（§I.2 的「资源读取」行 + §I.3 的读法）的两种写法：一个判断（CLI 用它决定
+ * 走 `read/:resource` 还是面板视图路由）与一份可用写法清单（未知资源的拒绝与 `--help` 用）。
+ */
+export { isSourceResource, READ_SOURCE_RESOURCES } from '../app/read.ts'
 
 /** `read` 能读的资源（§F.6 的 Router 读面 + 面板视图）。 */
 export const READ_RESOURCES: readonly string[] = [

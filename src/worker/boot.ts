@@ -136,6 +136,8 @@ import { parseSettingsBlock, validateSettingsBlock } from './app/settings-blocks
 import { createAssessmentHandlers, withAssessmentHandlers } from './http/assessment.ts'
 import { createEvalHandlers, withEvalHandlers } from './http/eval.ts'
 import { createEvalTools } from './app/eval.ts'
+import { createReadHandlers, withReadHandlers } from './http/read.ts'
+import { createReadTools } from './app/read.ts'
 import { admissionSettingsOf } from './sources/admission-context.ts'
 import { createDecisionHandlers, withDecisionHandlers } from './http/decisions.ts'
 import { createPromptHandlers, withPromptHandlers } from './http/prompts.ts'
@@ -1077,6 +1079,19 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
     roots: evalRoots,
     log: (message) => logger.info(message)
   })
+  // `read <resource>` 的 Source 读面（§G.2 的 read 行、§I.2 的「资源读取」行、§I.3 的读法）：
+  // 资源名路由到 kind 自己的读模块；Source 配置与 Trigger 现读（设置改了不必重建工具），
+  // Ticket 现读（assignment 只能读自己 Ticket 相关的资源，§O）。
+  const readTools = createReadTools({
+    commands: commandPort,
+    sourceConfig: (kind) => {
+      const instance = registry.instance(kind, sourceSettings)
+      return instance === undefined || !instance.enabled ? undefined : instance.config
+    },
+    trigger: (id) => repo.triggers.get(id),
+    tickets: () => repo.tickets.list(),
+    log: (message) => logger.info(message)
+  })
   // Prompt 配置的读/写面（§L.4、§L.5）：版本库、部署事实与「保存后通知 Router」都在这里接线。
   // 部署事实给的是**路径**（CLI 的绝对路径、调用者自己的 token 文件），绝不写 token 值（§D.6）；
   // 保存产生新版本时，Router 保活器把 revision 换成一条短消息排队——不重启会话（§F.4）。
@@ -1165,17 +1180,20 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
   const routes: readonly RouteDefinition[] = withSettingsHandlers(
     withDecisionHandlers(
         withPromptHandlers(
-          withEvalHandlers(
-            withAssessmentHandlers(
-              withDomainHandlers(ROUTE_TABLE, domain),
-              createAssessmentHandlers({
-                tools: routerTools,
-                afterWrite: () => {
-                  refresh()
-                }
-              })
+          withReadHandlers(
+            withEvalHandlers(
+              withAssessmentHandlers(
+                withDomainHandlers(ROUTE_TABLE, domain),
+                createAssessmentHandlers({
+                  tools: routerTools,
+                  afterWrite: () => {
+                    refresh()
+                  }
+                })
+              ),
+              createEvalHandlers({ tools: evalTools })
             ),
-            createEvalHandlers({ tools: evalTools })
+            createReadHandlers({ tools: readTools })
           ),
           prompts
         ),
