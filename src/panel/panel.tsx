@@ -346,6 +346,8 @@ export function setup(ctx: PanelContext): () => void {
     disposed = true
     resetSettings()
     resetSources()
+    // Search 页的晚到响应也不能写进下一次挂载（与 Source 页同一条理由）。
+    resetSearch()
     if (retryTimer !== null) {
       clearTimeout(retryTimer)
       retryTimer = null
