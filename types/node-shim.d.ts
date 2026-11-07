@@ -70,6 +70,7 @@ declare module 'node:fs' {
     isFile(): boolean
     isDirectory(): boolean
   }
+  export function copyFileSync(from: string, to: string): void
   export function readFileSync(path: string, encoding: 'utf8'): string
   export function writeFileSync(path: string, data: string, encoding?: 'utf8'): void
   /** 带权限位的写入（可执行的 shim §H.11、token 与指针文件的 0600）；`mode` 可为空。 */

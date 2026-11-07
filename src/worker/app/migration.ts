@@ -4,10 +4,10 @@
 // 更低则先 `VACUUM INTO` 备份到 `<stateDir>/backups/superagent-<from>-<ts>.sqlite`，
 // 再逐级执行 `MIGRATIONS`，每级一个事务。失败时回滚、报告可恢复的备份路径、
 // 不带着半迁移库启动。
-import { mkdirSync, readdirSync, unlinkSync } from 'node:fs'
+import { copyFileSync, existsSync, mkdirSync, readdirSync, unlinkSync } from 'node:fs'
 import { join } from 'node:path'
 import { SILENT_LOG, type LogSink, type LogLine } from '../infra/log-line.ts'
-import { KV_KEY_LITERALS, SCHEMA_VERSION_KEY } from './kv.ts'
+import { SCHEMA_VERSION_KEY } from './kv.ts'
 import { MIGRATIONS, SCHEMA_VERSION, type MigrationStep, type SchemaDatabase } from './schema.ts'
 
 /** 迁移在 `exec` 之外还要一次 `get` 去读版本（`DatabaseSync` 满足这个形状）。 */
@@ -162,6 +162,44 @@ export function migrate(db: MigrationDatabase, options: MigrateOptions): Migrate
   return { from, to: current, applied, backup }
 }
 
+/** 从备份恢复的输入。 */
+export interface RestoreOptions {
+  /** 被恢复的库文件（`<stateDir>/superagent.sqlite`）。 */
+  readonly databasePath: string
+  /** 迁移前的那份备份（`MigrationError.backupPath`）。 */
+  readonly backupPath: string
+  /** 恢复行的时钟（测试注入固定时刻）。 */
+  readonly now?: () => Date
+  /** 恢复行也要留下可读日志（§N.5、§N.6「不静默」）。 */
+  readonly log?: LogSink
+}
+
+/**
+ * 从备份恢复数据库文件（§N.6 第 2 条）：调用方必须先关掉数据库句柄，再把备份**整文件**复制
+ * 回来，并清掉失败那一轮留下的 `-wal` / `-shm` / `-journal`。复制而不是重放 SQL：备份是
+ * 迁移前用 `VACUUM INTO` 写出的完整库，恢复后的状态与「从未升级过」完全一致。
+ */
+export function restoreFromBackup(options: RestoreOptions): void {
+  const { databasePath, backupPath } = options
+  if (!existsSync(backupPath)) {
+    throw new Error(`cannot restore: the backup ${backupPath} is missing`)
+  }
+  for (const suffix of ['-wal', '-shm', '-journal']) {
+    try {
+      unlinkSync(`${databasePath}${suffix}`)
+    } catch {
+      // 没有这个副文件就是我们要的结果。
+    }
+  }
+  copyFileSync(backupPath, databasePath)
+  const at = (options.now?.() ?? new Date()).toISOString()
+  ;(options.log ?? SILENT_LOG)({
+    ts: at,
+    level: 'error',
+    msg: `restored database from ${backupPath} after a failed migration`
+  })
+}
+
 /** 迁移前备份：`VACUUM INTO <backupDir>/superagent-<from>-<ts>.sqlite`，只保留最近 N 份。 */
 export function backupBeforeMigrate(
   db: MigrationDatabase,
@@ -186,6 +224,12 @@ export function backupBeforeMigrate(
   return { path, from, at, kept }
 }
 
+/** 备份文件里的时刻：`superagent-<version>-<ts>.sqlite` 的 `ts`（定宽，文本排序即时间排序）。 */
+function backupTimestamp(name: string): string {
+  const match = /^superagent-\d+-(.+)\.sqlite$/.exec(name)
+  return match === null ? name : (match[1] as string)
+}
+
 /** 只保留最近 `keep` 份备份，返回剩下的（从旧到新，绝对路径）。 */
 export function pruneBackups(backupDir: string, keep: number): readonly string[] {
   let names: readonly string[]
@@ -196,7 +240,11 @@ export function pruneBackups(backupDir: string, keep: number): readonly string[]
   } catch {
     return []
   }
-  const sorted = [...names].sort()
+  // 按时间而不是文件名排序：文件名前缀是「备份时的 schema 版本」，跨版本升级时版本号与
+  // 时间并不同向（`superagent-0-…` 可能是比 `superagent-1-…` 更新的一份）。
+  const sorted = [...names].sort(
+    (a, b) => backupTimestamp(a).localeCompare(backupTimestamp(b)) || a.localeCompare(b)
+  )
   const excess = sorted.slice(0, Math.max(0, sorted.length - keep))
   for (const name of excess) {
     try {
