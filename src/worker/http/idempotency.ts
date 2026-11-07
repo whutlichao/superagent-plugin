@@ -7,6 +7,7 @@
 // 纪律：**失败不缓存**——一次拒绝或内部错误在重试时应该有机会成功，否则「重试」这个动作
 // 本身就没有意义（HTTP 层的 429/超时重试尤其如此）。
 import { REQUEST_ID_PREFIX, requestIdKey } from '../app/kv.ts'
+import { hashToken } from '../infra/tokens.ts'
 import type { Store } from '../app/store.ts'
 
 /** 幂等窗口：一小时（§G.1 幂等行）。 */
@@ -123,4 +124,35 @@ function pruneExpired(store: Store, at: string): void {
     if (record === null) continue
     if (now - new Date(record.at).getTime() > IDEMPOTENCY_WINDOW_MS) store.kvDelete(key)
   }
+}
+
+/** 一次写请求的幂等输入（`token` 只以哈希入键；原文不落库、不回显，§O）。 */
+export interface WriteInput {
+  readonly store: Store
+  readonly token?: string
+  readonly requestId?: string | null
+  readonly at: string
+}
+
+/** 一条记录的调用者键：token 的哈希（不是 token 原文，§D.6）。 */
+export function callerKey(token: string | undefined): string {
+  return token === undefined ? 'unknown' : hashToken(token)
+}
+
+/**
+ * 幂等地跑一次写（§G.1 幂等行）：有 `requestId` 时同 id 一小时内返回首次结果，
+ * 否则直接跑一次；**失败不缓存**。HTTP handler 只有一个读法——别处不要再拼一遍窗口逻辑。
+ */
+export async function runWrite<T>(
+  input: WriteInput,
+  work: () => T | Promise<T>
+): Promise<T> {
+  const run = await runIdempotentAsync({
+    store: input.store,
+    caller: callerKey(input.token),
+    requestId: input.requestId ?? null,
+    at: input.at,
+    run: work
+  })
+  return run.outcome.result as T
 }

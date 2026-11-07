@@ -11,7 +11,7 @@
 // `OrcaRuntime` 与端口进入。
 import { mkdirSync } from 'node:fs'
 import { join } from 'node:path'
-import type { PanelState } from '../panel/protocol'
+import type { DeploymentView, PanelState } from '../panel/protocol'
 import { Engine } from './core/index.ts'
 import type { Store } from './app/store.ts'
 import { openStore } from './app/store.ts'
@@ -25,8 +25,14 @@ import {
   TOKENS_DIR,
   ensureApiToken,
   issueAssignmentToken,
-  issueRouterToken
+  issueRouterToken,
+  rotateApiToken
 } from './infra/tokens.ts'
+import { deploymentView } from './app/deployment-view.ts'
+import { machineLimits } from './app/limits.ts'
+import { runDoctor } from './app/doctor.ts'
+import type { DoctorOptions } from './app/doctor.ts'
+import type { DoctorResult } from './app/doctor-types.ts'
 import { createRepositories } from './app/repositories.ts'
 import {
   createPolicy,
@@ -59,6 +65,7 @@ import {
 } from './app/kv.ts'
 import { createRefreshableStateSource, type RefreshableStateSource } from './app/state-source.ts'
 import { deliveredFollowups } from './app/views.ts'
+import { followupOwners } from './core/index.ts'
 import { readEvalsHealth, readUnavailableProblems } from './app/views/attention.ts'
 import { readSystemProblems, replyTarget } from './app/views/problems.ts'
 import { statusBarView } from './app/status-bar.ts'
@@ -100,6 +107,9 @@ import { retryTicket } from './executor/retry.ts'
 import { resumeAfterUpgrade, type ResumeReport } from './executor/resume.ts'
 import { DEFAULT_MAX_WORKERS } from './http/state.ts'
 import { createDomainHandlers, withDomainHandlers } from './http/domain.ts'
+import { createSettingsHandlers, withSettingsHandlers } from './http/settings.ts'
+import { runWrite } from './http/idempotency.ts'
+import { parseSettingsBlock, validateSettingsBlock } from './app/settings-blocks.ts'
 import { createAssessmentHandlers, withAssessmentHandlers } from './http/assessment.ts'
 import { createEvalHandlers, withEvalHandlers } from './http/eval.ts'
 import { createEvalTools } from './app/eval.ts'
@@ -207,6 +217,12 @@ export interface BootHandle {
    * **不重启 Orca**。`checked: false` 表示检查时本来就没有问题——没有可检查的东西。
    */
   checkSetup(): Promise<SetupCheckOutcome>
+  /** Deployment 页的读数（§M.3）：setup 问题、状态目录、机器限额、暂停、health 与 Router。 */
+  deployment(): DeploymentView
+  /** doctor 的八项诊断（§G.2、§N.4）：与 HTTP 的 `POST doctor` 同一份接线。 */
+  doctor(): Promise<DoctorResult>
+  /** 轮换主 token（§D.6、§O）：只回 token 文件路径，绝不回 token 值。 */
+  rotateToken(): { readonly rotated: boolean; readonly tokenFile: string }
   shutdown(): Promise<void>
 }
 
@@ -328,6 +344,27 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
       focusTerminal: (terminalId: string): Promise<void> => options.runtime.focusTerminal(terminalId),
       // follower 不读库、不跑探针：它没有可以做检查的东西。
       checkSetup: async () => ({ checked: false, problem: null, issues: [], restarted: false }),
+      // 部署页读到的是「这一进程只跟着另一个实例」：没有自己的 health，也不假装在跑。
+      deployment: () =>
+        deploymentView({
+          stateDir: resolved,
+          setup: [],
+          limits: machineLimits(settings),
+          paused: true,
+          health: {},
+          router: emptyRouterSnapshot()
+        }),
+      // 诊断与轮换由那个真正持有 stateDir 的实例做。
+      doctor: async () => {
+        throw Object.assign(new Error('another instance owns the state directory; run doctor through it'), {
+          code: 'refused'
+        })
+      },
+      rotateToken: () => {
+        throw Object.assign(new Error('another instance owns the state directory; it owns the token'), {
+          code: 'refused'
+        })
+      },
       shutdown: async () => undefined
     }
     return follower
@@ -349,6 +386,20 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
   const githubStored = block(rawSources[GITHUB_KIND])
   const commandPort: CommandsHost =
     options.commands ?? new Commands({ configuredPrograms: () => [text(settings['githubCli'])] })
+  // 机器限额（§H.12、§H.22）：设置里写了的用写的，没写的用缺省值；启动时读一次。
+  const limits = machineLimits(settings)
+  /**
+   * `doctor` 的接线（§G.2、§N.4）：HTTP 的 `POST doctor` 与面板的 `doctor` 请求走**同一份**选项，
+   * 于是两处读数永远一致。只 stat 文件、不读 secret（§O）。
+   */
+  const doctorOptions: DoctorOptions = {
+    stateDir: resolved,
+    run: (program, args) => commandPort.run(program, args),
+    cliPath: options.cliPath ?? defaultCliPath(),
+    now,
+    inspectDatabase: () => store.inspect()
+  }
+  const doctorNow = (): Promise<DoctorResult> => runDoctor(doctorOptions)
   const githubInstance = githubInstanceOf({ raw: settings, stored: githubStored })
   const feishuCli = feishuCliOf(rawSources)
   const setupInput = (): SetupCheckInput => ({
@@ -776,6 +827,12 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
   }
 
   // ---- 命令面（HTTP + CLI 共用同一份 handler）
+  /** 写命令的幂等（§G.1 幂等行）：窗口/键/清理只有 `http/idempotency.ts` 一份。 */
+  const idempotent = (
+    input: { readonly token?: string; readonly requestId?: string | null; readonly at: string },
+    work: () => unknown | Promise<unknown>
+  ): Promise<unknown> =>
+    runWrite({ store, token: input.token, requestId: input.requestId ?? null, at: input.at }, work)
   const domain = createDomainHandlers({
     report: (ticketId, report) => engine.report(ticketId, report),
     reply: (request) => engine.reply(request),
@@ -786,10 +843,20 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
     // 拼一次（`executor/retry.ts`），这里只把 Ticket 交给它——避免第二个说法。
     stop: (ticketId, reason) => engine.stopTicket(ticketId, reason),
     retry: (ticketId) => retryTicket(engine, ticketId),
+    // 本票的四条领域命令（§G.2 的 trigger requeue / thread follow / thread unrelated /
+    // thread unsubscribe）：语义全在 Engine，HTTP 层只判固定码。
+    reevaluate: (triggerId) => engine.reevaluate(triggerId),
+    unsubscribe: (thread) => engine.unsubscribe(thread),
+    markUnrelated: (ticketId, thread, reason) => engine.markUnrelated(ticketId, thread, reason),
+    followForContext: (ticketId, ref, reason) => engine.followForContext(ticketId, ref, reason),
+    threadOf: (key) => repo.threads.get(key),
+    triggerOf: (id) => repo.triggers.get(id),
+    owners: (trigger) => followupOwners(trigger, repo),
     ticketOf: (id) => repo.tickets.get(id),
     tickets: () => repo.tickets.list(),
     // 读模型里的「已投递到该 Ticket」：归属判定与扇出/交回同一份记录（`followupOwners`）。
     followups: (ticket) => deliveredFollowups(ticket, repo),
+    idempotent,
     afterWrite: () => {
       refresh()
     }
@@ -845,30 +912,99 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
       refresh()
     }
   })
-  const routes: readonly RouteDefinition[] = withDecisionHandlers(
-    withPromptHandlers(
-      withEvalHandlers(
-        withAssessmentHandlers(
-          withDomainHandlers(ROUTE_TABLE, domain),
-          createAssessmentHandlers({
-            tools: routerTools,
-            afterWrite: () => {
-              refresh()
-            }
-          })
+  // ---- 设置与名单同步的写面（§G.2 的 settings get/save 与 policy sync、§K.8）：写入器是
+  // #20 的 `settingsWriter`，块的 strict schema 由 Policy（含各 Source 的 extras）与各 kind 的
+  // config schema 提供，账号类字段（`cli`/`repository`）的写前检查是 #44 的探针，名单同步是
+  // #23 的驱动器（`policySync` 在下面创建：端口用晚绑定的 holder，请求只会在启动之后到达）。
+  let policySyncDriver: PolicySync | null = null
+  const settingsHandlers = createSettingsHandlers({
+    settings: settingsWriter,
+    validate: (name) => {
+      if (parseSettingsBlock(name) === undefined) return undefined
+      return (value: unknown) =>
+        validateSettingsBlock(name, value, {
+          // Policy 块的字段表与跨 Source 的 extras 在 `policy/schema.ts`（§K.1）。
+          policy: (candidate) => validatePolicy(candidate, { kinds: policyKind }),
+          // Source 块的 config 键属于该 kind（§I.1）：只把它的 issues 接进同一份结果。
+          sourceConfig: (id) => {
+            const schema = registry.kind(id)?.schema
+            return schema === undefined ? undefined : (config: unknown) => schema.safeParse(config)
+          }
+        }) ?? { success: true as const, data: value }
+    },
+    blocks: () => [
+      'policy',
+      'eval',
+      'executor',
+      ...Object.keys(sourceSettings.sources).map((id) => `source:${id}`)
+    ],
+    effective: (name) => {
+      if (name === 'policy') return effectivePolicy()
+      if (name === 'eval') return block(settings['eval'])
+      if (name === 'executor') return block(settings['executor'])
+      const parsed = parseSettingsBlock(name)
+      return parsed?.kind === 'source'
+        ? (sourceSettings.sources[parsed.id] ?? { enabled: false, config: {} })
+        : null
+    },
+    // 账号类字段的写前 setup 检查（§K.8）：按候选值跑 #44 的探针，只回 github 那一组问题
+    // （repository / CLI 账号）；不写 gitconfig、不改任何设置。
+    checkAccount: async (candidate) => {
+      const report = await runSetupChecks({
+        ...setupInput(),
+        ...(candidate.repository === undefined ? {} : { repository: candidate.repository }),
+        ...(candidate.cli === undefined ? {} : { githubCli: candidate.cli }),
+        gitConfig: undefined
+      })
+      return issuesOf(report.issues, 'github')
+    },
+    idempotent,
+    policySync: {
+      syncable: () => policySyncDriver?.syncable() ?? [],
+      sync: (id) => {
+        if (policySyncDriver === null) {
+          throw new Error('the policy sync driver is not wired yet')
+        }
+        return policySyncDriver.sync(id)
+      },
+      // 同步前的名单：影响面从「现在生效的那份 Policy」算起（保存过就以存下来的为准）。
+      allowed: (id) => effectivePolicy().sources[id]?.allowed ?? [],
+      policy: () => ({
+        revision: settingsWriter.blockRevision('policy'),
+        version: savedSettingsVersion(store, 'policy')?.policyVersion ?? null
+      })
+    },
+    afterWrite: () => {
+      refresh()
+    }
+  })
+  const routes: readonly RouteDefinition[] = withSettingsHandlers(
+    withDecisionHandlers(
+        withPromptHandlers(
+          withEvalHandlers(
+            withAssessmentHandlers(
+              withDomainHandlers(ROUTE_TABLE, domain),
+              createAssessmentHandlers({
+                tools: routerTools,
+                afterWrite: () => {
+                  refresh()
+                }
+              })
+            ),
+            createEvalHandlers({ tools: evalTools })
+          ),
+          prompts
         ),
-        createEvalHandlers({ tools: evalTools })
+        createDecisionHandlers({
+          // 面板的 dismiss（§K.7）：领域只接受 unavailable 的 Decision，其余给固定拒绝。
+          dismiss: (decisionId) => engine.dismiss(decisionId),
+          afterWrite: () => {
+            refresh()
+          }
+        })
       ),
-      prompts
-    ),
-    createDecisionHandlers({
-      // 面板的 dismiss（§K.7）：领域只接受 unavailable 的 Decision，其余给固定拒绝。
-      dismiss: (decisionId) => engine.dismiss(decisionId),
-      afterWrite: () => {
-        refresh()
-      }
-    })
-  )
+      settingsHandlers
+    )
 
   ensureApiToken(resolved)
   const http: HttpServerHandle = await startHttpServer({
@@ -898,7 +1034,8 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
     ops: {
       run: (program, args) => commandPort.run(program, args),
       cliPath: options.cliPath ?? defaultCliPath(),
-      setupCheck: () => checkSetup()
+      setupCheck: () => checkSetup(),
+      doctor: doctorNow
     },
     log: (line) => logger.info('http request', { method: line.method, path: line.path, status: line.status, ms: line.ms })
   })
@@ -1108,6 +1245,7 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
     signal: lifetimeAbort.signal,
     log: (message) => logger.info(message)
   })
+  policySyncDriver = policySync
 
   // ---- passes：先做 effect，再评估，再把确定性评估的决定落库
   const passes = createPasses({
@@ -1249,6 +1387,22 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
     // 面板不能直接聚焦终端（§M.2）：worker 跑 `orca terminal focus --terminal <handle>`。
     focusTerminal: (terminalId: string): Promise<void> => options.runtime.focusTerminal(terminalId),
     checkSetup,
+    // Deployment 页的三条读数（§M.3）：状态目录与限额只读；health 是健康板；Router 只读快照。
+    deployment: () =>
+      deploymentView({
+        stateDir: resolved,
+        setup: setup.issues(),
+        limits,
+        paused: paused.paused(),
+        health: board.all(),
+        router: routerSupervision.snapshot()
+      }),
+    doctor: doctorNow,
+    rotateToken: () => {
+      // §D.6、§O：只回文件路径；值不出现在任何读数里。
+      const rotated = rotateApiToken(resolved)
+      return { rotated: true, tokenFile: rotated.path }
+    },
     shutdown
   }
 }

@@ -14,6 +14,7 @@ import { bootPlugin, type BootHandle } from '../src/worker/boot.ts'
 import { dispatch } from '../src/worker/cli/commands.ts'
 import { parseArgs } from '../src/worker/cli/io.ts'
 import { readApiToken } from '../src/worker/infra/tokens.ts'
+import { openStore } from '../src/worker/app/store.ts'
 import { FakeCommands } from './support/fake-commands.ts'
 import { FakeOrcaRuntime } from './support/fake-orca-runtime.ts'
 import { assignmentToken, COMMENT, NOTIFICATION, settingsOf } from './support/boot.ts'
@@ -780,6 +781,101 @@ test('retries a failed ticket on the same worktree with the recovery note, and r
     const missing = await cli(h.stateDir, portOf(h), ['ticket', 'retry', 'nope'], token)
     assert.equal(missing.exit, 2)
     assert.equal((missing.envelope as { error?: { code?: string } }).error?.code, 'missing')
+  } finally {
+    await h.cleanup()
+  }
+})
+
+test('threads and requeue act on the real subscriptions: follow as context, declare unrelated, then unsubscribe', async () => {
+  const h = await openFollowup()
+  try {
+    await settle(h)
+    const [ticket] = h.handle.snapshot().tickets ?? []
+    assert.ok(ticket, 'the mention opened a ticket')
+    const operator = readApiToken(h.stateDir)
+    const view = await ticketOf(h, ticket.id, operator)
+    const worker = assignmentToken(h.stateDir, (view['assignment'] as { readonly id: string }).id)
+    const ownThread = 'github:42'
+
+    /** 库里的 Trigger id（按时刻；第一条是来源点名，第二条是那条人 follow-up）。 */
+    const triggerIds = (): string[] => {
+      const store = openStore({ stateDir: h.stateDir })
+      try {
+        return store.sql
+          .all('SELECT id FROM trigger ORDER BY at, id')
+          .map((row) => String((row as Record<string, unknown>)['id']))
+      } finally {
+        store.close()
+      }
+    }
+    const run = (argv: readonly string[], token: string | null) => cli(h.stateDir, portOf(h), argv, token)
+    const codeOf = (envelope: unknown): string | undefined =>
+      (envelope as { readonly error?: { readonly code?: string } }).error?.code
+
+    // 一条人 follow-up 归这张 Ticket 的 worker：重排它会绕开决定它的 worker（`not_requeueable`）。
+    h.comments.push(FOLLOWUP)
+    await h.handle.pollOnce()
+    await h.handle.passOnce()
+    await h.handle.passOnce()
+    const followUpTrigger = triggerIds().at(-1)!
+    const notRequeueable = await run(['trigger', 'requeue', followUpTrigger], operator)
+    assert.equal(notRequeueable.exit, 2)
+    assert.equal(codeOf(notRequeueable.envelope), 'not_requeueable')
+    const unknownTrigger = await run(['trigger', 'requeue', 'nope'], operator)
+    assert.equal(codeOf(unknownTrigger.envelope), 'missing')
+
+    // 一条没人拥有的 Trigger（另一个 Thread 上的候选）可以重排；它已经在等 Eval，所以如实回 false。
+    h.notifications.push(OTHER_NOTIFICATION)
+    await h.handle.pollOnce()
+    await h.handle.passOnce()
+    const pending = triggerIds().at(-1)!
+    const queued = await run(['trigger', 'requeue', pending], operator)
+    assert.equal(queued.exit, 0, JSON.stringify(queued.envelope))
+    assert.equal(resultOf(queued.envelope)['queued'], false, 'an Eval already holds it')
+
+    // `thread follow`：worker 跟随一条它不拥有的 Thread，只作语境；自己的 Thread 是 `own_thread`。
+    const missingThread = await run(['thread', 'follow', 'github:99', '--reason=Related'], worker)
+    assert.equal(codeOf(missingThread.envelope), 'missing')
+    const own = await run(['thread', 'follow', ownThread, '--reason=Mine'], worker)
+    assert.equal(own.exit, 2)
+    assert.equal(codeOf(own.envelope), 'own_thread')
+    const otherThread = 'github:43'
+    const followed = await run(['thread', 'follow', otherThread, '--reason=Related context'], worker)
+    assert.equal(followed.exit, 0, JSON.stringify(followed.envelope))
+    assert.equal(resultOf(followed.envelope)['followed'], true)
+    // 跟随时 Ticket 仍决定该 Thread 上的消息是不允许的：先声明无关再说。
+    const again = await run(['thread', 'follow', otherThread, '--reason=Again'], worker)
+    assert.equal(again.exit, 0)
+    assert.equal(resultOf(again.envelope)['followed'], false, 'already followed as context')
+
+    // `thread unrelated`：自己的 Thread 不能标无关；跟随过的可以，且不再订阅；再标一次是 `not_followed`。
+    const ownUnrelated = await run(['thread', 'unrelated', ownThread, '--reason=Not mine'], worker)
+    assert.equal(ownUnrelated.exit, 2)
+    assert.equal(codeOf(ownUnrelated.envelope), 'own_thread')
+    const unrelated = await run(['thread', 'unrelated', otherThread, '--reason=Not this ticket'], worker)
+    assert.equal(unrelated.exit, 0, JSON.stringify(unrelated.envelope))
+    const unrelatedResult = resultOf(unrelated.envelope)
+    assert.equal(unrelatedResult['dropped'], true)
+    assert.equal(unrelatedResult['handedBack'], 0, 'the ticket decided none of its messages')
+    const notFollowed = await run(['thread', 'unrelated', otherThread, '--reason=Again'], worker)
+    assert.equal(notFollowed.exit, 2)
+    assert.equal(codeOf(notFollowed.envelope), 'not_followed')
+
+    // `thread unsubscribe` 是 Router/operator 的命令：一次丢掉这个 Thread 上的全部订阅。
+    const removed = await run(['thread', 'unsubscribe', ownThread], operator)
+    assert.equal(removed.exit, 0, JSON.stringify(removed.envelope))
+    assert.deepEqual(resultOf(removed.envelope), { removed: true, thread: ownThread })
+    const nothingLeft = await run(['thread', 'unsubscribe', ownThread], operator)
+    assert.equal(codeOf(nothingLeft.envelope), 'missing')
+    const unknownThread = await run(['thread', 'unsubscribe', 'github:99'], operator)
+    assert.equal(codeOf(unknownThread.envelope), 'missing')
+
+    // 角色（§G.1）：worker 的 token 不能做 Router/operator 的那几条。
+    for (const argv of [['thread', 'unsubscribe', ownThread], ['trigger', 'requeue', pending], ['ticket', 'list']]) {
+      const refused = await run(argv, worker)
+      assert.equal(refused.exit, 2, argv.join(' '))
+      assert.equal(codeOf(refused.envelope), 'not_permitted_role', argv.join(' '))
+    }
   } finally {
     await h.cleanup()
   }

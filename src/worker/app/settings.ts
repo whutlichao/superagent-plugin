@@ -161,7 +161,7 @@ export type SettingsStore = Pick<
   'kvGet' | 'kvSet' | 'settingsVersions' | 'transaction'
 >
 
-/** `app/settings.ts` 的句柄：读当前版本、读一个块、保存一个块。 */
+/** `app/settings.ts` 的句柄：读当前版本、读一个块、保存一个块、读历史。 */
 export interface Settings {
   /** 全局设置版本（`settings-revision`）。 */
   revision(): number
@@ -169,6 +169,8 @@ export interface Settings {
   blockRevision(block: string): number
   /** 一个块当前的记录；没存过是 undefined。 */
   block(block: string): SettingsVersionRecord | undefined
+  /** 版本历史，新→旧（面板 History 页与 `settings get --history` 共用）。 */
+  history(limit?: number): readonly SettingsVersionRecord[]
   /** 校验并保存一个块（全有或全无）。 */
   save(input: SettingsSaveInput): SettingsSaveResult
 }
@@ -216,6 +218,7 @@ export function createSettings(input: {
     revision,
     blockRevision,
     block,
+    history: (limit?: number) => store.settingsVersions.list(limit),
     save(saveInput: SettingsSaveInput): SettingsSaveResult {
       const { block: name, value, origin } = saveInput
       // 1. 来源规则（§K.8）：setup 字段只有面板与 operator 能改。写之前就拒。
