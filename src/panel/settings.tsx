@@ -33,7 +33,6 @@ import {
   Textarea,
   update,
   type OrcaElement,
-  type OrcaNode,
   type SelectOption
 } from 'orca'
 import { translate, type CopyKey } from './copy'
@@ -46,14 +45,13 @@ import {
   type DraftState,
   type SaveBar
 } from './draft'
-import { Deployment, loadDeployment, openDeployment, resetDeployment } from './deployment'
+import { Deployment, openDeployment, resetDeployment } from './deployment'
 import { markLabel, sourceMark } from './marks'
 import type {
   AdmissionRowView,
   EvalGroupView,
   ExecutionGroupView,
   LimitsGroupView,
-  SettingsBlockSaved,
   SettingsFact,
   SettingsField,
   SettingsFieldColumn,
@@ -778,15 +776,9 @@ async function syncSource(card: SourceSettingsCard): Promise<void> {
   set(note, '')
   set(actionError, '')
   try {
-    const result = await plugin.request('policy.sync', { source: card.id })
-    const locale = handlerLocale()
-    set(
-      note,
-      translate(locale, 'settings.sources.syncDone', {
-        added: result.added.length,
-        removed: result.removed.length
-      })
-    )
+    // #41 的面板面就是这一个请求（与 `policy sync` 命令同一个驱动器）：只回报名单条数。
+    const result = await plugin.request('source.sync', { sourceId: card.id })
+    set(note, translate(handlerLocale(), 'settings.sources.syncDone', { count: result.allowed }))
     await loadSettings()
     await loadHistory()
   } catch (error) {

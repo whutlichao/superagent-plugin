@@ -143,6 +143,69 @@ export const COPY = {
     en: 'No worker is waiting for a trigger, so nothing was asked.'
   },
   'execution.endedBy': { zh: '结束于', en: 'Ended by' },
+
+  // ---- Trigger 页（§M.2）：Thread 列表的四档筛选、四列与三态 ----
+  'thread.filters': { zh: '筛选', en: 'Filter' },
+  'thread.filter.subscribed': { zh: '已订阅', en: 'Subscribed' },
+  'thread.filter.evaluating': { zh: '评估中', en: 'Evaluating' },
+  'thread.filter.recent': { zh: '24 小时内新增', en: 'New in 24 h' },
+  'thread.filter.all': { zh: '全部', en: 'All' },
+  'thread.columnThread': { zh: '线程', en: 'Thread' },
+  'thread.columnSubscriptions': { zh: '订阅数', en: 'Subscriptions' },
+  'thread.columnLatest': { zh: '最近触发', en: 'Latest trigger' },
+  'thread.columnState': { zh: '状态', en: 'State' },
+  'thread.noLatest': { zh: '还没有触发', en: 'No trigger yet' },
+  'thread.empty': { zh: '还没有线程。', en: 'No threads yet' },
+  'thread.back': { zh: '返回列表', en: 'Back to the list' },
+  'thread.source': { zh: '来源：{source}', en: 'Source: {source}' },
+  'thread.created': { zh: '创建于', en: 'Created' },
+  'thread.latestAt': { zh: '最近触发', en: 'Latest trigger' },
+  'thread.openOriginal': { zh: '打开原始链接', en: 'Open original' },
+  'thread.timeline': { zh: '时间线', en: 'Timeline' },
+  'thread.noTriggers': { zh: '这条线程还没有触发。', en: 'No Trigger on this Thread yet.' },
+  'thread.loadEarlier': { zh: '加载更早的触发', en: 'Load earlier Triggers' },
+  'thread.decisions': { zh: '这条线程的决定', en: 'Decisions in this Thread' },
+  'thread.noDecisions': { zh: '这条线程还没有决定。', en: 'No Decision on this Thread yet.' },
+  'thread.subscribedTickets': { zh: '订阅的工单', en: 'Subscribed tickets' },
+  'thread.noSubscribedTickets': {
+    zh: '没有工单订阅这条线程。',
+    en: 'No ticket subscribes to this Thread.'
+  },
+  'thread.contextOnly': { zh: '仅语境', en: 'Context only' },
+  'thread.ticket.open': { zh: '进行中', en: 'Open' },
+  'thread.ticket.ended': { zh: '已结束', en: 'Ended' },
+  'thread.ticket.unknown': { zh: '未知工单', en: 'Unknown ticket' },
+  'thread.evaluatingBanner': {
+    zh: '正在评估 {count} 条触发（强度：{strength}）',
+    en: 'Evaluating {count} Triggers (strength: {strength})'
+  },
+  'thread.evaluatingDeadline': { zh: '截止', en: 'Deadline' },
+  'thread.pollFailed': { zh: '轮询失败：{error}', en: 'Polling failed: {error}' },
+  'thread.disposition.queued': { zh: '等待评估', en: 'Waiting for Eval' },
+  'thread.delivered': { zh: '已交给工单的执行器', en: 'Its worker decides it' },
+  'thread.fanout': { zh: '扇出给 {count} 个工单', en: 'Fanned out to {count} tickets' },
+  'thread.handedBack': {
+    zh: '“{ticket}”的执行器把这条触发交回评估：{reason}',
+    en: 'The Executor of “{ticket}” handed it back for an Eval: {reason}'
+  },
+  'thread.requeue': { zh: '再评估一次', en: 'Evaluate again' },
+  'thread.requeued': { zh: '已重新排进评估。', en: 'Queued for a new Eval.' },
+  'thread.requeueHeld': {
+    zh: '已有评估持有这条触发，没有重复排队。',
+    en: 'An Eval already holds this Trigger; nothing was queued.'
+  },
+  'thread.unsubscribe': { zh: '取消订阅', en: 'Unsubscribe' },
+  'thread.unsubscribeDone': { zh: '已取消订阅这条线程。', en: 'Unsubscribed from this Thread.' },
+  'thread.notSubscribed': {
+    zh: '这条线程上已经没有订阅了。',
+    en: 'No ticket subscribes to this Thread any more.'
+  },
+  'thread.unsubscribeHint': {
+    zh: '取消订阅会丢掉这条线程上全部工单的订阅。',
+    en: 'Unsubscribing drops every Ticket’s subscription on this Thread.'
+  },
+  'thread.actions': { zh: '线程动作', en: 'Thread actions' },
+  'thread.openTicket': { zh: '打开工单', en: 'Open ticket' },
   'mandate.via.addressed': { zh: '点名', en: 'Addressed' },
   'mandate.via.followup': { zh: '线程上的后续消息', en: 'Follow-up' },
   'mandate.via.admission': { zh: '准入表', en: 'Admission' },
@@ -343,6 +406,74 @@ export const COPY = {
     zh: 'token 的值不显示在这里，也不进日志。',
     en: 'The token value is never shown here, and never logged.'
   },
+
+  // ---- Source 页（§M.2）：每 Source 一张卡、24 h 计数、被过滤与被 drop 的列表、四个动作 ----
+  'source.intro': {
+    zh: '每个来源一张卡：开关、配置、派生事实、健康、24 小时计数，以及最近被过滤的触发与被丢弃的消息。',
+    en: 'One card per Source: its switch, configuration, derived facts, health, 24-hour counts, and the Triggers it filtered or the messages it dropped recently.'
+  },
+  'source.empty': { zh: '还没有配置任何来源。', en: 'No Source is configured yet.' },
+  'source.emptyHint': {
+    zh: '去设置页添加 GitHub 或飞书来源；每加一个，这里就多一张卡。',
+    en: 'Add a GitHub or Feishu Source on the Settings page; each one appears here as its own card.'
+  },
+  'source.checkedAgain': { zh: '已重跑部署检查。', en: 'Setup was checked again.' },
+  'source.received': { zh: '24 小时到达 {count}', en: '{count} received in 24 h' },
+  'source.filtered': { zh: '被过滤 {count}', en: '{count} filtered' },
+  'source.latest': { zh: '最近', en: 'Latest' },
+  'source.fields': { zh: '配置', en: 'Configuration' },
+  'source.facts': { zh: '派生事实', en: 'Derived facts' },
+  'source.health': { zh: '健康', en: 'Health' },
+  'source.notInstalled': {
+    zh: '这个来源的 kind 没有安装；存过的配置原样保留。',
+    en: "This Source's kind is not installed; its saved configuration is kept as it is."
+  },
+  'source.configInvalid': {
+    zh: '配置无效，已禁用：{detail}',
+    en: 'The configuration is invalid, so the Source is disabled: {detail}'
+  },
+  'source.filteredTitle': { zh: '被过滤的触发', en: 'Filtered triggers' },
+  'source.filteredHint': {
+    zh: '最近 24 小时内被来源或准入过滤的触发，每行给原因码。',
+    en: 'Triggers filtered by the Source or the admission in the last 24 hours; each row names its reason code.'
+  },
+  'source.droppedTitle': { zh: '被丢弃的消息', en: 'Dropped messages' },
+  'source.droppedHint': {
+    zh: '最近 24 小时内没能送达的消息：原因，以及它所属的工单或线程。',
+    en: 'Messages that could not be delivered in the last 24 hours: why, and the Ticket or Thread they belonged to.'
+  },
+  'source.showingLatest': {
+    zh: '只列最近 {shown} 条，窗口内共 {total} 条。',
+    en: 'Showing the latest {shown} of {total} in this window.'
+  },
+  'source.sync': { zh: '立即同步', en: 'Sync now' },
+  'source.syncing': { zh: '正在同步…', en: 'Syncing…' },
+  'source.synced': { zh: '已同步：允许名单 {count} 人。', en: 'Synced: {count} allowed.' },
+  'source.refreshLabels': { zh: '刷新显示名', en: 'Refresh labels' },
+  'source.refreshingLabels': { zh: '正在刷新…', en: 'Refreshing…' },
+  'source.labelsRefreshed': {
+    zh: '显示名已更新：新增 {added}，共 {total}。',
+    en: 'Labels refreshed: {added} added, {total} total.'
+  },
+  'source.checked': { zh: '检查完成。', en: 'The check finished.' },
+  'source.actionFailed': { zh: '动作没有成功：{reason}', en: 'The action did not succeed: {reason}' },
+  'source.enable': { zh: '运行来源：{name}', en: 'Run Source: {name}' },
+  'source.openThread': { zh: '打开线程', en: 'Open the Thread' },
+  'source.drop.channelIgnored': {
+    zh: '来源已不再监听这个对话',
+    en: 'The Source no longer listens to this conversation'
+  },
+  'source.drop.channelGone': {
+    zh: '对话已无法接收消息',
+    en: 'The conversation can no longer receive messages'
+  },
+  'source.drop.withdrawn': {
+    zh: '工单已停止，消息被撤回',
+    en: 'The Ticket was stopped, so the message was withdrawn'
+  },
+  'field.on': { zh: '开', en: 'On' },
+  'field.off': { zh: '关', en: 'Off' },
+  'field.queueJoiner': { zh: '、', en: ', ' },
 
   // ---- 已知限制（§A.3 的十一项近似；面板 Limitations 段与 README 同源同措辞）----
   'deployment.limitations': { zh: '已知限制', en: 'Limitations' },
@@ -714,6 +845,11 @@ export const COPY = {
   'userError.unknownAssignment': { zh: '未知的派工', en: 'Unknown assignment' },
   'userError.unknownDecision': { zh: '未知的决定', en: 'Unknown decision' },
   'userError.unknownProblem': { zh: '找不到这条未完成的评估', en: 'Unavailable Eval not found' },
+  'userError.unknownThread': { zh: '未知的线程', en: 'Unknown thread' },
+  'userError.notRequeueable': {
+    zh: '这张工单的 worker 仍拥有这条消息；由它决定或交回',
+    en: "A ticket's worker still owns this message; its worker decides it or hands it back"
+  },
   'userError.ticketEnded': { zh: '工单已结束', en: 'Ticket has ended' },
   'userError.assignmentEnded': {
     zh: '派工已结束；该工单属于更新的派工',
@@ -839,8 +975,8 @@ export const COPY = {
   'settings.sources.sync': { zh: '立即同步', en: 'Sync now' },
   'settings.sources.syncing': { zh: '正在同步…', en: 'Syncing…' },
   'settings.sources.syncDone': {
-    zh: '已同步：新增 {added}，移除 {removed}',
-    en: 'Synced: {added} added, {removed} removed'
+    zh: '已同步：{count} 条允许名单',
+    en: 'Synced: {count} allowed'
   },
   'settings.sources.syncHint': {
     zh: '名单同步会以 origin=sync 写回 Policy 块，与面板保存同一条路径。',
@@ -1053,7 +1189,7 @@ export const GLOSSARY_GROUPS: readonly GlossaryGroup[] = [
 export type CopyValues = Readonly<Record<string, string | number>>
 
 /** 该语言是否是中文（BCP-47 的 `zh`、`zh-CN`、`zh-Hans` 都算）。 */
-function isChinese(locale: string): boolean {
+export function isChinese(locale: string): boolean {
   return /^zh(?:[-_]|$)/i.test(locale)
 }
 

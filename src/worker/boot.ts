@@ -19,11 +19,15 @@ import type {
   ExecutionValues,
   PanelState,
   PanelTerminal,
-  PolicySyncView,
   SettingsHistoryView,
   SettingsPageView,
   SettingsSaveInput,
   SettingsSaveOutcome,
+  SourcePageView,
+  ThreadDetailInput,
+  ThreadDetailView,
+  ThreadListInput,
+  ThreadListPage,
   TicketDetailView,
   TicketListInput,
   TicketListPage
@@ -98,7 +102,9 @@ import {
   type RefreshableStateSource
 } from './app/state-source.ts'
 import { deliveredFollowups, ticketDetail } from './app/views.ts'
+import { sourcePage, type SourceViewHost } from './app/views/sources.ts'
 import { decisionDetail, decisionPage } from './app/views/decisions.ts'
+import { threadDetailView, threadListPage, threadRecordsOf } from './app/views/threads.ts'
 import {
   followupOwners,
   latestAssignment,
@@ -116,7 +122,11 @@ import { notePluginVersion } from './app/upgrade.ts'
 import { createSourceContext } from './app/source-context.ts'
 import { createSetupState, issuesOf, runSetupChecks } from './app/setup.ts'
 import type { SetupCheckInput, SetupIssue, SetupProblem, SetupReport } from './app/setup.ts'
-import { SourceRegistry, type SourceSettingsView } from './sources/registry.ts'
+import {
+  SourceRegistry,
+  type ResolvedSourceInstance,
+  type SourceSettingsView
+} from './sources/registry.ts'
 import { Commands, type CommandsHost } from './sources/commands.ts'
 import {
   claimReportedPull,
@@ -151,7 +161,7 @@ import { WORKTREE_PREFIX } from './executor/workspace.ts'
 import { resumeAfterUpgrade, type ResumeReport } from './executor/resume.ts'
 import { DEFAULT_MAX_WORKERS } from './http/state.ts'
 import { createDomainHandlers, withDomainHandlers } from './http/domain.ts'
-import { createSettingsHandlers, withSettingsHandlers, allowListDiff } from './http/settings.ts'
+import { createSettingsHandlers, withSettingsHandlers } from './http/settings.ts'
 import { runWrite } from './http/idempotency.ts'
 import { MACHINE_LIMITS_BLOCK, parseSettingsBlock, validateSettingsBlock } from './app/settings-blocks.ts'
 import { createAssessmentHandlers, withAssessmentHandlers } from './http/assessment.ts'
@@ -270,6 +280,20 @@ export interface BootHandle {
    * 不让整个详情失败。未知工单抛 `unknownTicket`。
    */
   ticketDetail(ticketId: string): Promise<TicketDetailView>
+  /** Trigger 列表的一页（§M.2 的四档筛选 + §M.4 的分页）：筛选与分页都在读模型里。 */
+  threads(input: ThreadListInput): ThreadListPage
+  /**
+   * 一条 Thread 的详情（§M.2）：时间线（`(at, id)` 游标分页）、决定、订阅与 handback 原因。
+   * 未知的 Thread 抛 `unknownThread`。
+   */
+  threadDetail(
+    threadKey: string,
+    input: Omit<ThreadDetailInput, 'threadKey'>
+  ): ThreadDetailView
+  /** 再评估一次（§G.2 的 `trigger requeue`）：返回它是否排进了 Eval（已有 Eval 持有时是 false）。 */
+  requeueTrigger(triggerId: string): boolean
+  /** 取消订阅一条 Thread（§G.2 的 `thread unsubscribe`）：返回是否真的丢了订阅。 */
+  unsubscribeThread(threadKey: string): boolean
   /** 人的停止（§E.5、§K.3：撤回 Mandate）；面板先做行内二次确认。 */
   stopTicket(ticketId: string): PanelState
   /** 发一条 fact note（§G.2 的 `ticket note`）：只加语境，不授权任何事。 */
@@ -296,6 +320,17 @@ export interface BootHandle {
   checkSetup(): Promise<SetupCheckOutcome>
   /** Deployment 页的读数（§M.3）：setup 问题、状态目录、机器限额、暂停、health 与 Router。 */
   deployment(): DeploymentView
+  /**
+   * Source 页的读数（§M.2）：每个配置过的 Source 一张卡——开关、字段、facts、health、
+   * 24 h 计数、被过滤的 Trigger 与被 drop 的消息。
+   */
+  sources(): SourcePageView
+  /** 打开/关闭一个 Source（写 `source:<id>` 的 `enabled` 并立即生效），返回写后的读数。 */
+  setSourceEnabled(sourceId: string, enabled: boolean): SourcePageView
+  /** 「立即同步」一个 Source 的允许名单（§I.3）；不能同步时拒绝。 */
+  syncSource(sourceId: string): Promise<{ readonly allowed: number }>
+  /** 重读一个 Source 的行键显示名（§G.2 的 `source labels`）；Kind 没有这个能力时拒绝。 */
+  refreshSourceLabels(sourceId: string): Promise<{ readonly added: number; readonly total: number }>
   /** doctor 的八项诊断（§G.2、§N.4）：与 HTTP 的 `POST doctor` 同一份接线。 */
   doctor(): Promise<DoctorResult>
   /** 轮换主 token（§D.6、§O）：只回 token 文件路径，绝不回 token 值。 */
@@ -306,8 +341,6 @@ export interface BootHandle {
   settingsSave(input: SettingsSaveInput): Promise<SettingsSaveOutcome>
   /** 设置版本历史（§K.5）：新→旧，带每一版的值（恢复走同一条保存路径）。 */
   settingsHistory(): SettingsHistoryView
-  /** 立即同步一个 Source 的名单（§I.3）：返回同步后的 Policy 版本与名单差异。 */
-  policySyncView(source: string): Promise<PolicySyncView>
   shutdown(): Promise<void>
 }
 
@@ -368,7 +401,8 @@ function settingsView(
 
 /** 一个 Source 实例的配置与 setup 问题（缺 repository/cli 时不轮询，§I.2）。 */
 interface GithubSetup {
-  readonly enabled: boolean
+  /** 面板的开关会改它（§M.2「打开/关闭」）：其余字段仍是启动时读到的设置。 */
+  enabled: boolean
   readonly config: Record<string, unknown>
   /** setup 探针读到的 agent 账号（读不到时回落设置；§I.2 的 `@mention` 与自身消息都要它）。 */
   readonly login: string
@@ -434,6 +468,23 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
           code: 'unavailable'
         })
       },
+      // follower 不读库：Trigger 页的读数与两条动作都属于拥有者（固定拒绝，不假装成功）。
+      threads: () => ({ items: [], nextOffset: null }),
+      threadDetail: () => {
+        throw Object.assign(new Error('another Superagent instance owns this state directory'), {
+          code: 'unavailable'
+        })
+      },
+      requeueTrigger: () => {
+        throw Object.assign(new Error('another Superagent instance owns this state directory'), {
+          code: 'action_failed'
+        })
+      },
+      unsubscribeThread: () => {
+        throw Object.assign(new Error('another Superagent instance owns this state directory'), {
+          code: 'action_failed'
+        })
+      },
       stopTicket: () => {
         throw Object.assign(new Error('another Superagent instance owns this state directory'), {
           code: 'action_failed'
@@ -473,6 +524,23 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
       },
       // follower 不读库、不跑探针：它没有可以做检查的东西。
       checkSetup: async () => ({ checked: false, problem: null, issues: [], restarted: false }),
+      // follower 不读库：Source 页的读数与动作都属于拥有者（固定拒绝，不假装成功）。
+      sources: () => ({ items: [], elsewhere: [] }),
+      setSourceEnabled: () => {
+        throw Object.assign(new Error('another Superagent instance owns this state directory'), {
+          code: 'action_failed'
+        })
+      },
+      syncSource: async () => {
+        throw Object.assign(new Error('another Superagent instance owns this state directory'), {
+          code: 'action_failed'
+        })
+      },
+      refreshSourceLabels: async () => {
+        throw Object.assign(new Error('another Superagent instance owns this state directory'), {
+          code: 'action_failed'
+        })
+      },
       // 部署页读到的是「这一进程只跟着另一个实例」：没有自己的 health，也不假装在跑。
       deployment: () =>
         deploymentView({
@@ -511,11 +579,6 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
           code: 'unavailable'
         })
       },
-      policySyncView: async (): Promise<PolicySyncView> => {
-        throw Object.assign(new Error('another Superagent instance owns this state directory'), {
-          code: 'unavailable'
-        })
-      },
       shutdown: async () => undefined
     }
     return follower
@@ -536,11 +599,29 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
   claimModelsEntry(board)
   const paused = createPausedState(store, now)
   const repo = createRepositories(store)
+  // Trigger 页的读模型：真库上的时间线 + 真仓储的归属判定（组合根与测试同一处构造）。
+  const threadRecords = threadRecordsOf(repo, store)
 
   // ---- 设置与 setup 探针（§N.1、§I.4）：一次只告诉人缺什么，不把「没配置」写成 error
   const executorSettings = resolveExecutorSettings(settings)
   const rawSources = block(settings['sources'])
-  const githubStored = block(rawSources[GITHUB_KIND])
+  /**
+   * 存过的 `source:<id>` 块里有效的 `enabled`（§N.2：面板保存的设置存库即生效）。
+   * 只读这一项：`cli`/`repository` 这类 setup 字段仍取启动时读到的设置，改它们要重启。
+   */
+  const savedSourceEnabled = (id: string): boolean | undefined => {
+    const saved = savedSettingsVersion(store, `source:${id}`)?.config
+    if (typeof saved !== 'object' || saved === null) return undefined
+    const enabled = (saved as { enabled?: unknown }).enabled
+    return typeof enabled === 'boolean' ? enabled : undefined
+  }
+  /** 一个 Source 的存储形态：安装时的设置，加上面板保存过的 `enabled`（若有）。 */
+  const storedSource = (id: string): Record<string, unknown> => {
+    const base = block(rawSources[id])
+    const enabled = savedSourceEnabled(id)
+    return enabled === undefined ? base : { ...base, enabled }
+  }
+  const githubStored = storedSource(GITHUB_KIND)
   const commandPort: CommandsHost =
     options.commands ?? new Commands({ configuredPrograms: () => [text(settings['githubCli'])] })
   // 机器限额（§H.12、§H.22）：保存过的块优先，没写的用缺省值；启动时读一次。
@@ -587,7 +668,7 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
     config: githubInstance.config,
     login: fallbackLogin
   }
-  const feishuStored = block(rawSources[FEISHU_KIND])
+  const feishuStored = storedSource(FEISHU_KIND)
   const feishuSetup = await setupFeishu({
     raw: settings,
     stored: feishuStored,
@@ -597,14 +678,17 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
     log: (message) => logger.info(message)
   })
   const setup = createSetupState(await runSetupChecks(setupInput()))
-  const sourceSettings: SourceSettingsView = settingsView(settings, githubSetup, feishuSetup)
+  let sourceSettings: SourceSettingsView = settingsView(settings, githubSetup, feishuSetup)
 
   // ---- 注册表与 kind
   const registry = new SourceRegistry({ health: board, settings: () => sourceSettings })
   registry.register(createGithubKind(String(githubSetup.config['cli'] ?? 'gh')))
   // Feishu 的 kind 绑定配置的 CLI 与 stateDir：语境读/图片下载要它们（§I.3、§H.17）。
   registry.register(
-    createFeishuKind(feishuSetup.cli === '' ? 'lark-cli' : feishuSetup.cli, { stateDir: resolved })
+    createFeishuKind(feishuSetup.cli === '' ? 'lark-cli' : feishuSetup.cli, {
+      stateDir: resolved,
+      labelsKey: sourceLabelsKey(FEISHU_KIND)
+    })
   )
   const githubHealth = registry.healthEntries(['github']).get('github')
   const feishuHealth = registry.healthEntries(['feishu', 'history'])
@@ -1658,6 +1742,116 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
   refresh()
 
   let closed = false
+  /**
+   * Source 页的读数（§M.2）：卡片要的输入全部经这个宿主取——注册表的总览、健康板、setup
+   * 结论、kind 的字段与事实、outbox 的 drop 行与三个仓储的读面。面板不自己查库。
+   */
+  const sourceViewHost = (): SourceViewHost => ({
+    now: now(),
+    overview: () => registry.overview(),
+    health: () => board.all(),
+    setup: () => setup.issues(),
+    kind: (id) => registry.kind(id),
+    facts: () =>
+      registry.facts(deployment(settings, { ...githubSetup, login: githubLogin() }, feishuSetup)),
+    config: (id) => registry.instance(id)?.config,
+    syncable: () => policySyncDriver?.syncable() ?? [],
+    reader: { sql: store.sql },
+    dropped: (since) => outbox.droppedSince(since),
+    ticket: (id) => repo.tickets.get(id),
+    trigger: (id) => repo.triggers.get(id),
+    thread: (key) => repo.threads.get(key)
+  })
+
+  /**
+   * 面板的「打开/关闭」（§M.2 的主操作）：写 `source:<id>` 的 `enabled`（下一个作业周期起按新
+   * 状态判定监听与回复），并把本进程的 Source 视图换成新状态——注册表、Channel 与环境都读它。
+   * 其余配置原样写回，这个动作不改 setup 字段。
+   */
+  const applySourceEnabled = (id: string, enabled: boolean): void => {
+    if (id === GITHUB_KIND) githubSetup.enabled = enabled
+    else if (id === FEISHU_KIND) feishuSetup.enabled = enabled
+    sourceSettings = settingsView(settings, githubSetup, feishuSetup)
+  }
+
+  /** 一个 Source 必须已安装（面板只对已装的实例给开关）。 */
+  const requireSource = (id: string): ResolvedSourceInstance => {
+    const instance = registry.instance(id)
+    if (instance === undefined) {
+      throw Object.assign(new Error(`The ${id} Source is not installed`), { code: 'invalid_params' })
+    }
+    return instance
+  }
+
+  /** `source:<id>` 设置块的校验器（与 `PUT settings/:block` 同一份 §K.8 形状）。 */
+  const sourceValidator = (id: string) => (value: unknown) =>
+    validateSettingsBlock(`source:${id}`, value, {
+      sourceConfig: () => {
+        const schema = registry.kind(id)?.schema
+        return schema === undefined ? undefined : (config: unknown) => schema.safeParse(config)
+      }
+    }) ?? { success: true as const, data: value }
+
+  const setSourceEnabled = (id: string, enabled: boolean): SourcePageView => {
+    const instance = requireSource(id)
+    const name = `source:${id}`
+    settingsWriter.save({
+      block: name,
+      value: { enabled, config: instance.config },
+      origin: 'panel',
+      expectedRevision: settingsWriter.blockRevision(name),
+      validate: sourceValidator(id)
+    })
+    applySourceEnabled(id, enabled)
+    refresh()
+    return sourcePage(sourceViewHost())
+  }
+
+  /** 「立即同步」（§I.3）：与 `superagent policy sync` 同一个驱动器；不能同步时它自己拒绝。 */
+  const syncSource = async (id: string): Promise<{ readonly allowed: number }> => {
+    requireSource(id)
+    if (policySyncDriver === null) {
+      throw Object.assign(new Error('the list sync driver is not wired yet'), {
+        code: 'invalid_params'
+      })
+    }
+    const part = await policySyncDriver.sync(id)
+    const allowed = Array.isArray(part['allowed']) ? part['allowed'].length : 0
+    refresh()
+    return { allowed }
+  }
+
+  /**
+   * 「刷新显示名」（§G.2 的 `source labels`）：kind 自己重读行键显示名并写进它的 kv；
+   * 这里只数新增了几条（同步前那份名单来自同一个键）。Kind 没有这个能力时拒绝。
+   */
+  const refreshSourceLabels = async (
+    id: string
+  ): Promise<{ readonly added: number; readonly total: number }> => {
+    const instance = requireSource(id)
+    if (!registry.canRefreshLabels(id)) {
+      throw Object.assign(new Error(`The ${id} Source has no display names to refresh`), {
+        code: 'invalid_params'
+      })
+    }
+    const before = store.kvGet<Record<string, string>>(sourceLabelsKey(id)) ?? {}
+    const labels = await registry.refreshLabels(
+      id,
+      createSourceContext({
+        engine,
+        store,
+        commands: (options.commands ?? new Commands()).withSignal(),
+        instance: { id, enabled: instance.enabled, config: instance.config, health: {} },
+        configured: () => true,
+        triggerOf: (triggerId) => repo.triggers.get(triggerId),
+        notify: (input) => options.notify?.(input)
+      })
+    )
+    const added = Object.keys(labels).filter((key) => !(key in before)).length
+    refresh()
+    return { added, total: Object.keys(labels).length }
+  }
+
   const shutdown = async (): Promise<void> => {
     if (closed) return
     closed = true
@@ -1893,29 +2087,6 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
         }
       })
     )
-  /** 「立即同步」（§I.3）：走 #23 的驱动器，报告名单差异与同步后的 Policy 版本。 */
-  const policySyncView = async (source: string): Promise<PolicySyncView> => {
-    const before = effectivePolicy().sources[source]?.allowed ?? []
-    let part: Record<string, unknown>
-    try {
-      part = await policySync.sync(source)
-    } catch (error) {
-      throw Object.assign(new Error(stringOf(error)), {
-        code: policySyncable().includes(source) ? 'sync_failed' : 'not_syncable'
-      })
-    }
-    const allowed = Array.isArray(part['allowed']) ? (part['allowed'] as unknown[]) : []
-    const diff = allowListDiff(before, allowed)
-    return {
-      policy: {
-        revision: settingsWriter.blockRevision('policy'),
-        version: savedSettingsVersion(store, 'policy')?.policyVersion ?? null
-      },
-      added: diff.added,
-      removed: diff.removed
-    }
-  }
-
   const ready = Promise.resolve()
   return {
     mode: 'leader',
@@ -1962,6 +2133,36 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
         { threads: repo.threads, triggers: repo.triggers },
         terminal === undefined ? {} : { terminal }
       )
+    },
+    // Trigger 页（§M.2）：列表、详情与两条动作都读/写同一份记录——时间线由 `trigger_thread`
+    // 供（`(at, id)` 复合游标），归属判定就是 `followupOwners`。
+    threads: (input: ThreadListInput): ThreadListPage =>
+      threadListPage(threadRecords, { ...input, now: now() }),
+    threadDetail: (threadKey: string, input: Omit<ThreadDetailInput, 'threadKey'>): ThreadDetailView => {
+      const detail = threadDetailView(threadRecords, threadKey, input)
+      if (detail === undefined) throw new UserError('unknownThread', { thread: threadKey })
+      return detail
+    },
+    // `trigger requeue`（§G.2）：执行器仍拥有的人消息不能被绕过——那会绕开决定它的 worker
+    // （§K.2 第 3 条）。已有 Eval 持有时如实回 false，不当成成功。
+    requeueTrigger: (triggerId: string): boolean => {
+      const trigger = repo.triggers.get(triggerId)
+      if (trigger === undefined) throw new UserError('unknownTrigger')
+      const owners = followupOwners(trigger, repo)
+      if (owners.length > 0) throw new UserError('notRequeueable', { tickets: owners.join(',') })
+      const queued = engine.reevaluate(triggerId)
+      refresh()
+      return queued
+    },
+    // `thread unsubscribe`（§G.2）：丢这条 Thread 上全部 Ticket 的订阅。没有订阅可丢时回
+    // false（面板照实说，不当成「取消了」）。
+    unsubscribeThread: (threadKey: string): boolean => {
+      if (repo.threads.get(threadKey) === undefined) {
+        throw new UserError('unknownThread', { thread: threadKey })
+      }
+      const removed = engine.unsubscribe(threadKey)
+      refresh()
+      return removed
     },
     // §E.5、§G.2：停止（撤回 Mandate）与重试是同一个领域写入面；note 只加一条语境，
     // request-status 只问已经在等的 worker（返回它是否真的发了一条问题）。
@@ -2012,6 +2213,11 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
       await options.runtime.removeWorkspace(workspace)
     },
     checkSetup,
+    // Source 页（§M.2）：每个配置过的 Source 一张卡，读数来自注册表、健康板与 outbox。
+    sources: () => sourcePage(sourceViewHost()),
+    setSourceEnabled,
+    syncSource,
+    refreshSourceLabels,
     // Deployment 页的三条读数（§M.3）：状态目录与限额只读；health 是健康板；Router 只读快照。
     deployment: () =>
       deploymentView({
@@ -2032,7 +2238,6 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
     settingsView: settingsPage,
     settingsSave,
     settingsHistory,
-    policySyncView,
     shutdown
   }
 }
@@ -2231,7 +2436,8 @@ function feishuCliOf(rawSources: Record<string, unknown>): string | undefined {
  * `botId` 是 open_id（自己消息的丢弃与「点名了机器人」都靠它）；未就绪时是空串。
  */
 interface FeishuSetup {
-  readonly enabled: boolean
+  /** 面板的开关会改它（§M.2「打开/关闭」）：其余字段仍是启动时读到的设置。 */
+  enabled: boolean
   readonly config: Record<string, unknown>
   readonly cli: string
   readonly botId: string

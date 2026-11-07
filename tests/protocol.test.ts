@@ -14,10 +14,11 @@ test('the worker push is the one state.changed event, carrying a monotonic revis
   assert.deepEqual([...PLUGIN_PANEL_EVENTS], ['state.changed'])
 })
 
-test('the panel declares the state snapshot, the Overview actions, the Execution page and the Deployment group', () => {
+test('the panel declares the state snapshot, the list pages and the Deployment group', () => {
   // 每个票据追加自己那一组请求：Overview 的 `check`/`ticket.retry`/`terminal.focus`（#37）、
-  // Execution 的列表/详情与五个动作（#38）、Eval 的列表/详情/dismiss（#40），以及 Deployment
-  // 组的读数、doctor、重跑探针、轮换 token、重启 Router（#47）。
+  // Execution 的列表/详情与五个动作（#38）、Trigger 的列表/详情与两个动作（#39）、Eval 的
+  // 列表/详情/dismiss（#40）、Deployment 组的读数、doctor、重跑探针、轮换 token、重启
+  // Router（#47），以及 Source 页的读数与打开/关闭、立即同步、刷新显示名（#41）。
   assert.deepEqual([...PLUGIN_REQUESTS], [
     'state',
     'pause',
@@ -25,6 +26,10 @@ test('the panel declares the state snapshot, the Overview actions, the Execution
     'decisions',
     'decision.detail',
     'decision.dismiss',
+    'threads',
+    'thread.detail',
+    'trigger.requeue',
+    'thread.unsubscribe',
     'tickets',
     'ticket.detail',
     'ticket.retry',
@@ -39,11 +44,15 @@ test('the panel declares the state snapshot, the Overview actions, the Execution
     'setupCheck',
     'rotateToken',
     'restartRouter',
-    // Settings 页（#42）：四个可编辑组的读数、块保存、版本历史与手动名单同步。
+    // Source 页（#41）：卡片读数、开关、名单同步与显示名刷新。
+    'sources',
+    'source.setEnabled',
+    'source.sync',
+    'source.labels',
+    // Settings 页（#42）：四个可编辑组的读数、块保存与版本历史。
     'settings.read',
     'settings.save',
-    'settings.history',
-    'policy.sync'
+    'settings.history'
   ])
 })
 

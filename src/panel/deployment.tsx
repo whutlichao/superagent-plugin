@@ -201,7 +201,7 @@ function placeLabel(locale: string, place: string): string {
 }
 
 /** 一条 setup 问题：现状 + 修法 + 重跑入口，全部在人能照做的那一面上。 */
-function SetupProblemRow(props: {
+export function SetupProblemRow(props: {
   readonly locale: string
   readonly issue: DeploymentSetupIssue
 }): OrcaElement {
