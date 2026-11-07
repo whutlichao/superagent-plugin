@@ -226,6 +226,32 @@ describe('settings version bookkeeping', () => {
       cleanup()
     }
   })
+
+  test('a write notifies the saved hook only when it really wrote a version', () => {
+    const { store, cleanup } = openTempStore()
+    try {
+      const seen: string[] = []
+      const settings = createSettings({
+        store,
+        now: () => AT,
+        saved: (record) => seen.push(`${record.block}@${record.revision}`)
+      })
+      // 开关保存（§M.2）：组合根在这里把新状态交给 Source 运行时。
+      settings.save({ block: 'source:github', origin: 'panel', value: { enabled: false } })
+      assert.deepEqual(seen, ['source:github@1'])
+      // 没有改动（面板重复保存同一个值）：不写版本，也不通知（不该白白降级健康）。
+      settings.save({ block: 'source:github', origin: 'panel', value: { enabled: false } })
+      assert.deepEqual(seen, ['source:github@1'])
+      // 被拒的保存：同样不通知。
+      refusal(() => settings.save({ block: 'executor', origin: 'tool', value: { stateDir: '/x' } }))
+      assert.deepEqual(seen, ['source:github@1'])
+      // 真的改了：通知一次。
+      settings.save({ block: 'source:github', origin: 'panel', value: { enabled: true } })
+      assert.deepEqual(seen, ['source:github@1', 'source:github@2'])
+    } finally {
+      cleanup()
+    }
+  })
 })
 
 // ---------------------------------------------------------------- 命令面（#56）

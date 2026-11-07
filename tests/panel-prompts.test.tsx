@@ -30,6 +30,7 @@ import { PROMPT_TABS } from '../src/panel/protocol'
 import { changedParts, skillPath } from '../src/panel/prompt-view'
 import * as panelModule from '../src/panel/panel'
 import * as main from '../src/worker/main'
+import { emptySettingsPage } from './support/settings-page'
 import { AT, openTempStore } from './support/state'
 
 /** 面板挂载后的请求表（测试只写用到的名字）。 */
@@ -206,13 +207,17 @@ async function openPrompts(
       // 保存写下的配置就是预览说会写下的那份（与 worker 的预览同一语义）。
       return viewOf({ ...read(), config, revision: read().revision + 1 })
     },
-    'prompts.restore': () => read()
+    'prompts.restore': () => read(),
+    // Prompts 是 Settings 页的一组：组框架自己的读数与历史也要答得上（空读数就够，
+    // 这一组的内容只读写 `prompts` 那一份）。
+    'settings.read': () => emptySettingsPage(),
+    'settings.history': () => ({ revision: 1, history: [] })
   }
   panel = await mount(panelModule, {
     host: mockHost({
       requests,
-      // 打开面板就停在 Settings 的 Prompts 组：keyed atom 读插件存储。
-      storage: { 'panel.page': 'settings', 'panel.settingsGroup': 'prompts' }
+      // 打开面板就停在 Settings 的 Prompts 组（`settings.group` 是这个 atom 的 id）。
+      storage: { 'panel.page': 'settings', 'settings.group': 'prompts' }
     }),
     locale
   })

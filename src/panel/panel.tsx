@@ -36,7 +36,8 @@ import {
   type PanelContext
 } from 'orca'
 import { GLOSSARY_GROUPS, translate, type CopyKey } from './copy'
-import { openSettingsGroup, resetSettings, SettingsGroups } from './settings-groups'
+import { loadDeployment } from './deployment'
+import { loadSettings, openSettings as openSettingsPage, resetSettings, Settings } from './settings'
 import { problemDecisionId, reasonText, reasonsText } from './eval'
 import { executionMark, executionRow } from './execution'
 import {
@@ -67,7 +68,6 @@ import {
   type PanelSubscription,
   type PanelTicket,
   type PanelDecision,
-  type PanelReason,
   type PanelThread,
   type PanelTimelineCursor,
   type PanelTriggerCard,
@@ -293,8 +293,12 @@ export function setup(ctx: PanelContext): () => void {
       if (!read(ctx.visible)) return
       void load()
       // 部署页读的是另一份读数（限额、health、Router）：停留在这页时跟着推送刷新，但不重跑
-      // doctor（那是人要的时候才跑的 `gh`/`lark-cli` 诊断）。
-      if (read(page) === 'settings') void openSettingsGroup()
+      // doctor（那是人要的时候才跑的 `gh`/`lark-cli` 诊断）。Settings 的四个可编辑组也重读，
+      // 草稿按 `revisionArrived` 保留（`draft.ts` 的合并语义）。
+      if (read(page) === 'settings') {
+        void loadDeployment()
+        void loadSettings()
+      }
       // Execution 页读的是自己的那条请求：详情重读那一张，列表重读已经读到的那几页。
       if (read(page) === 'execution') {
         const focused = read(focus)
@@ -322,8 +326,8 @@ export function setup(ctx: PanelContext): () => void {
   const startPage = read(page)
   if (read(ctx.visible)) {
     void load()
-    // 重开面板时停在 Deployment 组：这一页的读数也要读一次（渲染里不发请求）。
-    if (startPage === 'settings') void openSettingsGroup()
+    // 重开面板时停在 Settings：设置读数与 Deployment 组各读一次（渲染里不发请求）。
+    if (startPage === 'settings') void openSettingsPage()
     // 停在 Execution：焦点指向一张工单就是详情，否则是列表。
     if (startPage === 'execution') enterExecution()
     // 停在 Eval：同理（焦点指向一条决定就是详情，否则是列表）。
@@ -881,10 +885,10 @@ function openThreadFromElsewhere(threadKey: string): void {
   openThread(threadKey)
 }
 
-/** 打开设置页并读一次当前分组（Source 页的空态与 setup 提示指向那里）。 */
+/** 打开设置页并读一次（Source 页的空态与 setup 提示指向那里）。 */
 function openSettings(): void {
   set(page, 'settings')
-  void openSettingsGroup()
+  void openSettingsPage()
 }
 
 /** 打开决定开的工单（Execution 详情）：与 Overview 的行同一个动作。 */
@@ -2348,9 +2352,9 @@ function PageBody(props: {
   const state = read(snapshot)
   const stage = read(phase)
   if (props.current === 'settings') {
-    // Settings 页的分组在 `settings-groups.tsx`：每组自己管读取、错误态与动作（§M.3）。
-    // Sources/Eval/Execution 三组由 #42 填进同一张表，Prompts 是 #43，Deployment 是 #47。
-    return <SettingsGroups locale={locale} />
+    // Settings 页的五组框架与 Sources/Eval/Execution/Deployment 由 #42 提供；Prompts 组的内容
+    // 归 #43（`settings.tsx` 的 `SETTINGS_GROUP_BODIES.prompts` 指向 `prompts.tsx`）。
+    return <Settings locale={locale} />
   }
   if (props.current === 'source') {
     // Source 页自己管读取、错误态与动作（一张卡的失败不把整页换成错误态）。
@@ -2465,8 +2469,9 @@ export default function Panel(): OrcaElement {
         onChange={(next) => {
           if (!isNavPage(next)) return
           set(page, next)
-          // Deployment 组、Execution 列表与 Eval 列表打开时才读（隐藏与未打开的页面不发请求，§M.6）。
-          if (next === 'settings') void openSettingsGroup()
+          // Settings（含 Deployment 组）、Execution 列表与 Eval 列表打开时才读（隐藏与未打开的
+          // 页面不发请求，§M.6）。
+          if (next === 'settings') void openSettingsPage()
           if (next === 'execution') enterExecution()
           if (next === 'eval') enterEval()
           if (next === 'source') void openSources()

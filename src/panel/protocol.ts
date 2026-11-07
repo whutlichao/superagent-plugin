@@ -993,6 +993,312 @@ export interface FocusOutcome {
 }
 
 /**
+ * Settings 页的五个组（§M.3）：顺序即语义，导航表与页面都读它。
+ * 组体只有一张表（`settings.tsx` 的 `SETTINGS_GROUP_BODIES`）：Prompts 那一格由 #43 的
+ * `prompts.tsx` 注册进去，其余四组由 #42 实现（见 `SETTINGS_GROUP_OWNER`）。
+ */
+export const SETTINGS_GROUPS = ['sources', 'eval', 'execution', 'prompts', 'deployment'] as const
+export type SettingsGroupId = (typeof SETTINGS_GROUPS)[number]
+
+/** 每组的内容由谁交付（`/` 表示两组交接）。 */
+export const SETTINGS_GROUP_OWNER: Readonly<Record<SettingsGroupId, string>> = {
+  sources: '#42',
+  eval: '#42',
+  execution: '#42',
+  prompts: '#43',
+  deployment: '#42/#47'
+}
+
+/** 一段双语文案（Source kind 的字段标签、提示与选项名，§I.1）。 */
+export interface SettingsText {
+  readonly zh: string
+  readonly en: string
+}
+
+/** 表单里的一列（kind 的 `FieldColumn`）：文本或下拉。 */
+export type SettingsFieldColumn =
+  | {
+      readonly key: string
+      readonly type: 'text'
+      readonly label: SettingsText
+      readonly hint?: SettingsText
+      readonly pattern?: string
+      readonly readonly?: true
+      readonly optional?: true
+      readonly choose?: SettingsText
+      readonly refresh?: SettingsText
+    }
+  | {
+      readonly key: string
+      readonly type: 'select'
+      readonly label: SettingsText
+      readonly hint?: SettingsText
+      readonly options: readonly { readonly value: string; readonly label: SettingsText }[]
+    }
+
+/** 一个设置表单字段（kind 的 `Field`）：面板按它生成控件，不自己猜形状。 */
+export type SettingsField =
+  | {
+      readonly key: string
+      readonly type: 'switch'
+      readonly label: SettingsText
+      readonly hint?: SettingsText
+      readonly advanced?: true
+    }
+  | {
+      readonly key: string
+      readonly type: 'select'
+      readonly label: SettingsText
+      readonly hint?: SettingsText
+      readonly advanced?: true
+      readonly options: readonly { readonly value: string; readonly label: SettingsText }[]
+    }
+  | {
+      readonly key: string
+      readonly type: 'number'
+      readonly label: SettingsText
+      readonly hint?: SettingsText
+      readonly advanced?: true
+      readonly min: number
+      readonly max: number
+    }
+  | {
+      readonly key: string
+      readonly type: 'text'
+      readonly label: SettingsText
+      readonly hint?: SettingsText
+      readonly advanced?: true
+      readonly pattern?: string
+      readonly readonly?: true
+      readonly choose?: SettingsText
+    }
+  | {
+      readonly key: string
+      readonly type: 'fact'
+      readonly label: SettingsText
+      readonly hint?: SettingsText
+      readonly advanced?: true
+      readonly settings?: 'deployment'
+    }
+  | {
+      readonly key: string
+      readonly type: 'rows'
+      readonly label: SettingsText
+      readonly hint?: SettingsText
+      readonly advanced?: true
+      readonly columns: readonly SettingsFieldColumn[]
+    }
+
+/** 一条 setup 派生事实（账号、仓库）；`type: 'fact'` 的字段读它。 */
+export interface SettingsFact {
+  readonly key: string
+  readonly value: SettingsText | string
+}
+
+/** Source 的六档生命周期（与 `sources/registry.ts` 的 `SourceState` 同值，面板不 import worker）。 */
+export type SettingsSourceState = 'missing' | 'off' | 'starting' | 'paused' | 'error' | 'ready'
+
+/** Sources 组的一张卡：一个实例的设置、字段表与只读事实。 */
+export interface SourceSettingsCard {
+  /** 块名（`source:<id>`）：保存栏按它发请求。 */
+  readonly block: string
+  readonly id: string
+  readonly kind: string
+  readonly title: SettingsText
+  readonly description: SettingsText
+  readonly state: SettingsSourceState
+  readonly enabled: boolean
+  /** 配置校验失败的原因（`state: 'error'` 时面板内联显示）。 */
+  readonly configError?: string
+  readonly config: Record<string, unknown>
+  readonly fields: readonly SettingsField[]
+  readonly facts: readonly SettingsFact[]
+  /** 这个实例能不能立刻同步名单（§I.3；不能时不给按钮）。 */
+  readonly syncable: boolean
+  /** 这个块的当前修订号（保存时提交的基版本）。 */
+  readonly revision: number
+}
+
+/** 一个块当前的保存记录（版本 + 时刻 + 来源），面板用它显示"已保存"与历史。 */
+export interface SettingsBlockSaved {
+  readonly revision: number
+  readonly at: string
+  readonly origin: 'panel' | 'tool' | 'sync' | 'operator'
+  /** Policy 块的内容哈希；其余块为 `null`（§K.5）。 */
+  readonly policyVersion: string | null
+}
+
+/** Sources 组：每个实例一张卡。 */
+export interface SourcesGroupView {
+  readonly instances: readonly SourceSettingsCard[]
+}
+
+/** 一条团队写的准入规则（§K.1 `Rule`）。 */
+export interface PolicyRuleView {
+  readonly id: string
+  readonly name: string
+  readonly instruction: SettingsText
+  readonly enabled: boolean
+}
+
+/** 准入表的一格（§K.1 `AdmissionCells`）：可用性与已生效值都由 worker 决定。 */
+export interface AdmissionCellView {
+  readonly cell: 'listedUnaddressed' | 'unlistedAddressed' | 'unlistedUnaddressed'
+  /** 这一格能不能编辑：只有该行 observe（receive-all）时才可用（§I.1、§I.2）。 */
+  readonly available: boolean
+  /** 现在生效的判定（配置值或缺省值）。 */
+  readonly value: 'explicit' | 'inferred' | 'ignore'
+  /** 没有配置时的判定：保存时只写偏离它的格子，未来缺省变了才跟得上。 */
+  readonly default: 'explicit' | 'inferred' | 'ignore'
+  readonly options: readonly ('explicit' | 'inferred' | 'ignore')[]
+}
+
+/** 准入表的一行（一个接收 scope）。 */
+export interface AdmissionRowView {
+  readonly id: string
+  readonly label: SettingsText
+  readonly note: SettingsText
+  readonly cells: readonly AdmissionCellView[]
+}
+
+/** Eval 组的"On each Source"：名单、bots、准入表与 kind 自有的键（如 Feishu 的 syncChat）。 */
+export interface SourcePolicyView {
+  readonly source: string
+  readonly title: SettingsText
+  /** kind 的 Policy 字段表（`allowed` / `bots` 与 `syncChat` 这类自有键），面板用同一套控件。 */
+  readonly fields: readonly SettingsField[]
+  /** 这些字段的值：`allowed` / `bots` 是行数组，自有键是标量。 */
+  readonly values: Record<string, unknown>
+  readonly admission: readonly AdmissionRowView[]
+  /** 这个 Source 的名单能不能同步（`policy sync` / Sources 组的"Sync now"）。 */
+  readonly syncable: boolean
+}
+
+/** Eval 组：Policy 版本、规则、accept mode、超时、模型，以及每个 Source 的部分。 */
+export interface EvalGroupView {
+  readonly block: 'policy'
+  readonly revision: number
+  readonly saved: SettingsBlockSaved | null
+  /** 生效的内容哈希（§K.5）；没保存过时是启动时那份的哈希。 */
+  readonly policyVersion: string
+  readonly acceptMode: 'off' | 'observe' | 'auto'
+  readonly model: string
+  readonly timeoutSeconds: number
+  readonly rules: readonly PolicyRuleView[]
+  readonly sources: readonly SourcePolicyView[]
+}
+
+/** Execution 组：worker 的模型、并发、命名、准备命令与工作树保留策略（§E.6、§E.11、§N.2）。 */
+export interface ExecutionValues {
+  readonly agent: string
+  readonly model: string
+  readonly effort: string
+  readonly maxWorkers: number
+  readonly baseRepo: string
+  readonly baseBranch: string
+  readonly branchPrefix: string
+  readonly prepare: string
+  readonly blockedCommands: readonly string[]
+  readonly inlineLimit: number
+  readonly worktreeRetention: 'keep' | 'on-end'
+  readonly confirmDelivery: boolean
+}
+
+/** Execution 组。 */
+export interface ExecutionGroupView {
+  readonly block: 'executor'
+  readonly revision: number
+  readonly saved: SettingsBlockSaved | null
+  readonly value: ExecutionValues
+  /** `orca repo list` 的镜（读不到时为空，面板退化成文本框）。 */
+  readonly repos: readonly { readonly value: string; readonly label: string }[]
+  /** prepare 的插入菜单：§E.11 的白名单变量，点击插入 `${…}`。 */
+  readonly variables: readonly string[]
+}
+
+/** Deployment 组的机器限额（#42 起可编辑；同一保存/修订路径）。 */
+export interface LimitsGroupView {
+  readonly block: 'limits'
+  readonly revision: number
+  readonly saved: SettingsBlockSaved | null
+  readonly value: {
+    readonly promptMaxChars: number
+    readonly admissionContextMaxPages: number
+    readonly admissionContextTimeoutMs: number
+    readonly retentionDays: number
+  }
+}
+
+/** Settings 页的一次读数：四个可编辑组；Prompts 组由 #43 提供内容。 */
+export interface SettingsPageView {
+  /** 全局设置修订号（`settings-revision`）。 */
+  readonly revision: number
+  readonly sources: SourcesGroupView
+  readonly eval: EvalGroupView
+  readonly execution: ExecutionGroupView
+  readonly limits: LimitsGroupView
+}
+
+/** 一条字段级问题（400 + `issues[]` 的面板面）。 */
+export interface SettingsIssueView {
+  readonly path: string
+  readonly message: string
+}
+
+/**
+ * 一次保存的结果（面板的保存栏只认这一份）：成功带新修订号，失败带字段级 issues、
+ * 冲突（409）带服务端现在的修订号，其余固定拒绝给一句原因。
+ */
+export type SettingsSaveOutcome =
+  | {
+      readonly ok: true
+      readonly block: string
+      readonly revision: number
+      readonly changed: boolean
+      readonly restarting: boolean
+      readonly policyChanged: boolean
+      readonly origin: 'panel' | 'tool' | 'sync' | 'operator'
+    }
+  | { readonly ok: false; readonly reason: 'invalid'; readonly block: string; readonly issues: readonly SettingsIssueView[] }
+  | { readonly ok: false; readonly reason: 'conflict'; readonly block: string; readonly revision: number }
+  | { readonly ok: false; readonly reason: 'forbidden' | 'failed'; readonly block: string; readonly error: string }
+
+/** 一次保存的输入（面板只能以 `panel` 保存；来源由 worker 填，不由面板选）。 */
+export interface SettingsSaveInput {
+  readonly block: string
+  /** 面板提交的基版本：与当前块修订号不一致就是冲突（409）。 */
+  readonly revision: number
+  readonly value: unknown
+}
+
+/** 一条设置版本历史（面板的 History 与 `settings get --history` 同一份读数）。 */
+export interface SettingsHistoryRow {
+  readonly revision: number
+  readonly predecessor: number | null
+  readonly at: string
+  readonly origin: 'panel' | 'tool' | 'sync' | 'operator'
+  readonly block: string
+  readonly policyVersion: string | null
+  /** 那一版的值："恢复"把它再存一次（同一条保存路径）。 */
+  readonly value: unknown
+  /** 这次 Policy 变更影响的未结束 Ticket（§K.5）；其他块为空。 */
+  readonly affectedTickets: readonly string[]
+}
+
+/** 历史读数：新→旧。 */
+export interface SettingsHistoryView {
+  readonly revision: number
+  readonly history: readonly SettingsHistoryRow[]
+}
+
+/** `policy sync <source>` 的面板面：同步后的版本与名单差异。 */
+export interface PolicySyncView {
+  readonly policy: { readonly revision: number; readonly version: string | null }
+  readonly added: readonly string[]
+  readonly removed: readonly string[]
+}
+
+/**
  * 本票声明的请求名（运行时值，供测试与 worker 侧注册处对照）。
  * 类型侧由下面的声明合并给出：本清单必须与 `PluginRequests` 的键一致。
  */
@@ -1028,7 +1334,10 @@ export const PLUGIN_REQUESTS = [
   'prompts',
   'prompts.preview',
   'prompts.save',
-  'prompts.restore'
+  'prompts.restore',
+  'settings.read',
+  'settings.save',
+  'settings.history'
 ] as const
 
 /** 本票声明的推送名（运行时值），与 `PluginPanelEvents` 的键一致。 */
@@ -1149,6 +1458,18 @@ declare module 'orca' {
      * 面板因此直接回到编辑页看到恢复后的文本。
      */
     'prompts.restore': { input: PromptRestoreRequest; output: PanelPromptsView }
+    /**
+     * Settings 页的一次读数（§M.3）：Sources / Eval / Execution / Deployment 四个可编辑组。
+     * Prompts 组的内容由 #43 提供，不在本请求里。
+     */
+    'settings.read': { output: SettingsPageView }
+    /**
+     * 保存一个设置块（§K.8）：`panel` 来源由 worker 填；账号类字段变更时先跑 setup 校验，
+     * 不通过就返回字段级 issues 且什么都不写。结果总是 resolve（保存栏要画四种状态）。
+     */
+    'settings.save': { input: SettingsSaveInput; output: SettingsSaveOutcome }
+    /** 设置版本历史（§K.5）：新→旧，带每一版的值（恢复走同一条保存路径）。 */
+    'settings.history': { output: SettingsHistoryView }
     /**
      * Source 页的读数（§M.2）：每个配置过的 Source 一张卡——开关、字段、facts、health、
      * 24 h 计数、被过滤的 Trigger 与被 drop 的消息。页面打开时读一次，推送后再读。

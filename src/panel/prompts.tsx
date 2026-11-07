@@ -37,6 +37,7 @@ import { translate, type CopyKey } from './copy'
 import { lineDiff } from './diff'
 import {
   barShown,
+  changedLeafCount,
   draftReducer,
   initialDraft,
   saveBar,
@@ -564,6 +565,28 @@ function IssueCallout(props: {
   )
 }
 
+/**
+ * 「N changes」只数人改的东西：团队三段的文本、每个 override 的正文、每个团队技能。
+ * override 记的 `base` 是「编辑自哪一版内置文本」的账（`prompts.save` 要它），不是一次编辑；
+ * 按叶子全算的话，改一行 override 会读成「2 changes」。
+ */
+function promptChangeCount(state: DraftState<PanelPromptConfig>): number {
+  const draft = state.draft
+  if (draft === undefined) return 0
+  return changedLeafCount(promptCountShape(draft.base), promptCountShape(draft.value))
+}
+
+/** 计数用的形状：override 只留正文。 */
+function promptCountShape(config: PanelPromptConfig): Record<string, unknown> {
+  const overrides: Record<string, string> = {}
+  for (const [key, override] of Object.entries(config.overrides ?? {})) overrides[key] = override.text
+  return {
+    ...(config.team === undefined ? {} : { team: config.team }),
+    ...(Object.keys(overrides).length === 0 ? {} : { overrides }),
+    ...(config.skills === undefined ? {} : { skills: config.skills })
+  }
+}
+
 /** 保存栏（§M.3）：草稿为空时不占空间；有改动显示「N changes · Save / Discard」。 */
 function SaveBar(props: {
   readonly locale: string
@@ -571,7 +594,7 @@ function SaveBar(props: {
   readonly limit: number
 }): OrcaElement | null {
   const { locale, state } = props
-  const bar = saveBar(locale, state, savedValue)
+  const bar = saveBar(locale, state, savedValue, promptChangeCount)
   if (!barShown(bar)) return null
   return (
     <Stack gap="xs">

@@ -14,7 +14,13 @@ import { DEFAULT_MACHINE_LIMITS, machineLimits, type MachineLimits } from '../sr
 import { deploymentView } from '../src/worker/app/deployment-view'
 import type { SetupIssue } from '../src/worker/app/setup'
 import type { RouterSnapshot } from '../src/worker/router/supervision'
-import type { DoctorView, DeploymentView, PanelState } from '../src/panel/protocol'
+import type {
+  DeploymentLimits,
+  DeploymentView,
+  DoctorView,
+  PanelState,
+  SettingsPageView
+} from '../src/panel/protocol'
 import { COPY } from '../src/panel/copy'
 import { LIMITATIONS } from '../src/panel/limitations'
 import { readRepoFile } from './support/repo'
@@ -96,6 +102,57 @@ function doctorOf(overrides: Partial<DoctorView> = {}): DoctorView {
   }
 }
 
+/** Settings 页的读数：Deployment 组的机器限额用这一份部署读数里的四个值（同一份数）。 */
+function settingsOf(limits: DeploymentLimits): SettingsPageView {
+  return {
+    revision: 1,
+    sources: { instances: [] },
+    eval: {
+      block: 'policy',
+      revision: 0,
+      saved: null,
+      policyVersion: 'abc123def456',
+      acceptMode: 'observe',
+      model: '',
+      timeoutSeconds: 300,
+      rules: [],
+      sources: []
+    },
+    execution: {
+      block: 'executor',
+      revision: 0,
+      saved: null,
+      value: {
+        agent: 'pi',
+        model: '',
+        effort: '',
+        maxWorkers: 2,
+        baseRepo: 'path:/repos/widgets',
+        baseBranch: 'main',
+        branchPrefix: 'agent/',
+        prepare: '',
+        blockedCommands: [],
+        inlineLimit: 1000,
+        worktreeRetention: 'keep',
+        confirmDelivery: true
+      },
+      repos: [{ value: 'path:/repos/widgets', label: 'widgets (/repos/widgets)' }],
+      variables: ['DSH_SUPERAGENT_DIR']
+    },
+    limits: {
+      block: 'limits',
+      revision: 0,
+      saved: null,
+      value: {
+        promptMaxChars: limits.promptMaxChars,
+        admissionContextMaxPages: limits.admissionContextMaxPages,
+        admissionContextTimeoutMs: limits.admissionContextTimeoutMs,
+        retentionDays: limits.retentionDays
+      }
+    }
+  }
+}
+
 /** 一个固定时刻的 setup 问题（修法与重跑入口恒在）。 */
 function problem(overrides: Partial<SetupIssue> = {}): SetupIssue {
   return {
@@ -131,12 +188,17 @@ async function openDeployment(
         pause: (input: unknown) => snapshot((input as { paused?: boolean } | null)?.paused === true),
         setupCheck: options.onSetupCheck ?? (() => ({ checked: true, problems: [] })),
         rotateToken: options.onRotate ?? (() => ({ rotated: true, tokenFile: '/var/lib/superagent/api-token' })),
-        restartRouter: options.onRestart ?? (() => routerOf())
+        restartRouter: options.onRestart ?? (() => routerOf()),
+        // Settings 页（#42）：四个可编辑组的读数与历史（Deployment 组的限额与部署读数同值）。
+        'settings.read': () => settingsOf(read().limits),
+        'settings.history': () => ({ revision: 1, history: [] })
       }
     }),
     locale: options.locale ?? 'en'
   })
+  // 导航到 Settings，再打开其中的 Deployment 组（#42 的五组框架：一次只渲染当前组）。
   await panel.select({ type: 'Tabs' }, 'settings')
+  await panel.select({ type: 'Tabs', label: COPY['nav.settings'].en }, 'deployment')
   return panel
 }
 
@@ -163,15 +225,17 @@ test('the Deployment page shows the state directory, the machine limits and the 
   assert.ok(mounted.find({ text: COPY['deployment.stateDirReadOnly'].en }), 'the path is read-only')
   assert.ok(mounted.find({ text: COPY['deployment.stateDirChange'].en }), 'the change entry is named')
 
-  // 机器限额：四个数值都来自设置，缺省时是设计里的缺省值。
-  assert.ok(mounted.find({ type: 'KeyValue' }), 'the limits are a facts table')
+  // 机器限额（#42 起可编辑）：四个数值都来自设置，缺省时是设计里的缺省值。
+  assert.ok(mounted.find({ text: COPY['settings.limits.title'].en }), 'the limits block is shown')
   const rendered = JSON.stringify(mounted.tree())
-  for (const key of ['promptMaxChars', 'admissionContextMaxPages', 'admissionContextTimeoutMs', 'retentionDays'] as const) {
-    assert.ok(rendered.includes(JSON.stringify(COPY[`deployment.limit.${key}`].en)), `the ${key} label`)
+  for (const key of ['promptMaxChars', 'pages', 'timeoutMs', 'retentionDays'] as const) {
+    assert.ok(rendered.includes(JSON.stringify(COPY[`settings.limits.${key}`].en)), `the ${key} label`)
   }
   for (const value of ['111111', '7', '2222', '45']) {
-    assert.ok(rendered.includes(`"${value}"`) || rendered.includes(`:${value},`), `the value in force: ${value}`)
+    assert.ok(rendered.includes(`"${value}"`), `the value in force: ${value}`)
   }
+  // 没有改动时保存栏不占空间（§M.3）。
+  assert.equal(mounted.find({ text: COPY['action.save'].en }), null, 'a clean limits draft shows no save bar')
 
   // 暂停开关：标签是「暂停处理」，当前值来自这一份部署读数。
   const toggle = mounted.find({ type: 'Switch' })
@@ -426,6 +490,7 @@ test('the plugin check scenario opens on the Deployment group with a real read',
     'settings',
     'the scenario opens Settings'
   )
+  await mounted.select({ type: 'Tabs', label: COPY['nav.settings'].en }, 'deployment')
   assert.ok(mounted.find({ text: COPY['deployment.stateDir'].en }), 'the deployment read is on screen')
   assert.ok(mounted.find({ text: `${COPY['deployment.setup'].en} · 1` }), 'setup problems too')
   assert.deepEqual(mounted.refusals, [])

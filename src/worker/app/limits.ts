@@ -41,6 +41,40 @@ function block(value: unknown): Record<string, unknown> {
 }
 
 /**
+ * 把版本化的 `limits` 块（`app/settings-blocks.ts`）叠到宿主设置快照上：保存过的值优先，
+ * `retention` 只覆盖写了的键（`relayDays` 之类的同棵树设置不丢）。
+ *
+ * 组合根在启动时调它一次，部署视图、提示词上限、评估语境窗口与保留天数因此读同一份数；
+ * 改限额仍是「重启后生效」（§H.12：没有热重载）。未保存过（`undefined` / 非对象）时原样返回。
+ */
+export function withMachineLimits(
+  settings: Readonly<Record<string, unknown>>,
+  saved: unknown
+): Readonly<Record<string, unknown>> {
+  const stored = block(saved)
+  if (Object.keys(stored).length === 0) return settings
+  const merged: Record<string, unknown> = { ...settings, ...stored }
+  const retention = block(stored['retention'])
+  if (Object.keys(retention).length > 0) {
+    merged['retention'] = { ...block(settings['retention']), ...retention }
+  }
+  return merged
+}
+
+/**
+ * 四个限额 → `limits` 块的形状（`retention.days` 嵌一层，与 §D.2 的设置键同名）。
+ * `settings get --block limits` 与面板的 Deployment 组读同一份形状，因此缺省值只填一次。
+ */
+export function limitsBlockValue(limits: MachineLimits): Record<string, unknown> {
+  return {
+    promptMaxChars: limits.promptMaxChars,
+    admissionContextMaxPages: limits.admissionContextMaxPages,
+    admissionContextTimeoutMs: limits.admissionContextTimeoutMs,
+    retention: { days: limits.retentionDays }
+  }
+}
+
+/**
  * 从一份设置快照读出四个限额：写了的用写的，没写（或写坏）的用缺省值。设置是启动时读到的
  * 那一份，所以改限额要重启插件（§H.12：没有热重载）。
  */
