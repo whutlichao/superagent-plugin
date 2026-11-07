@@ -204,6 +204,8 @@ export interface Repositories {
     get(id: string): Decision | undefined
     save(decision: Decision): void
     byThread(key: string): Decision[]
+    /** 全部 Decision，最新的在前（面板 Eval 页与 CLI 的 `read decisions` 共用）。 */
+    list(): Decision[]
   }
 }
 
