@@ -1732,7 +1732,7 @@ $ orca plugin types <dir> --json
 | CLI 凭证 | 由机器上的 `gh` / `lark-cli` 持有；插件**不存** GitHub token、不存 Feishu app secret；`secrets` 只用于可选的自定义（如私有镜像口令），且有 `protection()==='unavailable'` 时的降级说明 |
 | 破坏性操作 | 面板二次确认（§M.2）；CLI 侧 `ticket stop` / `worktree rm` / `rotate-token` 要求 `--yes`（或 `--request-id` 幂等 + `--confirm`） |
 | 命令注入 | 所有子进程用 **argv 数组** + `shell:false`；程序名白名单（`gh`/`lark-cli`/`git`/`orca`/`sh`），路径必须是设置里给的绝对值；`prepare` 命令里只允许 `${DSH_SUPERAGENT_*}` 白名单变量，替换时逐值单引号转义；**绝不**把消息正文拼进 shell |
-| 超时 | CLI 60 s（`prepare` 10 min，`worktree create` 120 s）；HTTP handler 内不做超过 10 s 的同步等待（长活进 effect） |
+| 超时 | CLI 60 s（`prepare` 10 min，`worktree create` 120 s）；HTTP handler 内不做超过 10 s 的同步等待（长活进 effect）。两条会同步等外部 CLI 的路由因此各有预算：`POST setup/check` 单条探针 2 s、整次 9 s（`src/worker/http/ops.ts` 的 `SETUP_CHECK_BUDGET`），`POST policy-sync/:id` 整次 8 s（`http/settings.ts` 的 `POLICY_SYNC_BUDGET`）；到点先取消（信号进 `execFile`，子进程被 SIGTERM 掐掉）再返回固定码 `unavailable` + 「稍后重试」，半个结论都不落库（`infra/deadline.ts`） |
 | 路径 | `stateDir` 必须是绝对路径且可写；`inbox/relay/skills/backups` 都在其后代内；任何用户提供的路径（`eval-read --path`）必须 realpath 后落在 base repo 或 ticket worktree 之内，否则 `refused` |
 | 审批面 | manifest 的 10 个 capability 就是用户看到并批准的清单；插件不请求 `appearance:write`，也不注册 hook 之外的拦截点（不用 `terminal.send`/`agent.tool.before` 做「安全网关」，避免把可靠性问题变成安全断言） |
 | 供应链 | 零运行时 npm 依赖（只用 Node 内置：`node:sqlite`、`node:fs`、`node:crypto`、`node:child_process`、`node:http`）；若必须引入 zod，以 MIT 单文件内置（`src/worker/infra/schema.ts` 的最小校验器），避免 `node_modules`（插件不允许提交 `node_modules`，也不做打包） |

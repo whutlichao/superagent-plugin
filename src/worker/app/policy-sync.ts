@@ -124,7 +124,9 @@ export function createPolicySync(options: PolicySyncOptions): PolicySync {
     const signals = [options.signal, extra].filter(
       (candidate): candidate is AbortSignal => candidate !== undefined
     )
-    return signals.length === 0 ? new AbortController().signal : combineSignals(signals)
+    if (signals.length === 0) return new AbortController().signal
+    // 只有一个信号时直接用（启动路径一直是这样：停机信号就是读取的取消线）。
+    return signals.length === 1 ? (signals[0] as AbortSignal) : combineSignals(signals)
   }
 
   const sync = async (id: string, signal?: AbortSignal): Promise<Record<string, unknown>> => {
