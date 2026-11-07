@@ -777,7 +777,9 @@ function createOutboxRepository(sql: SqlAccess): OutboxRepository {
     countDropped(): number {
       return Number(
         field(
-          sql.one("SELECT COUNT(*) AS n FROM outbox WHERE status = 'dropped' AND dropped_reason <> 'withdrawn'"),
+          sql.one(
+            "SELECT COUNT(*) AS n FROM outbox WHERE status = 'dropped' AND COALESCE(dropped_reason, '') <> 'withdrawn'"
+          ),
           'n'
         )
       )
