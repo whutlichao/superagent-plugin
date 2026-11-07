@@ -61,6 +61,7 @@ import {
   type TicketListPage
 } from './protocol'
 import { TicketRow } from './rows'
+import { loadSources, openSources, resetSources, SourcePage } from './source-page'
 import {
   BootingState,
   ConfirmAction,
@@ -250,6 +251,8 @@ export function setup(ctx: PanelContext): () => void {
   set(decisionDetail, null)
   set(decisionDetailError, '')
   set(decisionActing, false)
+  // Source 页同理：上一份读数与各卡的动作状态都不带进这一次。
+  resetSources()
   // 上一次挂载还在飞行的列表/详情请求作废（它们的答案不该画进这一次）。
   listRequest += 1
   decisionRequest += 1
@@ -274,6 +277,8 @@ export function setup(ctx: PanelContext): () => void {
         if (focused?.page === 'eval') void loadDecisionDetail(focused.id)
         else void refreshDecisions()
       }
+      // Source 页读的是它自己的读数（新的 Trigger、drop 与 health 都会改变卡片）。
+      if (read(page) === 'source') void loadSources()
     })
   )
   const startPage = read(page)
@@ -285,10 +290,13 @@ export function setup(ctx: PanelContext): () => void {
     if (startPage === 'execution') enterExecution()
     // 停在 Eval：同理（焦点指向一条决定就是详情，否则是列表）。
     if (startPage === 'eval') enterEval()
+    // 停在 Source：读一次卡片（推送之后会各自重读）。
+    if (startPage === 'source') void openSources()
   } else set(phase, 'starting')
   return () => {
     disposed = true
     resetDeployment()
+    resetSources()
     if (retryTimer !== null) {
       clearTimeout(retryTimer)
       retryTimer = null
@@ -824,10 +832,16 @@ function backToEval(): void {
   else void refreshDecisions()
 }
 
-/** 打开决定所在的 Thread（Trigger 页的详情；页面由 #39 填充，焦点是两页的共享契约）。 */
-function openDecisionThread(threadKey: string): void {
+/** 打开一条 Thread（Trigger 页的焦点）：Source 页的过滤行与 Eval 页的 Thread 链接共用它。 */
+function openThread(threadKey: string): void {
   set(focus, { page: 'trigger', id: threadKey })
   set(page, 'trigger')
+}
+
+/** 打开设置页并读一次 Deployment 组（Source 页的空态与 setup 提示指向那里）。 */
+function openSettings(): void {
+  set(page, 'settings')
+  void openDeployment()
 }
 
 /** 打开决定开的工单（Execution 详情）：与 Overview 的行同一个动作。 */
@@ -1629,7 +1643,7 @@ function DecisionDetailPage(props: {
           variant="outline"
           size="sm"
           icon="next"
-          onPress={() => openDecisionThread(shown.thread.key)}
+          onPress={() => openThread(shown.thread.key)}
         >
           {words(locale, 'eval.openThread')}
         </Button>
@@ -1685,6 +1699,17 @@ function PageBody(props: { readonly locale: string; readonly current: NavPage })
     // Settings 页的其余四组（Sources/Eval/Execution/Prompts）由 #42/#43 填进同一页；
     // 本票交付的是 Deployment 组，它自己管读取、错误态与动作。
     return <Deployment locale={locale} />
+  }
+  if (props.current === 'source') {
+    // Source 页自己管读取、错误态与动作（一张卡的失败不把整页换成错误态）。
+    return (
+      <SourcePage
+        locale={locale}
+        onOpenSettings={() => openSettings()}
+        onOpenTicket={(ticketId) => openTicket(ticketId)}
+        onOpenThread={(threadKey) => openThread(threadKey)}
+      />
+    )
   }
   if (props.current === 'overview' || props.current === 'eval' || props.current === 'execution') {
     if (stage === 'error') {
@@ -1787,6 +1812,7 @@ export default function Panel(): OrcaElement {
           if (next === 'settings') void openDeployment()
           if (next === 'execution') enterExecution()
           if (next === 'eval') enterEval()
+          if (next === 'source') void openSources()
         }}
       >
         {NAV_PAGES.map((item) => (

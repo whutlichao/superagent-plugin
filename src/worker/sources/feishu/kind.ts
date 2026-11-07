@@ -8,9 +8,11 @@
 import type { ScopeResult } from '../../core/index.ts'
 import { array, object, refine, string } from '../../infra/schema.ts'
 import type { Deployment, Localized, ScopeInput, SourceKind } from '../kind.ts'
+import { createFeishuApi } from './api.ts'
 import { sendFeishu, feishuLink } from './channel.ts'
 import type { FeishuConfig } from './config.ts'
 import { feishuConfigSchema } from './config.ts'
+import { refreshChatNames } from './poll.ts'
 import { runFeishuSync } from './sync.ts'
 import { FEISHU_SOURCE } from './translate.ts'
 import { feishuFind, feishuThreadContext } from './read.ts'
@@ -90,6 +92,15 @@ export function feishuScope(trigger: ScopeInput, config: FeishuConfig): ScopeRes
 }
 
 /**
+ * Feishu kind 的注册选项：语境读要 `stateDir`（§H.17），刷新显示名要它写名单的 kv 键
+ * （§D.3：键字面量只活在 `app/kv.ts`，由组合根注入，kind 自己不知道命名）。
+ */
+export interface FeishuKindOptions extends FeishuContextOptions {
+  /** `source-labels:<feishu>`。没有它时 `refreshLabels` 拒绝，而不是写到一个猜出来的键上。 */
+  readonly labelsKey?: string
+}
+
+/**
  * 造一个 Feishu kind。`cli` 是配置的机器人 `lark-cli`：Channel、名单同步、语境读与图片下载
  * 都需要它，而 `SourceChannel.send` / `sync.run` / `threadContext.image` 的签名里没有配置
  * （§I.1），所以由组合根在注册时闭包进来（设置变了就重新注册，与设计 §N.2 的「重启后生效」
@@ -97,7 +108,7 @@ export function feishuScope(trigger: ScopeInput, config: FeishuConfig): ScopeRes
  */
 export function createFeishuKind(
   cli = 'lark-cli',
-  options: FeishuContextOptions = {}
+  options: FeishuKindOptions = {}
 ): SourceKind<FeishuConfig> {
   return {
     kind: FEISHU_KIND,
@@ -306,6 +317,23 @@ export function createFeishuKind(
           }
         ]
       }
+    },
+    /**
+     * 刷新显示名（§G.2 的 `source labels`、§I.3 群名刷新行）：读机器人已加入的群，把
+     * `chat_id -> name` 写进 `source-labels:<feishu>`。失败抛错（不覆盖上一次的名单），
+     * 由调用方决定怎么报告。
+     */
+    async refreshLabels(host, config, signal) {
+      const labels = options.labelsKey
+      if (labels === undefined) {
+        throw new Error('The Feishu kind has no labels key; the composition root must inject it')
+      }
+      return refreshChatNames({
+        api: createFeishuApi(host.commands, config.cli),
+        host,
+        keys: { labels },
+        signal
+      })
     }
   }
 }

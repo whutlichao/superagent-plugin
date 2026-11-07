@@ -29,6 +29,7 @@ import type {
   ChannelLinks,
   Deployment,
   Fact,
+  SourceContext,
   SourceInstance,
   SourceKind,
   ThreadContext,
@@ -227,10 +228,13 @@ export class SourceRegistry implements SourceScope {
       claimed.set(name, claim)
       this.#claims.set(name, claim)
     }
-    this.#kinds.set(kind.kind, kind as unknown as AnySourceKind)
+    // SAFETY: 注册表只按 kind 的公共形状（`AnySourceKind`）使用它；`register<C>` 的配置类型
+    // 在注册后丢失是有意的——每个实例的配置在 `resolve()` 里按同一个 schema 重新校验。
+    const anyKind = kind as unknown as AnySourceKind
+    this.#kinds.set(kind.kind, anyKind)
     let unregistered: () => void
     try {
-      unregistered = this.#registered(kind as unknown as AnySourceKind)
+      unregistered = this.#registered(anyKind)
     } catch (error) {
       this.#kinds.delete(kind.kind)
       releaseHealth()
@@ -247,6 +251,30 @@ export class SourceRegistry implements SourceScope {
   /** 已注册的 kind；没装时 undefined。 */
   kind(id: string): AnySourceKind | undefined {
     return this.#kinds.get(id)
+  }
+
+  /** 这个 Source 是否声明了「刷新显示名」（面板据此决定是否给按钮，§G.2 的 `source labels`）。 */
+  canRefreshLabels(id: string): boolean {
+    return this.#kinds.get(id)?.refreshLabels !== undefined
+  }
+
+  /**
+   * 让 kind 重读它的行键显示名（§I.1 `refreshLabels`）：kind 没装或没实现时抛错，绝不编一个
+   * 空名单；读写都经 `SourceContext`（kind 拿不到 Store，§C.2 规则 2）。
+   */
+  async refreshLabels(
+    id: string,
+    host: SourceContext,
+    signal: AbortSignal = new AbortController().signal,
+    settings: SourceSettingsView = this.#settings()
+  ): Promise<Record<string, string>> {
+    const kind = this.#kinds.get(id)
+    const refresh = kind?.refreshLabels
+    if (kind === undefined || refresh === undefined) {
+      throw new Error(`The ${id} Source cannot refresh its display names`)
+    }
+    const instance = this.resolve(kind, settings.sources[id])
+    return refresh.call(kind, host, instance.config, signal)
   }
 
   /** 注册了的 kind，按 id 排序。 */

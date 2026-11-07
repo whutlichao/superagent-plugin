@@ -16,8 +16,9 @@ test('the worker push is the one state.changed event, carrying a monotonic revis
 
 test('the panel declares the state snapshot, the Overview actions, the Execution page and the Deployment group', () => {
   // 每个票据追加自己那一组请求：Overview 的 `check`/`ticket.retry`/`terminal.focus`（#37）、
-  // Execution 的列表/详情与五个动作（#38）、Eval 的列表/详情/dismiss（#40），以及 Deployment
-  // 组的读数、doctor、重跑探针、轮换 token、重启 Router（#47）。
+  // Execution 的列表/详情与五个动作（#38）、Eval 的列表/详情/dismiss（#40）、Deployment
+  // 组的读数、doctor、重跑探针、轮换 token、重启 Router（#47），以及 Source 页的读数与
+  // 打开/关闭、立即同步、刷新显示名（#41）。
   assert.deepEqual([...PLUGIN_REQUESTS], [
     'state',
     'pause',
@@ -38,7 +39,11 @@ test('the panel declares the state snapshot, the Overview actions, the Execution
     'doctor',
     'setupCheck',
     'rotateToken',
-    'restartRouter'
+    'restartRouter',
+    'sources',
+    'source.setEnabled',
+    'source.sync',
+    'source.labels'
   ])
 })
 
