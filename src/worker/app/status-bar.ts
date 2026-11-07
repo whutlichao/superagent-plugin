@@ -1,6 +1,12 @@
 // 状态栏项的视图与节流（§N.7）。纯逻辑：不 import `orca`，时钟与定时器都注入，
 // 因此单测可以用虚拟时间推进「最多每 2 s 一次」而不 sleep（§P.1 第 4 条）。
 //
+// 与设计的偏离（#45，协调者裁决）：§N.7 让状态栏项的点击跑 `superagent.pause`。本实现
+// **故意不挂点击动作**——清单的 `contributes.statusBarItems[0]` 没有 `command` 字段——
+// 因为状态栏常驻在标题栏上，误点会暂停整个处理；宿主当前也没有「只读/打开面板」的点击
+// 动作可挂，不为了有得点而新增一个破坏性命令。`superagent.pause` 仍在命令面板里可用。
+// DOC2（#50）负责把设计文本改成同口径。
+//
 // 文本是设计给死的四种（§N.7）：`Superagent` / `Superagent 3` / `Superagent paused` /
 // `Superagent error`；worker 侧拿不到宿主的 UI 语言，所以它们不走面板的 `copy.ts`。
 // 计数与健康来自同一份 `PanelState`，因此状态栏、tooltip 与面板永远说的是同一件事。
@@ -36,9 +42,6 @@ export function statusBarView(state: PanelState): StatusBarView {
   return { text: 'Superagent', tone: 'success', tooltip }
 }
 
-/** 注入的定时器句柄：测试给数字，生产给 Node 的 `Timeout`；发布器只负责原样交回 `cancel`。 */
-export type TimerHandleLike = unknown
-
 /** 状态栏更新：节流器与发送端都是注入的。 */
 export interface StatusBarPublisher {
   /** 交给它一份新取值；它在允许的时机（且值确实变了）调用 `send`。 */
@@ -51,9 +54,10 @@ export interface StatusBarPublisher {
 export interface StatusBarPublisherOptions {
   readonly send: (update: StatusBarUpdate) => void
   readonly now: () => number
-  readonly schedule: (run: () => void, milliseconds: number) => TimerHandleLike
+  /** 定时器句柄：测试给数字，生产给 Node 的 `Timeout`；发布器只负责原样交回 `cancel`。 */
+  readonly schedule: (run: () => void, milliseconds: number) => unknown
   /** 句柄原样交回；发布器不解释它，因此注入方可以给任意形状。 */
-  readonly cancel: (handle: TimerHandleLike) => void
+  readonly cancel: (handle: unknown) => void
   /** 两次发送之间的最小间隔；缺省 2 s（§N.7）。 */
   readonly intervalMs?: number
 }
@@ -72,7 +76,7 @@ export function createStatusBarPublisher(options: StatusBarPublisherOptions): St
   let lastSent: StatusBarView | undefined
   let lastSentAt = Number.NEGATIVE_INFINITY
   let pending: StatusBarView | undefined
-  let timer: TimerHandleLike | null = null
+  let timer: unknown = null
 
   const flush = (): void => {
     timer = null

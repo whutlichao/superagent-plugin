@@ -111,6 +111,79 @@ export function defaultHealth(http: HttpSelfView, at: string): Readonly<Record<s
   }
 }
 
+/** 一条 health error 条目（Overview 的 System problems 与 `status` 的退出码读它）。 */
+export interface HealthProblem {
+  readonly name: string
+  readonly state: 'error'
+  readonly detail?: string
+}
+
+/**
+ * 把 health 读数里所有 error 条目按条目名升序列出（§N.4）。面板的 System problems、状态栏的
+ * problem 计数与 `status` 的 2/1 判定都从这一份推导，避免两边各判一次。
+ */
+export function healthProblems(
+  health: Readonly<Record<string, HealthEntry | undefined>>
+): readonly HealthProblem[] {
+  return Object.entries(health)
+    .filter(([, entry]) => entry?.state === 'error')
+    .sort(([left], [right]) => left.localeCompare(right))
+    .map(([name, entry]) => ({
+      name,
+      state: 'error',
+      ...(entry?.detail === undefined ? {} : { detail: entry.detail })
+    }))
+}
+
+/** 面板 health 摘要（`WorkerHealth.error`）与状态栏的 problem 计数。 */
+export interface HealthSummary {
+  readonly error: boolean
+  readonly problems: number
+}
+
+/** 同一份 health 读数的两个派生值：有没有 error、有几条。 */
+export function healthSummary(
+  health: Readonly<Record<string, HealthEntry | undefined>>
+): HealthSummary {
+  const problems = healthProblems(health).length
+  return { error: problems > 0, problems }
+}
+
+/** `status` 的四个退出码（§N.4）：0 正常、1 运行时问题、2 非运行时部件报错、3 未就绪。 */
+export type StatusCode = 0 | 1 | 2 | 3
+
+/**
+ * `status` 的退出码（§N.4，与上游 `scripts/dsh-superagent status` 对齐；#8 补「暂停」一档）：
+ *   1 runtime 不是 ready/paused —— 没跑 / 不响应 / 运行时错误（starting 也算「还没跑起来」，
+ *     与上游 `runtime_up()` 的判定一致）；
+ *   3 等 setup（`setup.problem` 非空）—— 重启不修，要人补配置；
+ *   3 已暂停（`paused: true`）—— 不是故障，但「不在处理」，所以是未就绪；
+ *   2 非 runtime 的 health 条目报错 —— 重启不修，要人看；
+ *   0 其余。
+ *
+ * 顺序即优先级，与上游 `outcome()` 的骨架一致（runtime 先、setup 次、部件错误最后）：
+ * 「人为停下来的两种状态」（等 setup、已暂停）排在部件错误之前——它们解释了「为什么现在
+ * 什么都没有发生」，而部件错误是恢复处理之后才会被消费的事实。
+ *
+ * 这里**不是** CLI 专用的：`status` 与面板读同一个 `StateView`，所以判定放在读模型旁边，
+ * CLI 只负责把 0/1/2/3 换成它自己的 `ExitCode`。
+ */
+export function statusCode(view: unknown): StatusCode {
+  if (typeof view !== 'object' || view === null) return 1
+  const state = view as {
+    readonly health?: Readonly<Record<string, HealthEntry | undefined>>
+    readonly setup?: { readonly problem?: unknown } | null
+    readonly paused?: unknown
+  }
+  const health = state.health ?? {}
+  const runtime = health['runtime']?.state
+  if (runtime !== 'ready' && runtime !== 'paused') return 1
+  const setupProblem = state.setup?.problem
+  if (setupProblem !== null && setupProblem !== undefined) return 3
+  if (state.paused === true) return 3
+  return healthProblems(health).some((problem) => problem.name !== 'runtime') ? 2 : 0
+}
+
 /**
  * 组装 `GET state`。`http` 由调用方（server）给出实际监听读数——这样 CLI 看到的端口
  * 永远等于端口文件里的那个。

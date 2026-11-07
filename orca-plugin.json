@@ -62,8 +62,7 @@
         "text": "Superagent",
         "icon": "bot",
         "tone": "neutral",
-        "tooltip": "Superagent",
-        "command": "superagent.pause"
+        "tooltip": "Superagent"
       }
     ]
   },

@@ -107,3 +107,16 @@ test('asks for exactly the ten capabilities the design approves', () => {
 test('declares the four host settings that decide whether the plugin can start', () => {
   assert.deepEqual(identities('settings', 'key'), ['stateDir', 'agent', 'routerAgent', 'baseRepo'])
 })
+
+test('the status bar item has no click command (approved deviation from §N.7, #45)', () => {
+  // §N.7 原本让点击跑 `superagent.pause`；#45 的裁决是**不挂点击动作**：状态栏常驻在标题栏上，
+  // 误点会暂停整个处理，而宿主没有「只读/打开面板」的点击动作可挂。`superagent.pause` 仍在
+  // 命令面板里（上面的四条命令断言）。DOC2（#50）把设计文本改成同口径。
+  const items = (manifest.contributes['statusBarItems'] ?? []) as readonly {
+    readonly id?: string
+    readonly command?: string
+  }[]
+  assert.equal(items.length, 1)
+  assert.equal(items[0]?.id, 'superagent')
+  assert.equal(Object.hasOwn(items[0] ?? {}, 'command'), false, 'the click is inert')
+})

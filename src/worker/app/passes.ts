@@ -5,12 +5,10 @@
 // 依赖全部注入（effects 的 `kick`/`idle`、engine 的 `evaluateDue`、健康板、定时器），
 // 因此本模块不读环境时钟，也没有自己的 I/O（§P.1）。
 import type { HealthBoardLike, HealthEntryHandle } from '../infra/health'
+import { FAILURES_BEFORE_ERROR } from '../infra/health'
 
 /** 周期 pass 的间隔（§N.1 的 2 s 巡检；设计 §C.1 的「单线程 pass」由它驱动）。 */
 export const PASS_INTERVAL_MS = 2000
-
-/** 连续多少次 pass 失败才把 `passes` 条目报成 error（§N.4 `passes` 行）。 */
-export const PASS_FAILURES_BEFORE_ERROR = 3
 
 /** 一个待执行的 pass：先踢一次 effect 派发，再让引擎处理到期的 Eval。 */
 export interface PassPorts {
@@ -164,7 +162,7 @@ export class Passes implements PassesPort {
     this.#failures += 1
     const detail = `pass failed after ${this.#failures} attempt${this.#failures === 1 ? '' : 's'}: ${messageOf(error)}`
     this.#entry.set({
-      state: this.#failures >= PASS_FAILURES_BEFORE_ERROR ? 'error' : 'ready',
+      state: this.#failures >= FAILURES_BEFORE_ERROR ? 'error' : 'ready',
       detail
     })
   }

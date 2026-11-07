@@ -5,6 +5,12 @@
 import { assert, test } from 'orca/testing'
 import type { PanelState } from '../src/panel/protocol'
 import { createStatusBarPublisher, statusBarView, STATUS_BAR_ID } from '../src/worker/app/status-bar'
+import { emptyState } from '../src/worker/app/state-source'
+import { readAttentionCounts } from '../src/worker/app/views/attention'
+import { healthSummary } from '../src/worker/http/state'
+import { HealthBoard } from '../src/worker/infra/health'
+import { readRepoJson } from './support/repo'
+import { AT, openTempStore } from './support/state'
 
 /** 一份最小的快照；只关心状态栏读到的字段。 */
 function state(overrides: {
@@ -180,4 +186,119 @@ test('the interval is two seconds by default and configurable for tests', () => 
   publisher.publish(statusBarView(state({ answer: 1 })))
   timers.advance(100)
   assert.deepEqual(sent, ['Superagent', 'Superagent 1'])
+})
+
+// ---------------------------------------------------------------- 真实读数与惰性点击
+
+/** 清单里的状态栏项与命令（独立真相：宿主拿到的就是这份 JSON）。 */
+interface StatusBarManifest {
+  readonly contributes: {
+    readonly statusBarItems: readonly { readonly id: string; readonly command?: string }[]
+    readonly commands: readonly { readonly id: string }[]
+  }
+}
+
+test('the status bar item has no command: a click is inert (approved deviation from §N.7)', () => {
+  // 协调者裁决（#45）：§N.7 原本让点击跑 `superagent.pause`，但状态栏常驻在标题栏上，
+  // 误点会暂停整个处理。宿主没有「只读/打开面板」的点击动作可挂，所以宁可不挂，
+  // 也不新增一个为了有得点而存在的破坏性命令。暂停仍在命令面板里（下一行断言）。
+  // DOC2（#50）负责把设计文本改成同口径。
+  const manifest = readRepoJson<StatusBarManifest>('orca-plugin.json')
+  const item = manifest.contributes.statusBarItems[0]
+  assert.ok(item !== undefined, 'the manifest contributes one status bar item')
+  assert.equal(item.id, 'superagent')
+  assert.equal('command' in item, false, 'no click action at all')
+  assert.equal(item.command, undefined)
+  assert.ok(
+    manifest.contributes.commands.some((command) => command.id === 'superagent.pause'),
+    'pause stays available in the command palette'
+  )
+})
+
+test('the count comes from the real store tickets, not the shell stub zeros', () => {
+  const { store, cleanup } = openTempStore()
+  try {
+    const base = {
+      inputs: [],
+      undelivered: [],
+      assignments: [],
+      channels: [],
+      title: 'a ticket',
+      decisionId: 'decision-1',
+      mandate: {},
+      budget: undefined,
+      createdAt: AT,
+      updatedAt: AT,
+      origin: { triggerId: 'trigger-1', triggerIds: ['trigger-1'] }
+    }
+    // 一个等人回答的 Ticket。
+    store.tickets.put({
+      id: 'ticket-answer',
+      at: AT,
+      body: { ...base, attention: { id: 'attention-1', question: 'Which repo?', at: AT } }
+    })
+    // 一个最近报告是 ready、等评审的 Ticket。
+    store.tickets.put({
+      id: 'ticket-review',
+      at: AT,
+      body: {
+        ...base,
+        assignments: [
+          {
+            id: 'assignment-1',
+            state: 'running',
+            createdAt: AT,
+            report: { state: 'ready', summary: 'done', at: AT }
+          }
+        ]
+      }
+    })
+    // 一个还在工作中：不算待人工。
+    store.tickets.put({ id: 'ticket-working', at: AT, body: base })
+    // 已结束的 Ticket 即使留着 attention 也不算。
+    store.tickets.put({
+      id: 'ticket-ended',
+      at: AT,
+      body: {
+        ...base,
+        attention: { id: 'attention-2', question: 'stale?', at: AT },
+        ended: { at: AT, by: 'person', outcome: 'dropped' }
+      }
+    })
+
+    const counts = readAttentionCounts(store)
+    assert.deepEqual(counts, { answer: 1, review: 1 })
+    const shell = emptyState()
+    const view = statusBarView({
+      ...shell,
+      attention: { ...shell.attention, ...counts }
+    })
+    assert.equal(view.text, 'Superagent 2')
+    assert.equal(view.tone, 'warning', 'waiting for a person is a warning tone, not an error')
+    assert.equal(view.tooltip, '1 awaiting answer · 1 awaiting review · 0 problems')
+  } finally {
+    cleanup()
+  }
+})
+
+test('the problem count in the tooltip is the real health problem count', () => {
+  const board = new HealthBoard()
+  board.claim('runtime', { state: 'ready', detail: 'loopback api on 127.0.0.1:3847' })
+  board.claim('github', { state: 'error', detail: 'poll failed 3 times' })
+  board.claim('feishu', { state: 'error', detail: 'event stream closed' })
+  const summary = healthSummary(
+    Object.fromEntries(
+      Object.entries(board.all()).map(([name, entry]) => [name, { ...entry, at: AT }])
+    )
+  )
+  assert.equal(summary.problems, 2)
+  const shell = emptyState()
+  const view = statusBarView({
+    ...shell,
+    health: { ...shell.health, error: summary.error },
+    attention: { ...shell.attention, problems: summary.problems }
+  })
+  assert.equal(view.text, 'Superagent error')
+  assert.equal(view.tone, 'danger')
+  assert.equal(view.tooltip, '0 awaiting answer · 0 awaiting review · 2 problems')
 })
