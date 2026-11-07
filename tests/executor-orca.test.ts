@@ -1802,6 +1802,67 @@ test('agent status: a done event after a human stop is idempotent compensation, 
   await h.cleanup()
 })
 
+test('agent status: each of the four states is persisted on the ticket with the moment it was observed', async () => {
+  // §E.7 的四个状态要能在库里读回（#58）：Ticket 上带 `agentState` 与 `agentStateAt`，重启后
+  // 读模型照样拿得到。`waiting` 结束 Assignment 但状态留在 `waiting`（§E.8 第 7 行的观测值）。
+  for (const state of ['working', 'blocked', 'waiting', 'done'] as const) {
+    const h = harness()
+    h.seed(runningWithTerminal())
+    withTerminal(h.runtime)
+
+    await statusOf(h)(event(state, { terminalId: 'term_1' }))
+
+    const stored = h.read('ticket-11')!
+    assert.equal(stored.agentState, state, `${state} is written to the ticket`)
+    assert.equal(stored.agentStateAt, AT, `${state} keeps the moment it was observed`)
+    await h.cleanup()
+  }
+})
+
+test('agent status: an ending assignment settles a stale blocked to done, and a human stop clears it', async () => {
+  // 附录 C S7 的回落：不等事件，直接置为结束；事件只作幂等补偿。陈旧的 blocked 不该留下来
+  // 把 Ticket 永远钉在 Blocked（§E.8 的收尾行）；`done` 仍是那一行集合的成员。
+  const h = harness()
+  h.seed(
+    ticket({
+      agentState: 'blocked',
+      agentStateAt: AT,
+      assignments: [
+        {
+          id: 'a-1',
+          state: 'running',
+          createdAt: AT,
+          startedAt: AT,
+          terminalId: 'term_1',
+          report: { state: 'blocked', summary: 'need a decision', at: AT }
+        }
+      ]
+    })
+  )
+  withTerminal(h.runtime)
+
+  await statusOf(h)(event('done', { terminalId: 'term_1' }))
+
+  const settled = h.read('ticket-11')!
+  assert.equal(settled.agentState, 'done', 'the ended turn settles the observation')
+  assert.deepEqual(ticketStage(settled), { stage: 'person', action: 'blocked' }, 'row 5 still holds on done')
+  await h.cleanup()
+
+  const stopped = harness()
+  stopped.seed(
+    ticket({
+      agentState: 'blocked',
+      agentStateAt: AT,
+      assignments: [{ id: 'a-1', state: 'running', createdAt: AT, startedAt: AT, terminalId: 'term_1' }]
+    })
+  )
+  withTerminal(stopped.runtime)
+  stopped.engine.stopTicket('ticket-11')
+  await stopped.effects.idle()
+  assert.equal(stopped.read('ticket-11')!.agentState, 'done', 'a closed ticket leaves no stale blocked')
+  await stopped.cleanup()
+})
+
 // ---- 崩溃 / 重启恢复（§E.5、§E.10）：全机终端枚举，认领或重建 -------------------------
 
 /** 恢复夹具：一个仍在跑的 Assignment 与它记录下来的 worktree。 */
@@ -1825,6 +1886,9 @@ function resumeHarness(options: {
     ticket({
       id: options.id ?? 'ticket-11',
       execution: { name: 'fix-the-login-flow', directory, assignment: 'the brief' },
+      // 重启前 agent 停在提示上：认领（adopt）不该改写它，重建（interrupt）则收尾成 done。
+      agentState: 'blocked',
+      agentStateAt: AT,
       assignments: [
         {
           id: `${options.id ?? 'ticket-11'}-a1`,
@@ -1853,6 +1917,9 @@ test('resume adopts a live terminal whose worktree is this ticket and says resto
 
   const stored = h.read('ticket-11')!
   assert.deepEqual(stored.assignments.map((item) => item.state), ['running'], 'the assignment is adopted')
+  // 认领是「会话还在」：观测值原样保留（§E.10 的恢复不改事实，下一个事件才改）。
+  assert.equal(stored.agentState, 'blocked', 'an adopted assignment keeps the observed agent state')
+  assert.equal(stored.agentStateAt, AT, 'and the moment it was observed')
   assert.equal(h.runtime.calls.sent.length, 1, 'the worker is told it was restored')
   const sent = h.runtime.calls.sent[0]!
   assert.equal(sent.terminalId, 'term_1')
@@ -1924,6 +1991,7 @@ test('resume interrupts a terminal that is alive but belongs to another worktree
 
   assert.deepEqual(report.assignments.map((item) => item.outcome), ['interrupted'])
   assert.equal(h.read('ticket-11')?.assignments[0]?.endedReason, 'interrupted')
+  assert.equal(h.read('ticket-11')?.agentState, 'done', 'the replaced session leaves no stale blocked')
   assert.deepEqual(h.runtime.calls.sent, [], 'the wrong terminal is never written to')
   await h.cleanup()
 })

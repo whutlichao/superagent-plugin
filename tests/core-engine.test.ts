@@ -1281,6 +1281,66 @@ describe('worker reports', () => {
       (error: unknown) => error instanceof UserError && error.code === 'ticketEnded'
     )
   })
+
+  test('an observed agent state is written with its time and decides the two set-membership rows (\u00a7E.8)', () => {
+    const h = harness()
+    const ticketId = accepted(h).ticketId!
+    // 还没观测：blocked 报告不满足 `agentState \u2208 {blocked, done}`，落到 working。
+    h.engine.report(ticketId, { state: 'blocked', summary: 'need permission' })
+    h.tick(1)
+    assert.deepEqual(ticketStage(h.opened.tickets.get(ticketId)!), { stage: 'working' })
+
+    // 执行器观测到 agent 停在提示上：同一张 Ticket 现在落 person/blocked。
+    h.engine.agentStateChanged(ticketId, 'blocked')
+    const blocked = h.opened.tickets.get(ticketId)!
+    assert.equal(blocked.agentState, 'blocked')
+    assert.equal(blocked.agentStateAt, '2026-09-23T00:00:01.000Z', 'the moment of the observation is kept')
+    assert.deepEqual(ticketStage(blocked), { stage: 'person', action: 'blocked' })
+    // 显式传 `null` 仍是「未观察」：§E.8 的集合成员不变松。
+    assert.deepEqual(ticketStage(blocked, null), { stage: 'working' })
+
+    // 第二个维度：waiting 报告 + agent 空闲 -> idle。
+    h.engine.report(ticketId, { state: 'waiting', summary: 'idle for now' })
+    h.engine.agentStateChanged(ticketId, 'waiting')
+    assert.deepEqual(ticketStage(h.opened.tickets.get(ticketId)!), { stage: 'idle' })
+  })
+
+  test('ending an assignment or a ticket settles the observed state to done, so no stale blocked sticks', () => {
+    const h = harness()
+    const ticketId = accepted(h).ticketId!
+    h.engine.agentStateChanged(ticketId, 'blocked')
+    h.engine.report(ticketId, { state: 'blocked', summary: 'need permission' })
+    h.tick(1)
+    assert.deepEqual(ticketStage(h.opened.tickets.get(ticketId)!), { stage: 'person', action: 'blocked' })
+
+    // 一轮结束：Assignment 结束，`done` 仍是那块集合的成员，所以 blocked/failed 不会被抹掉。
+    h.engine.assignmentEnded(ticketId, h.opened.tickets.get(ticketId)!.assignments.at(-1)!.id, 'done')
+    const settled = h.opened.tickets.get(ticketId)!
+    assert.equal(settled.agentState, 'done')
+    assert.deepEqual(ticketStage(settled), { stage: 'person', action: 'blocked' })
+
+    // 人停掉：Ticket 结束时同样收尾（终端关闭不等事件，附录 C S7 的回落）。
+    const other = harness()
+    const otherId = accepted(other).ticketId!
+    other.engine.agentStateChanged(otherId, 'blocked')
+    other.engine.stopTicket(otherId)
+    assert.equal(other.opened.tickets.get(otherId)!.agentState, 'done')
+  })
+
+  test('refuses an agent state for an unknown ticket and leaves an ended ticket alone', () => {
+    const h = harness()
+    const ticketId = accepted(h).ticketId!
+    assert.throws(
+      () => h.engine.agentStateChanged('nope', 'working'),
+      (error: unknown) => error instanceof UserError && error.code === 'unknownTicket'
+    )
+    h.engine.stopTicket(ticketId)
+    const done = h.opened.tickets.get(ticketId)!.agentStateAt
+    h.engine.agentStateChanged(ticketId, 'blocked')
+    const after = h.opened.tickets.get(ticketId)!
+    assert.equal(after.agentState, 'done', 'a late compensation event never reopens the ending')
+    assert.equal(after.agentStateAt, done)
+  })
 })
 
 describe('outcomes', () => {

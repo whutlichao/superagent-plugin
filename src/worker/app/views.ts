@@ -7,6 +7,7 @@ import {
   latestAssignment,
   latestReport,
   ticketStage,
+  type AgentState,
   type Assignment,
   type FollowupRecords,
   type Thread,
@@ -76,6 +77,11 @@ export interface TicketView {
   readonly title: string
   /** §E.8 的七档之一；已结束的没有标签。 */
   readonly stage: StageLabel | 'ended'
+  /**
+   * 执行器观测到的 agent 状态（§E.7 的四态）。它已随 Ticket 持久化（`agentState`），所以
+   * 读模型直接给出它——stage 的 §E.8 两行集合成员用的就是这次观测。没观测过则省略。
+   */
+  readonly agentState?: AgentState
   readonly strength: 'explicit' | 'inferred'
   readonly actor: string
   readonly createdAt: string
@@ -124,6 +130,7 @@ export function ticketView(
     id: ticket.id,
     title: ticket.title,
     stage,
+    ...(ticket.agentState === undefined ? {} : { agentState: ticket.agentState }),
     strength: ticket.mandate.strength,
     actor: `${ticket.mandate.actor.source}:${ticket.mandate.actor.id}`,
     createdAt: ticket.createdAt,

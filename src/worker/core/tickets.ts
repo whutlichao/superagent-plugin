@@ -12,6 +12,7 @@ import {
   waitsForPerson
 } from './model.ts'
 import type {
+  AgentState,
   Assignment,
   ChannelRef,
   Evaluation,
@@ -579,6 +580,8 @@ export class Tickets extends EnginePart {
     ticket.ended = { at, by, outcome, ...why }
     ticket.undelivered = []
     ticket.updatedAt = this.now()
+    // 终端关闭直接置为 `done`，不等事件（附录 C S7 的回落）：关掉的工单不留陈旧的 `blocked`。
+    this.agentSettled(ticket, at)
     delete ticket.attention
     delete ticket.delivery
     // 结束停掉的 Assignment 也随它结束，记的是结局码（§E.5 的 `ended(reason: stopped)`）；
@@ -634,7 +637,34 @@ export class Tickets extends EnginePart {
     assignment.state = 'ended'
     assignment.endedAt = this.now()
     assignment.endedReason = reason
+    // 替换/重试/中断之后，旧会话的 agent 状态不再说得上话（§E.7 的 `done`）。
+    this.agentSettled(ticket, assignment.endedAt)
     this.emit('assignment.ended', { ticketId: ticket.id, assignmentId: assignment.id, reason })
+  }
+
+  /**
+   * 记下执行器观测到的 agent 状态（§E.7）并留下观测时刻。这是 `agentState` 的唯一写入口
+   * （§D.4：Ticket 的写者只有本部件，执行器经 `Engine.agentStateChanged` 进来）；已结束的
+   * Ticket 不再改——收尾的 `done` 不该被迟到的补偿事件改写。
+   * @throws UserError Ticket 未知。
+   */
+  observed(ticketId: string, state: AgentState, at = this.now()): void {
+    const ticket = this.require(ticketId)
+    if (!liveTicket(ticket)) return
+    ticket.agentState = state
+    ticket.agentStateAt = at
+    this.repo.tickets.save(ticket)
+  }
+
+  /**
+   * agent 状态随 Assignment 一起收尾：会话结束、终端关闭、被替换或 Ticket 结束时都记 `done`
+   * （§E.7 的 `done`，§E.8 的收尾行）。陈旧的 `blocked` 因此不会把 Ticket 永远钉在「阻塞」，
+   * 而 `done` 在 §E.8 的两行集合里仍然成立。收尾是无条件的（`end` 会先置 `ended`）；拒绝
+   * 已结束 Ticket 的只有事件入口 `observed`。
+   */
+  agentSettled(ticket: Ticket, at = this.now()): void {
+    ticket.agentState = 'done'
+    ticket.agentStateAt = at
   }
 
   /**

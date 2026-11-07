@@ -195,6 +195,64 @@ test('a restart adopts the running assignment instead of opening a second ticket
   }
 })
 
+test('a restart keeps the observed agent state, and an adopted session does not rewrite it', async () => {
+  // #58：`agentState` 随 Ticket 落库（§E.7），所以重启后读模型读到的是同一次观测；认领（§E.10）
+  // 只投一条「已恢复」，不改写事实——下一个真实事件才改。
+  interface Row {
+    readonly id: string
+    readonly agentState?: string
+    readonly assignment?: { readonly terminalId?: string }
+  }
+  const first = await openBoot()
+  const stateDir = first.stateDir
+  const rows = async (port: number): Promise<Row[]> => {
+    const read = await cli(stateDir, port, ['read', 'tickets'], readApiToken(stateDir))
+    assert.equal(read.exit, 0)
+    return (read.envelope as { result: { items: Row[] } }).result.items
+  }
+  try {
+    await first.handle.pollOnce()
+    await first.handle.passOnce()
+    await first.handle.passOnce()
+    await first.handle.passOnce()
+    const terminalId = (await rows(first.handle.port()!))[0]?.assignment?.terminalId
+    assert.equal(typeof terminalId, 'string', 'the ticket runs on a terminal')
+
+    await first.handle.onAgentStatus({
+      workspaceId: null,
+      paneKey: '',
+      terminalId,
+      state: 'working',
+      receivedAt: 1
+    })
+    assert.equal((await rows(first.handle.port()!))[0]?.agentState, 'working', 'the event reached the ticket')
+
+    await first.handle.shutdown()
+    const second = await openBoot({ stateDir, boot: async (_dir, _runtime, commands) => {
+      const { bootPlugin } = await import('../src/worker/boot')
+      return bootPlugin({
+        runtime: first.runtime,
+        readSettings: async () => firstSettings(stateDir),
+        commands,
+        stateDir,
+        disableTimers: true
+      })
+    } })
+    try {
+      assert.equal(second.handle.resumeReport()?.assignments[0]?.outcome, 'adopted')
+      assert.equal(
+        (await rows(second.handle.port()!))[0]?.agentState,
+        'working',
+        'the state survived the restart'
+      )
+    } finally {
+      await second.cleanup()
+    }
+  } finally {
+    await first.cleanup()
+  }
+})
+
 test('the composition root wires a handler for every effect kind, and each reports its counts', async () => {
   const h = await openBoot()
   try {

@@ -41,8 +41,9 @@ const idleAgent = (state: AgentState | null | undefined): boolean =>
   state === 'waiting' || state === 'done'
 
 /**
- * 按 §E.8 的表判定 Ticket 的阶段；`agentState` 是 Orca 新加的维度，`null`/省略表示
- * 尚未观察到——它不满足任何集合成员条件，因此那两行都不命中，按表继续往下落。
+ * 按 §E.8 的表判定 Ticket 的阶段；`agentState` 是 Orca 新加的维度。省略它时用 Ticket 自己
+ * 持久化的 `agentState`（执行器写入，§E.7）；`null` 表示显式按「尚未观察到」判定——它不满足
+ * 任何集合成员条件，因此那两行都不命中，按表继续往下落。
  *
  * | 行 | 条件 | 阶段 |
  * | --- | --- | --- |
@@ -56,6 +57,8 @@ const idleAgent = (state: AgentState | null | undefined): boolean =>
  * | 8 | 其余 | working |
  */
 export function ticketStage(ticket: Ticket, agentState?: AgentState | null): TicketStage {
+  // 读模型不传第二维时，判定用的是 Ticket 上持久化的那次观测（这是生产路径）。
+  const observed = agentState === undefined ? ticket.agentState : agentState
   if (ticket.ended) return { stage: 'ended' }
   if (ticket.delivery) return { stage: 'person', action: 'delivery' }
   if (ticket.attention) return { stage: 'person', action: 'answer' }
@@ -66,12 +69,12 @@ export function ticketStage(ticket: Ticket, agentState?: AgentState | null): Tic
   if (
     (report === 'blocked' || report === 'failed') &&
     waitsForPerson(ticket) &&
-    settledAgent(agentState)
+    settledAgent(observed)
   ) {
     return { stage: 'person', action: report }
   }
   if (!assignment || assignment.state === 'pending') return { stage: 'working', action: 'queued' }
-  if ((report === 'waiting' || assignment.state === 'ended') && idleAgent(agentState)) {
+  if ((report === 'waiting' || assignment.state === 'ended') && idleAgent(observed)) {
     return { stage: 'idle' }
   }
   return { stage: 'working' }
