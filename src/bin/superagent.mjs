@@ -13,9 +13,17 @@
 // 类型剥离），所以入口不需要构建步骤，仓库也仍然「零运行时依赖」。
 import { main } from '../worker/cli/main.ts'
 
+/** `--decisions -` / `--assessment -`：从 stdin 读一次全部正文。 */
+async function stdinText() {
+  const chunks = []
+  for await (const chunk of process.stdin) chunks.push(chunk)
+  return Buffer.concat(chunks).toString('utf8')
+}
+
 const exit = await main({
   argv: process.argv.slice(2),
-  env: process.env
+  env: process.env,
+  stdin: stdinText
 })
 
 process.exitCode = exit.exit

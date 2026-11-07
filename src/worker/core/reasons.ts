@@ -11,6 +11,8 @@ export const REASONS = {
   startedTicket: 'Already started ticket {ticket}',
   acceptedBefore: 'Trigger {trigger} was accepted before',
   routed: 'Routed to ticket {ticket}',
+  explicitRouted: 'Explicit request from an allowed sender routed by the Router',
+  humanStop: 'A person asked to stop',
   forwarded: 'Forwarded to the worker of the Ticket already on this Thread',
   senderNotMember: 'The sender is not on the Source\'s list',
   notHuman: 'The sender is not a person and is not on the Source\'s bots list',

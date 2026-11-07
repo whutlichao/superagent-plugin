@@ -7,11 +7,12 @@
 // 列表，stateDir 用临时目录（§P.1：真库/真目录，不 mock 内部层）。
 import { describe, test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdirSync, rmSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, rmSync, statSync } from 'node:fs'
 import { join } from 'node:path'
 import { runSetupChecks } from '../src/worker/app/setup'
 import type { SetupCheckInput, SetupReport } from '../src/worker/app/setup'
 import { runDoctor } from '../src/worker/app/doctor'
+import { GITCONFIG_MODE, workerGitConfigPath } from '../src/worker/infra/gitconfig'
 import { bootPlugin } from '../src/worker/boot'
 import { dispatch } from '../src/worker/cli/commands'
 import { parseArgs } from '../src/worker/cli/io'
@@ -112,6 +113,40 @@ describe('the setup probes tell a person one missing thing at a time', () => {
           ['gh', 'api', 'user', '--jq', '.login']
         ]
       )
+    } finally {
+      rmSync(stateDir, { recursive: true, force: true })
+    }
+  })
+
+  test('a ready deployment writes the worker git config; an unfinished identity is a named issue', async () => {
+    const stateDir = tempStateDir()
+    try {
+      const email = '1+acme-agent@users.noreply.github.com'
+      const { report } = await checksOf(stateDir, { overrides: { gitConfig: { email } } })
+      assert.deepEqual(report.issues, [])
+      const path = workerGitConfigPath(stateDir)
+      assert.equal(existsSync(path), true, 'the setup check really writes the file')
+      assert.equal(statSync(path).mode & 0o777, GITCONFIG_MODE, 'mode 0600')
+      const text = readFileSync(path, 'utf8')
+      assert.ok(text.includes(email), 'the commit email comes from the deployment')
+      assert.ok(text.includes('acme-agent'), 'the account comes from the probed gh login')
+      assert.equal(text.includes('ghp_'), false, 'no token is ever written')
+
+      // 身份不完整：不写文件（宁可回落到操作者环境），并给一条具名问题。
+      rmSync(path)
+      const unfinished = await checksOf(stateDir, { overrides: { gitConfig: { email: '   ' } } })
+      const missing = issueOf(unfinished.report, 'gitconfig_missing')
+      assert.equal(missing?.place, 'executor')
+      assert.equal(missing?.kind, 'missing')
+      assert.equal(existsSync(path), false, 'a partial identity writes nothing')
+
+      // 路径被占用、写不进去：broken（有原因），而不是静默。
+      mkdirSync(path, { recursive: true })
+      const blocked = await checksOf(stateDir, { overrides: { gitConfig: { email } } })
+      const unwritable = issueOf(blocked.report, 'gitconfig_unwritable')
+      assert.equal(unwritable?.place, 'executor')
+      assert.equal(unwritable?.kind, 'broken')
+      assert.ok(unwritable?.detail.includes(path), 'the path is not a secret (§N.5)')
     } finally {
       rmSync(stateDir, { recursive: true, force: true })
     }
@@ -546,6 +581,63 @@ describe('the setup check on the composition root', () => {
       assert.equal(result['problem'], null)
       assert.equal(result['restarted'], true, 'the router supervision was armed')
       assert.equal(h.handle.snapshot().health.setupMissing, false)
+    } finally {
+      await h.cleanup()
+    }
+  })
+
+  test('the worker git config exists after start with mode 0600 and the agent identity', async () => {
+    const h = await openBoot()
+    try {
+      const path = workerGitConfigPath(h.stateDir)
+      assert.equal(existsSync(path), true, 'boot writes the file the launch hook points at')
+      assert.equal(statSync(path).mode & 0o777, GITCONFIG_MODE)
+      const text = readFileSync(path, 'utf8')
+      assert.ok(text.includes('!gh auth git-credential'), 'the agent account gh is the credential helper')
+      assert.ok(text.includes('git@github.com:'), 'SSH URIs are rewritten to HTTPS')
+      assert.ok(text.includes('acme-agent'), 'the name is the agent account (probed from gh)')
+      assert.ok(text.includes('1+acme-agent@users.noreply.github.com'), 'the email is the deployment noreply')
+      assert.equal(h.handle.snapshot().health.setupMissing, false, 'a written file is not a setup problem')
+    } finally {
+      await h.cleanup()
+    }
+  })
+
+  test('a worker git config that cannot be written is a named setup problem', async () => {
+    const stateDir = tempStateDir()
+    // 路径被同名目录占住：写文件不可能成功。
+    mkdirSync(workerGitConfigPath(stateDir), { recursive: true })
+    const h = await openBoot({ stateDir })
+    try {
+      assert.equal(h.handle.snapshot().health.setupMissing, true)
+      const port = h.handle.port() as number
+      const status = await runCli(h.stateDir, port, ['status'])
+      const problem = ((status.envelope as { result: Record<string, unknown> }).result['setup'] as {
+        problem: Record<string, unknown>
+      }).problem
+      assert.equal(problem['place'], 'executor')
+      assert.equal(problem['code'], 'gitconfig_unwritable')
+      assert.equal(String(problem['fix']).length > 0, true, 'the issue carries a fix')
+    } finally {
+      await h.cleanup()
+    }
+  })
+
+  test('an unfinished identity leaves the file missing and says what to configure', async () => {
+    const stateDir = tempStateDir()
+    const settings = { ...settingsOf(stateDir) }
+    delete settings['githubCommitEmail']
+    const h = await openBoot({ stateDir, settings })
+    try {
+      assert.equal(existsSync(workerGitConfigPath(stateDir)), false, 'no partial identity is written')
+      const port = h.handle.port() as number
+      const status = await runCli(h.stateDir, port, ['status'])
+      const problem = ((status.envelope as { result: Record<string, unknown> }).result['setup'] as {
+        problem: Record<string, unknown>
+      }).problem
+      assert.equal(problem['place'], 'executor')
+      assert.equal(problem['code'], 'gitconfig_missing')
+      assert.match(String(problem['fix']), /githubCommitEmail/)
     } finally {
       await h.cleanup()
     }

@@ -23,6 +23,7 @@ import type { SchemaIssue } from '../src/worker/infra/schema.ts'
 import {
   ADMISSION_DEFAULTS,
   ADMISSION_OPTIONS,
+  assessmentOutcome,
   createPolicy,
   UNVERSIONED_POLICY,
   validatePolicy
@@ -740,52 +741,54 @@ describe('the policy block schema', () => {
   })
 })
 
-describe('the engine records what the gate refused', () => {
-  /** 真引擎 + 内存仓储 + 本套件的真 Policy：只看 Gate 与 Decision/去向的接缝。 */
-  function engineHarness(initial: FixtureInput = {}) {
-    let current = fixture(initial)
-    const opened = new MemoryRepositories()
-    const repo = opened.claimWriter()
-    const requests: Candidate[] = []
-    const scope = { scope: (trigger: Trigger) => scopeOf(trigger, initial.observe ?? [TEAM]) }
-    const policy = () =>
-      createPolicy({
-        block: () => current.block,
-        sources: scope,
-        rows: (source: string) => (source === 'chat' ? rowsOf(initial.observe ?? [TEAM]) : []),
-        version: () => UNVERSIONED_POLICY
-      })
-    const engine = new Engine({
-      repo,
-      scope,
-      policy,
-      assessor: {
-        request: (candidate: Candidate) => {
-          requests.push(candidate)
-        }
-      },
-      executor: {
-        start: () => undefined,
-        deliver: () => undefined,
-        stop: () => undefined
-      },
-      outbox: {
-        send: () => undefined,
-        status: () => undefined,
-        withdraw: () => undefined
-      },
-      now: () => AT
+/** 真引擎 + 内存仓储 + 本套件的真 Policy：只看 Gate、评估与 Decision/Ticket 的接缝。 */
+function engineHarness(initial: FixtureInput = {}) {
+  let current = fixture(initial)
+  const opened = new MemoryRepositories()
+  const repo = opened.claimWriter()
+  const requests: Candidate[] = []
+  const scope = { scope: (trigger: Trigger) => scopeOf(trigger, initial.observe ?? [TEAM]) }
+  const policy = () =>
+    createPolicy({
+      block: () => current.block,
+      sources: scope,
+      rows: (source: string) => (source === 'chat' ? rowsOf(initial.observe ?? [TEAM]) : []),
+      version: () => UNVERSIONED_POLICY
     })
-    return {
-      engine,
-      repo,
-      requests,
-      replace: (input: FixtureInput) => {
-        current = fixture(input)
+  const engine = new Engine({
+    repo,
+    scope,
+    policy,
+    assessor: {
+      request: (candidate: Candidate) => {
+        requests.push(candidate)
       }
+    },
+    executor: {
+      start: () => undefined,
+      deliver: () => undefined,
+      stop: () => undefined
+    },
+    outbox: {
+      send: () => undefined,
+      status: () => undefined,
+      withdraw: () => undefined
+    },
+    now: () => AT
+  })
+  return {
+    engine,
+    repo,
+    requests,
+    /** 当前的 Policy 块：评估的完整性/模式以它为真相（§K.4）。 */
+    block: () => current.block,
+    replace: (input: FixtureInput) => {
+      current = fixture(input)
     }
   }
+}
 
+describe('the engine records what the gate refused', () => {
   test('a refused Trigger leaves a filtered record with its reason code, no candidate and no Ticket', () => {
     const { engine, repo, requests } = engineHarness()
     assert.equal(engine.receive(inRow(TEAM, GUEST)), 'stored')
@@ -808,5 +811,74 @@ describe('the engine records what the gate refused', () => {
     assert.equal(engine.reevaluate('trigger-1'), true)
     engine.evaluateDue()
     assert.equal(repo.triggers.disposition('trigger-1')?.filtered, undefined)
+  })
+})
+
+describe('accept mode and the assessment outcome (§K.4)', () => {
+  /** 一份通过完整性检查的评估：唯一的规则 `copy` 匹配，方向已定。 */
+  const assessment = {
+    decision: 'accept',
+    direction: {
+      implementation_requested: true,
+      target_basis: 'specified',
+      requires_design_decision: false,
+      evidence: 'the message names the typo'
+    },
+    rule_assessments: [{ rule_id: 'copy', matched: true, reason: 'it is a typo fix' }],
+    title: 'Fix the typo',
+    scope: 'one typo',
+    reason: 'asked',
+    intent_evidence: 'please fix the typo',
+    worktree_name: 'fix-typo'
+  }
+
+  /** 跑一次候选 → 评估 → Decision，返回观测到的这些东西。 */
+  function assessed(acceptMode: AcceptMode) {
+    const h = engineHarness({ acceptMode })
+    h.engine.receive(inRow(TEAM, MEMBER))
+    h.engine.evaluateDue()
+    const candidate = h.requests[0]
+    if (candidate === undefined) return { h, candidate, decision: undefined, outcome: undefined }
+    const result = assessmentOutcome(assessment, h.block(), candidate.strength)
+    assert.equal(result.ok, true, JSON.stringify(result))
+    if (!result.ok) throw new Error('unreachable')
+    const decision = h.engine.decide('trigger-1', { ...result.outcome, evalId: candidate.evalId })
+    return { h, candidate, decision, outcome: result.outcome }
+  }
+
+  test('observe records would-accept without a ticket (R6)', () => {
+    const { h, candidate, decision, outcome } = assessed('observe')
+    assert.notEqual(candidate, undefined, 'observe still assesses the candidate')
+    assert.equal(candidate?.strength, 'inferred')
+    assert.equal(outcome?.kind, 'ignore')
+    assert.equal(decision?.kind, 'ignore')
+    assert.equal(decision?.reason.some((reason) => reason.code === 'observed'), true)
+    assert.deepEqual(decision?.audit?.['would_accept'], true)
+    assert.equal(decision?.ticketId, undefined)
+    assert.deepEqual(h.repo.tickets.list(), [], 'observe creates no ticket')
+  })
+
+  test('off records nothing actionable: a Decision with a reason, no ticket, no candidate', () => {
+    const h = engineHarness({ acceptMode: 'off' })
+    h.engine.receive(inRow(TEAM, MEMBER))
+    h.engine.evaluateDue()
+    assert.deepEqual(h.requests, [], 'off admits no inferred candidate')
+    const [decision] = h.repo.decisions.byThread('chat:room')
+    assert.equal(decision?.kind, 'ignore')
+    assert.ok((decision?.reason.length ?? 0) > 0, 'the ignore carries a reason')
+    assert.equal(decision?.ticketId, undefined)
+    assert.deepEqual(h.repo.tickets.list(), [])
+  })
+
+  test('auto accepts the proactive candidate: a Ticket with the matched rule in its mandate', () => {
+    const { h, decision, outcome } = assessed('auto')
+    assert.equal(outcome?.kind, 'accept')
+    assert.equal(decision?.kind, 'accept')
+    const [ticket] = h.repo.tickets.list()
+    assert.notEqual(ticket, undefined, 'auto creates the ticket')
+    assert.equal(ticket?.id, decision?.ticketId)
+    assert.deepEqual(ticket?.mandate.basis.rules, ['copy'])
+    assert.equal(ticket?.mandate.strength, 'inferred')
+    assert.equal(ticket?.mandate.scope, 'one typo')
   })
 })

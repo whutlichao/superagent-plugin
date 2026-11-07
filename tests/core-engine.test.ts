@@ -12,6 +12,7 @@ import {
   ticketStage,
   UserError
 } from '../src/worker/core/index.ts'
+import { assessmentOutcome } from '../src/worker/policy/index.ts'
 import type {
   Assignment,
   Candidate,
@@ -278,6 +279,59 @@ describe('eval', () => {
     h.pump()
     assert.deepEqual(h.requests[1]!.triggers.map((item) => item.id), ['2', '3'])
     assert.equal(h.requests[1]!.strength, 'explicit')
+  })
+
+  test('accepts a proactive candidate once, with its matched rules in the mandate (§K.4)', () => {
+    // 一个把名单外的人判成推断候选的 Gate：本用例只看「评估 → 接受」这一段，
+    // 人与 Ticket 的归属（follow-up）由 `subscription fan-out` 套件覆盖。
+    const h = harness({
+      gate: (t) =>
+        t.actor.id === 'alice'
+          ? { admissible: true, strength: 'explicit', basis: { via: 'addressed', addressed: 'mention' } }
+          : { admissible: true, strength: 'inferred', basis: { via: 'followup' } }
+    })
+    h.engine.receive(trigger('2', { actor: guest }))
+    h.pump()
+    const candidate = h.requests.at(-1)!
+    assert.equal(candidate.strength, 'inferred')
+    const rules = [
+      { id: 'copy', name: 'Copy fixes', instruction: { zh: '改错别字', en: 'Fix typos' }, enabled: true }
+    ]
+    const result = assessmentOutcome(
+      {
+        decision: 'accept',
+        direction: {
+          implementation_requested: true,
+          target_basis: 'specified',
+          requires_design_decision: false,
+          evidence: 'the message names the typo'
+        },
+        rule_assessments: [{ rule_id: 'copy', matched: true, reason: 'it is a typo' }],
+        title: 'Fix the typo',
+        scope: 'one typo',
+        reason: 'asked',
+        intent_evidence: 'please fix the typo',
+        worktree_name: 'fix-typo'
+      },
+      { acceptMode: 'auto', rules },
+      candidate.strength
+    )
+    assert.equal(result.ok, true, JSON.stringify(result))
+    if (!result.ok) return
+    const decision = h.decide(candidate, result.outcome)
+    h.settle()
+    assert.equal(decision.kind, 'accept')
+    const proactive = h.opened.tickets.get(decision.ticketId!)!
+    assert.deepEqual(proactive.mandate.basis.rules, ['copy'])
+    assert.equal(proactive.mandate.strength, 'inferred')
+    assert.equal(proactive.mandate.scope, 'one typo')
+    assert.equal(h.opened.tickets.list().length, 1)
+    assert.equal(h.starts, 1, 'the accepted ticket asked the executor for an assignment')
+
+    // 同一条 Trigger 再决定一次：幂等，不建第二张 Ticket。
+    const replay = h.engine.decide('2', result.outcome)
+    assert.equal(replay.id, decision.id)
+    assert.equal(h.opened.tickets.list().length, 1)
   })
 
   test('accept creates a ticket with a mandate, subscribes the thread, queues the acknowledgement and starts an assignment', () => {

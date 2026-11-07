@@ -31,6 +31,7 @@ import type { PolicyKindView } from './policy/index.ts'
 import { resolveRoles } from './app/roles.ts'
 import { ROUTER_RESTARTS_KEY, ROUTER_TERMINAL_KEY, ROUTER_WORKSPACE_KEY, PROMPT_REVISION_KEY } from './app/kv.ts'
 import { createDeterministicAssessor } from './app/assessor.ts'
+import { createRouterTools } from './app/assessment.ts'
 import { createOutbox, registerReplyEffects } from './app/outbox.ts'
 import { createPausedState } from './app/pause.ts'
 import {
@@ -81,6 +82,7 @@ import { launchCapacity } from './executor/slots.ts'
 import { resumeAfterUpgrade, type ResumeReport } from './executor/resume.ts'
 import { DEFAULT_MAX_WORKERS } from './http/state.ts'
 import { createDomainHandlers, withDomainHandlers } from './http/domain.ts'
+import { createAssessmentHandlers, withAssessmentHandlers } from './http/assessment.ts'
 import { ROUTE_TABLE, type RouteDefinition } from './http/routes.ts'
 import type { LoopEntry } from './http/state.ts'
 import { startHttpServer, type HttpServerHandle } from './http/server.ts'
@@ -307,6 +309,11 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
     githubCli: githubInstance.cli,
     githubEnabled: githubInstance.enabled,
     ...(feishuCli === undefined ? {} : { feishuCli }),
+    // worker 的提交身份（§H.11）：账号以探针读到的 `gh` 为准，邮箱来自设置（§E.11 同源）。
+    gitConfig: {
+      email: text(settings['githubCommitEmail']) ?? '',
+      account: text(settings['githubLogin']) ?? ''
+    },
     ports: {
       run: (program, args) => commandPort.run(program, args),
       repos: () => options.runtime.listRepos(),
@@ -613,7 +620,26 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
       refresh()
     }
   })
-  const routes: readonly RouteDefinition[] = withDomainHandlers(ROUTE_TABLE, domain)
+  // Router 的两条命令（§G.2 的 `route` / `eval-decide`）：策略判断在 `policy/assessment.ts`，
+  // 领域写入经 Engine；版本与块取组合根持有的那一份（#25 把版本换成内容哈希）。
+  const routerTools = createRouterTools({
+    candidate: (triggerId) => engine.candidate(triggerId),
+    policy: () => ({ acceptMode: policyBlock.acceptMode, rules: policyBlock.rules }),
+    policyVersion: () => policy.version,
+    decide: (triggerId, outcome) => engine.decide(triggerId, outcome),
+    attach: (ticketId, triggerId, note) => engine.attach(ticketId, triggerId, note),
+    ticketOf: (id) => repo.tickets.get(id),
+    log: (message) => logger.warn(message)
+  })
+  const routes: readonly RouteDefinition[] = withAssessmentHandlers(
+    withDomainHandlers(ROUTE_TABLE, domain),
+    createAssessmentHandlers({
+      tools: routerTools,
+      afterWrite: () => {
+        refresh()
+      }
+    })
+  )
 
   ensureApiToken(resolved)
   const http: HttpServerHandle = await startHttpServer({

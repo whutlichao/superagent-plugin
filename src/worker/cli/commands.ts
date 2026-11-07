@@ -54,6 +54,8 @@ export interface CommandArgs {
   /** 位置参数（不含命令路径）。 */
   readonly positionals: readonly string[]
   readonly flags: Readonly<Record<string, string | true>>
+  /** 可重复 flag 的全部取值（`--item`；§G.2 的 route 行）。 */
+  readonly repeated: Readonly<Record<string, readonly string[]>>
   /** `--text`。 */
   readonly text: boolean
 }
@@ -197,7 +199,7 @@ export const CLI_COMMANDS: readonly CommandDefinition[] = [
   },
   {
     name: ['doctor'],
-    summary: 'diagnose token, port, lock, database, CLI paths and logins (presence only; the setup check decides whether to start)',
+    summary: 'diagnose token, port, lock, database, CLI paths, the worker git config and logins (presence only; the setup check decides whether to start)',
     flags: [],
     positionals: [],
     write: false,
@@ -225,7 +227,7 @@ export const CLI_COMMANDS: readonly CommandDefinition[] = [
     ],
     positionals: [],
     write: true,
-    available: false
+    available: true
   },
   {
     name: ['eval'],
@@ -255,7 +257,7 @@ export const CLI_COMMANDS: readonly CommandDefinition[] = [
     flags: [{ name: 'assessment', kind: 'value', hint: 'JSON assessment, or - for stdin' }, REQUEST_ID_FLAG],
     positionals: [{ name: 'trigger_id', required: true }],
     write: true,
-    available: false
+    available: true
   },
 
   // ---- Ticket / Trigger / Thread（#28/#29/#27）
@@ -524,6 +526,7 @@ export async function dispatch(input: DispatchInput): Promise<DispatchResult> {
     const args: CommandArgs = {
       positionals,
       flags,
+      repeated: input.parsed.repeated,
       // `reply --text "…"` 里那个 `--text` 是命令值，不是全局的人读输出开关：输出仍是 JSON
       // 信封，worker 才能解析（§G.1 的 `--text` 只在不被命令声明为值时生效）。
       text: usesTextValue(command, input.parsed) ? false : input.parsed.text
@@ -673,6 +676,66 @@ function summaryFile(args: CommandArgs): string | undefined {
   return readFileSync(path, 'utf8')
 }
 
+/**
+ * 读一个 JSON flag：一个文件路径，或 `-` 表示 stdin（`--decisions -` / `--assessment -`）。
+ * 读不到或不是 JSON 都是 `invalid_params`，消息只提 flag 名，不回显正文或路径。
+ */
+async function jsonFlag(
+  args: CommandArgs,
+  input: DispatchInput,
+  name: string
+): Promise<unknown> {
+  const source = valueArgs(args.flags, name)
+  if (source === undefined) return undefined
+  let text: string
+  if (source === '-') {
+    if (input.stdin === undefined) {
+      throw new ApiError(ERROR_CODES.invalidParams, `--${name} - needs a readable stdin`)
+    }
+    text = await input.stdin()
+  } else {
+    try {
+      text = readFileSync(source, 'utf8')
+    } catch {
+      throw new ApiError(ERROR_CODES.invalidParams, `--${name} could not be read`)
+    }
+  }
+  try {
+    return JSON.parse(text)
+  } catch {
+    throw new ApiError(ERROR_CODES.invalidParams, `--${name} must be JSON`)
+  }
+}
+
+/**
+ * `route` 的入参：`--decisions <file|->`（JSON 数组）或重复的 `--item '<json>'`，二选一。
+ * 条数上限（1–20）由服务端判（`too_many_items`），CLI 只保证形状。
+ */
+async function routeDecisions(args: CommandArgs, input: DispatchInput): Promise<unknown[]> {
+  const items = args.repeated['item'] ?? []
+  const source = valueArgs(args.flags, 'decisions')
+  if (source !== undefined && items.length > 0) {
+    throw new ApiError(ERROR_CODES.invalidParams, 'route takes --decisions or --item, not both')
+  }
+  if (items.length > 0) {
+    return items.map((item) => {
+      try {
+        return JSON.parse(item)
+      } catch {
+        throw new ApiError(ERROR_CODES.invalidParams, 'each --item must be JSON')
+      }
+    })
+  }
+  if (source === undefined) {
+    throw new ApiError(ERROR_CODES.invalidParams, 'route needs --decisions or --item')
+  }
+  const value = await jsonFlag(args, input, 'decisions')
+  if (!Array.isArray(value)) {
+    throw new ApiError(ERROR_CODES.invalidParams, '--decisions must be a JSON array')
+  }
+  return value
+}
+
 /** 写命令的 request id（读命令忽略它：`--request-id` 只对写有意义）。 */
 function requestIdOf(parsed: ParsedArgs): string | null {
   const raw = valueArgs(parsed.flags, REQUEST_ID_FLAG_NAME)
@@ -771,6 +834,24 @@ async function run(
       return call(readPath(resource, args.positionals[1]), {
         method: 'GET',
         query: readQuery(resource, args)
+      })
+    }
+    case 'route':
+      return call('route', { method: 'POST', body: { decisions: await routeDecisions(args, input) } })
+    case 'eval-decide': {
+      const triggerId = args.positionals[0] ?? ''
+      if (triggerId.length === 0) {
+        throw new ApiError(ERROR_CODES.invalidParams, 'eval-decide needs a trigger id')
+      }
+      const assessment = await jsonFlag(args, input, 'assessment')
+      if (assessment === undefined) {
+        throw new ApiError(ERROR_CODES.invalidParams, 'eval-decide needs --assessment', {
+          flag: 'assessment'
+        })
+      }
+      return call(`eval-decide/${encodePathSegment(triggerId)}`, {
+        method: 'POST',
+        body: { assessment }
       })
     }
     default:

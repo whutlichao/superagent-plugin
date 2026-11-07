@@ -28,3 +28,13 @@ export type {
 } from './schema.ts'
 export { createPolicy, UNVERSIONED_POLICY } from './gate.ts'
 export type { PolicyInputs } from './gate.ts'
+export { ASSESSMENT_REFUSALS, assessmentOutcome, directionAllowed, parseAssessment, TARGET_BASES } from './assessment.ts'
+export type {
+  Assessment,
+  AssessmentDirection,
+  AssessmentPolicy,
+  AssessmentRefusalCode,
+  AssessmentResult,
+  RuleAssessment,
+  TargetBasis
+} from './assessment.ts'

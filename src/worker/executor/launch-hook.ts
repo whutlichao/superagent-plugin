@@ -10,6 +10,7 @@
 // 依赖纪律（§C.2）：本文件不 import `orca`、不起子进程；它只处理宿主送来的一份 JSON 载荷，
 // 把「本插件发起的 launch」与「别人的 launch」区分开。区分靠 `expect` 注册的 workspaceId：
 // 只有本插件的执行器在 launch 之前注册，一次 launch 消费一次。
+import { statSync } from 'node:fs'
 
 /** 清单 `contributes.hooks` 里的唯一钩子名。 */
 export const LAUNCH_HOOK_EVENT = 'agent.launch.before'
@@ -135,13 +136,31 @@ export interface LaunchEnvironmentOptions {
   readonly binDirectory?: string
   /** `<stateDir>/worker-gitconfig`：worker 的 git 全局配置（无身份、无操作者凭据）。 */
   readonly gitConfig?: string
+  /**
+   * 「这个配置文件在不在」的判定（缺省：存在且是普通文件）。**只有存在才注入**：git 看到
+   * `GIT_CONFIG_GLOBAL` 就不再读用户级配置，指向不存在的文件等于把操作者的 `user.name`、
+   * 凭据 helper 与 `http.*` 全部切断（#52 的缺陷）。宁可回落，也不注入一个空指向。
+   */
+  readonly gitConfigExists?: (path: string) => boolean
   /** PATH 的底座：插件进程自己的 PATH（钩子载荷里拿不到宿主环境）。 */
   readonly basePath?: string
 }
 
 /**
+ * 默认的存在性判定：存在且**是普通文件**才算（同名目录不是一份可读的 git 配置）。
+ * `statSync` 的失败就是「不在」，不把异常带到 launch 路径上。
+ */
+function isConfigFile(path: string): boolean {
+  try {
+    return statSync(path).isFile()
+  } catch {
+    return false
+  }
+}
+
+/**
  * 组出这次 launch 要注入的环境：变量表 + PATH 前置 shim 目录 + worker 的 git 配置。
- * PATH 为空时不留空段（空段等于把当前目录放进 PATH）。
+ * PATH 为空时不留空段（空段等于把当前目录放进 PATH）；git 配置只在文件真的存在时注入。
  */
 export function launchEnvironment(
   options: LaunchEnvironmentOptions
@@ -151,6 +170,9 @@ export function launchEnvironment(
     const base = options.basePath ?? ''
     injected['PATH'] = base === '' ? options.binDirectory : `${options.binDirectory}:${base}`
   }
-  if (options.gitConfig !== undefined) injected['GIT_CONFIG_GLOBAL'] = options.gitConfig
+  if (options.gitConfig !== undefined) {
+    const exists = options.gitConfigExists ?? isConfigFile
+    if (exists(options.gitConfig)) injected['GIT_CONFIG_GLOBAL'] = options.gitConfig
+  }
   return injected
 }

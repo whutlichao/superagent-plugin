@@ -710,7 +710,9 @@ Trigger 的 `meta`），不由 agent 发现；`${DSH_SUPERAGENT_*}` 的替换只
 文本里，按变量表白名单逐值单引号转义（`environment.ts` 的 `substituteVariables`），未知变量
 原样留给 shell。`executor.blockedCommands` 的 shim 与 `GIT_CONFIG_GLOBAL` 由 launch 钩子注入
 （§H.11）；shim 只让被禁命令非零退出，**不是安全边界**——这句同时写在 shim 的 stderr、设计
-§H.11 与面板 Settings/Deployment 的文案里（#42/#47 的落点）。
+§H.11 与面板 Settings/Deployment 的文案里（#42/#47 的落点）。`GIT_CONFIG_GLOBAL` 指向的
+`<stateDir>/worker-gitconfig` 由启动与 `superagent setup check` 写入（#52），文件不存在时
+**不注入**：指向一个不存在的文件会让 git 停止加载用户级配置，比回落更糟。
 
 ---
 
@@ -937,7 +939,7 @@ stateDir：/Users/me/.local/state/orca-superagent
 | H.8 | **DSH skills 注册表**（`skill` 工具按名加载） | 内置 skills 写盘到 `<stateDir>/skills/<name>/SKILL.md`；prompt 给绝对路径并要求 agent 用 `read` 读取；面板可编辑 | 没有「按名自动加载」；靠 prompt 指令 + 文件路径，agent 可能不读 | 是 |
 | H.9 | **`dsh` CLI**（`dsh plugin add`、`dsh superagent --from-default-profile`、`dsh --profile`） | `superagent` CLI（本文 §G）+ `orca` CLI（worktree/agent/terminal）；安装走 Orca 插件安装与审批 | 无 profile 概念、无 `--from-default-profile`；安装步骤完全不同（见规格 issue 的 Solution） | 是 |
 | H.10 | **`ask_user_question` / `present` / plan mode 被从 worker 工具集移除** | 无法移除：worker 是普通 Orca agent，可能弹自己的提问。等价物是 `report --human-action` + 把 agent 的 `blocked` 状态转成 Attention（§E.7） | worker 可能在终端里等人而不是报 `blocked`；此时靠 `agent.status.changed=blocked` 兜住，面板能看到终端摘要 | 是 |
-| H.11 | **进程环境注入**：`worker-bin` 命令 shim（`gh`/`lark-cli` 指向 agent 账号、blocked commands 失败）、`worker-gitconfig`（凭据 helper、SSH→HTTPS、LFS） | a) `agent.launch.before` hook 给**本插件发起的** launch 追加 `env`（PATH 前置 `<stateDir>/bin`，`GIT_CONFIG_GLOBAL=<stateDir>/worker-gitconfig`）；b) 该 hook 2 s 预算、失败 fail-open；c) blocked commands 由 shim 脚本 `exit 1` 实现 | 若 hook 失败/超时，agent 用操作者的 `gh`（可能是个人账号）——**这是真实风险**，所以 setup 检查还会要求 agent 账号的 CLI 包装脚本路径，并在 prompt 里要求一律用该绝对路径；shim 不是安全边界（上游同样声明） | 是 |
+| H.11 | **进程环境注入**：`worker-bin` 命令 shim（`gh`/`lark-cli` 指向 agent 账号、blocked commands 失败）、`worker-gitconfig`（凭据 helper、SSH→HTTPS、LFS） | a) `agent.launch.before` hook 给**本插件发起的** launch 追加 `env`（PATH 前置 `<stateDir>/bin`；`GIT_CONFIG_GLOBAL=<stateDir>/worker-gitconfig` **只在文件存在时**注入）；b) 该 hook 2 s 预算、失败 fail-open；c) blocked commands 由 shim 脚本 `exit 1` 实现；d) `<stateDir>/worker-gitconfig`（0600，启动与 `superagent setup check` 时写）只含三组键：`credential."https://github.com".helper = !gh auth git-credential`、`url."https://github.com/".insteadOf = git@github.com:`、`user.name`/`user.email`（部署的 agent 账号与其 noreply 邮箱，与 `DSH_SUPERAGENT_GITHUB_ACCOUNT`/`_COMMIT_EMAIL` 同源），**不写**任何 token、secret 或操作者个人身份；身份不全或写不进去时 setup 报 `gitconfig_missing`/`gitconfig_unwritable` 且**不注入**（回落操作者环境）；e) `doctor` 的 `gitconfig` 项只 stat（存在 + 0600），不读内容 | 若 hook 失败/超时，agent 用操作者的 `gh`（可能是个人账号）——**这是真实风险**，所以 setup 检查还会要求 agent 账号的 CLI 包装脚本路径，并在 prompt 里要求一律用该绝对路径；shim 不是安全边界（上游同样声明）。`GIT_CONFIG_GLOBAL` 一旦指向这份文件，用户级全局配置就不再加载：只有写进去的这三组键生效，`filter.lfs.*`（LFS）、`http.*`、用户的 `include.path` 等其余项只剩**系统级**配置——仍是**近似**，LFS 依赖系统配置 | 是 |
 | H.12 | **`cordis.patch.yml` 机器配置**（`stateDir`、`promptMaxChars`、`admissionContextMaxPages/TimeoutMs`） | `stateDir`/`superagent.home` 在 `contributes.settings`；其余进面板 Deployment 页（存库，改完即生效，`stateDir` 除外） | 无 YAML、无热重载机制；`stateDir` 变更需重启插件 | 否 |
 | H.13 | **DSH 进程重启**（升级后需重启 profile） | 插件 worker 重启（保存即重启，Orca 管理）；Orca 升级后由 Orca 自己重启 | 插件重启会丢内存态——所有内存态都必须在库/`storage` 里（设计上已要求） | 否 |
 | H.14 | **Inbox relay**（`Sessions.relay` 注入到 turn 的下一步） | `relay` effect 把消息 `sendText` 进 Router 终端（§F.2） | 不保证 Router 在「下一步」看到；快慢取决于 Router 是否在等输入。顺序仍保证（单 key FIFO） | 是 |
@@ -1952,7 +1954,7 @@ manifest + types + tsconfig + boot + lock + sqlite(trigger/thread/ticket/decisio
 5. 生命周期属 Orca：没有 `start/stop` 命令，没有 tmux 会话；「停」用 `paused`（H.7）。
 6. Skills 不是宿主注册表：写盘 + prompt 给路径，agent 可能不读（H.8）。
 7. Worker 可能在自己的终端里提问：由 `blocked` 状态兜底，但问题文本是终端摘要而非结构化（H.10）。
-8. blocked commands 与账号 shim 依赖 `agent.launch.before` hook（2 s、fail-open），不是安全边界（H.11）。
+8. blocked commands 与账号 shim 依赖 `agent.launch.before` hook（2 s、fail-open），不是安全边界（H.11）。worker 的 git 配置是一份最小副本（凭据 helper、SSH→HTTPS、提交身份），其余全局项（`http.*`、LFS 的 `filter.lfs.*`）只剩系统级配置——LFS 依赖系统配置，仍是近似（H.11）。
 9. Relay 不保证「下一步」送达，只保证顺序与重试（H.14）。
 10. 没有权威模型清单，model id 填错要到 launch 才报（H.16）。
 11. 若 Router 的 agent 不能读图，图片评估退化为文本 + 明确说明（H.17）。
@@ -2125,7 +2127,9 @@ return { ...e, command: a.command, ...s ? { env: s } : {} }             // ← �
 - `prepare` 的变量替换在插件内完成，不依赖注入；
 - `<ticketDir>/.superagent/env.sh` 让 worker 自己 `source`（值在插件内算好、转义正确）；
 - setup 检查（#44）继续要求 agent 账号的 CLI 包装脚本与 `git config`，即上游 `worker-bin` /
-  `worker-gitconfig` 的等价面。
+  `worker-gitconfig` 的等价面。#52 把后者的写入补上了：`<stateDir>/worker-gitconfig`（0600）
+  只含凭据 helper、SSH→HTTPS 重写与提交身份；文件不存在时**不注入** `GIT_CONFIG_GLOBAL`
+  （回落操作者环境），setup 与 `doctor` 各自有一条具名读数。
 
 **结论**：「钩子的 `env` 进入 spawn 的 `env`」是宿主实现里读到的事实；「本机 2 s 内稳定」由
 插件侧 µs 级测量支持，宿主 IPC 那一段未实测。§H.11 因此保持**近似**（已知限制为「是」），shim

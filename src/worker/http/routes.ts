@@ -173,6 +173,8 @@ export const ROUTE_TABLE: readonly RouteDefinition[] = [
   { method: 'POST', path: 'prompts/preview', command: 'prompts save --preview', minimumRole: 'router', handler: stub },
 
   // ---- Router 的动作（§F.6）
+  { method: 'POST', path: 'route', command: 'route', minimumRole: 'router', handler: stub },
+  { method: 'POST', path: 'eval-decide/:id', command: 'eval-decide', minimumRole: 'router', handler: stub },
   { method: 'POST', path: 'policy-sync/:id', command: 'policy sync', minimumRole: 'router', handler: stub },
   { method: 'POST', path: 'triggers/:id/requeue', command: 'trigger requeue', minimumRole: 'router', handler: stub },
   // `trigger handback` 是 worker 的命令（§G.2）：Ticket 来自 assignment token，不是参数。

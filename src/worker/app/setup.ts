@@ -11,10 +11,12 @@
 // ref 搜索、文件系统）都经注入的端口进入，于是启动路径与单测用同一份实现。
 import { accessSync, constants } from 'node:fs'
 import { isAbsolute } from 'node:path'
+import { writeWorkerGitConfig, type WorkerGitConfigWrite } from '../infra/gitconfig.ts'
 import type {
   RepoRow,
   RepoSelectorLike,
   SetupCheckInput,
+  SetupGitConfigIdentity,
   SetupIssue,
   SetupPlace,
   SetupPorts,
@@ -28,6 +30,7 @@ export type {
   RepoSelectorLike,
   SetupCheckInput,
   SetupCode,
+  SetupGitConfigIdentity,
   SetupIssue,
   SetupKind,
   SetupPlace,
@@ -316,6 +319,49 @@ async function probeGithub(
   }
 }
 
+// ---------------------------------------------------------------- worker git config
+
+/**
+ * `<stateDir>/worker-gitconfig`（§H.11）：在部署就绪时写，身份不完整就不写。
+ *
+ * 两条不变量：
+ * - 身份不全（账号或 noreply 邮箱为空）时**不写**：留一份没有 `user.email` 的配置会把
+ *   操作者环境整体切断（#52 的缺陷），这比回落坏得多；
+ * - GitHub 探针本身有问题时不再加一条同因的结论：根因（`account_unreadable`）该先被人看到。
+ *
+ * 写失败也只变成一条具名问题（`gitconfig_unwritable`），不抛错。
+ */
+function probeGitConfig(
+  input: SetupCheckInput,
+  config: SetupGitConfigIdentity,
+  github: { readonly issues: readonly SetupIssue[]; readonly login: string },
+  write: NonNullable<SetupPorts['writeGitConfig']>
+): SetupIssue | undefined {
+  if (github.issues.length > 0) return undefined
+  const account = (github.login || config.account || '').trim()
+  const email = config.email.trim()
+  /** 身份不全：同一条修法（没写与写不成身份都走它）。 */
+  const missingIdentity = (): SetupIssue =>
+    issue({
+      place: 'executor',
+      code: 'gitconfig_missing',
+      kind: 'missing',
+      detail: 'the worker git config has no commit identity yet: the agent account or its noreply email is empty',
+      fix: 'set the agent noreply commit email (githubCommitEmail) in the Superagent settings, then run the check again'
+    })
+  if (account === '' || email === '') return missingIdentity()
+  const outcome: WorkerGitConfigWrite = write({ stateDir: input.stateDir, account, email })
+  if (outcome.state === 'written') return undefined
+  if (outcome.state === 'missing_identity') return missingIdentity()
+  return issue({
+    place: 'executor',
+    code: 'gitconfig_unwritable',
+    kind: 'broken',
+    detail: `the worker git config ${outcome.path} could not be written: ${outcome.detail}`,
+    fix: `fix the permissions of the state directory or of ${outcome.path}, then run the check again`
+  })
+}
+
 /** `lark-cli auth status` 里身份面的两个字段（其余字段不读：输出里有 appId、openId、scope）。 */
 export interface LarkIdentities {
   readonly botStatus?: string
@@ -455,6 +501,15 @@ export async function runSetupChecks(input: SetupCheckInput): Promise<SetupRepor
   issues.push(...(await probeBaseRepo(baseInput, { repos, searchRefs })))
   const github = await probeGithub(input, run)
   issues.push(...github.issues)
+  if (input.gitConfig !== undefined) {
+    const written = probeGitConfig(
+      input,
+      input.gitConfig,
+      github,
+      ports.writeGitConfig ?? writeWorkerGitConfig
+    )
+    if (written !== undefined) issues.push(written)
+  }
   issues.push(...(await probeFeishu(input, run)))
 
   return { issues, githubLogin: github.login }

@@ -14,15 +14,18 @@ import {
   DeliveryError,
   confirmsDelivery,
   inboxPath,
+  renderInputMarkdown,
   type DeliverySettings
 } from '../src/worker/executor/deliver'
 import { launchTicketAgent, seedPrompt } from '../src/worker/executor/launch'
 import type { EnvironmentDeployment } from '../src/worker/executor/environment'
 import { createLaunchHook, type LaunchHook } from '../src/worker/executor/launch-hook'
+import { writeWorkerGitConfig, workerGitConfigPath } from '../src/worker/infra/gitconfig'
 import {
   OrcaExecutor,
   registerExecutorEffects,
   registerExecutorLifecycle,
+  renderAssignmentBrief,
   resolveExecutorSettings
 } from '../src/worker/executor/orca-executor'
 import {
@@ -811,6 +814,56 @@ test('a launch builds the worktree, writes the brief and starts the worker on a 
   await h.cleanup()
 })
 
+/** 一张主动接受（inferred）的票：Mandate 记着匹配到的规则。 */
+function proactiveTicket(): Ticket {
+  return ticket({
+    title: 'Fix the typo',
+    mandate: {
+      strength: 'inferred',
+      policyVersion: 'policy-1',
+      basis: { via: 'followup', rules: ['copy', 'visual'] },
+      actor: { source: 'github', id: 'royce' },
+      scope: 'one typo'
+    }
+  })
+}
+
+/** 开播正文的固定输入（与真 launch 同一形状）。 */
+const BRIEF = {
+  short: 'fix-the-typo',
+  directory: '/tmp/superagent-worktrees/superagent-fix-the-typo',
+  cliPath: LAUNCH.cliPath,
+  tokenFile: LAUNCH.tokenFile,
+  environment: {}
+} as const
+
+test('a proactive ticket briefs its matched rules and the local-only limit', () => {
+  const brief = renderAssignmentBrief({ ticket: proactiveTicket(), trigger: trigger(), ...BRIEF })
+  assert.ok(brief.includes('Proactively accepted'), brief)
+  for (const rule of ['copy', 'visual']) assert.ok(brief.includes(rule), `the brief names ${rule}`)
+  assert.ok(brief.includes('only the local small change'), brief)
+  // 显式票没有这段限制：它的授权来自那条消息，不需要额外收窄。
+  const explicit = renderAssignmentBrief({ ticket: ticket(), trigger: trigger(), ...BRIEF })
+  assert.equal(explicit.includes('only the local small change'), false)
+})
+
+test('every later input to a proactive ticket repeats the local-only limit', () => {
+  const markdown = renderInputMarkdown(
+    proactiveTicket(),
+    { id: 'input-2', kind: 'text', text: 'a person replied', at: AT },
+    2,
+    undefined
+  )
+  assert.ok(markdown.includes('only the local small change'), markdown)
+  const explicit = renderInputMarkdown(
+    ticket(),
+    { id: 'input-2', kind: 'text', text: 'a person replied', at: AT },
+    2,
+    undefined
+  )
+  assert.equal(explicit.includes('only the local small change'), false)
+})
+
 test('three failed launches mark the ticket failed and put the launch health entry in error', async () => {
   const h = harness()
   h.runtime.script.ensureWorkspace = () => {
@@ -1094,6 +1147,15 @@ test('the launch hook injects this launch and leaves every other launch alone', 
   const injected: Record<string, string>[] = []
   const strangers: Record<string, string>[] = []
   const h = harness({ deployment: DEPLOYMENT, blockedCommands: ['personal-gh'], launchHook: hook })
+  // 组合根在启动时写好这份文件（§H.11）；这里显式写一次，费定「文件存在才注入」。
+  assert.equal(
+    writeWorkerGitConfig({
+      stateDir: h.stateDir,
+      account: DEPLOYMENT.githubLogin,
+      email: DEPLOYMENT.githubCommitEmail
+    }).state,
+    'written'
+  )
   // 替身扮演宿主：真正 launch 之前先发一次钩子，把环境交给「启动」这一步。
   h.runtime.script.launchAgent = (spec) => {
     const mine = hook.handle(
@@ -1135,8 +1197,40 @@ test('the launch hook injects this launch and leaves every other launch alone', 
   assert.equal(injected[0]?.['DSH_SUPERAGENT_TICKET'], 'ticket-11')
   assert.equal(injected[0]?.['DSH_SUPERAGENT_NAME'], 'fix-the-login-flow')
   assert.equal(injected[0]?.['PATH'], `${h.stateDir}/bin:/usr/bin:/bin`, 'the shim directory leads PATH')
-  assert.equal(injected[0]?.['GIT_CONFIG_GLOBAL'], `${h.stateDir}/worker-gitconfig`)
+  assert.equal(injected[0]?.['GIT_CONFIG_GLOBAL'], workerGitConfigPath(h.stateDir))
   assert.deepEqual(strangers, [{}], 'another worktree is untouched')
+  await h.cleanup()
+})
+
+test('without the worker git config file nothing is injected, so the operator config still applies', async () => {
+  const hook = createLaunchHook()
+  const injected: Record<string, string>[] = []
+  const h = harness({ deployment: DEPLOYMENT, launchHook: hook })
+  h.runtime.script.launchAgent = (spec) => {
+    hook.handle(
+      {
+        agent: spec.agent,
+        workspaceId: spec.workspace.workspaceId,
+        workspaceKind: 'worktree',
+        command: 'pi',
+        env: {}
+      },
+      (event) => {
+        injected.push({ ...event.env })
+        return { kind: 'continue' as const, event }
+      }
+    )
+    return { terminalId: 'term_1', workspaceId: spec.workspace.workspaceId, launchedAt: 1 }
+  }
+  const pending = ticket({ assignments: [assignment('a-1', 'pending')] })
+  h.seed(pending)
+  h.seedTrigger(trigger())
+  h.executor.start(pending, pending.assignments[0]!)
+  await h.effects.idle('launch')
+
+  assert.equal(injected.length, 1)
+  assert.equal('GIT_CONFIG_GLOBAL' in (injected[0] ?? {}), false, 'a missing file must not sever the operator config')
+  assert.equal(injected[0]?.['DSH_SUPERAGENT_TICKET'], 'ticket-11', 'the rest of the environment is still injected')
   await h.cleanup()
 })
 

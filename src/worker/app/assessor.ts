@@ -1,19 +1,19 @@
-// 本票的评估器（§K.4 的模型判断位）：**确定性**地把一次 Eval 收成 accept 或 ignore。
+// 本票的评估器（§K.4 的模型判断位）：**确定性**地处理它在进程内唯一能负责的那一种候选。
 //
-// 完整实现会把候选卡 relay 给 Router、由模型给出方向与规则判定（#24/#16/#32）。本票的
-// 垂直切片只需要一条真实链路，因此这条评估器只做两件事：
-// - 显式强度的候选（Gate 已经判定「名单上的人点名了 agent」）→ accept；
-// - 其它强度 → ignore（推断候选要 accept mode 与规则，本票不假装支持）。
+// 显式候选（Gate 已经判定「名单上的人点名了 agent」）→ accept；主动（inferred）候选**不在**
+// 这里决定：它们要按 accept mode 与启用规则评估，由 Router 的 `eval-decide` 完成
+// （`policy/assessment.ts` + `app/assessment.ts`，#24）。这里不假装判规则，也不提前把候选
+// 收掉，否则 observe 模式的「本该接受」与 auto 的规则判定都没机会发生。
 //
 // 它仍然走同一个端口（`core/ports.ts` 的 `Assessor`）：`request` 排队、`release` 丢弃、
 // `drain` 在 pass 里逐条交给 `Engine.decide`。把决定放到 pass 里而不是在 `request` 里
 // 立刻调用，是为了让 decide 落在自己的事务里，不嵌进 `evaluateDue` 的那一次。
-import type { Assessor, Candidate, Outcome, Reason } from '../core/index.ts'
+import type { Assessor, Candidate, Outcome } from '../core/index.ts'
 
 /** accept 后的作业标题上限（面板与 worktree 短名都用它，别把整段评论当标题）。 */
 export const TITLE_LIMIT = 80
 
-/** 一条排队的决定：显式 accept 或 ignore。 */
+/** 一条排队的决定：显式的 accept。 */
 interface Queued {
   readonly evalId: string
   readonly triggerId: string
@@ -77,9 +77,6 @@ function acceptOutcome(candidate: Candidate, at: string): Outcome {
   }
 }
 
-/** 推断候选不在这条链路里（要 accept mode 与规则判定）：给一条可读的固定原因。 */
-const noRule: Reason = { code: 'noRuleMatched' }
-
 /**
  * 造一个确定性评估器。`request` 只排队（可以是 `evaluateDue` 的事务内部），`drain` 才
  * 调用 `decide`；`release` 丢掉某个 Eval 的排队项（它在别处结束了）。
@@ -105,14 +102,8 @@ export function createDeterministicAssessor(
     request(candidate: Candidate): void {
       const trigger = candidate.triggers[0]
       if (trigger === undefined) return
-      if (candidate.strength !== 'explicit') {
-        remember({
-          evalId: candidate.evalId,
-          triggerId: trigger.id,
-          outcome: { evalId: candidate.evalId, kind: 'ignore', reason: noRule }
-        })
-        return
-      }
+      // 主动候选留给 Router 的 `eval-decide`（accept mode 与规则判定，§K.4）。
+      if (candidate.strength !== 'explicit') return
       remember({
         evalId: candidate.evalId,
         triggerId: trigger.id,

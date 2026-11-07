@@ -294,6 +294,7 @@ describe('policy depends only on the domain and the minimal validator', () => {
   test('the policy module has a file set to scan', () => {
     assert.deepEqual(policyFiles(), [
       'src/worker/policy/admission.ts',
+      'src/worker/policy/assessment.ts',
       'src/worker/policy/gate.ts',
       'src/worker/policy/index.ts',
       'src/worker/policy/schema.ts'
