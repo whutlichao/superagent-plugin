@@ -32,6 +32,7 @@ import {
   renderEnvFile,
   writeEnvFile
 } from '../src/worker/executor/env-file'
+import { promptFilePath, writePromptFile } from '../src/worker/executor/prompt-file'
 
 const directories: string[] = []
 
@@ -185,6 +186,19 @@ describe('keeping the env file out of git', () => {
     await assert.rejects(git(worktree, 'check-ignore', '-q', '.superagent/env.sh'))
     ensureExcluded(worktree)
     assert.equal((await git(worktree, 'check-ignore', '.superagent/env.sh')).trim(), '.superagent/env.sh')
+  })
+
+  test('the assembled prompt file sits next to env.sh and rides the same directory exclusion', async () => {
+    const { worktree } = await repoWithWorktree()
+    writeEnvFile({ directory: worktree, environment: tableFor(worktree), ticketId: 'ticket-11' })
+    // §L.5：组装后的全文落在 ticket 目录里的固定文件；它与 env.sh 同目录，所以不需要第二条排除项。
+    const path = writePromptFile({ directory: worktree, text: '# Assembled prompt\n' })
+    assert.equal(path, join(worktree, '.superagent', 'prompt.md'))
+    assert.equal(promptFilePath(worktree), path)
+    await assert.rejects(git(worktree, 'check-ignore', '-q', '.superagent/prompt.md'))
+    ensureExcluded(worktree)
+    assert.equal((await git(worktree, 'check-ignore', '.superagent/prompt.md')).trim(), '.superagent/prompt.md')
+    assert.equal(await git(worktree, 'status', '--porcelain'), '', 'the assembled prompt is never an untracked change')
   })
 
   test('a plain directory outside git is left alone instead of failing the launch', () => {

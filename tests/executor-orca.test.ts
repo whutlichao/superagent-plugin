@@ -19,6 +19,10 @@ import {
 } from '../src/worker/executor/deliver'
 import { launchTicketAgent, seedPrompt } from '../src/worker/executor/launch'
 import type { EnvironmentDeployment } from '../src/worker/executor/environment'
+import { ENVIRONMENT_VARIABLES } from '../src/worker/executor/environment'
+import { promptFilePath } from '../src/worker/executor/prompt-file'
+import { assembleLaunchPrompt } from '../src/worker/app/launch-prompt'
+import { createPromptVersions, type PromptVersions } from '../src/worker/app/prompts'
 import { createLaunchHook, type LaunchHook } from '../src/worker/executor/launch-hook'
 import { writeWorkerGitConfig, workerGitConfigPath } from '../src/worker/infra/gitconfig'
 import {
@@ -280,16 +284,21 @@ const LAUNCH = {
   short: 'fix-the-login-flow',
   cliPath: '/plugins/superagent/src/bin/superagent.mjs',
   tokenFile: '/state/tokens/asg-1',
+  // 组装后的全文落在 ticket 目录里（§L.5）：开播语只给这个文件与它的 revision。
+  promptPath: '/tmp/superagent-worktrees/superagent-fix-the-login-flow/.superagent/prompt.md',
+  revision: 4,
   inboxPath: '/state/inbox/ticket-11/0.md'
 } as const
 
-test('the seed prompt is short and names the role, ticket, directory, CLI and first input', () => {
+test('the seed prompt is short and names the role, ticket, directory, CLI, prompt file and first input', () => {
   const prompt = seedPrompt({
     ticketId: 'ticket-11',
     short: 'fix-the-login-flow',
     directory: '/tmp/superagent-worktrees/superagent-fix-the-login-flow',
     cliPath: LAUNCH.cliPath,
     tokenFile: LAUNCH.tokenFile,
+    promptPath: LAUNCH.promptPath,
+    revision: LAUNCH.revision,
     inboxPath: LAUNCH.inboxPath
   })
   assert.ok(prompt.length <= 400, `the seed prompt stays under 400 chars (got ${prompt.length})`)
@@ -300,22 +309,29 @@ test('the seed prompt is short and names the role, ticket, directory, CLI and fi
     '/tmp/superagent-worktrees/superagent-fix-the-login-flow',
     '/plugins/superagent/src/bin/superagent.mjs',
     '/state/tokens/asg-1',
+    LAUNCH.promptPath,
+    'prompt revision 4',
     '/state/inbox/ticket-11/0.md'
   ]) {
     assert.ok(prompt.includes(part), `the seed prompt names ${part}`)
   }
 })
 
-test('with very long deployment paths the seed prompt keeps the first-input pointer', () => {
+test('with very long deployment paths the seed prompt keeps the prompt file and the first-input pointer', () => {
+  const directory = `/Users/someone/${'deep/'.repeat(30)}worktree`
   const prompt = seedPrompt({
     ticketId: 'ticket-11',
     short: 'fix-the-login-flow',
-    directory: `/Users/someone/${'deep/'.repeat(30)}worktree`,
+    directory,
     cliPath: `/Users/someone/Library/Application Support/Orca/plugins/${'x'.repeat(80)}/src/bin/superagent.mjs`,
     tokenFile: `/Users/someone/.local/state/${'y'.repeat(60)}/tokens/asg-1`,
+    promptPath: `${directory}/.superagent/prompt.md`,
+    revision: 9,
     inboxPath: '/state/inbox/ticket-11/0.md'
   })
   assert.ok(prompt.length <= 400)
+  assert.ok(prompt.includes(`${directory}/.superagent/prompt.md`), 'the assembled prompt file is still named')
+  assert.ok(prompt.includes('prompt revision 9'), 'and so is the revision it carries')
   assert.ok(prompt.includes('/state/inbox/ticket-11/0.md'), 'the worker still learns what to read first')
   assert.equal(prompt.includes('\n'), false)
 })
@@ -337,6 +353,8 @@ test('the worker agent is launched on the terminal surface with model, effort an
   assert.equal(spec.effort, 'high')
   assert.equal(spec.workspace.workspaceId, 'ws:superagent-fix-the-login-flow')
   assert.ok((spec.prompt ?? '').includes('/state/inbox/ticket-11/0.md'))
+  assert.ok((spec.prompt ?? '').includes(LAUNCH.promptPath), 'the seed points at the assembled prompt file')
+  assert.ok((spec.prompt ?? '').includes('prompt revision 4'), 'and says which revision it is')
   assert.equal(handle.terminalId, 'term_1')
 })
 
@@ -692,6 +710,8 @@ function harness(
     readonly blockedCommands?: readonly string[]
     readonly deployment?: EnvironmentDeployment
     readonly launchHook?: LaunchHook
+    /** 注入真的 prompt 版本库（§L.4）：不给时启动读到 revision 0 与默认文本。 */
+    readonly prompts?: boolean
   } = {}
 ) {
   const opened = new MemoryRepositories()
@@ -738,6 +758,7 @@ function harness(
     ...(options.blockedCommands === undefined ? {} : { blockedCommands: [...options.blockedCommands] })
   }
   const settings = resolveExecutorSettings({ agent: 'pi', executor: executorBlock })
+  const promptVersions: PromptVersions = createPromptVersions({ store: queue.store, now: () => queue.clock.iso() })
   registerExecutorEffects({
     runtime,
     effects: queue.effects,
@@ -749,6 +770,7 @@ function harness(
     tokenFile: (assignmentId) => `/state/tokens/${assignmentId}`,
     apiBase: 'http://127.0.0.1:3082',
     path: '/usr/bin:/bin',
+    prompts: promptVersions,
     ...(options.deployment === undefined ? {} : { deployment: options.deployment }),
     ...(options.launchHook === undefined ? {} : { launchHook: options.launchHook }),
     wait: async () => undefined,
@@ -775,6 +797,7 @@ function harness(
     engine,
     executor,
     settings,
+    prompts: promptVersions,
     seed,
     seedTrigger,
     read,
@@ -1132,6 +1155,97 @@ test('a launch writes the ticket environment, shims the blocked commands and bri
   assert.ok(brief.includes(`DSH_SUPERAGENT_DIR = ${directory}`))
   assert.ok(brief.includes('.superagent/env.sh'), 'and names the env file')
   assert.ok(/Never write these values/.test(brief), 'and says they must not be committed')
+  await h.cleanup()
+})
+
+test('a launch writes the assembled prompt into the ticket directory and seeds the worker with its pointer', async () => {
+  const h = harness({ deployment: DEPLOYMENT })
+  const pending = ticket({ assignments: [assignment('a-1', 'pending')] })
+  h.seed(pending)
+  h.seedTrigger(trigger())
+  h.executor.start(pending, pending.assignments[0]!)
+  await h.effects.idle('launch')
+
+  const directory = `${h.worktreeRoot}/superagent-fix-the-login-flow`
+  const path = join(directory, '.superagent', 'prompt.md')
+  // §L.5：固定文件、在 `.superagent/` 里（与 env.sh 同一个目录，同一份 git 排除）。
+  assert.equal(promptFilePath(directory), path)
+  const text = readFileSync(path, 'utf8')
+  // 文件内容就是那个唯一的组装函数的结果（§L.3：一个组装函数，两个消费者）。
+  const expected = assembleLaunchPrompt({
+    role: 'worker',
+    revision: 0,
+    config: {},
+    environment: {
+      variables: [...ENVIRONMENT_VARIABLES],
+      cliPath: '/plugins/superagent/src/bin/superagent.mjs',
+      tokenFile: '/state/tokens/a-1',
+      stateDir: h.stateDir,
+      repository: DEPLOYMENT.repository,
+      account: DEPLOYMENT.githubLogin
+    }
+  })
+  assert.equal(text, expected.text, 'the file equals the assembled result')
+  // 独立抽查（不只靠上面的等号）：角色、团队段、环境段与 revision 都在正文里。
+  assert.ok(text.includes('## The worker'), 'the worker role layer')
+  assert.ok(text.includes('## Communication'), 'the team sections')
+  assert.ok(text.includes('Inherited variables: DSH_SUPERAGENT_DIR'), 'the deployment section')
+  assert.ok(text.includes("node '/plugins/superagent/src/bin/superagent.mjs'".replaceAll("'", '"')))
+  assert.ok(text.includes('/state/tokens/a-1'), 'the token file path, never a token value')
+  assert.ok(text.includes(`${DEPLOYMENT.repository}   agent account: ${DEPLOYMENT.githubLogin}`))
+  assert.ok(text.includes('Prompt revision 0'))
+
+  // 开播语 ≤400 字符、单行，并且只给文件与号，不给正文。
+  const seed = h.runtime.calls.launchAgent[0]!.prompt!
+  assert.ok(seed.length <= 400, `the seed stays under 400 chars (got ${seed.length})`)
+  assert.equal(seed.includes('\n'), false)
+  assert.ok(seed.includes(path), 'the seed points at the prompt file')
+  assert.ok(seed.includes('prompt revision 0'), 'and names the revision it carries')
+  assert.ok(seed.includes(inboxPath(h.stateDir, 'ticket-11', 0)), 'the first input is still named')
+
+  // §L.5：日志只有 revision 与长度，绝不出现正文。
+  const promptLogs = h.logs.filter((line) => line.includes('prompt revision'))
+  assert.equal(promptLogs.length, 1)
+  assert.equal(/prompt revision 0 \(\d+ chars\)/.test(promptLogs[0]!), true, 'revision and length only')
+  for (const line of h.logs) {
+    assert.equal(line.includes('## The worker'), false, 'no prompt body in any log line')
+    assert.equal(line.includes('## Communication'), false)
+  }
+  await h.cleanup()
+})
+
+test('a relaunch after a prompt version bump carries the new revision and the new text', async () => {
+  const h = harness({ deployment: DEPLOYMENT })
+  const pending = ticket({ assignments: [assignment('a-1', 'pending')] })
+  h.seed(pending)
+  h.seedTrigger(trigger())
+  h.executor.start(pending, pending.assignments[0]!)
+  await h.effects.idle('launch')
+  assert.ok(h.runtime.calls.launchAgent[0]!.prompt!.includes('prompt revision 0'))
+
+  // 保存一版：团队段与一个 override。下一次 launch 必须用新内容与新 revision（§L.4、§L.5）。
+  const saved = h.prompts.save({
+    config: {
+      team: { scope: 'Only the settings page.' },
+      overrides: { 'team/communication': { text: 'Report in one sentence.' } }
+    },
+    baseRevision: 0,
+    origin: 'panel'
+  })
+  assert.equal(saved.revision, 1)
+
+  h.engine.report('ticket-11', { state: 'failed', summary: 'the build is broken' })
+  retryTicket(h.engine, 'ticket-11')
+  await h.effects.idle()
+
+  const directory = `${h.worktreeRoot}/superagent-fix-the-login-flow`
+  const text = readFileSync(join(directory, '.superagent', 'prompt.md'), 'utf8')
+  assert.ok(text.includes('Only the settings page.'), 'the new team section is in the new launch')
+  assert.ok(text.includes('Report in one sentence.'), 'and so is the new override')
+  assert.ok(text.includes('Prompt revision 1'), 'the new revision is written down')
+  const seed = h.runtime.calls.launchAgent.at(-1)!.prompt!
+  assert.ok(seed.includes('prompt revision 1'), 'the seed names the revision it points at')
+  assert.ok(seed.length <= 400)
   await h.cleanup()
 })
 

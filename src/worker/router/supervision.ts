@@ -29,7 +29,8 @@ import type {
 } from '../runtime/orca-runtime.ts'
 import type { HealthEntry } from '../core/index.ts'
 import { FAILURES_BEFORE_ERROR, type HealthBoardLike, type HealthEntryHandle } from '../infra/health.ts'
-import { routerPrompt } from './prompt.ts'
+import { promptLogLine } from '../app/launch-prompt.ts'
+import type { RouterPromptComposer } from './prompt.ts'
 import { ensureRouterWorkspace, launchRouter, type RouterLaunchSettings } from './router.ts'
 
 /** 监督周期（§F.1 的 3 s tick）。 */
@@ -84,13 +85,10 @@ export interface RouterNoticePort {
   enqueue(summary: string): void
 }
 
-/** 监督需要的设置（Router 的角色设置 + 部署事实）。 */
+/** 监督需要的设置：Router 的角色与工作区设置（`executor.*`，§F.1）。 */
 export interface RouterSupervisionSettings extends RouterLaunchSettings {
   readonly baseRepo?: RepoSelector
   readonly baseBranch?: string
-  readonly repository: string
-  readonly acceptMode: 'off' | 'observe' | 'auto'
-  readonly policyVersion: string
 }
 
 /** 监督的依赖：全部注入，监督自己不读时钟、不建定时器（§P.1）。 */
@@ -100,13 +98,15 @@ export interface RouterSupervisionOptions {
   readonly state: RouterStateStore
   readonly notice: RouterNoticePort
   readonly settings: RouterSupervisionSettings
-  /** `superagent` CLI 的绝对路径（写进 launch prompt，§G.5）。 */
-  readonly cliPath: string
-  readonly stateDir: string
   /** 轮换并返回 Router token 文件路径（重启即轮换，§D.6）。 */
   readonly rotateToken: () => string
   /** 当前 prompt revision（launch prompt 里写明）。 */
   readonly promptRevision: number
+  /**
+   * 组装 Router 的 launch prompt（§L.3、§L.5）：每次 launch 现读保存的配置、当时的 Policy
+   * 与部署事实。监督只拿回拼好的全文与长度，不自己拼文本，也不缓存旧版本。
+   */
+  readonly prompt: RouterPromptComposer
   /**
    * setup 是否就绪：未就绪时保持 paused，不建 worktree、不 launch（§N.1 同一口径）。
    * 也接受一个取值函数：`superagent setup check` 修好设置后不必重启 Orca，下一次 `start()`
@@ -278,20 +278,16 @@ export function createRouterSupervision(options: RouterSupervisionOptions): Rout
       workspace = { workspaceId: handle.workspaceId, path: handle.path }
       options.state.saveWorkspace(workspace)
       const tokenFile = options.rotateToken()
-      const prompt = routerPrompt({
-        cliPath: options.cliPath,
+      // 组装在 launch 的那一刻做：团队段、Policy 段与环境段都是当下的值（§L.5）。
+      const composed = options.prompt.compose({
         tokenFile,
-        stateDir: options.stateDir,
         directory: handle.path,
-        repository: options.settings.repository,
-        acceptMode: options.settings.acceptMode,
-        policyVersion: options.settings.policyVersion,
-        promptRevision: currentRevision
+        revision: currentRevision
       })
       const launched: AgentHandle = await launchRouter(options.runtime, {
         workspace: handle,
         settings: options.settings,
-        prompt
+        prompt: composed.text
       })
       terminal = {
         terminalId: launched.terminalId,
@@ -309,7 +305,10 @@ export function createRouterSupervision(options: RouterSupervisionOptions): Rout
         saveRestarts()
       }
       report()
-      log(`router session ${launched.terminalId} is up in ${handle.path}`)
+      log(
+        `router session ${launched.terminalId} is up in ${handle.path}; ` +
+          `router launch prompt: ${promptLogLine({ revision: currentRevision, length: composed.length })}`
+      )
     } catch (error) {
       terminal = null
       options.state.saveTerminal(null)
