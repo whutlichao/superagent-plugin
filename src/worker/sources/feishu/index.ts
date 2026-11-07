@@ -4,6 +4,16 @@ export { FEISHU_KIND, createFeishuKind, feishuKind } from './kind.ts'
 export { feishuConfigSchema } from './config.ts'
 export type { FeishuChatConfig, FeishuConfig, FeishuListen } from './config.ts'
 export { createFeishuApi, DEFAULT_PAGE_SIZE } from './api.ts'
+export {
+  IDEMPOTENCY_KEY_MAX,
+  WITHDRAWN_CODE,
+  feishuGone,
+  feishuIdempotencyKey,
+  feishuLink,
+  sendFeishu
+} from './channel.ts'
+export { membersOf, runFeishuSync } from './sync.ts'
+export type { FeishuMember } from './sync.ts'
 export type { FeishuApi, FeishuChat, FeishuChatQuery, FeishuPage, FeishuThreadQuery } from './api.ts'
 export {
   CONSUMER_ARGS,

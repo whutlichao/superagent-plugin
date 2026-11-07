@@ -117,14 +117,14 @@ const isPersonAction = (value: string): value is PersonAction =>
 
 /** 一条 Ticket 的 stage 是否在等人（§E.8 的 person 档）。 */
 function personAction(ticket: Ticket): PersonAction | undefined {
-const stage = ticketStage(ticket)
-return stage.stage === 'person' && isPersonAction(stage.action) ? stage.action : undefined
+  const stage = ticketStage(ticket)
+  return stage.stage === 'person' && isPersonAction(stage.action) ? stage.action : undefined
 }
 
 /** 一条 Ticket 正在跑的终端（「Open terminal」那个直接动作用它；没有就不给这个动作）。 */
 function runningTerminal(ticket: Ticket): string | undefined {
-const assignment = ticket.assignments.at(-1)
-return assignment?.state === 'running' ? assignment.terminalId : undefined
+  const assignment = ticket.assignments.at(-1)
+  return assignment?.state === 'running' ? assignment.terminalId : undefined
 }
 
 /** Ticket 的更新时间（epoch ms；没有可解析时刻时给 0，`RelativeTime` 会显示得很旧）。 */

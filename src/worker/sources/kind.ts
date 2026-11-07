@@ -122,9 +122,16 @@ export interface SourcePolicyPart<P = Record<string, unknown>> {
   readonly sync?: {
     readonly label: Localized
     ready(part: P): boolean
-    run(host: SourceContext, part: P, signal: AbortSignal): Promise<P>
+    /** 跑一次同步：读外部来源、把新的 `part` 返回（保存由设置层负责，kind 不写库）。 */
+    run(host: SyncContext, part: P, signal: AbortSignal): Promise<P>
   }
 }
+
+/**
+ * 名单同步能看到的引擎面：命令端口 + 自己实例的配置。比整个 `SourceContext` 窄——同步只
+ * 读外部名单，不需要收 Trigger、写 Thread meta 或报告健康（健康条目由设置层写，§N.4）。
+ */
+export type SyncContext = Pick<SourceContext, 'commands' | 'config'>
 
 /** 一条 Channel 地址的链接：`url` 为空表示缺部署信息、构造不出页面。 */
 export interface ChannelLink {

@@ -13,6 +13,7 @@
 // 依赖纪律（§C.2）：本文件在 `http/`，只 import core 的类型、`app/views` 与同目录的
 // `ApiError`；领域写入经注入的 Engine 端口，存储经注入的读口。
 import { ApiError, ERROR_CODES } from './errors.ts'
+import { IM_WORDS, wordCount } from '../infra/text.ts'
 import { REPORT_STATES } from '../core/index.ts'
 import type {
   EngineForExecutor,
@@ -27,8 +28,8 @@ import type { TicketFollowup, TicketView } from '../app/views.ts'
 
 /** `reply` 的三种用途（§G.2）。 */
 export const REPLY_PURPOSES = ['answer', 'result', 'attention'] as const
-/** 一条回复/确认的词数上限（§G.2：100 词）。 */
-export const REPLY_WORD_LIMIT = 100
+/** 一条回复/确认的词数上限（§G.2：100 词；计数规则只有 `infra/text.ts` 一份）。 */
+export const REPLY_WORD_LIMIT = IM_WORDS
 /** `report --summary` 的字符上限（§G.2：600 字符）。 */
 export const SUMMARY_LIMIT = 600
 
@@ -105,10 +106,9 @@ function requiredText(body: Record<string, unknown>, key: string): string {
   return value
 }
 
-/** 词数（按空白切分，与上游「100 词」同一口径）。 */
-export function wordCount(text: string): number {
-  return text.trim().split(/\s+/).filter((word) => word.length > 0).length
-}
+// 词数只有一份实现（`infra/text.ts`，中文按词段、英文按空白）：命令面与 Channel 的
+// 发送前校验因此不会出现两种口径。这里转出，历史调用方不必改 import。
+export { wordCount } from '../infra/text.ts'
 
 /** 一条正文是否超过词数上限。 */
 function assertWords(text: string): void {

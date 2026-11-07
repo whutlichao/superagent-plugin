@@ -34,8 +34,8 @@ export function replyTarget(channel: { readonly source: string; readonly thread:
 }
 
 /**
- * 读出全部系统问题行。顺序是先按来源（见 `KIND_ORDER`），再按名字——同一份读数每次都
- * 得到同一个顺序，面板不会因为对象的键序而跳动。
+ * 读出全部系统问题行。顺序是先按来源（部件 → 发不出去的消息 → 等人看的评估），再按名字：
+ * 同一份读数每次都得到同一个顺序，面板不会因为对象的键序而跳动。
  */
 export function readSystemProblems(input: SystemProblemInput): readonly SystemProblem[] {
   const health: SystemProblem[] = Object.keys(input.health)

@@ -41,10 +41,22 @@ export interface NoticeMessage {
   readonly value?: Readonly<Record<string, unknown>>
 }
 
-/** 两种 kind 的 handler 形状（组合根把它们接到 effect 队列上）。 */
+/**
+ * 一张候选卡：正文（Markdown）落盘为 `relay/<name>.md`，终端只收一行指针。
+ * 与 `app/notices.ts` 的 `RouterCard` 同形状（不 import 它：本文件不依赖 app 层的实现）。
+ */
+export interface RouterCardMessage {
+  readonly name: string
+  readonly summary: string
+  readonly body: string
+}
+
+/** 三种 kind 的 handler 形状（组合根把它们接到 effect 队列上）。 */
 export interface RouterRelayHandlers {
   readonly relay: (payload: RelayMessage, key: string) => Promise<void>
   readonly notice: (payload: NoticeMessage, key: string) => Promise<void>
+  /** 候选卡（`assessment` 的送达）：与 relay/notice 共用同一条串行链（§J.2 末注）。 */
+  readonly card: (payload: RouterCardMessage) => Promise<void>
 }
 
 /** relay 的依赖：宿主、状态目录、当前终端与队列序号，全部注入。 */
@@ -103,6 +115,16 @@ export function noticeLine(payload: NoticeMessage): string {
   return `[superagent] ${oneLine(payload.summary)}`
 }
 
+/** 文件与编号用的安全名字：候选卡的名字来自我们自己的 `eval-<hex>`，这里仍只放行安全字符。 */
+function safeName(name: string): string {
+  return name.replace(/[^A-Za-z0-9_-]+/g, '-')
+}
+
+/** 候选卡的终端行：一行摘要 + 文件指针（与 relay 同形，§F.2）。 */
+export function cardLine(name: string, summary: string, file: string): string {
+  return `[superagent eval #${name}] candidate · ${inline(summary)} — read: ${file}`
+}
+
 /** 正文文件的内容：头部事实 + 原样的长文（不做换行压缩）。 */
 export function relayBody(payload: RelayMessage, at: number): string {
   return [
@@ -117,8 +139,9 @@ export function relayBody(payload: RelayMessage, at: number): string {
 }
 
 /**
- * 建一个 relay 投递器。两个 kind 共用 `#tail` 这一条串行链：`send` 在上一件结束后才开始，
- * 即使上一件失败也继续（失败已经记在 effect 行上，后面的仍要按顺序尝试）。
+ * 建一个 relay 投递器。三个 kind（relay/notice/候选卡）共用 `#tail` 这一条串行链：`send`
+ * 在上一件结束后才开始，即使上一件失败也继续（失败已经记在 effect 行上，后面的仍要按顺序
+ * 尝试）。候选卡与 relay/notice 都是往 Router 终端写，因此同一个互斥（§J.2 末注）。
  */
 export function createRouterRelay(options: RouterRelayOptions): RouterRelay {
   const now = options.now ?? (() => Date.now())
@@ -162,6 +185,17 @@ export function createRouterRelay(options: RouterRelayOptions): RouterRelay {
       await write(noticeLine(payload))
     })
 
+  const card = (payload: RouterCardMessage): Promise<void> =>
+    exclusive(async () => {
+      const name = safeName(payload.name)
+      const file = relayFilePath(options.stateDir, name)
+      mkdirSync(join(options.stateDir, RELAY_DIR), { recursive: true })
+      // 先落盘再写终端：终端里出现指针时，正文一定已经在了（与 relay 同序）。
+      writeFileSync(file, payload.body, 'utf8')
+      await write(cardLine(name, payload.summary, file))
+      log(`relayed candidate ${name} to the router`)
+    })
+
   const prune = (): number => {
     const directory = join(options.stateDir, RELAY_DIR)
     const cutoff = now() - retentionDays * 24 * 60 * 60 * 1000
@@ -190,7 +224,11 @@ export function createRouterRelay(options: RouterRelayOptions): RouterRelay {
   }
 
   return {
-    handlers: () => ({ relay: (payload: RelayMessage) => relay(payload), notice: (payload: NoticeMessage) => notice(payload) }),
+    handlers: () => ({
+      relay: (payload: RelayMessage) => relay(payload),
+      notice: (payload: NoticeMessage) => notice(payload),
+      card: (payload: RouterCardMessage) => card(payload)
+    }),
     prune
   }
 }

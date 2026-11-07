@@ -289,6 +289,16 @@ export class Engine {
   }
 
   /**
+   * 把人 follow-up 交回 Eval（`return` effect 的领域入口，§J.2 的 `return` 行）：幂等。
+   * 命令（handback/markUnrelated/ticket 结束）只在事务里写 disposition 与一条 `return`
+   * effect；真正重排发生在 effect 跑过之后，Thread 的写者因此仍然只有 Engine（§D.4）。
+   * @returns 是否排进了 Eval：已在那里、被接手、或已有已了结的 Decision 时为 false。
+   */
+  returnToEval(triggerId: string): boolean {
+    return this.repo.atomic(() => this.evals.returnToEval(triggerId))
+  }
+
+  /**
    * 执行器订阅一个它发现相关的 Thread，只作语境（见 `Thread.context`）。
    * @returns Ticket 已经跟随该 Thread 时返回 false。
    * @throws UserError Ticket 未知或已结束。

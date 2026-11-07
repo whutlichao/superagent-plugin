@@ -360,7 +360,7 @@ bin     → http client only
 | Trigger | `trigger` 表一行 + `trigger_thread` 关联 + `disposition` 一行 | 无差异。`id = key('<kind>', <原生 id>[, <版本>])` 保证幂等 |
 | Thread | `thread` 表一行，key 形如 `github:<number>` / `feishu:<chat>:<root>` | 无差异 |
 | Correlation | 一个 Trigger 挂在多个 Thread 上（`trigger_thread.primary_thread=0/1`） | 无差异；只加语境不路由 |
-| Channel | kind 的 `channel.send/ allowed / link`；地址是 Source 原生地址 | GitHub 用 comment/review-reply；Feishu 用话题回复 |
+| Channel | kind 的 `channel.send/ allowed / link`；地址是 Source 原生地址 | GitHub 用 comment/review-reply；Feishu 用话题回复（`--reply-in-thread`） |
 | Policy | `policy/*` + 版本化 `policy` 设置块（规则/accept mode/每 Source 部分） | 无差异 |
 | Eval | `evals` 部分 + `decision` 表；评估由 Router 调 `eval/eval-read/eval-decide` 完成 | **评估在 Router 会话里做**（上游也在 Main Session 里做），一致 |
 | Mandate | Ticket body 里的 `mandate`（policy version、scope、strength、matchedRules、basis、sender、via） | 无差异；不可变，只有 accept 建立 / 人停撤回 / 复验失败撤销 |
@@ -1040,7 +1040,7 @@ export interface SourceKind<C = unknown> {
 | Trigger | 一条消息；`addressed='mention'\|'direct'`；bot 自身消息丢弃；编辑/删除按 `update_time` 生成新 id | — |
 | Thread | `<chat>:<root message id>`；私聊为 `<chat>:direct` | — |
 | 准入行 | 每个 chat 一行、`other`、`direct` | — |
-| Channel | `im +message-reply --as bot --message-id <root> --text …`（幂等：`uuid` 或正文隐藏标记）；Markdown→富文本由 CLI 负责 | 撤回/找不到 → `gone`；其余抛错重试；100 词上限在发送前强制（中英混排按上游分词规则） |
+| Channel | `im +messages-reply --as bot --message-id <root> --reply-in-thread --markdown <text> --idempotency-key <key>`（幂等：`uuid` 或正文隐藏标记；`--idempotency-key` 上限 50 字符，超长确定性截短）；Markdown→富文本由 CLI 负责 | 撤回/找不到 → `gone`；其余抛错重试；100 词上限在发送前强制（中英混排按上游分词规则） |
 | 线程上下文 | `feishu/<trigger>/message`、`/root`、`/parent`、`/thread`、`/around`（前后各 5 条，按时间分页） | 无权限/已删 → 明确 `status` 而不是空 | 
 | 图片 | `--image-id` → `lark-cli` 下载到 `inbox/images/<id>`，返回路径（§H.17） | 下载失败 → 「无法读取图片」，不猜内容 |
 | find | 消息 id（`om_…`）、群 id（`oc_…`）、消息链接 | — |
@@ -1127,6 +1127,8 @@ kind 清单：
 | `return` | triggerKey | 人 follow-up 回到 Eval（handback 后） | 1 | 2 s→60 s |
 
 > 与上游的一处合并：上游 `relay` 与 `notice` 是两个 kind；这里保留两个 kind，但**共用同一串行队列**（都是 Router 终端），实现上用一个 `routerQueue` 互斥即可，语义上仍是「失败挡住后来的同种」。
+
+> `return` 的入队点与语义（#31）：`trigger handback`、`thread unrelated` 与 Ticket 结束时的释放（`letGo`）在**同一个事务里只写 disposition 与一行 `return`**（key 是该 Trigger 的 id），handler 经 `Engine.returnToEval` 幂等重排，提交之后才执行。上游在这三处是同步入队；这里改成持久意图，崩溃后「它该回到 Eval」这件事不会丢。因此 `{queued:true}` 的含义是「**会**进入 Eval」，候选出现在 `return` 跑过之后，而不是命令的事务里（实现上它在提交后的微任务里就跑了，所以调用方几乎立刻能看到候选）。
 
 ### J.3 与健康看板的关系
 
