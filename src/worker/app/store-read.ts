@@ -98,13 +98,19 @@ export function workingSetPlan(reader: SqlReader): Readonly<Record<WorkingSetNam
 export interface TimelineOptions {
   /** 每页行数（默认 50，面板一次最多 50 行，§M.4）。 */
   readonly limit?: number
-  /** 上一页返回的游标；未给则从最早一行开始。 */
+  /** 上一页返回的游标：升序时是「下一页」，降序时是「更早一页」。 */
   readonly after?: TimelineCursor | null
+  /**
+   * 方向：`oldest`（默认）从最早一行开始升序读，`newest` 从最新一行开始降序读。
+   * 面板的 Thread 详情按后者读（最新一页 + 「更早」），两种方向用同一个 `(at, id)` 游标。
+   */
+  readonly order?: 'oldest' | 'newest'
 }
 
 /**
- * Thread 时间线：按 `(at, trigger_id)` 升序，游标是同形的复合值。
- * 用行值比较 `(at, trigger_id) > (?, ?)`，同一时刻的多条记录既不丢也不重。
+ * Thread 时间线：按 `(at, trigger_id)` 排序，游标是同形的复合值。
+ * 用行值比较 `(at, trigger_id) > (?, ?)`（升序）或 `< (?, ?)`（降序），同一时刻的多条记录
+ * 既不丢也不重。
  */
 export function readTimeline(
   reader: SqlReader,
@@ -113,21 +119,24 @@ export function readTimeline(
 ): TimelinePage {
   const limit = Math.max(1, options.limit ?? 50)
   const after = options.after ?? null
+  const newest = options.order === 'newest'
+  const order = newest ? 'at DESC, trigger_id DESC' : 'at, trigger_id'
+  const compare = newest ? '<' : '>'
   const rows =
     after === null
       ? reader.all(
           `SELECT at, trigger_id, human, primary_thread
              FROM trigger_thread
             WHERE thread_key = ?
-            ORDER BY at, trigger_id
+            ORDER BY ${order}
             LIMIT ?`,
           [threadKey, limit + 1]
         )
       : reader.all(
           `SELECT at, trigger_id, human, primary_thread
              FROM trigger_thread
-            WHERE thread_key = ? AND (at, trigger_id) > (?, ?)
-            ORDER BY at, trigger_id
+            WHERE thread_key = ? AND (at, trigger_id) ${compare} (?, ?)
+            ORDER BY ${order}
             LIMIT ?`,
           [threadKey, after.at, after.triggerId, limit + 1]
         )

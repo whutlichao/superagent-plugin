@@ -22,8 +22,12 @@ import type {
   ExecutionFilter,
   HumanSlot,
   PanelState,
+  PanelThread,
   PanelTicket,
   SystemProblem,
+  ThreadDetailView,
+  ThreadFilter,
+  ThreadListPage,
   TicketDetailView,
   TicketListPage
 } from './protocol'
@@ -169,6 +173,155 @@ function executionPage(state: PanelState, input: unknown): TicketListPage {
   }
 }
 
+/** Trigger 页的一行：与读模型同一形状（§M.2 的 label/订阅数/最近触发/状态标记）。 */
+function threadRow(
+  key: string,
+  title: string,
+  stage: PanelThread['stage'] = 'subscribed',
+  overrides: Partial<PanelThread> = {}
+): PanelThread {
+  return {
+    key,
+    source: 'github',
+    title,
+    stage,
+    pending: 0,
+    subscriptions: 1,
+    lastAt: 1_700_000_000_000,
+    createdAt: 1_700_000_000_000,
+    latest: {
+      actor: 'github:alice',
+      human: true,
+      at: 1_700_000_000_000,
+      preview: 'please fix the login redirect'
+    },
+    ...overrides
+  }
+}
+
+/** 情景里的 Thread：四档筛选各有一条可看的行。 */
+const THREAD_ROWS: readonly PanelThread[] = [
+  threadRow('github:owner/widgets#12', 'owner/widgets#12'),
+  threadRow('github:owner/widgets#13', 'owner/widgets#13', 'evaluating'),
+  threadRow('github:owner/widgets#14', 'owner/widgets#14', 'queued', { pending: 2 }),
+  threadRow('github:owner/widgets#15', 'owner/widgets#15', 'error', {
+    pollError: 'graphql: 502 Bad Gateway'
+  }),
+  threadRow('github:owner/widgets#16', 'owner/widgets#16', 'dormant')
+]
+
+/** Trigger 列表的长列表：60 条订阅的线程（§M.4 的「分页 50 条」）。 */
+const MANY_THREADS: readonly PanelThread[] = Array.from({ length: 60 }, (_, index) =>
+  threadRow(
+    `github:owner/widgets#${index}`,
+    `owner/widgets#${index}`,
+    'subscribed',
+    { subscriptions: index % 3 }
+  )
+)
+
+/** 四档筛选在夹具上的判定（档位与 worker 的读模型同一口径，只是把 `PanelThread` 切片）。 */
+const THREAD_STAGES: Readonly<Record<ThreadFilter, readonly PanelThread['stage'][]>> = {
+  subscribed: ['subscribed'],
+  evaluating: ['evaluating', 'queued'],
+  recent: ['subscribed', 'evaluating', 'queued', 'error', 'dormant'],
+  all: ['subscribed', 'evaluating', 'queued', 'error', 'dormant', 'unsubscribed']
+}
+
+/** `threads` 请求的答案（§M.2 的四档筛选 + §M.4 的分页 50 条）。 */
+function threadsPage(rows: readonly PanelThread[], input: unknown): ThreadListPage {
+  const window = (input ?? {}) as {
+    readonly filter?: ThreadFilter
+    readonly offset?: number
+    readonly limit?: number
+  }
+  const filter = window.filter ?? 'subscribed'
+  const offset = Math.max(0, window.offset ?? 0)
+  const limit = Math.max(1, Math.min(50, window.limit ?? 50))
+  const matching = rows.filter((row) => THREAD_STAGES[filter].includes(row.stage))
+  return {
+    items: matching.slice(offset, offset + limit),
+    nextOffset: offset + limit < matching.length ? offset + limit : null
+  }
+}
+
+/** 一条 Thread 的详情：一条被交回的触发、一条被接单的触发、订阅与决定都在。 */
+function threadDetailFixture(rows: readonly PanelThread[], key: string): ThreadDetailView {
+  const thread = rows.find((row) => row.key === key)
+  return {
+    key,
+    source: 'github',
+    title: thread?.title ?? 'owner/widgets#12',
+    url: 'https://github.test/owner/widgets/pull/12',
+    stage: thread?.stage ?? 'subscribed',
+    createdAt: 1_700_000_000_000,
+    lastAt: 1_700_000_060_000,
+    pending: thread?.pending ?? 0,
+    subscriptions: [
+      { id: 't1', title: 'Fix the login redirect', state: 'open', context: false },
+      { id: 't2', title: 'Review the parser rewrite', state: 'ended', context: true }
+    ],
+    decisions: [
+      {
+        id: 'decision-1',
+        kind: 'accept',
+        reason: [{ code: 'explicitRouted' }],
+        strength: 'explicit',
+        policyVersion: 'v3',
+        at: 1_700_000_000_000,
+        ticketId: 't1'
+      }
+    ],
+    timeline: [
+      {
+        id: 'trigger-2',
+        source: 'github',
+        actor: 'github:bob',
+        human: true,
+        at: 1_700_000_060_000,
+        text: 'also update the docs',
+        queued: false,
+        evaluating: false,
+        delivered: false,
+        fanout: ['t1'],
+        handbacks: [
+          {
+            ticketId: 't1',
+            ticketTitle: 'Fix the login redirect',
+            reason: 'Asks for a new page',
+            at: 1_700_000_120_000
+          }
+        ],
+        canRequeue: true
+      },
+      {
+        id: 'trigger-1',
+        source: 'github',
+        actor: 'github:alice',
+        human: true,
+        at: 1_700_000_000_000,
+        text: 'please fix the login redirect',
+        queued: false,
+        evaluating: false,
+        delivered: false,
+        fanout: ['t1'],
+        handbacks: [],
+        decision: {
+          id: 'decision-1',
+          kind: 'accept',
+          reason: [{ code: 'explicitRouted' }],
+          strength: 'explicit',
+          policyVersion: 'v3',
+          at: 1_700_000_000_000,
+          ticketId: 't1'
+        },
+        canRequeue: false
+      }
+    ],
+    earlier: null
+  }
+}
+
 /** 详情的读数：一张可以直接看的工单（授权、等待中的输入、订阅、派工、报告、待人工、终端）。 */
 function detailFixture(state: PanelState, ticketId: string): TicketDetailView {
   const ticket = (state.tickets ?? []).find((row) => row.id === ticketId)
@@ -223,7 +376,7 @@ function detailFixture(state: PanelState, ticketId: string): TicketDetailView {
 }
 
 /** 一个情景的宿主选项：`state` 的答案 + Execution 列表/详情 + 动作的答案（同一份快照的变体）。 */
-function hostFor(state: PanelState) {
+function hostFor(state: PanelState, threadRows: readonly PanelThread[] = THREAD_ROWS) {
   return {
     requests: {
       state: () => state,
@@ -243,7 +396,13 @@ function hostFor(state: PanelState) {
       'ticket.requestStatus': () => ({ asked: true }),
       'terminal.focus': () => ({ focused: true }),
       'workspace.open': () => ({ opened: true }),
-      'workspace.remove': () => ({ removed: true })
+      'workspace.remove': () => ({ removed: true }),
+      // Trigger 页（§M.2）：列表、详情与两条动作（check 的 `trigger` 情景真的走这四条）。
+      threads: (input: unknown) => threadsPage(threadRows, input),
+      'thread.detail': (input: unknown) =>
+        threadDetailFixture(threadRows, (input as { threadKey?: string } | null)?.threadKey ?? ''),
+      'trigger.requeue': () => ({ queued: true }),
+      'thread.unsubscribe': () => ({ removed: true })
     }
   }
 }
@@ -402,6 +561,17 @@ export default defineCheck({
       })
     ),
     storage: { 'panel.page': 'execution', 'panel.executionFilter': 'open' }
+  },
+  /** Trigger 列表本身：打开就停在这一页，60 条线程、四档筛选、首页 50 行 + 「加载更多」。 */
+  trigger: {
+    ...hostFor(
+      snapshot({
+        sources: { enabled: 1, problems: 0 },
+        activity: { received: 60, evaluated: 60, accepted: 0, ignored: 60 }
+      }),
+      MANY_THREADS
+    ),
+    storage: { 'panel.page': 'trigger', 'panel.threadFilter': 'subscribed' }
   },
   /** 浅色主题下的待人工页面（`theme` 是 check 能区分的维度；`locale` 见文件头）。 */
   zh: {

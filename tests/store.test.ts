@@ -134,6 +134,71 @@ test('a thread timeline pages by the (at, id) composite cursor without loss or r
   }
 })
 
+test('the same (at, id) cursor reads a thread timeline newest first, from the newest page back', () => {
+  // 面板的时间线从最新一条往回读（§M.2 的 Trigger 详情、「更早」）：方向反过来之后，
+  // 同一时刻的两条仍然只能靠 (at, id) 复合游标区分——只用时间做游标会丢掉其中一条。
+  const { store, cleanup } = openTempStore()
+  try {
+    const rows = [
+      { id: 'trigger-a', at: AT },
+      { id: 'trigger-b', at: AT },
+      { id: 'trigger-c', at: isoAfter(AT, 1000) }
+    ]
+    for (const row of rows) {
+      store.triggers.insert({
+        id: row.id,
+        source: 'github',
+        at: row.at,
+        actor: { source: 'github', id: 'alice' },
+        human: true,
+        addressed: null,
+        text: row.id,
+        url: null,
+        body: {}
+      })
+      store.triggerThreads.link({
+        threadKey: 'github:1',
+        at: row.at,
+        triggerId: row.id,
+        human: true,
+        primaryThread: row.id === 'trigger-a'
+      })
+    }
+
+    const first = store.triggerThreads.timeline('github:1', { limit: 2, order: 'newest' })
+    assert.deepEqual(
+      first.items.map((item) => item.triggerId),
+      ['trigger-c', 'trigger-b'],
+      'the newest page starts at the newest row, descending'
+    )
+    assert.deepEqual(
+      first.next,
+      { at: AT, triggerId: 'trigger-b' },
+      'the cursor is the oldest row of the page, as (at, id)'
+    )
+
+    const second = store.triggerThreads.timeline('github:1', {
+      limit: 2,
+      order: 'newest',
+      after: first.next
+    })
+    assert.deepEqual(
+      second.items.map((item) => item.triggerId),
+      ['trigger-a'],
+      'the row sharing its instant is neither skipped nor repeated'
+    )
+    assert.equal(second.next, null, 'no more pages once the last page is short')
+
+    const everything = [
+      ...first.items.map((item) => item.triggerId),
+      ...second.items.map((item) => item.triggerId)
+    ]
+    assert.deepEqual(everything, ['trigger-c', 'trigger-b', 'trigger-a'])
+  } finally {
+    cleanup()
+  }
+})
+
 test('the working sets are read through generated columns and partial indexes only', () => {
   const { store, cleanup } = openTempStore()
   try {

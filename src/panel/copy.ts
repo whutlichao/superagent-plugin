@@ -143,6 +143,69 @@ export const COPY = {
     en: 'No worker is waiting for a trigger, so nothing was asked.'
   },
   'execution.endedBy': { zh: '结束于', en: 'Ended by' },
+
+  // ---- Trigger 页（§M.2）：Thread 列表的四档筛选、四列与三态 ----
+  'thread.filters': { zh: '筛选', en: 'Filter' },
+  'thread.filter.subscribed': { zh: '已订阅', en: 'Subscribed' },
+  'thread.filter.evaluating': { zh: '评估中', en: 'Evaluating' },
+  'thread.filter.recent': { zh: '24 小时内新增', en: 'New in 24 h' },
+  'thread.filter.all': { zh: '全部', en: 'All' },
+  'thread.columnThread': { zh: '线程', en: 'Thread' },
+  'thread.columnSubscriptions': { zh: '订阅数', en: 'Subscriptions' },
+  'thread.columnLatest': { zh: '最近触发', en: 'Latest trigger' },
+  'thread.columnState': { zh: '状态', en: 'State' },
+  'thread.noLatest': { zh: '还没有触发', en: 'No trigger yet' },
+  'thread.empty': { zh: '还没有线程。', en: 'No threads yet' },
+  'thread.back': { zh: '返回列表', en: 'Back to the list' },
+  'thread.source': { zh: '来源：{source}', en: 'Source: {source}' },
+  'thread.created': { zh: '创建于', en: 'Created' },
+  'thread.latestAt': { zh: '最近触发', en: 'Latest trigger' },
+  'thread.openOriginal': { zh: '打开原始链接', en: 'Open original' },
+  'thread.timeline': { zh: '时间线', en: 'Timeline' },
+  'thread.noTriggers': { zh: '这条线程还没有触发。', en: 'No Trigger on this Thread yet.' },
+  'thread.loadEarlier': { zh: '加载更早的触发', en: 'Load earlier Triggers' },
+  'thread.decisions': { zh: '这条线程的决定', en: 'Decisions in this Thread' },
+  'thread.noDecisions': { zh: '这条线程还没有决定。', en: 'No Decision on this Thread yet.' },
+  'thread.subscribedTickets': { zh: '订阅的工单', en: 'Subscribed tickets' },
+  'thread.noSubscribedTickets': {
+    zh: '没有工单订阅这条线程。',
+    en: 'No ticket subscribes to this Thread.'
+  },
+  'thread.contextOnly': { zh: '仅语境', en: 'Context only' },
+  'thread.ticket.open': { zh: '进行中', en: 'Open' },
+  'thread.ticket.ended': { zh: '已结束', en: 'Ended' },
+  'thread.ticket.unknown': { zh: '未知工单', en: 'Unknown ticket' },
+  'thread.evaluatingBanner': {
+    zh: '正在评估 {count} 条触发（强度：{strength}）',
+    en: 'Evaluating {count} Triggers (strength: {strength})'
+  },
+  'thread.evaluatingDeadline': { zh: '截止', en: 'Deadline' },
+  'thread.pollFailed': { zh: '轮询失败：{error}', en: 'Polling failed: {error}' },
+  'thread.disposition.queued': { zh: '等待评估', en: 'Waiting for Eval' },
+  'thread.delivered': { zh: '已交给工单的执行器', en: 'Its worker decides it' },
+  'thread.fanout': { zh: '扇出给 {count} 个工单', en: 'Fanned out to {count} tickets' },
+  'thread.handedBack': {
+    zh: '“{ticket}”的执行器把这条触发交回评估：{reason}',
+    en: 'The Executor of “{ticket}” handed it back for an Eval: {reason}'
+  },
+  'thread.requeue': { zh: '再评估一次', en: 'Evaluate again' },
+  'thread.requeued': { zh: '已重新排进评估。', en: 'Queued for a new Eval.' },
+  'thread.requeueHeld': {
+    zh: '已有评估持有这条触发，没有重复排队。',
+    en: 'An Eval already holds this Trigger; nothing was queued.'
+  },
+  'thread.unsubscribe': { zh: '取消订阅', en: 'Unsubscribe' },
+  'thread.unsubscribeDone': { zh: '已取消订阅这条线程。', en: 'Unsubscribed from this Thread.' },
+  'thread.notSubscribed': {
+    zh: '这条线程上已经没有订阅了。',
+    en: 'No ticket subscribes to this Thread any more.'
+  },
+  'thread.unsubscribeHint': {
+    zh: '取消订阅会丢掉这条线程上全部工单的订阅。',
+    en: 'Unsubscribing drops every Ticket’s subscription on this Thread.'
+  },
+  'thread.actions': { zh: '线程动作', en: 'Thread actions' },
+  'thread.openTicket': { zh: '打开工单', en: 'Open ticket' },
   'mandate.via.addressed': { zh: '点名', en: 'Addressed' },
   'mandate.via.followup': { zh: '线程上的后续消息', en: 'Follow-up' },
   'mandate.via.admission': { zh: '准入表', en: 'Admission' },
@@ -691,6 +754,11 @@ export const COPY = {
   'userError.unknownTrigger': { zh: '未知的触发', en: 'Unknown trigger' },
   'userError.unknownAssignment': { zh: '未知的派工', en: 'Unknown assignment' },
   'userError.unknownProblem': { zh: '找不到这条未完成的评估', en: 'Unavailable Eval not found' },
+  'userError.unknownThread': { zh: '未知的线程', en: 'Unknown thread' },
+  'userError.notRequeueable': {
+    zh: '这张工单的 worker 仍拥有这条消息；由它决定或交回',
+    en: "A ticket's worker still owns this message; its worker decides it or hands it back"
+  },
   'userError.ticketEnded': { zh: '工单已结束', en: 'Ticket has ended' },
   'userError.assignmentEnded': {
     zh: '派工已结束；该工单属于更新的派工',
@@ -864,6 +932,20 @@ export function translate(locale: string, key: CopyKey, values: CopyValues = {})
   return template.replace(/\{(\w+)\}/g, (match, name: string) =>
     name in values ? String(values[name]) : match
   )
+}
+
+/**
+ * 一条原因（`core/reasons.ts` 的 `Reason` 的面板面）→ 本地化文本：按 `reason.<code>` 取词，
+ * `values` 填 `{ticket}`/`{attempts}` 之类的占位符。没有对应文案时原样显示代码——不假装
+ * 翻译过，也不把未知码吞掉。
+ */
+export function translateReason(
+  locale: string,
+  reason: { readonly code: string; readonly values?: Readonly<Record<string, string>> }
+): string {
+  const key = `reason.${reason.code}` as CopyKey
+  if (!(key in COPY)) return reason.code
+  return translate(locale, key, reason.values ?? {})
 }
 
 // ---------------------------------------------------------------------------

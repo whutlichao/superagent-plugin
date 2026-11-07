@@ -5,6 +5,7 @@ export const USER_ERRORS = {
   unknownTrigger: ['missing', 'Unknown trigger'],
   unknownAssignment: ['missing', 'Unknown assignment'],
   unknownProblem: ['missing', 'Unavailable Eval not found'],
+  unknownThread: ['missing', 'Unknown thread'],
   ticketEnded: ['refused', 'Ticket has ended'],
   assignmentEnded: ['refused', 'Assignment has ended; a newer assignment owns this ticket'],
   evalFinished: [
@@ -53,6 +54,10 @@ export const USER_ERRORS = {
   handedBackHere: [
     'refused',
     'The worker of this ticket handed that trigger back as beyond it: accept it as new work, attach it to another ticket, or ignore it'
+  ],
+  notRequeueable: [
+    'refused',
+    "A ticket's worker still owns this message; its worker decides it or hands it back"
   ],
   workerDecides: [
     'refused',
