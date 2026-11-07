@@ -10,6 +10,7 @@
 //
 // 依赖纪律（§C.2）：本文件只 import core 的领域类型、`OrcaRuntime` 接口与 `app/effects` 的
 // 队列形状；不 spawn、不 `host.call`（§B.1）。
+import { join } from 'node:path'
 import type { Assignment, Ticket, TicketInput, Trigger } from '../core/model.ts'
 import type { Executor } from '../core/ports.ts'
 import type { EngineForExecutor } from '../core/engine.ts'
@@ -24,7 +25,17 @@ import {
   type DeliverySettings
 } from './deliver.ts'
 import { launchTicketAgent, type LaunchSettings } from './launch.ts'
+import {
+  EMPTY_DEPLOYMENT,
+  environmentOf,
+  type EnvironmentDeployment,
+  type EnvironmentTable,
+  type SourceEnvironmentContribution
+} from './environment.ts'
+import { ensureExcluded, writeEnvFile } from './env-file.ts'
+import { launchEnvironment, launchHook as defaultLaunchHook, type LaunchHook } from './launch-hook.ts'
 import { runPrepare } from './prepare.ts'
+import { writeCommandShims } from './shims.ts'
 import { countSlots, DEFAULT_MAX_WORKERS, mayLaunch, mayWake, type SlotCounts } from './slots.ts'
 import { ensureTicketWorkspace, type WorkspaceSettings } from './workspace.ts'
 import { resolveAgentSetting } from '../app/agent-defaults.ts'
@@ -53,6 +64,8 @@ export interface ExecutorSettings {
   readonly worktreeRetention: 'keep' | 'on-end'
   /** `executor.prepare`：checkout 后置命令（§E.3），本票只读入并保留。 */
   readonly prepare?: string
+  /** `executor.blockedCommands`：不可运行的个人 CLI 名单（§E.11；shim 与变量都用它）。 */
+  readonly blockedCommands: readonly string[]
 }
 
 /** 队列只需要这两件事：入队与注册 handler（`Effects` 结构上满足它）。 */
@@ -89,6 +102,16 @@ export interface RegisterExecutorOptions {
   readonly cliPath: string
   /** 每个 Assignment 的 token 文件路径（§D.6；本票只取路径，不签发）。 */
   readonly tokenFile: (assignmentId: string) => string
+  /** 部署派生的事实（§E.11 的变量源）；缺省全空串，等 setup（#44）填。 */
+  readonly deployment?: EnvironmentDeployment
+  /** loopback API 基址（`SUPERAGENT_API`）；缺省空串。 */
+  readonly apiBase?: string
+  /** Source kind 对执行环境的额外贡献（§I.1；#17/#21 之后由组合根传入）。 */
+  readonly sourceEnvironments?: readonly SourceEnvironmentContribution[]
+  /** launch 钩子：`main.ts` 注册的是同一个实例，执行器在 launch 之前往里登记环境（§H.11）。 */
+  readonly launchHook?: LaunchHook
+  /** PATH 的底座（钩子载荷里拿不到宿主环境）；缺省取插件进程的 PATH。 */
+  readonly path?: string
   /** 注入的等待（投递回读用）；测试不 sleep。 */
   readonly wait?: (milliseconds: number) => Promise<void>
   readonly log?: (message: string) => void
@@ -116,6 +139,23 @@ function nonNegative(value: unknown): number | undefined {
 /** 一个设置项的布尔读法。 */
 function flag(value: unknown): boolean | undefined {
   return typeof value === 'boolean' ? value : undefined
+}
+
+/**
+ * 一个设置项的命令名单读法（`executor.blockedCommands`）：数组，或逗号/空白分隔的字符串。
+ * 去空项、去重，保留顺序；其余形态当没有。
+ */
+function commandNames(value: unknown): readonly string[] {
+  const raw: readonly unknown[] = Array.isArray(value)
+    ? (value as readonly unknown[])
+    : typeof value === 'string'
+      ? value.split(/[\s,]+/)
+      : []
+  const names = raw
+    .filter((item): item is string => typeof item === 'string')
+    .map((item) => item.trim())
+    .filter((item) => item !== '')
+  return [...new Set(names)]
 }
 
 /** 读取一个嵌套设置块；不是对象就当没有。 */
@@ -158,6 +198,7 @@ export function resolveExecutorSettings(raw: Readonly<Record<string, unknown>>):
     inlineLimit: nonNegative(executor['inlineLimit']) ?? DEFAULT_INLINE_LIMIT,
     confirmDelivery: flag(executor['confirmDelivery']) ?? DEFAULT_CONFIRM_DELIVERY,
     worktreeRetention: text(executor['worktreeRetention']) === 'on-end' ? 'on-end' : 'keep',
+    blockedCommands: commandNames(executor['blockedCommands']),
     ...(model === undefined ? {} : { model }),
     ...(effort === undefined ? {} : { effort }),
     ...(baseRepo === undefined ? {} : { baseRepo }),
@@ -191,7 +232,7 @@ function briefBody(text: string, original: string): string {
   } more characters; original: ${original})`
 }
 
-/** 开播前写好的作业文本（`inbox/0.md`）：Ticket 卡 + 原始请求 + 工作方式。 */
+/** 开播前写好的作业文本（`inbox/0.md`）：Ticket 卡 + 原始请求 + 环境 + 工作方式。 */
 export function renderAssignmentBrief(options: {
   readonly ticket: Ticket
   readonly trigger: Trigger | undefined
@@ -199,6 +240,8 @@ export function renderAssignmentBrief(options: {
   readonly directory: string
   readonly cliPath: string
   readonly tokenFile: string
+  /** §E.11 的变量表：值写进正文，同时说明「不要把它们写进提交」。 */
+  readonly environment: Readonly<Record<string, string>>
 }): string {
   const { ticket, trigger } = options
   const request = trigger === undefined ? '(the originating message is not stored any more)' : briefBody(trigger.text, trigger.url ?? trigger.id)
@@ -216,11 +259,18 @@ export function renderAssignmentBrief(options: {
     '',
     request,
     '',
+    '## Environment',
+    '',
+    `These variables are set for you and written to ${options.directory}/.superagent/env.sh (source it if you need them in a shell):`,
+    '',
+    ...Object.keys(options.environment).map((key) => `- ${key} = ${options.environment[key] ?? ''}`),
+    '',
+    'Never write these values, the state directory or the token file into a commit.',
+    '',
     '## Working here',
     '',
     `- Every later input is written to this ticket's inbox and announced as \`[superagent] #<n>\`; read the named file before acting.`,
-    `- Report with the CLI: node "${options.cliPath}" --token-file "${options.tokenFile}"`,
-    '- Never write the token file, the state directory or these paths into a commit.'
+    `- Report with the CLI: node "${options.cliPath}" --token-file "${options.tokenFile}"`
   ].join('\n')
 }
 
@@ -303,6 +353,42 @@ export function registerExecutorEffects(options: RegisterExecutorOptions): void 
       throw new Later(`all ${settings.maxWorkers} worker slots are taken`)
     }
     const workspace = await ensureTicketWorkspace(runtime, { ticket, settings: workspaceSettings })
+    const trigger = records.triggers.get(ticket.origin.triggerId)
+    const tokenFile = options.tokenFile(assignment.id)
+    // 执行环境先落盘：env.sh、它的 git 排除与被禁命令的 shim 都在 launch 之前就位（§E.11、§H.11）。
+    const environment: EnvironmentTable = environmentOf({
+      deployment: options.deployment ?? EMPTY_DEPLOYMENT,
+      ticket: { id: ticket.id, name: workspace.short, directory: workspace.handle.path },
+      plugin: {
+        cliPath,
+        tokenFile,
+        ...(options.apiBase === undefined ? {} : { apiBase: options.apiBase })
+      },
+      blockedCommands: settings.blockedCommands,
+      ...(trigger === undefined ? {} : { trigger }),
+      ...(options.sourceEnvironments === undefined ? {} : { sources: options.sourceEnvironments })
+    })
+    try {
+      const envPath = writeEnvFile({
+        directory: workspace.handle.path,
+        environment,
+        ticketId: ticket.id
+      })
+      const excluded = ensureExcluded(workspace.handle.path)
+      const shims = writeCommandShims({
+        binDirectory: join(stateDir, 'bin'),
+        blockedCommands: settings.blockedCommands
+      })
+      log(
+        `environment for ${ticket.id}: ${envPath}` +
+          (excluded?.added === true ? `, ignored in ${excluded.path}` : '') +
+          (shims.written.length === 0 ? '' : `, shims ${shims.written.join(', ')}`)
+      )
+    } catch (error) {
+      // 环境写不下去，这个 worktree 就不是一个可用的执行环境：直接记 failed，不重试（§E.3 同理）。
+      markFailed(ticket.id, `execution environment failed: ${messageOf(error)}`)
+      return
+    }
     if (!prepared.has(assignment.id)) {
       try {
         const result = await runPrepare({
@@ -311,7 +397,8 @@ export function registerExecutorEffects(options: RegisterExecutorOptions): void 
           assignmentId: assignment.id,
           workspace: workspace.handle,
           command: settings.prepare,
-          stateDir
+          stateDir,
+          environment
         })
         prepared.add(assignment.id)
         if (result.ran) log(`prepare ran for ${ticket.id} (${result.logPath})`)
@@ -321,15 +408,15 @@ export function registerExecutorEffects(options: RegisterExecutorOptions): void 
         return
       }
     }
-    const tokenFile = options.tokenFile(assignment.id)
     const briefPath = inboxPath(stateDir, ticket.id, 0)
     const brief = renderAssignmentBrief({
       ticket,
-      trigger: records.triggers.get(ticket.origin.triggerId),
+      trigger,
       short: workspace.short,
       directory: workspace.handle.path,
       cliPath,
-      tokenFile
+      tokenFile,
+      environment
     })
     writeInboxFile({ stateDir, ticketId: ticket.id, seq: 0, markdown: brief })
     const handle = await launchTicketAgent(runtime, {
@@ -340,6 +427,14 @@ export function registerExecutorEffects(options: RegisterExecutorOptions): void 
       cliPath,
       tokenFile,
       inboxPath: briefPath,
+      // 钩子只给这次 launch 追加环境：变量表 + PATH 前置 shim 目录 + worker 的 git 配置（§H.11）。
+      environment: launchEnvironment({
+        environment,
+        binDirectory: join(stateDir, 'bin'),
+        gitConfig: join(stateDir, 'worker-gitconfig'),
+        basePath: options.path ?? process.env['PATH'] ?? ''
+      }),
+      launches: options.launchHook ?? defaultLaunchHook,
       ...(options.wait === undefined ? {} : { wait: options.wait })
     })
     engine.assignmentStarted(ticket.id, assignment.id, {

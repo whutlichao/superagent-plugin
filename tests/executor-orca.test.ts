@@ -17,6 +17,8 @@ import {
   type DeliverySettings
 } from '../src/worker/executor/deliver'
 import { launchTicketAgent, seedPrompt } from '../src/worker/executor/launch'
+import type { EnvironmentDeployment } from '../src/worker/executor/environment'
+import { createLaunchHook, type LaunchHook } from '../src/worker/executor/launch-hook'
 import {
   OrcaExecutor,
   registerExecutorEffects,
@@ -668,11 +670,22 @@ function withTerminal(runtime: FakeOrcaRuntime): void {
 }
 
 /** 真实 Engine（内存仓储）+ 真实 SQLite 队列 + 假 Orca 的执行器夹具。 */
-function harness(options: { readonly maxWorkers?: number; readonly prepare?: string } = {}) {
+function harness(
+  options: {
+    readonly maxWorkers?: number
+    readonly prepare?: string
+    readonly blockedCommands?: readonly string[]
+    readonly deployment?: EnvironmentDeployment
+    readonly launchHook?: LaunchHook
+  } = {}
+) {
   const opened = new MemoryRepositories()
   const repo = opened.claimWriter()
   const queue = openQueue()
   const runtime = new FakeOrcaRuntime()
+  // 执行环境会往 worktree 目录里写文件：给它一个临时根，用例结束删干净。
+  const worktreeRoot = mkdtempSync(join(tmpdir(), 'superagent-worktrees-'))
+  runtime.worktreeRoot = worktreeRoot
   const logs: string[] = []
   const policy: Policy = {
     version: 'policy-1',
@@ -697,7 +710,8 @@ function harness(options: { readonly maxWorkers?: number; readonly prepare?: str
   })
   const executorBlock = {
     ...(options.maxWorkers === undefined ? {} : { maxWorkers: options.maxWorkers }),
-    ...(options.prepare === undefined ? {} : { prepare: options.prepare })
+    ...(options.prepare === undefined ? {} : { prepare: options.prepare }),
+    ...(options.blockedCommands === undefined ? {} : { blockedCommands: [...options.blockedCommands] })
   }
   const settings = resolveExecutorSettings({ agent: 'pi', executor: executorBlock })
   registerExecutorEffects({
@@ -709,6 +723,10 @@ function harness(options: { readonly maxWorkers?: number; readonly prepare?: str
     stateDir: queue.stateDir,
     cliPath: '/plugins/superagent/src/bin/superagent.mjs',
     tokenFile: (assignmentId) => `/state/tokens/${assignmentId}`,
+    apiBase: 'http://127.0.0.1:3082',
+    path: '/usr/bin:/bin',
+    ...(options.deployment === undefined ? {} : { deployment: options.deployment }),
+    ...(options.launchHook === undefined ? {} : { launchHook: options.launchHook }),
     wait: async () => undefined,
     log: (line) => logs.push(line)
   })
@@ -723,8 +741,21 @@ function harness(options: { readonly maxWorkers?: number; readonly prepare?: str
   const cleanup = async (): Promise<void> => {
     await queue.effects.idle().catch(() => undefined)
     queue.cleanup()
+    rmSync(worktreeRoot, { recursive: true, force: true })
   }
-  return { ...queue, cleanup, runtime, engine, executor, settings, seed, seedTrigger, read, logs }
+  return {
+    ...queue,
+    cleanup,
+    runtime,
+    engine,
+    executor,
+    settings,
+    seed,
+    seedTrigger,
+    read,
+    logs,
+    worktreeRoot
+  }
 }
 
 test('a launch builds the worktree, writes the brief and starts the worker on a terminal', async () => {
@@ -745,10 +776,7 @@ test('a launch builds the worktree, writes the brief and starts the worker on a 
   assert.equal(stored.assignments[0]?.state, 'running')
   assert.equal(stored.assignments[0]?.terminalId, 'term_1')
   assert.equal(stored.execution?.name, 'fix-the-login-flow')
-  assert.equal(
-    stored.execution?.directory,
-    `${FakeOrcaRuntime.WORKTREE_ROOT}/superagent-fix-the-login-flow`
-  )
+  assert.equal(stored.execution?.directory, `${h.worktreeRoot}/superagent-fix-the-login-flow`)
   const brief = readFileSync(inboxPath(h.stateDir, 'ticket-11', 0), 'utf8')
   assert.ok(brief.includes('Fix the login flow'), 'the brief names the ticket')
   assert.ok(brief.includes('Please fix the login flow before Friday.'), 'the brief carries the request')
@@ -955,7 +983,7 @@ test('the prepare command runs once per assignment with a ten minute budget', as
   assert.equal(h.runtime.calls.runCommand[0]?.timeoutMs, 600_000, 'ten minute budget')
   assert.equal(
     h.runtime.calls.runCommand[0]?.workspace.path,
-    `${FakeOrcaRuntime.WORKTREE_ROOT}/superagent-fix-the-login-flow`
+    `${h.worktreeRoot}/superagent-fix-the-login-flow`
   )
   assert.equal(h.runtime.calls.launchAgent.length, 1, 'the agent starts after prepare succeeds')
 
@@ -963,6 +991,128 @@ test('the prepare command runs once per assignment with a ten minute budget', as
   h.executor.start(pending, pending.assignments[0]!)
   await h.effects.idle('launch')
   assert.equal(h.runtime.calls.runCommand.length, 1)
+  await h.cleanup()
+})
+
+// ---- 执行环境（§E.11、§H.11）：env.sh、shim、prepare 替换、launch 钩子与开播语 ------------
+
+/** 部署派生的事实（测试里只有这四个字段被环境表读到）。 */
+const DEPLOYMENT: EnvironmentDeployment = {
+  repository: 'acme/widgets',
+  githubLogin: 'acme-agent',
+  githubCommitEmail: '1+acme-agent@users.noreply.github.com',
+  feishuBotId: 'ou_bot_1'
+}
+
+test('a launch writes the ticket environment, shims the blocked commands and briefs the values', async () => {
+  const h = harness({ deployment: DEPLOYMENT, blockedCommands: ['personal-gh'] })
+  const pending = ticket({ assignments: [assignment('a-1', 'pending')] })
+  h.seed(pending)
+  h.seedTrigger(trigger())
+  h.executor.start(pending, pending.assignments[0]!)
+  await h.effects.idle('launch')
+
+  const directory = `${h.worktreeRoot}/superagent-fix-the-login-flow`
+  const environment = readFileSync(join(directory, '.superagent', 'env.sh'), 'utf8')
+  assert.ok(environment.includes(`export DSH_SUPERAGENT_DIR='${directory}'`), 'the worktree path')
+  assert.ok(environment.includes("export DSH_SUPERAGENT_TICKET='ticket-11'"), 'the ticket id')
+  assert.ok(environment.includes("export DSH_SUPERAGENT_GITHUB_REPOSITORY='acme/widgets'"), 'the repository')
+  assert.ok(environment.includes("export DSH_SUPERAGENT_GITHUB_ACCOUNT='acme-agent'"), 'the account')
+  assert.ok(environment.includes("export DSH_SUPERAGENT_BLOCKED_COMMANDS='personal-gh'"), 'the blocked list')
+  assert.ok(environment.includes("export SUPERAGENT_TOKEN_FILE='/state/tokens/a-1'"), 'this assignment token')
+  assert.ok(environment.includes("export SUPERAGENT_API='http://127.0.0.1:3082'"), 'the API base')
+
+  const shim = readFileSync(join(h.stateDir, 'bin', 'personal-gh'), 'utf8')
+  assert.ok(/exit 1/.test(shim), 'a blocked command fails')
+  assert.ok(/not a security boundary/.test(shim), 'and says it is not a guarantee')
+
+  const brief = readFileSync(inboxPath(h.stateDir, 'ticket-11', 0), 'utf8')
+  assert.ok(brief.includes('DSH_SUPERAGENT_TICKET = ticket-11'), 'the brief carries the values')
+  assert.ok(brief.includes(`DSH_SUPERAGENT_DIR = ${directory}`))
+  assert.ok(brief.includes('.superagent/env.sh'), 'and names the env file')
+  assert.ok(/Never write these values/.test(brief), 'and says they must not be committed')
+  await h.cleanup()
+})
+
+test('prepare gets the substituted command, and a retry on a new assignment runs it again', async () => {
+  const h = harness({
+    deployment: DEPLOYMENT,
+    prepare: 'echo ${DSH_SUPERAGENT_TICKET} ${DSH_SUPERAGENT_GITHUB_PR_HEAD} ${SUPERAGENT_TOKEN_FILE}'
+  })
+  const pending = ticket({ assignments: [assignment('a-1', 'pending')] })
+  h.seed(pending)
+  h.seedTrigger(trigger({ meta: { number: 42, isPr: true } }))
+  h.executor.start(pending, pending.assignments[0]!)
+  await h.effects.idle('launch')
+  assert.equal(
+    h.runtime.calls.runCommand[0]?.command,
+    "echo 'ticket-11' 'refs/pull/42/head' '/state/tokens/a-1'"
+  )
+
+  // 人的 retry：同一 worktree、新 Assignment；prepare 按「一次 Assignment 一次」重跑。
+  const retried = ticket({
+    assignments: [pending.assignments[0]!, assignment('a-2', 'pending')]
+  })
+  h.seed(retried)
+  h.executor.start(retried, retried.assignments[1]!)
+  await h.effects.idle('launch')
+  assert.equal(h.runtime.calls.runCommand.length, 2, 'the new assignment runs prepare again')
+  assert.equal(
+    h.runtime.calls.runCommand[1]?.command,
+    "echo 'ticket-11' 'refs/pull/42/head' '/state/tokens/a-2'",
+    'with the new assignment token'
+  )
+  await h.cleanup()
+})
+
+test('the launch hook injects this launch and leaves every other launch alone', async () => {
+  const hook = createLaunchHook()
+  const injected: Record<string, string>[] = []
+  const strangers: Record<string, string>[] = []
+  const h = harness({ deployment: DEPLOYMENT, blockedCommands: ['personal-gh'], launchHook: hook })
+  // 替身扮演宿主：真正 launch 之前先发一次钩子，把环境交给「启动」这一步。
+  h.runtime.script.launchAgent = (spec) => {
+    const mine = hook.handle(
+      {
+        agent: spec.agent,
+        workspaceId: spec.workspace.workspaceId,
+        workspaceKind: 'worktree',
+        command: 'pi',
+        env: {}
+      },
+      (event) => {
+        injected.push({ ...event.env })
+        return { kind: 'continue' as const, event }
+      }
+    )
+    assert.equal('deny' in mine, false, 'the plugin never denies a launch')
+    hook.handle(
+      {
+        agent: 'claude',
+        workspaceId: 'ws:someone-else',
+        workspaceKind: 'worktree',
+        command: 'claude',
+        env: {}
+      },
+      (event) => {
+        strangers.push({ ...event.env })
+        return { kind: 'continue' as const, event }
+      }
+    )
+    return { terminalId: 'term_1', workspaceId: spec.workspace.workspaceId, launchedAt: 1 }
+  }
+  const pending = ticket({ assignments: [assignment('a-1', 'pending')] })
+  h.seed(pending)
+  h.seedTrigger(trigger())
+  h.executor.start(pending, pending.assignments[0]!)
+  await h.effects.idle('launch')
+
+  assert.equal(injected.length, 1, 'one launch, one injection')
+  assert.equal(injected[0]?.['DSH_SUPERAGENT_TICKET'], 'ticket-11')
+  assert.equal(injected[0]?.['DSH_SUPERAGENT_NAME'], 'fix-the-login-flow')
+  assert.equal(injected[0]?.['PATH'], `${h.stateDir}/bin:/usr/bin:/bin`, 'the shim directory leads PATH')
+  assert.equal(injected[0]?.['GIT_CONFIG_GLOBAL'], `${h.stateDir}/worker-gitconfig`)
+  assert.deepEqual(strangers, [{}], 'another worktree is untouched')
   await h.cleanup()
 })
 

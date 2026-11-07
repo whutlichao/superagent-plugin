@@ -2,14 +2,16 @@
 //
 // 上游的 `prepare` 是「建目录的命令」；Orca 里 worktree 已经由 `orca worktree create` 建好，
 // 所以这里只剩「在 worktree 里执行一条命令」：10 分钟预算、输出落日志、非零退出让 Ticket
-// 失败。命令文本的 `${DSH_SUPERAGENT_*}` 变量替换归 #13（§E.3、§E.11），本文件只执行
-// 已经替换好的最终文本——绝不在插件内拼接未转义的 shell。
+// 失败。命令文本里的 `${DSH_SUPERAGENT_*}` 在**本文件里**按 §E.11 的变量表替换（§E.3）：
+// 只认白名单变量，逐值单引号转义（`substituteVariables`）——因此这条命令永远不会把消息
+// 正文或配置里的一个字当成 shell 语法（§O）。
 //
 // 「一条 Ticket 只跑一次、重试或人的新消息会重跑」的记账在调用方（`orca-executor.ts`）：
 // 一次 Assignment 一条命令，新 Assignment（retry / resume）自然重跑。
 import { mkdirSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import type { OrcaRuntime, WorkspaceHandle } from '../runtime/orca-runtime.ts'
+import { substituteVariables } from './environment.ts'
 
 /** prepare 的预算：10 分钟（§E.3）。 */
 export const PREPARE_TIMEOUT_MS = 10 * 60 * 1000
@@ -59,10 +61,12 @@ export interface PrepareOptions {
   readonly ticketId: string
   readonly assignmentId: string
   readonly workspace: WorkspaceHandle
-  /** 已替换变量、可安全执行的最终命令文本；空串表示没有配置。 */
+  /** 设置里的原始命令文本（可含 `${DSH_SUPERAGENT_*}`）；空串表示没有配置。 */
   readonly command: string | undefined
   /** `<stateDir>`：日志写在它下面。 */
   readonly stateDir: string
+  /** §E.11 的变量表；`${DSH_SUPERAGENT_*}` 只从这里取值，逐值单引号转义。 */
+  readonly environment: Readonly<Record<string, string>>
 }
 
 /**
@@ -70,9 +74,11 @@ export interface PrepareOptions {
  * 超时（seam 的 `cli_timeout`）按同样方式上抛，由调用方把 Ticket 标记失败。
  */
 export async function runPrepare(options: PrepareOptions): Promise<PrepareResult> {
-  const command = options.command?.trim() ?? ''
+  const configured = options.command?.trim() ?? ''
   const logPath = prepareLogPath(options.stateDir, options.ticketId, options.assignmentId)
-  if (command === '') return { ran: false, exitCode: null, output: [], logPath }
+  if (configured === '') return { ran: false, exitCode: null, output: [], logPath }
+  // 替换后的文本就是交给 shell 的最终文本：白名单之外的 `${…}` 原样保留，值全部在单引号里。
+  const command = substituteVariables(configured, options.environment)
 
   const handle = await options.runtime.runCommand({
     workspace: options.workspace,

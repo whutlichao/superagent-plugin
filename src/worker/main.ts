@@ -10,6 +10,7 @@ import type { OrcaWorkerApi } from './runtime/worker-api'
 import { createWorkerHost } from './runtime/worker-host'
 import { createStatusBarPublisher, statusBarView } from './app/status-bar'
 import { createStubStateSource } from './app/state-source'
+import { LAUNCH_HOOK_EVENT, launchHook, type LaunchHookEvent } from './executor/launch-hook'
 
 /** 四个贡献命令的 id，与 orca-plugin.json 的 contributes.commands 一一对应。 */
 const COMMANDS = {
@@ -25,9 +26,6 @@ const EVENTS = [
   'workspace.created',
   'workspace.removed'
 ] as const
-
-/** 唯一钩子：agent 启动前，用来注入执行环境（§H.11；实现在 F6C）。 */
-const HOOK = 'agent.launch.before'
 
 /**
  * 插件入口：Orca 在插件启用时调用一次。本票登记贡献点、接上面板契约与状态栏，
@@ -76,7 +74,10 @@ export default function activate(orca: OrcaWorkerApi): void {
   host.register(COMMANDS.checkSetup, () => 'Superagent: checkSetup is not wired up yet.')
 
   for (const event of EVENTS) host.subscribe(event)
-  host.hook(HOOK)
+  // 执行环境钩子（§H.11）：执行器在 launch 之前往同一个单例里登记环境，这里把它接到宿主，
+  // 并把超预算/失败的那一行日志接到 Orca 的插件日志上（§N.5）。
+  launchHook.setLog((message) => host.log(message))
+  host.hook<LaunchHookEvent>(LAUNCH_HOOK_EVENT, (event, next) => launchHook.handle(event, next))
 
   host.log('Superagent worker activated (boot stub, panel contract wired).')
 }
