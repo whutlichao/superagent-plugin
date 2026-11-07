@@ -6,8 +6,8 @@
 // 不发网络：所有 `gh` 调用都经 `CommandsHost`，测试用 `FakeCommands` 喂
 // `tests/fixtures/cli/github/` 的真实输出片段（§I.6）。
 import { assert, test } from 'orca/testing'
-import { key } from '../src/worker/core/index.ts'
-import type { Thread, Ticket, Trigger } from '../src/worker/core/index.ts'
+import { Engine, key, MemoryRepositories } from '../src/worker/core/index.ts'
+import type { Policy, Thread, Ticket, Trigger } from '../src/worker/core/index.ts'
 import { CliError } from '../src/worker/sources/commands'
 import { SourceRegistry, EMPTY_SOURCE_SETTINGS } from '../src/worker/sources/registry'
 import { githubKind } from '../src/worker/sources/github/kind'
@@ -17,6 +17,7 @@ import type {
   GithubCheckRun,
   GithubComment,
   GithubCommitStatus,
+  GithubPull,
   GithubReview
 } from '../src/worker/sources/github/api'
 import {
@@ -30,6 +31,14 @@ import {
 } from '../src/worker/sources/github/translate'
 import { createGithubPoller, subscribedThreads, withinHorizon } from '../src/worker/sources/github/poll'
 import { githubSetupProblem } from '../src/worker/sources/github/config'
+import {
+  claimPull,
+  claimReportedPull,
+  observePull,
+  pullEndNotices,
+  ticketBranch
+} from '../src/worker/sources/github/index'
+import type { GithubPullHost } from '../src/worker/sources/github/index'
 import { createPolicy, validatePolicy } from '../src/worker/policy/index'
 import { githubBodyKey, githubCiKey, githubCursorKey } from '../src/worker/app/kv'
 import { FakeCommands } from './support/fake-commands'
@@ -38,7 +47,11 @@ import { mkdtempSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { readRepoFile, readRepoJson } from './support/repo'
-import { openBoot, settingsOf } from './support/boot'
+import { assignmentToken, openBoot, settingsOf } from './support/boot'
+import type { BootHarness } from './support/boot'
+import { readApiToken } from '../src/worker/infra/tokens'
+import { dispatch } from '../src/worker/cli/commands'
+import { parseArgs } from '../src/worker/cli/io'
 
 const NOTIFICATION = {
   id: 'notification-1',
@@ -411,12 +424,17 @@ test('the PR read keeps the PR state a later ticket needs for the closing rule',
         url: 'https://github.com/acme/widgets/pull/45',
         state: 'closed',
         merged: true,
+        mergedAt: '2023-11-06T07:59:03Z',
+        closedAt: '2023-11-06T07:59:03Z',
         // 草稿与分支名供资源读说明这条 PR 从哪来（#36）；草稿不为真时不当作可合并的改动。
         draft: false,
-        headRef: 'agent/fix-login',
         baseRef: 'main',
         // CI 读这个 head 提交的检查与状态（#19）。
         headSha: CI_SHA,
+        // PR 规则读 head 仓库与分支（§I.2 的 claimPull / observePull 行）；夹具的 head 仓库
+        // 已被删（fork 关掉后 GitHub 给 `null`），因此是空串而不是猜一个仓库名。
+        headRef: 'agent/fix-login',
+        headRepo: '',
         updatedAt: '2026-11-07T03:09:36Z',
         body: 'When the agent account is described in the docs, a reader cannot tell whether the worker signs its commits with a token or a dedicated account.\n\nThis change says the agent CLI is signed in to the agent account and that the commit email is the noreply address. No behaviour changes.',
         login: 'bob',
@@ -2245,6 +2263,718 @@ test('the composition root reads CI for a subscribed PR when CI observation is o
       'the composition root passes the CI fingerprint key, so checks are read'
     )
     assert.equal(read.includes(`repos/acme/widgets/commits/${CI_SHA}/statuses`), true)
+  } finally {
+    await h.cleanup()
+  }
+})
+
+// ---- PR 规则与 Ticket 结束（§I.2 的「PR 规则」「结束通知」两行、§I.5 的六条规则）----------
+//
+// 规则本身住在 `sources/github/pull.ts`，读写的都是领域端口：测试用内存仓储 + 真的
+// `Engine` 拼一份宿主，于是「绑定」「关闭」「结束」跑的是真的领域代码（§P.1：不 mock 内层）。
+
+/** 一份 Ticket 夹具：已有 worktree 短名、一条 running 的 Assignment、GitHub 来源 Channel。 */
+function ticketFixture(id: string, short: string, overrides: Partial<Ticket> = {}): Ticket {
+  return {
+    id,
+    title: `Ticket ${id}`,
+    decisionId: `decision-${id}`,
+    mandate: {
+      strength: 'explicit',
+      policyVersion: 'v1',
+      basis: { via: 'addressed', addressed: 'mention' },
+      actor: { source: 'github', id: 'alice' },
+      scope: 'comments'
+    },
+    channels: [
+      { source: 'github', thread: 'github:42', address: { repo: 'acme/widgets', issue: '42' } }
+    ],
+    assignments: [{ id: `assignment-${id}`, state: 'running', createdAt: '2026-11-07T03:00:00Z' }],
+    inputs: [],
+    undelivered: [],
+    createdAt: '2026-11-07T03:00:00Z',
+    updatedAt: '2026-11-07T03:00:00Z',
+    execution: { name: short, directory: `/w/superagent-${short}`, assignment: 'the brief' },
+    origin: { triggerId: `trigger-${id}`, triggerIds: [`trigger-${id}`] },
+    ...overrides
+  }
+}
+
+/** 一条 GitHub Trigger（PR 规则只读 type/来源 Trigger 与人的消息）。 */
+function githubTrigger(id: string, overrides: Partial<Trigger> = {}): Trigger {
+  return {
+    id,
+    source: 'github',
+    threads: [{ source: 'github', id: '42' }],
+    actor: { source: 'github', id: 'alice' },
+    human: true,
+    at: '2026-11-07T03:00:00Z',
+    text: 'message',
+    channel: { source: 'github', thread: 'github:42', address: { repo: 'acme/widgets', issue: '42' } },
+    meta: {},
+    ...overrides
+  }
+}
+
+/**
+ * PR 规则的夹具宿主：内存仓储 + 真 Engine + 假 CLI 的 GitHub 读端口。`clock` 是可控时钟，
+ * `now()` 推它（结束时刻与「关闭之后才开始的工作」都靠它）。
+ */
+function pullHarness() {
+  const opened = new MemoryRepositories()
+  const repo = opened.claimWriter()
+  let clock = '2026-11-07T04:00:00Z'
+  const policy: Policy = {
+    version: 'v1',
+    paused: false,
+    evalTimeoutMs: 60_000,
+    gate: () => ({ admissible: false, reason: 'test' }),
+    revalidate: () => true,
+    admitsInferred: () => false
+  }
+  const engine = new Engine({
+    repo,
+    scope: { scope: () => ({ listened: true, observed: false }) },
+    policy: () => policy,
+    assessor: { request: () => {}, release: () => {} },
+    executor: { start: () => {}, deliver: () => {}, stop: () => {} },
+    outbox: {
+      // 领域的 outbox 不在这里断言：结束通知由组合根按 `pullEndNotices` 排队（§I.2）。
+      send: () => {},
+      status: () => undefined,
+      withdraw: () => {},
+      withdrawTicket: () => {}
+    },
+    now: () => clock
+  })
+  const commands = new FakeCommands()
+  const host: GithubPullHost = {
+    api: createGithubApi(commands, 'gh'),
+    tickets: {
+      get: (ticketId) => opened.tickets.get(ticketId),
+      open: () => opened.tickets.open()
+    },
+    trigger: (triggerId) => opened.triggers.get(triggerId),
+    bind: (ticketId, ref, own) => engine.bindThread(ticketId, ref, own),
+    close: (ref, outcome, at) => engine.threadClosed(ref, outcome, at),
+    login: 'acme-agent',
+    repository: 'acme/widgets',
+    now: () => clock
+  }
+  /** 在真仓储里放一张 Ticket（写只发生在事务里，与引擎同一纪律）。 */
+  const save = (ticket: Ticket): Ticket => {
+    repo.atomic(() => repo.tickets.save(ticket))
+    return opened.tickets.get(ticket.id)!
+  }
+  /** 在真仓储里放一条 Trigger（同上）。 */
+  const saveTrigger = (trigger: Trigger): void => {
+    repo.atomic(() => repo.triggers.save(trigger))
+  }
+  return {
+    opened,
+    engine,
+    commands,
+    host,
+    save,
+    saveTrigger,
+    /** 推时钟（`ms` 毫秒）。 */
+    advance: (ms: number): string => {
+      clock = new Date(Date.parse(clock) + ms).toISOString()
+      return clock
+    }
+  }
+}
+
+/** 一份 PR 读数：默认是 agent 在配置仓库里从 `agent/<short>` 开出来的、仍开着的 PR。 */
+function pullFixture(number: number, overrides: Partial<GithubPull> = {}): GithubPull {
+  return {
+    number,
+    title: `PR ${number}`,
+    url: `https://github.com/acme/widgets/pull/${number}`,
+    state: 'open',
+    merged: false,
+    mergedAt: null,
+    closedAt: null,
+    draft: false,
+    headSha: CI_SHA,
+    headRef: 'agent/fix-login',
+    headRepo: 'acme/widgets',
+    baseRef: 'main',
+    updatedAt: '2026-11-07T03:30:00Z',
+    body: 'a change',
+    login: 'acme-agent',
+    bot: false,
+    createdAt: '2026-11-07T03:20:00Z',
+    ...overrides
+  }
+}
+
+test('claimPull binds the pull request the ticket opened, and refuses one it did not', () => {
+  const h = pullHarness()
+  h.save(ticketFixture('t1', 'fix-login'))
+  // agent 在配置的仓库里从 `<prefix><short>` 开出来的 PR：绑为 own（§I.5 第 1 条）。
+  assert.equal(claimPull(h.host, 't1', pullFixture(9)), undefined)
+  assert.deepEqual(h.opened.tickets.get('t1')?.follows, [{ thread: 'github:9', own: true }])
+  assert.deepEqual(h.opened.threads.get('github:9')?.subscriptions, ['t1'])
+
+  // 别人的分支、fork 里的同名分支、别的 Ticket 的短名：都不是这张 Ticket 的 PR。
+  for (const pull of [
+    pullFixture(10, { login: 'bob' }),
+    pullFixture(11, { headRepo: 'someone/widgets' }),
+    pullFixture(12, { headRef: 'agent/other-ticket' })
+  ]) {
+    const refused = claimPull(h.host, 't1', pull)
+    assert.equal(typeof refused, 'string', `PR #${pull.number} must be refused`)
+    assert.equal(/does not belong to this ticket/u.test(refused!), true, refused!)
+  }
+  assert.deepEqual(h.opened.tickets.get('t1')?.follows, [{ thread: 'github:9', own: true }])
+})
+
+test('claimPull follows the PR the ticket started from without claiming it as its own', () => {
+  const h = pullHarness()
+  // 起点是 PR 30 的一条评审评论：那张 PR 不是 Ticket 开的，只是它跟随的（`own:false`）。
+  h.save(
+    ticketFixture('t2', 'fix-login', {
+      origin: { triggerId: 'trigger-pr-30', triggerIds: ['trigger-pr-30'] }
+    })
+  )
+  h.saveTrigger(
+    githubTrigger('trigger-pr-30', {
+      threads: [{ source: 'github', id: '30' }],
+      meta: { kind: 'review', repository: 'acme/widgets', issue: 30 }
+    })
+  )
+  assert.equal(claimPull(h.host, 't2', pullFixture(30, { login: 'bob' })), undefined)
+  assert.deepEqual(h.opened.tickets.get('t2')?.follows, [{ thread: 'github:30', own: false }])
+})
+
+test('a branch belongs to a ticket when its last path segment is the short name', () => {
+  const ticket = { execution: { name: 'fix-login', directory: '/w', assignment: 'x' } }
+  assert.equal(ticketBranch(ticket, 'agent/fix-login'), true)
+  assert.equal(ticketBranch(ticket, 'fix-login'), true)
+  assert.equal(ticketBranch(ticket, 'refs/heads/agent/fix-login'), true)
+  assert.equal(ticketBranch(ticket, 'agent/fix-login-2'), false)
+  // 短名还没写进 Ticket（执行器没建 worktree）：不猜任何分支。
+  assert.equal(ticketBranch({}, 'agent/fix-login'), false)
+})
+
+test('claimPull refuses a PR another live ticket follows, an ended ticket, and binds nothing closed', () => {
+  const h = pullHarness()
+  h.save(ticketFixture('t1', 'fix-login'))
+  h.save(
+    ticketFixture('t2', 'fix-other', {
+      follows: [{ thread: 'github:11', own: true }]
+    })
+  )
+  h.save(
+    ticketFixture('t3', 'fix-done', {
+      ended: { at: '2026-11-07T03:40:00Z', by: 'executor', outcome: 'merged' }
+    })
+  )
+  // 一个 PR 只能属于一个活 Ticket：另一个活 Ticket 已经跟随它时拒绝（§I.5 第 1 条）。
+  const taken = pullFixture(11, { headRef: 'agent/fix-login' })
+  assert.equal(claimPull(h.host, 't1', taken), 'PR already belongs to another active ticket')
+  // 已结束的 Ticket 不再绑任何东西。
+  assert.equal(
+    claimPull(h.host, 't3', pullFixture(12, { headRef: 'agent/fix-done' })),
+    'Ticket ended because its PR was closed'
+  )
+  // 已关闭的 PR 不是绑定的起点（结束由 `observePull` 判），且这不是拒绝。
+  assert.equal(
+    claimPull(h.host, 't1', pullFixture(13, { state: 'closed', closedAt: '2026-11-07T03:50:00Z' })),
+    undefined
+  )
+  assert.deepEqual(h.opened.tickets.get('t1')?.follows, undefined)
+  assert.deepEqual(h.opened.tickets.get('t3')?.follows, undefined)
+})
+
+test('observePull binds an open PR to the single live ticket on its branch, and moves no ticket', () => {
+  const h = pullHarness()
+  h.save(ticketFixture('t1', 'fix-login'))
+  assert.equal(observePull(h.host, pullFixture(9)), false, 'an open PR does not end a ticket')
+  assert.deepEqual(h.opened.tickets.get('t1')?.follows, [{ thread: 'github:9', own: true }])
+  // 同一分支上的第二条 PR：已经跟随一条开着的 PR 的 Ticket 只在 worker 报告时才换。
+  assert.equal(observePull(h.host, pullFixture(10)), false)
+  assert.deepEqual(h.opened.tickets.get('t1')?.follows, [{ thread: 'github:9', own: true }])
+  // 不是 agent 在配置仓库里开的 PR（别人的分支、fork）：一条都不绑。
+  assert.equal(observePull(h.host, pullFixture(11, { login: 'bob' })), false)
+  assert.equal(observePull(h.host, pullFixture(12, { headRepo: 'someone/widgets' })), false)
+  assert.deepEqual(h.opened.tickets.get('t1')?.follows, [{ thread: 'github:9', own: true }])
+})
+
+test('observePull binds nothing when several live tickets share the branch, and re-follows a reopened PR', () => {
+  const h = pullHarness()
+  // 短名撞车的两张活 Ticket：分支不再唯一，轮询谁也不绑（只有报告能指名）。
+  h.save(ticketFixture('t1', 'fix-login'))
+  h.save(ticketFixture('t2', 'fix-login'))
+  assert.equal(observePull(h.host, pullFixture(9)), false)
+  assert.deepEqual(h.opened.tickets.get('t1')?.follows, undefined)
+  assert.deepEqual(h.opened.tickets.get('t2')?.follows, undefined)
+
+  // 一条曾被关闭的 PR 又开着：它重新被跟随，尽管这张 Ticket 还有一条开着的 own PR。
+  h.save(
+    ticketFixture('t5', 'fix-5', {
+      follows: [
+        { thread: 'github:21', own: true },
+        { thread: 'github:22', own: true, closed: { at: '2026-11-07T03:50:00.000Z', outcome: 'closed' } }
+      ]
+    })
+  )
+  assert.equal(observePull(h.host, pullFixture(22, { headRef: 'agent/fix-5' })), false)
+  assert.deepEqual(h.opened.tickets.get('t5')?.follows, [
+    { thread: 'github:21', own: true },
+    { thread: 'github:22', own: true }
+  ])
+})
+
+test('one open PR of its own keeps the ticket alive; the last relevant close decides how it ends', () => {
+  const h = pullHarness()
+  h.save(ticketFixture('t3', 'fix-3'))
+  // 两条 own PR：一条关闭时另一条还开着 → 不结束（§I.5 第 2 条）。
+  assert.equal(claimPull(h.host, 't3', pullFixture(21, { headRef: 'agent/fix-3' })), undefined)
+  assert.equal(claimPull(h.host, 't3', pullFixture(22, { headRef: 'agent/fix-3' })), undefined)
+  assert.equal(
+    observePull(h.host, pullFixture(22, { state: 'closed', closedAt: '2026-11-07T03:50:00Z' })),
+    true
+  )
+  const alive = h.opened.tickets.get('t3')!
+  assert.equal(alive.ended, undefined, 'one own PR is still open')
+  assert.deepEqual(alive.follows, [
+    { thread: 'github:21', own: true },
+    { thread: 'github:22', own: true, closed: { at: '2026-11-07T03:50:00.000Z', outcome: 'closed' } }
+  ])
+  // 最后一条也合并：结束，结局与时刻都取最后一次相关关闭（§I.5 第 3 条）。
+  assert.equal(
+    observePull(
+      h.host,
+      pullFixture(21, { state: 'closed', merged: true, mergedAt: '2026-11-07T03:55:00Z' })
+    ),
+    true
+  )
+  assert.deepEqual(h.opened.tickets.get('t3')?.ended, {
+    at: '2026-11-07T03:55:00.000Z',
+    by: 'executor',
+    outcome: 'merged'
+  })
+})
+
+test('a ticket that opened no PR ends only when every PR it follows is closed', () => {
+  const h = pullHarness()
+  // 起点是 PR 30（跟随，非 own）：它是唯一跟随的 PR，关闭即结束（§I.5 第 2 条）。
+  h.save(
+    ticketFixture('t2', 'fix-2', {
+      origin: { triggerId: 'trigger-pr-30', triggerIds: ['trigger-pr-30'] }
+    })
+  )
+  h.saveTrigger(
+    githubTrigger('trigger-pr-30', {
+      threads: [{ source: 'github', id: '30' }],
+      meta: { kind: 'review', repository: 'acme/widgets', issue: 30 }
+    })
+  )
+  assert.equal(claimPull(h.host, 't2', pullFixture(30, { login: 'bob' })), undefined)
+  assert.equal(
+    observePull(h.host, pullFixture(30, { login: 'bob', state: 'closed', closedAt: '2026-11-07T03:51:00Z' })),
+    true
+  )
+  assert.deepEqual(h.opened.tickets.get('t2')?.ended, {
+    at: '2026-11-07T03:51:00.000Z',
+    by: 'executor',
+    outcome: 'closed'
+  })
+  // 订阅保留：人后续在这条 PR 上再说话可以恢复同一张 Ticket（§I.5 第 5 条）。
+  assert.deepEqual(h.opened.threads.get('github:30')?.subscriptions, ['t2'])
+})
+
+test('a ticket ends when the PR it opened merges, though the PR it started from is still open', () => {
+  const h = pullHarness()
+  h.save(
+    ticketFixture('t4', 'fix-4', {
+      origin: { triggerId: 'trigger-pr-30', triggerIds: ['trigger-pr-30'] }
+    })
+  )
+  h.saveTrigger(
+    githubTrigger('trigger-pr-30', {
+      threads: [{ source: 'github', id: '30' }],
+      meta: { kind: 'review', repository: 'acme/widgets', issue: 30 }
+    })
+  )
+  // 跟随的来源 PR 30 仍开着，同时开出了自己的 PR 31。
+  assert.equal(claimPull(h.host, 't4', pullFixture(30, { login: 'bob' })), undefined)
+  assert.equal(claimPull(h.host, 't4', pullFixture(31, { headRef: 'agent/fix-4' })), undefined)
+  assert.equal(
+    observePull(h.host, pullFixture(31, { headRef: 'agent/fix-4', state: 'closed', merged: true, mergedAt: '2026-11-07T03:52:00Z' })),
+    true
+  )
+  assert.deepEqual(h.opened.tickets.get('t4')?.ended, {
+    at: '2026-11-07T03:52:00.000Z',
+    by: 'executor',
+    outcome: 'merged'
+  })
+})
+
+test('unfinished work started after the close holds the ticket open until its next ready report', () => {
+  const h = pullHarness()
+  // 关闭发生在 03:30（PR 自己给的时刻），而 worker 的恢复/重试在 04:00 才开始：工作还没做完，
+  // 先不结束（§I.5 第 4 条），等它下一个 `ready`。
+  h.save(
+    ticketFixture('t6', 'fix-6', {
+      assignments: [{ id: 'assignment-t6', state: 'running', createdAt: '2026-11-07T04:00:00Z' }]
+    })
+  )
+  assert.equal(claimPull(h.host, 't6', pullFixture(41, { headRef: 'agent/fix-6' })), undefined)
+  assert.equal(
+    observePull(h.host, pullFixture(41, { headRef: 'agent/fix-6', state: 'closed', merged: true, mergedAt: '2026-11-07T03:30:00Z' })),
+    true
+  )
+  const held = h.opened.tickets.get('t6')!
+  assert.equal(held.ended, undefined, 'the recovery work is not done yet')
+  assert.deepEqual(held.follows, [
+    { thread: 'github:41', own: true, closed: { at: '2026-11-07T03:30:00.000Z', outcome: 'merged' } }
+  ])
+  // 下一个 ready：按那次合并结束，时刻是**现在**（那次关闭早已发生）。
+  const at = h.advance(60_000)
+  h.engine.report('t6', { state: 'ready', summary: 'the follow-up work is in' })
+  assert.deepEqual(h.opened.tickets.get('t6')?.ended, { at, by: 'executor', outcome: 'merged' })
+})
+
+test('an acknowledged human follow-up holds the ticket open until a later non-progress report', () => {
+  const h = pullHarness()
+  h.save(ticketFixture('t7', 'fix-7'))
+  assert.equal(claimPull(h.host, 't7', pullFixture(51, { headRef: 'agent/fix-7' })), undefined)
+  // 人在这条 PR 上又提出一件后续，worker 确认了它（ack）：此后还没有终结性的报告。
+  const followUp = githubTrigger('follow-up-7', {
+    threads: [{ source: 'github', id: '51' }],
+    channel: { source: 'github', thread: 'github:51', address: { repo: 'acme/widgets', issue: '51' } }
+  })
+  assert.equal(h.engine.receive(followUp), 'stored')
+  h.engine.reply({
+    purpose: 'acknowledgement',
+    ticketId: 't7',
+    triggerId: followUp.id,
+    text: 'On it.'
+  })
+  // 关闭到了：确认过的后续还没有非 progress 报告，所以先不结束（§I.5 第 4 条）。
+  assert.equal(
+    observePull(h.host, pullFixture(51, { headRef: 'agent/fix-7', state: 'closed', merged: true, mergedAt: '2026-11-07T03:53:00Z' })),
+    true
+  )
+  assert.equal(h.opened.tickets.get('t7')?.ended, undefined)
+  // 下一个 ready 结束它，结局仍取那次合并。
+  h.engine.report('t7', { state: 'ready', summary: 'the follow-up is answered' })
+  assert.equal(h.opened.tickets.get('t7')?.ended?.outcome, 'merged')
+})
+
+test('a ticket ending with its PR sends one stable notice, in the language of the request', () => {
+  const h = pullHarness()
+  h.save(
+    ticketFixture('t1', 'fix-login', {
+      channels: [
+        { source: 'github', thread: 'github:42', address: { repo: 'acme/widgets', issue: '42' } },
+        { source: 'feishu', thread: 'feishu:oc_1', address: { chatId: 'oc_1', messageId: 'om_1' } }
+      ]
+    })
+  )
+  assert.equal(claimPull(h.host, 't1', pullFixture(9)), undefined)
+  observePull(h.host, pullFixture(9, { state: 'closed', merged: true, mergedAt: '2026-11-07T03:54:00Z' }))
+  const ticket = h.opened.tickets.get('t1')!
+  const notices = pullEndNotices(ticket, '修一下登录跳转', 'acme/widgets')
+  // 一条，发往 chat（GitHub 自己的时间线已经显示合并，所以跳过 GitHub Channel）。
+  assert.equal(notices.length, 1)
+  assert.deepEqual(notices[0], {
+    id: key('pr-terminal', '9', 'feishu', JSON.stringify({ chatId: 'oc_1', messageId: 'om_1' }), 'merged'),
+    channel: { source: 'feishu', thread: 'feishu:oc_1', address: { chatId: 'oc_1', messageId: 'om_1' } },
+    text: '[PR #9](https://github.com/acme/widgets/pull/9) 已合并。',
+    kind: 'notice',
+    ticketId: 't1'
+  })
+  // 同一个结束重复算（重启、重复事件）仍是同一个 id：outbox 因此只发一条（§J.1 幂等）。
+  assert.deepEqual(
+    pullEndNotices(h.opened.tickets.get('t1')!, '修一下登录跳转', 'acme/widgets').map((notice) => notice.id),
+    notices.map((notice) => notice.id)
+  )
+})
+
+test('the notice says the PR was closed without merging, in English for an English request', () => {
+  const h = pullHarness()
+  h.save(
+    ticketFixture('t2', 'fix-2', {
+      channels: [
+        { source: 'github', thread: 'github:42', address: { repo: 'acme/widgets', issue: '42' } },
+        { source: 'chat', thread: 'chat:c1', address: { chat: 'c1' } }
+      ]
+    })
+  )
+  assert.equal(claimPull(h.host, 't2', pullFixture(12, { headRef: 'agent/fix-2' })), undefined)
+  observePull(
+    h.host,
+    pullFixture(12, { headRef: 'agent/fix-2', state: 'closed', closedAt: '2026-11-07T03:54:00Z' })
+  )
+  const notices = pullEndNotices(h.opened.tickets.get('t2')!, 'fix the login redirect', 'acme/widgets')
+  assert.deepEqual(notices.map((notice) => notice.text), [
+    '[PR #12](https://github.com/acme/widgets/pull/12) was closed without merging.'
+  ])
+  // 不是 PR 结束的 Ticket 没有这条通知。
+  const h2 = pullHarness()
+  h2.save(ticketFixture('t3', 'fix-3'))
+  h2.engine.report('t3', { state: 'ready', summary: 'done, no PR' })
+  assert.deepEqual(pullEndNotices(h2.opened.tickets.get('t3')!, 'x', 'acme/widgets'), [])
+})
+
+/** 夹具 `pull.json` 的一份改动版本（`report --pr-number` 只有号码，所以测试读同一份真输出）。 */
+function pullJson(overrides: Record<string, unknown>): string {
+  const pull = JSON.parse(fixture('pull.json')) as Record<string, unknown>
+  return JSON.stringify({ ...pull, ...overrides })
+}
+
+test('a reported PR number is read from GitHub and claimed, or told why it cannot be', async () => {
+  const h = pullHarness()
+  h.save(ticketFixture('t1', 'fix-login'))
+  h.commands.script(['api', 'repos/acme/widgets/pulls/9'], () =>
+    pullJson({
+      number: 9,
+      state: 'open',
+      merged: false,
+      head: { sha: CI_SHA, ref: 'agent/fix-login', repo: { full_name: 'acme/widgets' } },
+      user: { login: 'acme-agent', type: 'User' }
+    })
+  )
+  assert.equal(await claimReportedPull(h.host, 't1', 9), undefined)
+  assert.deepEqual(h.opened.tickets.get('t1')?.follows, [{ thread: 'github:9', own: true }])
+  // 读不到这条 PR：如实说读不到（命令层落成 `pr_mismatch`），不假装绑定成功。
+  h.commands.script(['api', 'repos/acme/widgets/pulls/77'], () => JSON.stringify({ number: 0 }))
+  assert.equal(await claimReportedPull(h.host, 't1', 77), 'PR #77 could not be read from GitHub')
+})
+
+test('a report with the number of a PR that is not the ticket\'s is refused as pr_mismatch', async () => {
+  const h = await openBoot({
+    scripts: (commands) => {
+      // 46 号是别人（bob）在别的分支上开的 PR：不属于这张 Ticket。
+      commands.script(['api', 'repos/acme/widgets/pulls/46'], () =>
+        pullJson({
+          number: 46,
+          state: 'open',
+          merged: false,
+          head: { sha: CI_SHA, ref: 'bob/something-else', repo: { full_name: 'acme/widgets' } },
+          user: { login: 'bob', type: 'User' }
+        })
+      )
+    }
+  })
+  try {
+    await settleGithub(h)
+    const [ticket] = h.handle.snapshot().tickets ?? []
+    assert.ok(ticket, 'the mention opened a ticket')
+    const worker = assignmentToken(
+      h.stateDir,
+      ((await ticketOfForGithub(h, ticket.id, readApiToken(h.stateDir)))['assignment'] as {
+        readonly id: string
+      }).id
+    )
+    const refused = await cliGithub(h, ['report', '--state', 'progress', '--pr-number', '46', '--summary', 'wip'], worker)
+    assert.equal(refused.exit, 2)
+    assert.equal((refused.envelope as { error?: { code?: string } }).error?.code, 'pr_mismatch')
+    // 报告没有写进去：worker 的最新报告仍是空的（拒绝是整条命令的拒绝）。
+    const after = await ticketOfForGithub(h, ticket.id, readApiToken(h.stateDir))
+    assert.equal((after['assignment'] as { readonly report?: unknown }).report, undefined)
+  } finally {
+    await h.cleanup()
+  }
+})
+
+// ---- 组合根（§P.1：真库 + 假 CLI + 真 loopback 服务器）-------------------------------
+
+/** 通知 → Eval → accept → 投递：本文件与 `followups.test.ts` 同一节奏。 */
+async function settleGithub(h: BootHarness): Promise<void> {
+  await h.handle.pollOnce()
+  await h.handle.passOnce()
+  await h.handle.passOnce()
+  await h.handle.passOnce()
+}
+
+/** boot 服务器的端口（没监听就是用例自己写错了）。 */
+function portOfGithub(h: BootHarness): number {
+  const port = h.handle.port()
+  assert.notEqual(port, null, 'the worker listens on a loopback port')
+  return port!
+}
+
+/** 跑一条 CLI 命令（真 loopback 服务器、真 token，§G.1）。 */
+async function cliGithub(
+  h: BootHarness,
+  argv: readonly string[],
+  token: string | null
+): Promise<{ readonly exit: number; readonly envelope: unknown }> {
+  const port = portOfGithub(h)
+  return dispatch({
+    parsed: parseArgs(argv),
+    target: {
+      stateDir: h.stateDir,
+      stateDirSource: 'argument' as const,
+      port,
+      baseUrl: `http://127.0.0.1:${port}/superagent/api`,
+      token,
+      tokenSource: 'argument' as const,
+      tokenFile: null
+    },
+    sleep: async () => undefined
+  })
+}
+
+/** 一条 Ticket 的读模型（`read ticket/<id>`）。 */
+async function ticketOfForGithub(
+  h: BootHarness,
+  id: string,
+  token: string | null
+): Promise<Record<string, unknown>> {
+  const read = await cliGithub(h, ['read', 'ticket', id], token)
+  assert.equal(read.exit, 0, 'the ticket is readable')
+  const ok = read.envelope as { readonly ok?: unknown; readonly result?: Record<string, unknown> }
+  assert.equal(ok.ok, true, 'a success envelope')
+  return ok.result!
+}
+
+test('the poller hands every PR it reads to observePull: an open one binds, a merged one ends the ticket', async () => {
+  const inRepo = (overrides: Record<string, unknown> = {}): string =>
+    pullJson({
+      state: 'open',
+      merged: false,
+      merged_at: null,
+      closed_at: null,
+      head: { sha: CI_SHA, ref: 'agent/fix-login', repo: { full_name: 'acme/widgets' } },
+      user: { login: 'acme-agent', type: 'User' },
+      ...overrides
+    })
+  const observe = (h: ReturnType<typeof pullHarness>, commands: FakeCommands) =>
+    createGithubPoller({
+      api: api(commands),
+      config: config(),
+      login: 'acme-agent',
+      host: host().port,
+      cursorKey: githubCursorKey,
+      // 一条活 Ticket 订阅着 PR 45：订阅那一路每轮读它一次（§I.2「订阅读取」行）。
+      subscribed: () => [{ issue: 45, live: true, lastAt: '2026-11-07T03:00:00Z' }],
+      observePull: (pull) => {
+        observePull(h.host, pull)
+      }
+    })
+
+  // 开着、在配置仓库里、分支末段是短名：轮询把它绑给唯一匹配的活 Ticket（§I.2 的 observePull）。
+  const open = pullHarness()
+  open.save(ticketFixture('t1', 'fix-login'))
+  const bound = await observe(open, scriptPull45(new FakeCommands(), inRepo())).poll()
+  assert.equal(bound.triggers, 0)
+  assert.deepEqual(open.opened.tickets.get('t1')?.follows, [{ thread: 'github:45', own: true }])
+
+  // 已合并：轮询把这次关闭交给领域，Ticket 按 §I.5 结束，没有人工介入（夹具驱动）。
+  const merged = pullHarness()
+  merged.save(ticketFixture('t2', 'fix-login'))
+  merged.engine.bindThread('t2', { source: 'github', id: '45' }, true)
+  const ended = await observe(
+    merged,
+    scriptPull45(
+      new FakeCommands(),
+      inRepo({ state: 'closed', merged: true, merged_at: '2026-11-07T04:10:00Z', closed_at: '2026-11-07T04:10:00Z' })
+    )
+  ).poll()
+  assert.equal(ended.triggers, 0, 'the closing of a PR is not a new Trigger for the worker')
+  assert.deepEqual(merged.opened.tickets.get('t2')?.ended, {
+    at: '2026-11-07T04:10:00.000Z',
+    by: 'executor',
+    outcome: 'merged'
+  })
+})
+
+test('an ended ticket keeps following its PR, so a later comment resumes it; unsubscribing stops the follow', () => {
+  const h = pullHarness()
+  h.save(ticketFixture('t1', 'fix-login'))
+  assert.equal(claimPull(h.host, 't1', pullFixture(9)), undefined)
+  observePull(h.host, pullFixture(9, { state: 'closed', merged: true, mergedAt: '2026-11-07T03:54:00Z' }))
+  assert.equal(h.opened.tickets.get('t1')?.ended?.outcome, 'merged')
+  assert.deepEqual(
+    h.opened.threads.get('github:9')?.subscriptions,
+    ['t1'],
+    'the subscription stays after the end (item 5)'
+  )
+  // 人在这条已合并的 PR 上再说一句：同一张 Ticket 在同一个 Mandate 下恢复。
+  h.advance(60_000)
+  const followUp = githubTrigger('after-the-merge', {
+    threads: [{ source: 'github', id: '9' }],
+    channel: { source: 'github', thread: 'github:9', address: { repo: 'acme/widgets', issue: '9' } }
+  })
+  assert.equal(h.engine.receive(followUp), 'stored')
+  const resumed = h.opened.tickets.get('t1')!
+  assert.equal(resumed.ended, undefined, 'the same ticket resumes')
+  assert.equal(resumed.assignments.length, 2, 'a new assignment on the same ticket')
+  assert.deepEqual(
+    h.opened.tickets.list().map((ticket) => ticket.id),
+    ['t1'],
+    'no second ticket'
+  )
+  // 轮询再读到同一次合并：恢复中的工作还没报告，因此先不结束（§I.5 第 4 条）。
+  assert.equal(
+    observePull(h.host, pullFixture(9, { state: 'closed', merged: true, mergedAt: '2026-11-07T03:54:00Z' })),
+    true
+  )
+  assert.equal(h.opened.tickets.get('t1')?.ended, undefined)
+
+  // 取消订阅该 PR 的 Thread：Ticket 不再跟随它，之后的关闭也不再结束它（§I.5 第 6 条）。
+  const other = pullHarness()
+  other.save(ticketFixture('t2', 'fix-2'))
+  assert.equal(claimPull(other.host, 't2', pullFixture(10, { headRef: 'agent/fix-2' })), undefined)
+  assert.equal(other.engine.unsubscribe('github:10'), true)
+  assert.deepEqual(other.opened.tickets.get('t2')?.follows, undefined)
+  assert.equal(
+    observePull(other.host, pullFixture(10, { headRef: 'agent/fix-2', state: 'closed', merged: true, mergedAt: '2026-11-07T03:54:00Z' })),
+    true
+  )
+  assert.equal(other.opened.tickets.get('t2')?.ended, undefined, 'it follows nothing, so it ends by no close')
+})
+
+test('a report with the PR the worker opened binds it, and the poller then reads that PR', async () => {
+  const h = await openBoot()
+  try {
+    await settleGithub(h)
+    const [panelTicket] = h.handle.snapshot().tickets ?? []
+    assert.ok(panelTicket, 'the mention opened a ticket')
+    const view = await ticketOfForGithub(h, panelTicket.id, readApiToken(h.stateDir))
+    const short = (view['worktree'] as { readonly name?: string } | undefined)?.name
+    assert.ok(short, 'the executor wrote the worktree short name')
+    const number = 61
+    const asIssue = { ...(readRepoJson('tests/fixtures/cli/github/pull-as-issue.json') as Record<string, unknown>), number }
+    h.commands
+      .script(['api', `repos/acme/widgets/pulls/${number}`], () =>
+        pullJson({
+          number,
+          state: 'open',
+          merged: false,
+          head: { sha: CI_SHA, ref: `agent/${short}`, repo: { full_name: 'acme/widgets' } },
+          user: { login: 'acme-agent', type: 'User' }
+        })
+      )
+      .script(['api', `repos/acme/widgets/issues/${number}`], () => JSON.stringify(asIssue))
+      .script(['api', `repos/acme/widgets/issues/${number}/comments`, '--paginate'], () => JSON.stringify([]))
+      .script(['api', `repos/acme/widgets/pulls/${number}/reviews`, '--paginate'], () => JSON.stringify([]))
+      .script(['api', `repos/acme/widgets/pulls/${number}/comments`, '--paginate'], () => JSON.stringify([]))
+    const worker = assignmentToken(
+      h.stateDir,
+      (view['assignment'] as { readonly id: string }).id
+    )
+    const reported = await cliGithub(
+      h,
+      ['report', '--state', 'progress', '--pr-number', String(number), '--summary', 'wip'],
+      worker
+    )
+    assert.equal(reported.exit, 0, 'its own PR is accepted')
+    // 绑定之后，订阅那一路每轮读这条 PR（§I.2「订阅读取」行）：这就是组合根真的绑上了。
+    const before = h.commands.calls.length
+    await h.handle.pollOnce()
+    const reads = h.commands.calls.slice(before).map((call) => String(call.args[1] ?? ''))
+    assert.equal(
+      reads.includes(`repos/acme/widgets/pulls/${number}`),
+      true,
+      'the ticket follows the reported PR'
+    )
   } finally {
     await h.cleanup()
   }

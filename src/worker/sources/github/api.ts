@@ -39,19 +39,27 @@ export interface GithubIssue {
   readonly createdAt: string
 }
 
-/** 一个 PR（`/repos/:o/:r/pulls/:n`）；`merged` 供 §I.5 的结束判定。 */
+/** 一个 PR（`/repos/:o/:r/pulls/:n`）；`merged` 与两个时刻供 §I.5 的结束判定。 */
 export interface GithubPull {
   readonly number: number
   readonly title: string
   readonly url: string
   readonly state: string
   readonly merged: boolean
+  /** 合并与关闭的时刻（GitHub 原值；没发生时为 null）：结束规则取「一次关闭」的时刻。 */
+  readonly mergedAt: string | null
+  readonly closedAt: string | null
   /** 草稿 PR：描述读把 `draft: true` 交给模型，免得它把草稿当可合并的改动。 */
   readonly draft: boolean
   /** PR 的 head 提交：CI 读这个提交的检查与状态（§I.2 CI 行）。 */
   readonly headSha: string
-  /** head 分支名；描述读用它说明这条 PR 从哪来。 */
+  /**
+   * PR 的 head 分支与它所在的仓库（`head.repo.full_name`；fork 被删时 GitHub 给 `null`，
+   * 这里如实是空串）。head 分支名描述读用它说明这条 PR 从哪来；PR 规则靠「分支 + 仓库」
+   * 判「这条 PR 是不是该 Ticket 开的」（§I.2 PR 规则行）。
+   */
   readonly headRef: string
+  readonly headRepo: string
   /** base（目标）分支名。 */
   readonly baseRef: string
   readonly updatedAt: string
@@ -292,21 +300,32 @@ export function issueOf(value: unknown): GithubIssue | undefined {
   }
 }
 
+/** 一个可选时刻：缺失或空串都当没有。 */
+function optionalTime(value: unknown, key: string): string | null {
+  const found = text(value, key)
+  return found.length === 0 ? null : found
+}
+
 /** 一个 PR → 端口形状；缺编号的条目返回 undefined（跳过）。 */
 export function pullOf(value: unknown): GithubPull | undefined {
   if (!isRecord(value)) return undefined
   const number = count(value, 'number')
   if (number <= 0) return undefined
   const author = authorOf(value)
+  const head = isRecord(value['head']) ? value['head'] : {}
+  const headRepo = isRecord(head['repo']) ? head['repo'] : {}
   return {
     number,
     title: text(value, 'title'),
     url: text(value, 'html_url'),
     state: text(value, 'state'),
     merged: flag(value, 'merged'),
+    mergedAt: optionalTime(value, 'merged_at'),
+    closedAt: optionalTime(value, 'closed_at'),
     draft: flag(value, 'draft'),
-    headSha: text(isRecord(value['head']) ? value['head'] : {}, 'sha'),
-    headRef: text(isRecord(value['head']) ? value['head'] : {}, 'ref'),
+    headSha: text(head, 'sha'),
+    headRef: text(head, 'ref'),
+    headRepo: text(headRepo, 'full_name'),
     baseRef: text(isRecord(value['base']) ? value['base'] : {}, 'ref'),
     updatedAt: text(value, 'updated_at'),
     body: text(value, 'body'),

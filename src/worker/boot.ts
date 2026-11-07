@@ -98,13 +98,16 @@ import type { SetupCheckInput, SetupIssue, SetupProblem, SetupReport } from './a
 import { SourceRegistry, type SourceSettingsView } from './sources/registry.ts'
 import { Commands, type CommandsHost } from './sources/commands.ts'
 import {
+  claimReportedPull,
   createGithubApi,
   createGithubKind,
   createGithubPoller,
+  observePull,
+  pullEndNotices,
   subscribedThreads,
   GITHUB_KIND
 } from './sources/github/index.ts'
-import type { GithubPollResult, GithubPoller } from './sources/github/index.ts'
+import type { GithubPollResult, GithubPoller, GithubPullHost } from './sources/github/index.ts'
 import {
   FEISHU_KIND,
   createFeishuApi,
@@ -751,6 +754,35 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
     },
     onError: (error, evalId) => logger.warn(`the assessment of ${evalId} could not be decided`, { error: stringOf(error) })
   })
+  // ---- GitHub 的 PR 规则（§I.2「PR 规则」行、§I.5）：读一条 PR、绑定与结束判定。宿主把
+  // Engine 的两条命令与仓储的读面拼成 Source 端口（§C.2 规则 2：sources 不 import app），
+  // 报告路径与轮询路径共用同一份，语义因此只有一处。
+  const githubRepository = String(githubSetup.config['repository'] ?? '')
+  const githubCli = String(githubSetup.config['cli'] ?? 'gh')
+  /** GitHub 的读端口：setup 完成（仓库与 CLI 都在）才读，否则 PR 绑定与通知都不接线。 */
+  const githubReady = githubSetup.enabled && githubRepository !== '' && githubCli !== ''
+  const githubApi = createGithubApi(
+    (options.commands ?? new Commands({ configuredPrograms: () => [text(settings['githubCli'])] })).withSignal(),
+    githubCli
+  )
+  const pullHost: GithubPullHost = {
+    api: githubApi,
+    tickets: {
+      get: (ticketId) => repo.tickets.get(ticketId),
+      open: () => repo.tickets.open()
+    },
+    trigger: (triggerId) => repo.triggers.get(triggerId),
+    bind: (ticketId, thread, own) => {
+      engine.bindThread(ticketId, thread, own)
+    },
+    close: (thread, outcome, at) => {
+      engine.threadClosed(thread, outcome, at)
+    },
+    // agent 的账号与配置仓库判「这条 PR 是不是它的」（§I.2 PR 规则行）。
+    login: deploymentFacts.githubLogin,
+    repository: githubRepository,
+    now
+  }
   const executor = new OrcaExecutor({ effects, runtime: options.runtime, log: (message) => logger.info(message) })
   const engine = new Engine({
     repo,
@@ -776,6 +808,16 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
       }
       // 新 Decision 落库即「不再疑似空转」（§F.3 的可观测事实，不是拦截）。
       if (event.type === 'decision.recorded') routerSupervision.noteDecision()
+      // 因 PR 结束的 Ticket 给 chat 发**一条**稳定通知（§I.2「结束通知」行）：键由 PR 号、
+      // Channel 与结局派生，同一结束重复算也只排一条（§J.1 幂等）。GitHub 自己的时间线已经
+      // 显示合并/关闭，所以通知只发往别的 Channel。
+      if (event.type === 'ticket.ended' && githubReady) {
+        const ended = repo.tickets.get(event.data.ticketId)
+        if (ended !== undefined) {
+          const request = repo.triggers.get(ended.origin.triggerId)?.text ?? ''
+          for (const notice of pullEndNotices(ended, request, githubRepository)) outbox.send(notice)
+        }
+      }
     }
   })
   // 候选卡送到 Router 之后才起算 Eval 的截止时间（§K.7）；送达与 relay/notice 共用同一条
@@ -986,6 +1028,14 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
     tickets: () => repo.tickets.list(),
     // 读模型里的「已投递到该 Ticket」：归属判定与扇出/交回同一份记录（`followupOwners`）。
     followups: (ticket) => deliveredFollowups(ticket, repo),
+    // `report --pr-number` 的绑定（§I.2「PR 规则」行）：读那条 PR、判归属并绑给这张 Ticket；
+    // 拒绝时整条命令落成固定码 `pr_mismatch`。没有 GitHub Source 时无从判归属，不接线。
+    ...(githubReady
+      ? {
+          claimPull: (ticketId: string, pull: { readonly number: number }) =>
+            claimReportedPull(pullHost, ticketId, pull.number)
+        }
+      : {}),
     idempotent,
     afterWrite: () => {
       refresh()
@@ -1201,13 +1251,10 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
   const poller: GithubPoller | null =
     githubSetup.enabled && githubInstance.repository !== '' && githubInstance.cli !== ''
       ? createGithubPoller({
-          api: createGithubApi(
-            (options.commands ?? new Commands()).withSignal(),
-            String(githubSetup.config['cli'] ?? 'gh')
-          ),
+          api: githubApi,
           config: {
-            repository: String(githubSetup.config['repository'] ?? ''),
-            cli: String(githubSetup.config['cli'] ?? 'gh'),
+            repository: githubRepository,
+            cli: githubCli,
             pollSeconds: Number(githubSetup.config['pollSeconds'] ?? 60),
             observeIssues: githubSetup.config['observeIssues'] === true,
             observePulls: githubSetup.config['observePulls'] === true,
@@ -1227,6 +1274,10 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
           // receive-all 的仓库流与默认分支 CI 基线也在这里命名（#36）。
           streamKey: githubStreamKey,
           branchCiKey: githubBranchCiKey,
+          // 读到 PR 就对账（§I.2「PR 规则」行）：绑定与结束都经领域命令，轮询器自己不写库。
+          observePull: (pull) => {
+            observePull(pullHost, pull)
+          },
           host: createSourceContext({
             engine,
             store,
