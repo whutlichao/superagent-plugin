@@ -1,5 +1,6 @@
-// 领域命令的 HTTP handler（§G.2 的 `report` / `reply` / `ack` / `ticket stop` / `ticket retry`
-// 行、§G.3 的读面）：CLI 与面板共用同一份实现，路由表只负责方法与角色。
+// 领域命令的 HTTP handler（§G.2 的 `report` / `reply` / `ack` / `ticket stop` / `ticket retry` /
+// `ticket list` / `trigger requeue` / `thread *` 行、§G.3 的读面）：CLI 与面板共用同一份实现，
+// 路由表只负责方法与角色。
 //
 // 三件事只在这里发生一次：
 // - 参数形状（worker 的 `--state`/`--summary`、回复的三个 purpose、确认的 trigger、停止的
@@ -14,12 +15,14 @@
 // `ApiError`；领域写入经注入的 Engine 端口，存储经注入的读口。
 import { ApiError, ERROR_CODES } from './errors.ts'
 import { IM_WORDS, wordCount } from '../infra/text.ts'
-import { REPORT_STATES } from '../core/index.ts'
+import { REPORT_STATES, threadKey } from '../core/index.ts'
 import type {
   EngineForExecutor,
   EngineForMainSession,
   EngineForPeople,
+  Thread,
   Ticket,
+  Trigger,
   WorkerReport
 } from '../core/index.ts'
 import type { RouteDefinition, RouteHandler, RouteInput } from './routes.ts'
@@ -32,6 +35,12 @@ export const REPLY_PURPOSES = ['answer', 'result', 'attention'] as const
 export const REPLY_WORD_LIMIT = IM_WORDS
 /** `report --summary` 的字符上限（§G.2：600 字符）。 */
 export const SUMMARY_LIMIT = 600
+
+/** 写命令的幂等端口（§G.1 幂等行）：拿到请求（token/requestId/at）与要跑的工作。 */
+export type WriteIdempotency = (
+  input: { readonly token?: string; readonly requestId?: string | null; readonly at: string },
+  work: () => unknown | Promise<unknown>
+) => Promise<unknown>
 
 /** handler 的接线：领域写入（engine）与读口（records）。 */
 export interface DomainHandlerOptions {
@@ -51,10 +60,39 @@ export interface DomainHandlerOptions {
    */
   readonly stop: EngineForPeople['stopTicket']
   /**
-   * 人重试一张卡住的 Ticket（§G.2 的 `ticket retry`）：结束当前 Assignment，在同一个
-   * worktree、分支与 PR 上新建一个并带恢复说明。组合根传执行器拼好的重试入口。
+   * `Engine.retryTicket` 是 `EngineForPeople` 的一条，但本票新增的
+   * `trigger requeue` 走 `reevaluate`（同一族的另一条）。
    */
   readonly retry: EngineForPeople['retryTicket']
+  /**
+   * `Engine.reevaluate`（§G.2 的 `trigger requeue`）：把一条 Trigger 重新排进 Eval。
+   * 返回 false 表示已有 Eval 持有它（此时不动它，如实回 `queued: false`）。
+   */
+  readonly reevaluate: EngineForPeople['reevaluate']
+  /**
+   * `Engine.unsubscribe`（§G.2 的 `thread unsubscribe`）：丢弃一个 Thread 上所有 Ticket 的
+   * Subscription；返回是否真的丢了什么。
+   */
+  readonly unsubscribe: EngineForPeople['unsubscribe']
+  /**
+   * `Engine.markUnrelated`（§G.2 的 `thread unrelated`）：丢自己的订阅、把这条 Thread 上
+   * 自己决定的人消息交回 Eval；返回交回了几条。
+   */
+  readonly markUnrelated: EngineForExecutor['markUnrelated']
+  /**
+   * `Engine.followForContext`（§G.2 的 `thread follow`）：把 Ticket 订阅到一条只作语境的
+   * Thread；已跟随过时返回 false。
+   */
+  readonly followForContext: (ticketId: string, ref: Thread['ref'], reason?: string) => boolean
+  /** 读一条 Thread（follow / unsubscribe 的存在性判定）。 */
+  readonly threadOf: (key: string) => Thread | undefined
+  /** 读一条 Trigger（`trigger requeue` 的存在性判定）。 */
+  readonly triggerOf: (id: string) => Trigger | undefined
+  /**
+   * 一条 Trigger 仍被哪些 Ticket 的 worker 拥有（`followupOwners`，§K.2 第 3 条）。
+   * `trigger requeue` 用它判 `not_requeueable`：执行器仍拥有的人消息不能被重排绕过。
+   */
+  readonly owners: (trigger: Trigger) => readonly string[]
   /** 读一条 Ticket（详情与写入的返回）。 */
   readonly ticketOf: (id: string) => Ticket | undefined
   /** 全部 Ticket（列表读模型）。 */
@@ -66,6 +104,11 @@ export interface DomainHandlerOptions {
   readonly followups?: (ticket: Ticket) => readonly TicketFollowup[]
   /** 一次写成功后的推推送/刷新钩子（面板 `state.changed` 与状态栏）。 */
   readonly afterWrite?: () => void
+  /**
+   * 写命令的幂等端口（组合根用真库实现 `runWrite`）；缺省直接执行一次。`--request-id`
+   * 一小时内重试返回首次结果（§G.1）：本票接线的四条写命令都过这一个口。
+   */
+  readonly idempotent?: WriteIdempotency
 }
 
 /** 一个 body 对象；不是对象就按 `invalid_params` 拒绝。 */
@@ -177,6 +220,8 @@ export interface TicketsResult {
  */
 export function createDomainHandlers(options: DomainHandlerOptions): ReadonlyMap<string, RouteHandler> {
   const handlers = new Map<string, RouteHandler>()
+  /** 写命令的幂等（§G.1）：组合根给端口时同 id 一小时内返回首次结果，否则照常跑一次。 */
+  const write = options.idempotent ?? ((_input, work) => Promise.resolve(work()))
   /** 一条 Ticket 的读模型（列表与详情同一份，含仍归它的人 follow-up 标记）。 */
   const viewOf = (ticket: Ticket): TicketView =>
     ticketView(ticket, options.followups === undefined ? [] : options.followups(ticket))
@@ -309,6 +354,101 @@ export function createDomainHandlers(options: DomainHandlerOptions): ReadonlyMap
     return { queued }
   })
 
+  handlers.set('POST triggers/:id/requeue', (input) =>
+    write(input, () => {
+      // `trigger requeue`（§G.2）：把一条 Trigger 放回 Eval。执行器仍拥有的人消息不能被绕过
+      // ——那会绕开决定它的 worker（§K.2 第 3 条）；已有 Eval 持有它时如实回 `queued:false`。
+      const triggerId = input.params['id'] ?? ''
+      const trigger = options.triggerOf(triggerId)
+      if (trigger === undefined) {
+        throw new ApiError(ERROR_CODES.missing, 'No such trigger', { trigger: triggerId })
+      }
+      const owners = options.owners(trigger)
+      if (owners.length > 0) {
+        throw new ApiError(
+          ERROR_CODES.notRequeueable,
+          "A ticket's worker still owns this message; its worker decides it or hands it back",
+          { trigger: triggerId, tickets: owners.join(',') }
+        )
+      }
+      const queued = options.reevaluate(triggerId)
+      options.afterWrite?.()
+      return { queued }
+    })
+  )
+
+  handlers.set('POST threads/:key/unsubscribe', (input) =>
+    write(input, () => {
+      // `thread unsubscribe`（§G.2）：丢一个 Thread 上所有 Ticket 的订阅。没有订阅可丢、或
+      // Thread 不存在，都是固定的 `missing`——不是「成功了但什么也没做」。
+      const key = input.params['key'] ?? ''
+      if (options.threadOf(key) === undefined) {
+        throw new ApiError(ERROR_CODES.missing, 'No such thread', { thread: key })
+      }
+      if (!options.unsubscribe(key)) {
+        throw new ApiError(ERROR_CODES.missing, 'No ticket subscribes to that thread', { thread: key })
+      }
+      options.afterWrite?.()
+      return { removed: true, thread: key }
+    })
+  )
+
+  handlers.set('POST threads/:key/follow', (input) =>
+    write(input, () => {
+      // `thread follow`（§G.2）：worker 按理由跟随一条它不拥有的 Thread，只作语境。
+      // - `own_thread`：那是它自己的 Thread（来源 Thread 或它跟随的 PR/Issue Thread），
+      //   本来就把消息交给它；
+      // - `unrelated_required`：它仍决定这条 Thread 上的消息（被 attach 的订阅者），要只留语境
+      //   就得先用 `thread unrelated` 声明无关。
+      const body = bodyFields(input.body)
+      const ticketId = callerTicket(input, body)
+      const key = input.params['key'] ?? ''
+      const thread = options.threadOf(key)
+      if (thread === undefined) {
+        throw new ApiError(ERROR_CODES.missing, 'No such thread', { thread: key })
+      }
+      const ticket = options.ticketOf(ticketId)
+      if (ticket === undefined) {
+        throw new ApiError(ERROR_CODES.missing, 'No such ticket', { ticket: ticketId })
+      }
+      const origin = options.triggerOf(ticket.origin.triggerId)
+      const owns =
+        origin?.threads.some((ref) => threadKey(ref) === key) === true ||
+        ticket.follows?.some((item) => item.thread === key) === true
+      if (owns) {
+        throw new ApiError(
+          ERROR_CODES.ownThread,
+          "This thread is the ticket's own; its messages already reach the ticket",
+          { thread: key }
+        )
+      }
+      if (thread.subscriptions.includes(ticketId) && thread.context?.includes(ticketId) !== true) {
+        throw new ApiError(
+          ERROR_CODES.unrelatedRequired,
+          'This thread still decides for the ticket; declare it unrelated before following it as context',
+          { thread: key }
+        )
+      }
+      const followed = options.followForContext(ticketId, thread.ref, optionalText(body, 'reason'))
+      options.afterWrite?.()
+      return { followed }
+    })
+  )
+
+  handlers.set('POST threads/:key/unrelated', (input) =>
+    write(input, () => {
+      // `thread unrelated`（§G.2）：丢自己的订阅，并把这条 Thread 上自己决定的人消息交回 Eval。
+      // 领域判自己的 Thread（`own_thread`）与没跟随（`not_followed`）两种固定拒绝。
+      const body = bodyFields(input.body)
+      const ticketId = callerTicket(input, body)
+      const key = input.params['key'] ?? ''
+      const reason = requiredText(body, 'reason')
+      const handedBack = options.markUnrelated(ticketId, key, reason)
+      options.afterWrite?.()
+      return { dropped: true, handedBack }
+    })
+  )
+
   handlers.set('POST ack', (input) => {
     const body = bodyObject(input.body)
     const ticketId = callerTicket(input, body)
@@ -323,10 +463,10 @@ export function createDomainHandlers(options: DomainHandlerOptions): ReadonlyMap
   return handlers
 }
 
-/** 一个 Ticket 筛选参数（`--state`）；未知值按 `invalid_value` 拒绝。 */
+/** 一个 Ticket 筛选参数（`--state`）；未知值按 `invalid_state` 拒绝（§G.2 的 ticket list 行）。 */
 function ticketFilterOf(value: string): TicketFilter {
   if (!(TICKET_FILTERS as readonly string[]).includes(value)) {
-    throw new ApiError(ERROR_CODES.invalidValue, `state must be one of: ${TICKET_FILTERS.join(', ')}`, {
+    throw new ApiError(ERROR_CODES.invalidState, `state must be one of: ${TICKET_FILTERS.join(', ')}`, {
       flag: 'state',
       choices: TICKET_FILTERS.join(',')
     })

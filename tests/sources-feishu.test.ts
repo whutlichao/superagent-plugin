@@ -21,6 +21,9 @@ import { createFeishuKind } from '../src/worker/sources/feishu/kind.ts'
 import type { SyncContext } from '../src/worker/sources/kind.ts'
 import { FakeHealthBoard } from './support/health-board.ts'
 import { openStore } from '../src/worker/app/store.ts'
+import { dispatch } from '../src/worker/cli/commands.ts'
+import { parseArgs } from '../src/worker/cli/io.ts'
+import { readApiToken } from '../src/worker/infra/tokens.ts'
 import { savedSettingsVersion } from '../src/worker/app/settings.ts'
 import {
   SYNC_FIRST_DELAY_MS,
@@ -1516,6 +1519,93 @@ test('a Feishu configuration that can act as a user is disabled with its setup p
     assert.deepEqual(
       harness.commands.calls.filter((call) => call.args.includes('+chat-members-list')),
       []
+    )
+  } finally {
+    await harness.cleanup()
+  }
+})
+
+test('the policy sync command runs the driver, keeps the sync health entry and reports the diff', async () => {
+  // 启动那一轮读到的是旧名单（与 Policy 相同 → 不写新版本），手动同步读到新名单：
+  // 于是 `{allowed, added, removed}` 的差异是确定的，而不是靠调用顺序猜。
+  const config = { cli: 'lark-cli', chats: [{ chatId: 'oc_all', listen: 'all' }] }
+  let reads = 0
+  const harness = await openBoot({
+    boot: async (stateDir, runtime, commands) => {
+      scriptFeishuIdentity(commands)
+      commands.script(['im', '+chat-members-list'], () => {
+        reads += 1
+        return membersPage([{ member_id: 'ou_old', name: 'Old' }])
+      }, { once: true })
+      commands.script(['im', '+chat-members-list'], () => {
+        reads += 1
+        return membersPage([{ member_id: 'ou_bob', name: 'Bob' }])
+      })
+      return bootPlugin({
+        runtime,
+        readSettings: async () =>
+          settingsWithFeishu(
+            stateDir,
+            { enabled: true, config },
+            {
+              github: { allowed: [{ id: 'alice' }] },
+              feishu: { allowed: [{ id: 'ou_old', name: 'Old' }], syncChat: 'oc_all' }
+            }
+          ),
+        commands,
+        stateDir,
+        disableTimers: true
+      })
+    }
+  })
+  try {
+    // 启动时那一轮（生产不等它；测试等这个 promise）。
+    await harness.handle.policySync()
+    assert.equal(reads, 1)
+    const port = harness.handle.port()
+    assert.notEqual(port, null, 'the worker listens')
+    const token = readApiToken(harness.stateDir)
+    const target = {
+      stateDir: harness.stateDir,
+      stateDirSource: 'argument' as const,
+      port: port as number,
+      baseUrl: `http://127.0.0.1:${port}/superagent/api`,
+      token,
+      tokenSource: 'argument' as const,
+      tokenFile: null
+    }
+    const run = (argv: readonly string[]) =>
+      dispatch({ parsed: parseArgs(argv), target, sleep: async () => undefined })
+
+    // `policy sync feishu` 走 #23 的驱动器：读一次、写 origin=sync 的 Policy 版本、写 `sync:feishu`。
+    const synced = await run(['policy', 'sync', 'feishu'])
+    assert.equal(synced.exit, 0, JSON.stringify(synced.envelope))
+    assert.equal(reads, 2, 'the driver ran exactly once')
+    const result = (synced.envelope as { result: Record<string, unknown> }).result
+    assert.deepEqual(result['allowed'], [{ id: 'ou_bob', name: 'Bob' }])
+    assert.deepEqual(result['added'], ['ou_bob'])
+    assert.deepEqual(result['removed'], ['ou_old'])
+    assert.equal(typeof (result['policy'] as Record<string, unknown>)['revision'], 'number')
+
+    // 健康条目由驱动器写（§N.4 的单一写者），`status` 与面板读同一份。
+    const status = await run(['status'])
+    const health = (status.envelope as { result: { health: Record<string, { state?: string; detail?: string }> } })
+      .result.health
+    assert.equal(health['sync:feishu']?.state, 'ready')
+    assert.equal(health['sync:feishu']?.detail, '1 allowed')
+
+    // 记账仍是驱动器做的：新版本 origin=sync。
+    const store = openStore({ stateDir: harness.stateDir })
+    const saved = savedSettingsVersion(store, 'policy')
+    store.close()
+    assert.equal(saved?.origin, 'sync')
+
+    // 没有同步目标的 Source 是固定的 `not_syncable`（不猜、不假装同步过）。
+    const notSyncable = await run(['policy', 'sync', 'github'])
+    assert.equal(notSyncable.exit, 2)
+    assert.equal(
+      (notSyncable.envelope as { error?: { code?: string } }).error?.code,
+      'not_syncable'
     )
   } finally {
     await harness.cleanup()

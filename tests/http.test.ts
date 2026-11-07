@@ -56,6 +56,8 @@ import { openStore } from '../src/worker/app/store'
 import { SCHEMA_VERSION } from '../src/worker/app/schema'
 import { runIdempotent } from '../src/worker/http/idempotency'
 import { createDecisionHandlers, withDecisionHandlers } from '../src/worker/http/decisions'
+import { createSettingsHandlers, withSettingsHandlers } from '../src/worker/http/settings'
+import { createSettings } from '../src/worker/app/settings'
 import type { Decision } from '../src/worker/core/model'
 import { tempStateDir } from './support/state'
 import { holdPortBlock } from './support/ports'
@@ -291,6 +293,14 @@ async function startHarness(options: HarnessOptions = {}): Promise<Harness> {
     startedAt: options.startedAt ?? STARTED_AT,
     ...options.host
   }
+  // `settings get/save` 是命令面的真 handler（§G.2、§K.8）：与组合根同一份实现，写入器
+  // 落在本服务器的真库上（其余路由保持路由表的 `stub`，它们的票各管各的）。
+  const settingsHandlers = createSettingsHandlers({
+    settings: createSettings({ store, now: () => STARTED_AT })
+  })
+  const routes =
+    options.routes ??
+    withSettingsHandlers(ROUTE_TABLE, settingsHandlers)
   const server = await startHttpServer({
     stateDir,
     host,
@@ -300,7 +310,7 @@ async function startHarness(options: HarnessOptions = {}): Promise<Harness> {
     startedAt: options.startedAt ?? STARTED_AT,
     log: (line) => void logs.push(line),
     rateLimiter: options.rateLimiter ?? GENEROUS_LIMITER(),
-    routes: options.routes
+    routes
   })
   const call: Harness['call'] = (path, callOptions = {}) => {
     const method = callOptions.method ?? 'GET'
@@ -718,9 +728,11 @@ test('a request log line carries only method/path/status/code/ms/tokenRole', asy
   const harness = await startHarness()
   try {
     const marker = 'body-marker-should-never-be-logged'
-    await harness.call('/superagent/api/settings/executor', {
-      method: 'PUT',
-      body: { value: { note: marker }, revision: 1 }
+    // 一条**仍是 stub** 的写路由（`router restart` 属于面板动作的票）：日志断言只关心
+    // 一次写请求的形状，不依赖任何已接线的 handler。
+    await harness.call('/superagent/api/router/restart', {
+      method: 'POST',
+      body: { note: marker }
     })
     await harness.call('/superagent/api/state', { token: null })
     await harness.call('/superagent/api/state')
@@ -735,7 +747,7 @@ test('a request log line carries only method/path/status/code/ms/tokenRole', asy
     const [stubbed, unauthorized, ok] = harness.logs
     assert.deepEqual(
       { method: stubbed?.method, path: stubbed?.path, status: stubbed?.status, code: stubbed?.code },
-      { method: 'PUT', path: '/superagent/api/settings/executor', status: 503, code: 'unavailable' }
+      { method: 'POST', path: '/superagent/api/router/restart', status: 503, code: 'unavailable' }
     )
     assert.equal(stubbed?.tokenRole, 'operator')
     assert.equal(unauthorized?.status, 401)
@@ -789,6 +801,8 @@ test('the route table carries every row §G.3 names', () => {
     'POST router/restart',
     'POST setup/check',
     'POST sources/:id/labels',
+    'POST threads/:key/follow',
+    'POST threads/:key/unrelated',
     'POST threads/:key/unsubscribe',
     'POST tickets/:id/note',
     'POST tickets/:id/request-status',
@@ -965,9 +979,19 @@ test('a router token may save ordinary settings but not a setup field', async ()
     const ordinary = await harness.call('/superagent/api/settings/executor', {
       method: 'PUT',
       token,
-      body: { value: { maxWorkers: 3 }, revision: 1 }
+      body: { value: { maxWorkers: 3 }, revision: 0 }
     })
-    assert.equal(ordinary.status, 503, 'authorization passed; the handler is a stub')
+    // 普通块（无 setup 字段）可以写：router 档够了，来源落成 `tool`（§K.8）。
+    assert.equal(ordinary.status, 200)
+    assert.deepEqual(resultOf(ordinary), {
+      block: 'executor',
+      revision: 1,
+      settings_revision: 1,
+      policy_changed: false,
+      restarting: false,
+      changed: true,
+      origin: 'tool'
+    })
 
     // §K.8 / §G.2：非 operator 改 setup 字段 → origin_forbidden。
     for (const value of [{ baseRepo: 'acme/widgets' }, { stateDir: '/tmp/x' }, { cli: '/usr/bin/gh' }]) {
@@ -980,12 +1004,13 @@ test('a router token may save ordinary settings but not a setup field', async ()
       assert.equal(failureOf(refused).code, 'origin_forbidden')
     }
 
-    // operator 改同样的字段可以（后续由 settings.save 做真正的校验）。
+    // operator（面板来源）改同样的字段可以：角色与来源两道规则都通过。
     const operator = await harness.call('/superagent/api/settings/executor', {
       method: 'PUT',
-      body: { value: { baseRepo: 'acme/widgets' }, revision: 1 }
+      body: { value: { baseRepo: 'acme/widgets' }, revision: 1, origin: 'panel' }
     })
-    assert.equal(operator.status, 503)
+    assert.equal(operator.status, 200)
+    assert.equal((resultOf(operator) as Record<string, unknown>)['origin'], 'panel')
 
     // Router 不能做的运维动作（§F.6 的 Router 命令清单之外）。
     for (const [method, path] of [
@@ -1043,7 +1068,7 @@ test('every route refuses a role below its minimum with not_permitted_role', asy
         checked += 1
       }
     }
-    // 39 条路由：34 条高于 assignment（5 条是 assignment 档），13 条是 operator → 47 次拒绝。
+    // 42 条路由：34 条高于 assignment（8 条是 assignment 档），13 条是 operator → 47 次拒绝。
     assert.equal(checked, 47, 'every route above assignment refuses it, and every operator route refuses router')
   } finally {
     harness.close()

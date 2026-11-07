@@ -2,7 +2,7 @@
 // 并把 worker 挂到同一个替身宿主上，所以面板的 `plugin.request` 真的会走到 worker 的处理器。
 //
 // 情景名单（§M.7）：booting、empty、healthy、needs-person、problems、paused、setup-missing、
-// long-lists、zh、en、danger-confirm。
+// long-lists、deployment、zh、en、danger-confirm。
 //
 // Overview（§M.2 的四块）由四个情景表达：empty（空态 + Source 概况）、needs-person（待人工行
 // 与它的直接动作）、problems（三类系统问题）、paused（暂停 + 恢复的二次确认）。
@@ -12,8 +12,13 @@
 // 是浅色/深色主题；中英双语的键集合与页面文案由 `tests/locales.test.ts` 与
 // `tests/panel-navigation.test.tsx` 覆盖（它们能传 `locale`）。这条边界在票的回报里记明。
 import { defineCheck } from 'orca/testing'
+import { HealthBoard } from '../worker/infra/health'
+import { DEFAULT_MACHINE_LIMITS } from '../worker/app/limits'
+import { deploymentView } from '../worker/app/deployment-view'
 import type {
   AttentionItem,
+  DeploymentView,
+  DoctorView,
   HumanSlot,
   PanelState,
   PanelTicket,
@@ -145,6 +150,69 @@ function hostFor(state: PanelState) {
   }
 }
 
+/** 部署页的一份读数：健康板是真的（三个条目由不同的写者 claim，与 #45 同一份形状）。 */
+function deploymentFixture(): DeploymentView {
+  const board = new HealthBoard()
+  board.claim('runtime', { state: 'ready', detail: 'loopback api on 127.0.0.1:3847' })
+  board.claim('passes', { state: 'starting', detail: 'not run yet' })
+  board.claim('router', { state: 'error', detail: 'restarts 5 in 10 min, last error: launch timed out' })
+  board.claim('sync:github', { state: 'paused', detail: 'not synced yet' })
+  return deploymentView({
+    stateDir: '/var/lib/superagent',
+    setup: [
+      {
+        place: 'executor',
+        code: 'base_repo_missing',
+        kind: 'missing',
+        detail: 'the base repository path:/repos/widgets is not registered in Orca',
+        fix: 'pick a repository Orca already has (`orca repo list`), or add it to Orca first',
+        checkAgain: 'superagent setup check'
+      }
+    ],
+    limits: DEFAULT_MACHINE_LIMITS,
+    paused: false,
+    health: board.all(),
+    router: {
+      state: 'error',
+      detail: 'restarts 5 in 10 min',
+      terminalId: 'term_router',
+      startedAt: '2026-11-07T03:00:00.000Z',
+      restarts: 5,
+      lastError: 'launch timed out'
+    }
+  })
+}
+
+/** doctor 的三档都出现一次（check 只看渲染，不真跑子进程）。 */
+const DOCTOR_FIXTURE: DoctorView = {
+  checks: [
+    { name: 'token', state: 'ok', detail: 'the operator token file is present (0600)' },
+    { name: 'lark', state: 'warn', detail: 'lark-cli is not installed', hint: 'install lark-cli when you use Feishu' },
+    { name: 'port', state: 'fail', detail: 'nothing answers on the recorded port' }
+  ],
+  summary: { ok: 1, warn: 1, fail: 1 },
+  at: '2026-11-07T03:20:00.000Z',
+  note: 'doctor diagnoses this machine (present or missing, never a value); the setup check decides whether the plugin may start: superagent setup check'
+}
+
+/** Deployment 组的情景：读数 + doctor + 三条动作的确定答案。 */
+function deploymentHost(state: PanelState) {
+  return {
+    ...hostFor(state),
+    requests: {
+      ...hostFor(state).requests,
+      deployment: () => deploymentFixture(),
+      doctor: () => DOCTOR_FIXTURE,
+      setupCheck: () => ({ checked: true, problems: [] }),
+      rotateToken: () => ({ rotated: true, tokenFile: '/var/lib/superagent/api-token' }),
+      restartRouter: () => deploymentFixture().router
+    },
+    // 打开面板就停在 Settings：check 渲染的是 Deployment 组本身（keyed atom 读插件存储，
+    // 所以用 mockHost 的 `storage` 播种；`persisted` 不喂 `persist: 'storage'` 的 atom）。
+    storage: { 'panel.page': 'settings' }
+  }
+}
+
 export default defineCheck({
   /** 冷启动：worker 还没应答，面板说「正在启动」并只重试一次。 */
   booting: {
@@ -208,6 +276,15 @@ export default defineCheck({
   ),
   /** setup 缺失：指向 Settings 的提示。 */
   'setup-missing': hostFor(snapshot({ setupMissing: true })),
+  /** Deployment 组：setup 问题、状态目录、限额、暂停、health、Router、doctor 与已知限制。 */
+  deployment: deploymentHost(
+    snapshot({
+      setupMissing: true,
+      error: true,
+      problems: [problem('health', 'health:router', 'router', 'restarts 5 in 10 min')],
+      activity: { received: 5, evaluated: 4, accepted: 1, ignored: 3 }
+    })
+  ),
   /** 长列表：60 行，首页 50 行 + 「加载更多」。 */
   'long-lists': hostFor(
     snapshot({

@@ -15,12 +15,16 @@ export type {
   GithubPollResult,
   GithubPoller,
   GithubPollHost,
+  GithubPullHead,
   GithubSubscribedThread
 } from './poll.ts'
-export { createGithubApi, issueNumberOf } from './api.ts'
+export { createGithubApi, issueNumberOf, rateLimited } from './api.ts'
 export type {
   GithubApi,
+  GithubChecks,
+  GithubCheckRun,
   GithubComment,
+  GithubCommitStatus,
   GithubIssue,
   GithubNotification,
   GithubPull,
@@ -30,6 +34,10 @@ export type {
 export { githubConfigSchema, githubSetupProblem, type GithubConfig } from './config.ts'
 export {
   bodyFingerprint,
+  ciFingerprint,
+  ciState,
+  ciSummary,
+  ciTrigger,
   commentTrigger,
   commentTriggerId,
   githubCommentChannel,
@@ -41,4 +49,4 @@ export {
   reviewCommentTrigger,
   reviewTrigger
 } from './translate.ts'
-export type { GithubBodySource } from './translate.ts'
+export type { CiState, GithubBodySource } from './translate.ts'

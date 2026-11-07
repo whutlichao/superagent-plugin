@@ -307,12 +307,14 @@ export const CLI_COMMANDS: readonly CommandDefinition[] = [
     name: ['ticket', 'list'],
     summary: 'list tickets (optionally by state)',
     flags: [
-      { name: 'state', kind: 'value', hint: 'open | person | working | idle | ended', choices: ['open', 'person', 'working', 'idle', 'ended'] },
+      // `--state` 的候选不在客户端判：服务端用 `invalid_state` 固定拒绝（§G.2 的 ticket list 行），
+      // 读模型与校验只有 `app/views.ts` 一份。
+      { name: 'state', kind: 'value', hint: 'open | person | working | idle | ended' },
       ...PAGE_FLAGS
     ],
     positionals: [],
     write: false,
-    available: false
+    available: true
   },
   {
     name: ['trigger', 'requeue'],
@@ -320,7 +322,7 @@ export const CLI_COMMANDS: readonly CommandDefinition[] = [
     flags: [REQUEST_ID_FLAG],
     positionals: [{ name: 'trigger_id', required: true }],
     write: true,
-    available: false
+    available: true
   },
   {
     name: ['trigger', 'handback'],
@@ -336,7 +338,7 @@ export const CLI_COMMANDS: readonly CommandDefinition[] = [
     flags: [REQUEST_ID_FLAG],
     positionals: [{ name: 'thread_key', required: true }],
     write: true,
-    available: false
+    available: true
   },
   {
     name: ['thread', 'follow'],
@@ -344,15 +346,15 @@ export const CLI_COMMANDS: readonly CommandDefinition[] = [
     flags: [{ name: 'reason', kind: 'value', hint: 'one sentence' }, REQUEST_ID_FLAG],
     positionals: [{ name: 'thread_key', required: true }],
     write: true,
-    available: false
+    available: true
   },
   {
     name: ['thread', 'unrelated'],
     summary: 'drop a followed thread as unrelated',
-    flags: [{ name: 'reason', kind: 'value', hint: 'one sentence' }, REQUEST_ID_FLAG],
+    flags: [{ name: 'reason', kind: 'value', hint: 'one sentence', required: true }, REQUEST_ID_FLAG],
     positionals: [{ name: 'thread_key', required: true }],
     write: true,
-    available: false
+    available: true
   },
 
   // ---- 回复与报告（#30/#31/#32）
@@ -412,7 +414,7 @@ export const CLI_COMMANDS: readonly CommandDefinition[] = [
     ],
     positionals: [],
     write: false,
-    available: false
+    available: true
   },
   {
     name: ['settings', 'save'],
@@ -425,7 +427,7 @@ export const CLI_COMMANDS: readonly CommandDefinition[] = [
     ],
     positionals: [],
     write: true,
-    available: false
+    available: true
   },
   {
     name: ['policy', 'sync'],
@@ -433,7 +435,7 @@ export const CLI_COMMANDS: readonly CommandDefinition[] = [
     flags: [REQUEST_ID_FLAG],
     positionals: [{ name: 'source', required: true }],
     write: true,
-    available: false
+    available: true
   },
   {
     name: ['prompts', 'get'],
@@ -829,6 +831,65 @@ async function run(
         method: 'POST',
         body: {}
       })
+    // `ticket list`（§G.2）：读模型已有（`app/views.ts`），分页与默认值与 `read tickets` 同。
+    case 'ticket list':
+      return call('tickets', { method: 'GET', query: ticketListQuery(args) })
+    // `trigger requeue`（§G.2）：把一条 Trigger 放回 Eval（`not_requeueable` 由 handler 判）。
+    case 'trigger requeue':
+      return call(`triggers/${encodePathSegment(args.positionals[0] ?? '')}/requeue`, {
+        method: 'POST',
+        body: {}
+      })
+    // `thread …`（§G.2）：一条命令一个动作，Ticket 由 assignment token 给出（不是参数）。
+    case 'thread unsubscribe':
+      return call(`threads/${encodePathSegment(args.positionals[0] ?? '')}/unsubscribe`, {
+        method: 'POST',
+        body: {}
+      })
+    case 'thread follow':
+      return call(`threads/${encodePathSegment(args.positionals[0] ?? '')}/follow`, {
+        method: 'POST',
+        body: compact({ reason: valueArgs(args.flags, 'reason') })
+      })
+    case 'thread unrelated':
+      return call(`threads/${encodePathSegment(args.positionals[0] ?? '')}/unrelated`, {
+        method: 'POST',
+        body: compact({ reason: valueArgs(args.flags, 'reason') })
+      })
+    // `settings get` / `settings save`（§G.2、§K.8）：一个块或全部；保存带基础版本号。
+    case 'settings get': {
+      if (switched(args, 'history')) return call('policy/history', { method: 'GET' })
+      const block = valueArgs(args.flags, 'block')
+      return call('settings', {
+        method: 'GET',
+        ...(block === undefined ? {} : { query: { block } })
+      })
+    }
+    case 'settings save': {
+      const block = valueArgs(args.flags, 'block') ?? ''
+      const revision = valueArgs(args.flags, 'revision') ?? ''
+      const base = Number(revision)
+      if (!Number.isInteger(base) || base < 0) {
+        throw new ApiError(ERROR_CODES.invalidValue, '--revision must be a non-negative integer', {
+          flag: 'revision'
+        })
+      }
+      const value = await jsonFlag(args, input, 'value')
+      if (value === undefined) {
+        throw new ApiError(ERROR_CODES.invalidParams, 'settings save needs --value', { flag: 'value' })
+      }
+      // CLI 恒为 `tool` 来源（§K.8）：改 setup 字段时服务端给 `origin_forbidden`。
+      return call(`settings/${encodePathSegment(block)}`, {
+        method: 'PUT',
+        body: { value, revision: base, origin: 'tool' }
+      })
+    }
+    // `policy sync <source>`（§G.2）：走 #23 的驱动器（`sync:<id>` 健康与 origin=sync 记账）。
+    case 'policy sync':
+      return call(`policy-sync/${encodePathSegment(args.positionals[0] ?? '')}`, {
+        method: 'POST',
+        body: {}
+      })
     case 'ticket request-status':
       return call(`tickets/${encodePathSegment(args.positionals[0] ?? '')}/request-status`, {
         method: 'POST',
@@ -1013,6 +1074,17 @@ export function readQuery(resource: string, args: CommandArgs): Record<string, n
   } else if (resource === 'threads' || resource === 'tickets' || resource === 'decisions') {
     query['limit'] = READ_DEFAULT_LIMIT
   }
+  return query
+}
+
+/**
+ * `ticket list` 的查询串（§G.2）：`--state` 原样交给服务端（`invalid_state` 由 handler 判），
+ * 分页与 `read tickets` 共用同一组默认值与上限。
+ */
+export function ticketListQuery(args: CommandArgs): Record<string, string | number> {
+  const query: Record<string, string | number> = { ...readQuery('tickets', args) }
+  const state = valueArgs(args.flags, 'state')
+  if (state !== undefined) query['state'] = state
   return query
 }
 

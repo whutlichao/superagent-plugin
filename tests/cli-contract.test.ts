@@ -17,6 +17,10 @@ import { dispatch } from '../src/worker/cli/commands'
 import { parseArgs } from '../src/worker/cli/io'
 import { main } from '../src/worker/cli/main'
 import { createDomainHandlers, withDomainHandlers } from '../src/worker/http/domain'
+import { createSettingsHandlers, withSettingsHandlers } from '../src/worker/http/settings'
+import { createSettings } from '../src/worker/app/settings'
+import { runWrite } from '../src/worker/http/idempotency'
+import { EVAL_BLOCK_SCHEMA } from '../src/worker/app/settings-blocks'
 import { createAssessmentHandlers, withAssessmentHandlers } from '../src/worker/http/assessment'
 import { createEvalHandlers, withEvalHandlers } from '../src/worker/http/eval'
 import { createEvalTools } from '../src/worker/app/eval'
@@ -25,7 +29,7 @@ import { createPromptHandlers, withPromptHandlers } from '../src/worker/http/pro
 import { createPromptVersions } from '../src/worker/app/prompts'
 import type { Store } from '../src/worker/app/store'
 import { createRouterTools } from '../src/worker/app/assessment'
-import type { Candidate, Decision, Ticket } from '../src/worker/core/index'
+import type { Candidate, Decision, Thread, Ticket } from '../src/worker/core/index'
 import { ROUTE_TABLE, type RouteDefinition } from '../src/worker/http/routes'
 import { UserError } from '../src/worker/core/index'
 import { AT, tempStateDir } from './support/state'
@@ -261,19 +265,84 @@ const WIRED: readonly (readonly [string, Case, Case])[] = [
       code: 'not_owned',
       token: 'assignment'
     }
+  ],
+  // 本票接线的命令面（§G.2）：ticket list / trigger requeue / thread * / settings * / policy sync。
+  [
+    'ticket list',
+    { argv: ['ticket', 'list', '--state', 'open', '--limit', '5'], exit: 0, resultKeys: ['items', 'next_offset'] },
+    // `--state` 的候选由服务端的读模型判（`invalid_state`），不在客户端猜。
+    { argv: ['ticket', 'list', '--state', 'nope'], exit: 2, code: 'invalid_state' }
+  ],
+  [
+    'trigger requeue',
+    { argv: ['trigger', 'requeue', 'trigger-2'], exit: 0, resultKeys: ['queued'] },
+    // 执行器仍拥有这条人的消息：固定的 `not_requeueable`，不绕开它的 worker。
+    { argv: ['trigger', 'requeue', 'trigger-1'], exit: 2, code: 'not_requeueable' }
+  ],
+  [
+    'thread unsubscribe',
+    { argv: ['thread', 'unsubscribe', 'github:acme/widgets#43'], exit: 0, resultKeys: ['removed', 'thread'] },
+    { argv: ['thread', 'unsubscribe', 'github:none'], exit: 2, code: 'missing' }
+  ],
+  [
+    'thread follow',
+    {
+      argv: ['thread', 'follow', 'github:acme/widgets#43', '--reason=Related context'],
+      exit: 0,
+      resultKeys: ['followed'],
+      token: 'assignment'
+    },
+    // 它自己的 Thread（来源 Thread）：不能当语境跟随。
+    {
+      argv: ['thread', 'follow', 'github:acme/widgets#42', '--reason=Mine'],
+      exit: 2,
+      code: 'own_thread',
+      token: 'assignment'
+    }
+  ],
+  [
+    'thread unrelated',
+    {
+      argv: ['thread', 'unrelated', 'github:acme/widgets#44', '--reason=Not this ticket'],
+      exit: 0,
+      resultKeys: ['dropped', 'handedBack'],
+      token: 'assignment'
+    },
+    {
+      argv: ['thread', 'unrelated', 'github:acme/widgets#45', '--reason=Not this ticket'],
+      exit: 2,
+      code: 'not_followed',
+      token: 'assignment'
+    }
+  ],
+  [
+    'settings get',
+    { argv: ['settings', 'get', '--block', 'executor'], exit: 0, resultKeys: ['revision', 'blocks'], token: 'router' },
+    { argv: ['settings', 'get', '--block', 'nope'], exit: 2, code: 'missing', token: 'router' }
+  ],
+  [
+    'settings save',
+    {
+      argv: ['settings', 'save', '--block', 'eval', '--value', '-', '--revision', '0'],
+      exit: 0,
+      resultKeys: ['revision', 'policy_changed', 'restarting'],
+      token: 'router',
+      stdin: '{"timeoutSeconds":120}'
+    },
+    // 基础版本号已被上一次保存超过：固定的 `stale_revision`（§G.2）。
+    {
+      argv: ['settings', 'save', '--block', 'eval', '--value', '-', '--revision', '0'],
+      exit: 2,
+      code: 'stale_revision',
+      token: 'router',
+      stdin: '{"timeoutSeconds":300}'
+    }
+  ],
+  [
+    'policy sync',
+    { argv: ['policy', 'sync', 'github'], exit: 0, resultKeys: ['policy', 'allowed', 'added', 'removed'], token: 'router' },
+    { argv: ['policy', 'sync', 'nope'], exit: 2, code: 'not_syncable', token: 'router' }
   ]
-]
-
-/** 未落地命令：唯一的用例就是那条固定的 `unavailable`（离线，退出 3）。 */
-const PENDING: readonly string[][] = [
-  ['ticket', 'list'],
-  ['trigger', 'requeue', 't-1'],
-  ['thread', 'unsubscribe', 'k'],
-  ['thread', 'follow', 'k'],
-  ['thread', 'unrelated', 'k'],
-  ['settings', 'get'],
-  ['settings', 'save', '--block', 'executor', '--value={}', '--revision', '1'],
-  ['policy', 'sync', 'github']
 ]
 
 /** 一个能通过领域 handler 形状检查的最小 Ticket（handler 只读它来组 view）。 */
@@ -363,7 +432,10 @@ function commandRouterTools() {
  * Prompt 配置的 handler 用**服务器自己打开的库**（版本表与 KV 都在里面），于是 `prompts save`
  * 在这里是一次真的写、`prompts get` 读得到它。
  */
-function commandRoutes(store: Store): readonly RouteDefinition[] {
+function commandRoutes(
+  store: Store,
+  counters: { readonly calls: { reevaluated: number } } = { calls: { reevaluated: 0 } }
+): readonly RouteDefinition[] {
   const ticket = ticketForCommands()
   const { trigger, candidate } = commandFixture()
   const evalTools = createEvalTools({
@@ -385,54 +457,113 @@ function commandRoutes(store: Store): readonly RouteDefinition[] {
     admission: () => ({ maxPages: 1, timeoutMs: 1_000 }),
     roots: () => []
   })
-  return withPromptHandlers(
-    withEvalHandlers(
-      withAssessmentHandlers(
-        withDomainHandlers(
-        ROUTE_TABLE,
-        createDomainHandlers({
-          report: () => ticket,
-          reply: () => ({ id: 'reply-1', status: 'pending', reused: false }),
-          note: () => ticket,
-          requestStatus: () => true,
-          handback: (ticketId, triggerId) => {
-            // 到达过这张 Ticket 的消息可以交回；其余的给核心的固定拒绝（`not_owned`）。
-            if (triggerId !== 'trigger-1') throw new UserError('notReached')
-            return ticketId === ticket.id
-          },
-          // 停止与重试的可用性由领域判定：这里只替身「能不能」与「是否已结束」两个事实。
-          stop: () => ticket,
-          retry: (ticketId) => {
-            if (ticketId === ticket.id) return ticket
-            if (ticketId === 'ticket-ended') throw new UserError('notRetryable')
-            throw new UserError('unknownTicket')
-          },
-          ticketOf: (id) =>
-            id === ticket.id
-              ? ticket
-              : id === 'ticket-ended'
-                ? { ...ticket, ended: { at: AT, by: 'human', outcome: 'stopped' } }
-                : undefined,
-          tickets: () => [ticket]
-          })
-        ),
-        createAssessmentHandlers({ tools: commandRouterTools() })
+  const keys = (key: string): Thread | undefined => {
+    if (!key.startsWith('github:')) return undefined
+    const ref = { source: 'github', id: key.slice('github:'.length) }
+    const base = { key, ref, createdAt: AT, correlated: [], pending: [], meta: {} }
+    // #42 是 Ticket 自己的来源 Thread；#44 attach 过（决定了消息）；其余只是存在的 Thread。
+    if (key === 'github:acme/widgets#42' || key === 'github:acme/widgets#44') {
+      return { ...base, subscriptions: [ticket.id] }
+    }
+    if (key === 'github:none') return undefined
+    return { ...base, subscriptions: [] }
+  }
+  const domain = createDomainHandlers({
+    report: () => ticket,
+    reply: () => ({ id: 'reply-1', status: 'pending', reused: false }),
+    note: () => ticket,
+    requestStatus: () => true,
+    handback: (ticketId, triggerId) => {
+      // 到达过这张 Ticket 的消息可以交回；其余的给核心的固定拒绝（`not_owned`）。
+      if (triggerId !== 'trigger-1') throw new UserError('notReached')
+      return ticketId === ticket.id
+    },
+    // 停止与重试的可用性由领域判定：这里只替身「能不能」与「是否已结束」两个事实。
+    stop: () => ticket,
+    retry: (ticketId) => {
+      if (ticketId === ticket.id) return ticket
+      if (ticketId === 'ticket-ended') throw new UserError('notRetryable')
+      throw new UserError('unknownTicket')
+    },
+    // 本票的四条领域命令：语义在 `route.test.ts`/`core-engine.test.ts`，这里替身边界事实。
+    reevaluate: (triggerId) => {
+      if (triggerId !== 'trigger-2') return false
+      counters.calls.reevaluated += 1
+      return true
+    },
+    unsubscribe: (thread) => thread === 'github:acme/widgets#43',
+    markUnrelated: (_ticketId, thread) => {
+      if (thread === 'github:acme/widgets#44') return 1
+      throw new UserError('notFollowing')
+    },
+    followForContext: (_ticketId, ref) => ref.id !== 'acme/widgets#42',
+    // 与组合根同一份幂等口（`runWrite` 落在本服务器自己的库上）。
+    idempotent: (input, work) =>
+      runWrite(
+        { store, token: input.token, requestId: input.requestId ?? null, at: input.at },
+        work
       ),
-      createEvalHandlers({ tools: evalTools })
+    threadOf: (key) => keys(key),
+    triggerOf: (id) =>
+      id === trigger.id ? trigger : id === 'trigger-2' ? { ...trigger, id: 'trigger-2' } : undefined,
+    // `trigger-1` 仍归这张 Ticket 的 worker；`trigger-2` 谁都不拥有。
+    owners: (found) => (found.id === 'trigger-1' ? [ticket.id] : []),
+    ticketOf: (id) =>
+      id === ticket.id
+        ? ticket
+        : id === 'ticket-ended'
+          ? { ...ticket, ended: { at: AT, by: 'human', outcome: 'stopped' } }
+          : undefined,
+    tickets: () => [ticket]
+  })
+  const settingsHandlers = createSettingsHandlers({
+    settings: createSettings({
+      store,
+      now: () => AT,
+      // `policy` 块的版本与影响面：这里只关心命令面的形状。
+      policy: { version: () => 'v1', effects: () => new Map(), apply: () => undefined }
+    }),
+    validate: (name) =>
+      name === 'eval' ? (value: unknown) => EVAL_BLOCK_SCHEMA.safeParse(value) : undefined,
+    blocks: () => ['policy', 'eval', 'executor'],
+    effective: (name) => (name === 'executor' ? { maxWorkers: 2 } : {}),
+    // 名单同步驱动器的替身：一次读回两条名单（新增 `bob`）。
+    idempotent: (input, work) =>
+      runWrite(
+        { store, token: input.token, requestId: input.requestId ?? null, at: input.at },
+        work
+      ),
+    policySync: {
+      syncable: () => ['github'],
+      sync: async () => ({ allowed: [{ id: 'alice' }, { id: 'bob' }] }),
+      allowed: () => [{ id: 'alice' }],
+      policy: () => ({ revision: 1, version: 'v1' })
+    }
+  })
+  return withSettingsHandlers(
+    withPromptHandlers(
+      withEvalHandlers(
+        withAssessmentHandlers(
+          withDomainHandlers(ROUTE_TABLE, domain),
+          createAssessmentHandlers({ tools: commandRouterTools() })
+        ),
+        createEvalHandlers({ tools: evalTools })
+      ),
+      createPromptHandlers({
+        versions: createPromptVersions({ store, now: () => AT }),
+        deployment: {
+          environment: () => ({
+            variables: ['SUPERAGENT_CLI', 'SUPERAGENT_TOKEN_FILE'],
+            cliPath: '/opt/superagent/src/bin/superagent.mjs',
+            tokenFile: '/tmp/state/tokens/router',
+            stateDir: '/tmp/state',
+            repository: 'acme/widgets'
+          }),
+          policy: () => ({ version: 'v1', mode: 'observe', rules: [] })
+        }
+      })
     ),
-    createPromptHandlers({
-      versions: createPromptVersions({ store, now: () => AT }),
-      deployment: {
-        environment: () => ({
-          variables: ['SUPERAGENT_CLI', 'SUPERAGENT_TOKEN_FILE'],
-          cliPath: '/opt/superagent/src/bin/superagent.mjs',
-          tokenFile: '/tmp/state/tokens/router',
-          stateDir: '/tmp/state',
-          repository: 'acme/widgets'
-        }),
-        policy: () => ({ version: 'v1', mode: 'observe', rules: [] })
-      }
-    })
+    settingsHandlers
   )
 }
 
@@ -468,12 +599,20 @@ function assertFailure(envelope: unknown, code: string): void {
 }
 
 test('the contract table covers every command in the dispatch table', () => {
-  const covered = new Set<string>([
-    ...WIRED.map(([name]) => name),
-    ...PENDING.map((argv) => (commandFor(argv) ?? { name: ['?'] }).name.join(' '))
-  ])
+  const covered = new Set<string>(WIRED.map(([name]) => name))
   const missing = CLI_COMMANDS.map((command) => command.name.join(' ')).filter((name) => !covered.has(name))
   assert.deepEqual(missing, [], 'every command has at least one contract case')
+})
+
+test('no command is left as a fixed unavailable', () => {
+  // 命令面收尾（#56）：表里的每一条都已接线；`available:false` 的清单必须为空，而不是留着
+  // 「这台构建还没有它」的旧行。
+  assert.deepEqual(
+    CLI_COMMANDS.filter((command) => !command.available).map((command) => command.name.join(' ')),
+    []
+  )
+  // `commandFor` 仍按最长前缀解析（`thread unrelated` 不会落到 `thread`）。
+  assert.equal(commandFor(['thread', 'unrelated', 'k'])?.name.join(' '), 'thread unrelated')
 })
 
 test('every command that is wired has a success case and a fixed refusal', async () => {
@@ -509,19 +648,6 @@ test('every command that is wired has a success case and a fixed refusal', async
       const refused = await runCase(server, refusal)
       assert.equal(refused.exit, refusal.exit, `${name}: refusal exit`)
       assertFailure(refused.envelope, refusal.code ?? 'invalid_params')
-    }
-  } finally {
-    server.close()
-  }
-})
-
-test('every command that has not landed yet refuses with a fixed unavailable, offline', async () => {
-  const server = await startTestServer()
-  try {
-    for (const argv of PENDING) {
-      const { exit, envelope } = await runCase(server, { argv, exit: 3, code: 'unavailable', offline: true })
-      assert.equal(exit, 3, `${argv.join(' ')}: not-ready exit`)
-      assertFailure(envelope, 'unavailable')
     }
   } finally {
     server.close()
@@ -738,6 +864,28 @@ test('--text prints a human line for a refusal and still carries the code', asyn
     })
     assert.equal(result.exit, 2)
     assert.equal(out.join('\n'), 'error: refused: rotate-token replaces the operator token; pass --yes to confirm (reason=confirmation_required)')
+  } finally {
+    server.close()
+  }
+})
+
+test('a request id replays the first result of a closeout write', async () => {
+  const counters = { calls: { reevaluated: 0 } }
+  const server = await startTestServer({ routes: (store) => commandRoutes(store, counters) })
+  try {
+    const run = (): Promise<{ readonly exit: number; readonly envelope: unknown }> =>
+      dispatch({
+        parsed: parseArgs(['trigger', 'requeue', 'trigger-2', '--request-id=req-requeue-1']),
+        target: server.target(),
+        sleep: async () => undefined
+      })
+    const first = await run()
+    assert.equal(first.exit, 0, JSON.stringify(first.envelope))
+    const replay = await run()
+    assert.equal(replay.exit, 0)
+    // 同 id 一小时内重试：先返回首次结果，且领域写入只发生一次（§G.1 幂等行）。
+    assert.deepEqual(replay.envelope, first.envelope)
+    assert.equal(counters.calls.reevaluated, 1, 'the write ran exactly once')
   } finally {
     server.close()
   }

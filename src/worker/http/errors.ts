@@ -16,6 +16,8 @@ export const ERROR_CODES = {
   invalidParams: 'invalid_params',
   /** 参数内容不合法（越界、未知枚举）。 */
   invalidValue: 'invalid_value',
+  /** `ticket list --state` 的未知筛选值（§G.2 的 `ticket list` 行）。 */
+  invalidState: 'invalid_state',
   /** 评估载荷不是文档里的形状（§G.2 的 eval-decide）。 */
   invalidAssessment: 'invalid_assessment',
   /** 评估没有把每条启用规则恰好判定一次（§K.4 第 1 条）。 */
@@ -53,6 +55,31 @@ export const ERROR_CODES = {
    */
   alreadyEnded: 'already_ended',
   notRetryable: 'not_retryable',
+  /**
+   * `trigger requeue` 的固定拒绝（§G.2）：执行器仍拥有这条人的消息，重排会绕过它的 worker。
+   */
+  notRequeueable: 'not_requeueable',
+  /**
+   * `thread follow` / `thread unrelated` 的固定拒绝（§G.2）：这是该 Ticket 自己的 Thread
+   * （它的来源 Thread、PR Thread 或 Source 跟随的 Thread），不能当语境跟随、也不能标为无关。
+   */
+  ownThread: 'own_thread',
+  /** `thread unrelated` 的固定拒绝（§G.2）：该 Ticket 没有跟随这个 Thread。 */
+  notFollowed: 'not_followed',
+  /**
+   * `thread follow` 的固定拒绝（§G.2）：该 Ticket 仍**决定**这个 Thread 上的消息（它是被
+   * attach 的订阅者），要跟随它的语境就得先用 `thread unrelated` 声明无关。
+   */
+  unrelatedRequired: 'unrelated_required',
+  /** `policy sync <source>` 的固定拒绝（§G.2）：这个 Source 现在不能同步名单。 */
+  notSyncable: 'not_syncable',
+  /** `policy sync <source>` 的固定拒绝（§G.2）：一次同步读取/保存失败。 */
+  syncFailed: 'sync_failed',
+  /**
+   * `settings save` 的固定拒绝（§K.8）：账号类字段（`cli`、`repository`）的写前 setup 检查
+   * 不通过——值没有写进库，`issues[]` 说清缺什么。
+   */
+  setupFailed: 'setup_failed',
   /** 并发冲突（同名资源已存在等）。 */
   conflict: 'conflict',
   /** body 超过 1 MiB（§G.3 第 6 条）。 */
@@ -68,11 +95,22 @@ export const ERROR_CODES = {
 /** 一个固定错误码。 */
 export type ErrorCode = (typeof ERROR_CODES)[keyof typeof ERROR_CODES]
 
+/** 一条字段级校验问题（§K.8 的 `{path,message}`；`path` 是点号分隔的字段路径）。 */
+export interface ErrorIssue {
+  readonly path: string
+  readonly message: string
+}
+
 /** 错误信封里的 `error` 段（§G.1）。 */
 export interface ErrorPayload {
   readonly code: string
   readonly message: string
   readonly values?: Readonly<Record<string, string>>
+  /**
+   * 字段级问题（§K.8：「错误以 `{issues:[{path,message}]}` 返回（400）」）。只有需要人改
+   * 具体字段的拒绝带它：`settings save` 的 `invalid_value` 与 `setup_failed`。
+   */
+  readonly issues?: readonly ErrorIssue[]
 }
 
 /** 响应信封（§G.1）：成功 `{ok:true, result}`，失败 `{ok:false, error}`。 */
@@ -82,13 +120,18 @@ export type ApiEnvelope =
 
 /**
  * 核心的用户可见码 → 命令在 §G.2 里写明的固定码（只映有分行的那几条）：领域语义不变，
- * 信封里落成调用方（面板与 agent）按码处理的那个名字。目前是 `trigger handback` 与
- * `ticket retry`。
+ * 信封里落成调用方（面板与 agent）按码处理的那个名字。目前是 `trigger handback`、
+ * `ticket retry` 与 `thread follow` / `thread unrelated`。
  */
 export const COMMAND_ERROR_CODES: Readonly<Record<string, string>> = {
   notReached: ERROR_CODES.notOwned,
   handedBack: ERROR_CODES.alreadyHandedBack,
-  notRetryable: ERROR_CODES.notRetryable
+  notRetryable: ERROR_CODES.notRetryable,
+  // `thread follow` / `thread unrelated`（§G.2）：核心只说「这是它自己的 Thread」与
+  // 「它没跟随」，信封里落成那两条命令写明的两个码。
+  sourceThread: ERROR_CODES.ownThread,
+  followedThread: ERROR_CODES.ownThread,
+  notFollowing: ERROR_CODES.notFollowed
 }
 
 /** 错误码 → HTTP 状态码（§G.3 第 8 条 + 三条边界码）。未知码一律 500。 */
@@ -108,6 +151,14 @@ export function statusForErrorCode(code: string): number {
     case ERROR_CODES.alreadyHandedBack:
     case ERROR_CODES.alreadyEnded:
     case ERROR_CODES.notRetryable:
+    // 本票接线的命令级固定拒绝（§G.2 的 trigger requeue / thread * / policy sync / settings save）。
+    case ERROR_CODES.notRequeueable:
+    case ERROR_CODES.ownThread:
+    case ERROR_CODES.notFollowed:
+    case ERROR_CODES.unrelatedRequired:
+    case ERROR_CODES.notSyncable:
+    case ERROR_CODES.syncFailed:
+    case ERROR_CODES.setupFailed:
       return 400
     case ERROR_CODES.unauthorized:
       return 401
@@ -136,12 +187,19 @@ export function statusForErrorCode(code: string): number {
 export class ApiError extends Error {
   readonly code: string
   readonly values?: Readonly<Record<string, string>>
+  readonly issues?: readonly ErrorIssue[]
 
-  constructor(code: string, message: string, values?: Readonly<Record<string, string>>) {
+  constructor(
+    code: string,
+    message: string,
+    values?: Readonly<Record<string, string>>,
+    issues?: readonly ErrorIssue[]
+  ) {
     super(message)
     this.name = 'ApiError'
     this.code = code
     if (values !== undefined) this.values = values
+    if (issues !== undefined && issues.length > 0) this.issues = issues
   }
 
   /** 这个错误在 HTTP 上的状态码。 */
@@ -151,9 +209,12 @@ export class ApiError extends Error {
 
   /** 信封里的 `error` 段。 */
   toJSON(): ErrorPayload {
-    return this.values === undefined
-      ? { code: this.code, message: this.message }
-      : { code: this.code, message: this.message, values: this.values }
+    return {
+      code: this.code,
+      message: this.message,
+      ...(this.values === undefined ? {} : { values: this.values }),
+      ...(this.issues === undefined ? {} : { issues: this.issues })
+    }
   }
 }
 
