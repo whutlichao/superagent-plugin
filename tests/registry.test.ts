@@ -264,7 +264,15 @@ describe('health ownership', () => {
     const sources = new SourceRegistry({ settings: () => settings, health: board })
     sources.register(probe)
     sources.register(policyKind)
-    assert.equal(board.entries[SOURCES_HEALTH_ENTRY]?.detail, 'No sources', 'initial value')
+    // 还没跑过第一轮 overview：总览条目已 claim 但没有任何读数，因此是 starting（§J.3）。
+    assert.equal(board.entries[SOURCES_HEALTH_ENTRY]?.state, 'starting', 'initial value')
+    assert.equal(board.entries[SOURCES_HEALTH_ENTRY]?.detail, 'Not measured yet', 'initial detail')
+    // kind 声明的条目同样是 claimed-but-unreported：policy-probe 还没有一次成功。
+    assert.deepEqual(
+      board.entries['policy-probe'],
+      { state: 'starting', detail: 'Waiting for policy-probe' },
+      'a freshly claimed entry starts as starting'
+    )
     const rows = sources.overview()
     assert.deepEqual(
       rows.map((row) => [row.id, row.state]),

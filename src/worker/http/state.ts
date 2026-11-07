@@ -15,9 +15,13 @@
 // 本票只有 `store` 是真读数（真库），其余从注入的端口取：进程与 HTTP 由 server 提供，
 // health/setup/paused/loops/load 的写者在后续票（#45、#44、#6、#11），缺省值就是「还没接上」。
 import type { Store } from '../app/store'
+import type { HealthState } from '../core/index.ts'
 
-/** health 条目的四档状态（§N.4）。 */
-export type HealthState = 'starting' | 'ready' | 'paused' | 'error'
+/**
+ * health 条目的四档状态（§J.3、§N.4）：**就是**领域 `core/ports.ts` 的 `HEALTH_STATES`，
+ * 这里原样转出，绝不另写一份——这张表曾经分叉过（`warning` 对 `starting/paused`）。
+ */
+export type { HealthState }
 
 /** 一条 health 读数。 */
 export interface HealthEntry {
