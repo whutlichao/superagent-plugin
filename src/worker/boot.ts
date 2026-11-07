@@ -410,7 +410,9 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
     paused: () => paused.paused(),
     // §E.6：`launch` 的取行上限 = 普通槽空位 + 「有人的唤醒在等」时那一个人人类槽。
     // 人/自动的精确判定仍在执行器里（拿不到槽抛 `Later`，不算失败）。
-    slots: () => launchCapacity(repo.tickets.list(), executorSettings.maxWorkers)
+    slots: () => launchCapacity(repo.tickets.list(), executorSettings.maxWorkers),
+    // §J.3：单条 dropped 不算错误、只计数；撤回是人的动作，不计入 drop 计数。
+    dropped: (kind) => (kind === 'reply' ? store.outbox.countDropped() : 0)
   })
   const outbox = createOutbox({ store, effects, now })
   // ---- Policy（§K.1、§K.2）：块从宿主设置里解析；Source 的 Policy 部分与准入行由 kind 认领。
@@ -569,6 +571,9 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
     effects,
     outbox,
     channel: {
+      // Source 关闭（或未安装）时等待（§J.1 暂停行）；不再监听该地址时 drop（§J.1 原因 a）。
+      enabled: (source) => registry.instance(source)?.enabled ?? false,
+      allowed: (message) => registry.channelAllowed(message.channel),
       send: (message) => registry.send(message, (options.commands ?? new Commands()).withSignal())
     },
     now,

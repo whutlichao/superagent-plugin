@@ -131,8 +131,13 @@ export interface Outbox {
   send(message: OutboundMessage): void
   /** 消息是否排过队，以及后来怎样了。 */
   status(id: string): ReplyStatus | undefined
-  /** 撤回一条还没发出的消息。 */
+  /** 撤回一条还没发出的消息（记成 `dropped(reason: withdrawn)`，永不重发）。 */
   withdraw(id: string): void
+  /**
+   * 撤回一张 Ticket 还没发出的消息（`keep` 里的收尾消息不动），例如它被人停掉时
+   * （§J.1 撤回行）：它们永不再入队，保留 `dropped_at`/`dropped_reason`/`ticket_id`。
+   */
+  withdrawTicket(ticketId: string, keep?: readonly string[]): void
 }
 
 /** Engine 每次变更之后报告的事件，按类型区分（§C.1 notices 消费）。 */

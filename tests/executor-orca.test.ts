@@ -720,7 +720,8 @@ function harness(
     },
     status: (id) =>
       outboxMessages.some((item) => item.id === id) ? 'pending' : undefined,
-    withdraw: () => undefined
+    withdraw: () => undefined,
+    withdrawTicket: () => undefined
   }
   const executor = new OrcaExecutor({ effects: queue.effects, runtime, log: (line) => logs.push(line) })
   const engine = new Engine({
