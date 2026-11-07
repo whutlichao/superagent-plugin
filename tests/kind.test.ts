@@ -243,6 +243,7 @@ describe('the SourceKind contract', () => {
       config: <C extends Record<string, unknown>>(_kind: string): C | undefined => undefined,
       commands: {
         run: async () => '',
+        stream: () => ({ stop: () => {} }),
         withSignal: () => context.commands
       }
     }
@@ -268,6 +269,13 @@ describe('the sources type surface', () => {
     assert.deepEqual(files, [
       'src/worker/sources/admission-context.ts',
       'src/worker/sources/commands.ts',
+      'src/worker/sources/feishu/api.ts',
+      'src/worker/sources/feishu/config.ts',
+      'src/worker/sources/feishu/index.ts',
+      'src/worker/sources/feishu/kind.ts',
+      'src/worker/sources/feishu/poll.ts',
+      'src/worker/sources/feishu/stream.ts',
+      'src/worker/sources/feishu/translate.ts',
       'src/worker/sources/github/api.ts',
       'src/worker/sources/github/config.ts',
       'src/worker/sources/github/index.ts',

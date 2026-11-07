@@ -23,6 +23,8 @@ export const KV_KEY_LITERALS = {
   githubCursorPrefix: 'github-cursor:',
   githubCiPrefix: 'github-ci:',
   feishuCursorPrefix: 'feishu-cursor:',
+  feishuChats: 'feishu-chats',
+  feishuTopicsPrefix: 'feishu-topics:',
   threadSeenPrefix: 'thread-seen:',
   sourceLabelsPrefix: 'source-labels:',
   lockPid: 'lock-pid',
@@ -75,6 +77,13 @@ export const githubCursorKey = (notificationId: string): string =>
 export const githubCiKey = (pull: string, headSha: string): string =>
   `${KV_KEY_LITERALS.githubCiPrefix}${pull}#${headSha}`
 export const feishuCursorKey = (chat: string): string => `${KV_KEY_LITERALS.feishuCursorPrefix}${chat}`
+/**
+ * 事件流见过的会话（`chat_id -> 是否私聊`）：回填要它才知道哪些群/私聊可以读（§I.3 回填）。
+ */
+export const feishuChatsKey = KV_KEY_LITERALS.feishuChats
+/** 一个群里见过的话题（`thread_id -> 最后一次见到消息的时刻`），话题轮询的候选集。 */
+export const feishuTopicsKey = (chat: string): string =>
+  `${KV_KEY_LITERALS.feishuTopicsPrefix}${chat}`
 export const threadSeenKey = (threadKey: string): string => `${KV_KEY_LITERALS.threadSeenPrefix}${threadKey}`
 export const sourceLabelsKey = (kind: string): string => `${KV_KEY_LITERALS.sourceLabelsPrefix}${kind}`
 
