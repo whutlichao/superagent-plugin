@@ -141,10 +141,11 @@ test('the §C.1 module table covers every module directory and names no missing 
 })
 
 /**
- * §R.2 声明为一对一、但 §P.2 还没有对应行的上游测试面。#50（设计文档最终对齐）负责逐条处理：
- * 补一行，或把 §R.2 的状态改成「合并/删除」。这里只放**已核实**的条目——新出现的漂移仍会红。
+ * §R.2 声明为一对一、但 §P.2 还没有对应行的上游测试面。#50（设计文档最终对齐）把这张表清空了：
+ * 每一行要么补了 §P.2 的对应，要么在 §R.2 里改成「合并/删除」并在 §P.2 表末记为差异。
+ * 留一个空数组是故意的——新出现的漂移会直接红。
  */
-const R2_PENDING: readonly string[] = ['cache']
+const R2_PENDING: readonly string[] = []
 
 /** §P.2 里有没有这个名字（`sources-*` 这类写法按前缀匹配）。 */
 function listedInP2(name: string, p2: string): boolean {
@@ -237,8 +238,10 @@ test('README is installable from: commands, the four host settings, state layout
     'lark-cli',
     // 没有 CI 的事实，原文如此。
     'no checks, repo has no workflows',
-    // 设计文本的对齐交接（§A.3 的 11 / §H 标「是」的 15 行 / 附录 B 的 12 条）。
-    '#50'
+    // 设计文本的对齐交接：§A.3 的 11 项、§H 标「是」的 15 行、附录 B 的 11 + 4（附加近似），
+    // 计数口径的单一来源是面板的 LIMITATIONS。
+    'src/panel/limitations.ts',
+    'H.14'
   ]
   const absent = required.filter((text) => !readme.includes(text))
   assert.deepEqual(absent, [])
