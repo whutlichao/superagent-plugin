@@ -186,6 +186,8 @@ export interface PromptVersionRepository {
   put(record: PromptVersionRecord): void
   byRevision(revision: number): PromptVersionRecord | null
   latest(): PromptVersionRecord | null
+  /** 版本历史，新→旧；`limit` 是页大小（§L.4 的 History 页，缺省 50）。 */
+  list(limit?: number): readonly PromptVersionRecord[]
 }
 
 /** 仓库句柄：打开/关闭、事务、KV、工作集与各表仓储。 */
@@ -835,6 +837,11 @@ function createPromptVersionRepository(sql: SqlAccess): PromptVersionRepository 
     latest(): PromptVersionRecord | null {
       const row = sql.one('SELECT * FROM prompt_version ORDER BY revision DESC LIMIT 1')
       return row === undefined ? null : promptVersionFrom(row)
+    },
+    list(limit = 50): readonly PromptVersionRecord[] {
+      return sql
+        .all('SELECT * FROM prompt_version ORDER BY revision DESC LIMIT ?', [limit])
+        .map((row) => promptVersionFrom(row))
     }
   }
 }

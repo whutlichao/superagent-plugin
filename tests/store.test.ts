@@ -474,6 +474,17 @@ test('effect, settings-version and prompt-version repositories round-trip their 
     assert.deepEqual(store.promptVersions.latest()?.config, {
       sections: { communication: 'be brief' }
     })
+    // 历史是新→旧的一列（§L.4 的版本表）：面板的 History 页与 `prompts get` 都按它取。
+    store.promptVersions.put({
+      revision: 2,
+      predecessor: 1,
+      at: isoAfter(AT, 1000),
+      origin: 'panel',
+      config: { team: { scope: 'Settings only.' } }
+    })
+    assert.deepEqual(store.promptVersions.list().map((version) => version.revision), [2, 1])
+    assert.deepEqual(store.promptVersions.list(1).map((version) => version.revision), [2])
+    assert.deepEqual(store.promptVersions.list().map((version) => version.predecessor), [1, null])
   } finally {
     cleanup()
   }
