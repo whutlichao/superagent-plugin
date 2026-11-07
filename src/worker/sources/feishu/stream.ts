@@ -95,6 +95,10 @@ interface ConsumeHandle {
   stop(): void
 }
 
+/**
+ * 建一个实时事件流：`run()` 起一次 `event consume` 子进程、等就绪行、逐行翻成 Trigger，直到
+ * 停机信号或实例被禁用（§I.3「实时事件」行）。依赖全部注入，所以测试不 sleep、不 spawn。
+ */
 export function createFeishuStream(options: FeishuStreamOptions): FeishuStream {
   const log = options.log ?? (() => undefined)
   const now = options.now ?? (() => Date.now())

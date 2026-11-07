@@ -1932,6 +1932,39 @@ test('resume adopts a live terminal whose worktree is this ticket and says resto
   await h.cleanup()
 })
 
+test('resume adopts an orphaned-but-connected terminal: no pane is not no process (附录 C S2/S7)', async () => {
+  const h = resumeHarness()
+  // #16 的附录 C 实测：`agent launch --surface terminal` 起在没打开的 worktree 里，终端是
+  // `connected: true, orphaned: true`——它只是没有挂载到可见 pane，进程与 TUI 都活着。判活因此
+  // 与 `OrcaRuntime.findAgent` 同一格（只看 `connected`）；把 orphaned 当死亡会让后台 worker
+  // 在插件重启后被重建，同一张 Ticket 上出现两条 Assignment。
+  h.runtime.script.listTerminals = () => [
+    {
+      handle: 'term_1',
+      worktreeId: 'ws:superagent-fix-the-login-flow',
+      worktreePath: '/w/superagent-fix-the-login-flow',
+      title: null,
+      connected: true,
+      orphaned: true
+    }
+  ]
+
+  const report = await h.resume()
+
+  const stored = h.read('ticket-11')!
+  assert.deepEqual(report.assignments.map((item) => item.outcome), ['adopted'], 'the background worker is adopted')
+  assert.deepEqual(stored.assignments.map((item) => item.state), ['running'], 'no second assignment is created')
+  assert.equal(stored.assignments[0]?.endedReason, undefined, 'the live assignment is not ended')
+  assert.equal(stored.agentState, 'blocked', 'the observed agent state is left for the next event')
+  assert.equal(h.runtime.calls.sent.length, 1, 'the worker is told it was restored')
+  assert.equal(h.runtime.calls.sent[0]?.terminalId, 'term_1')
+  assert.ok(/restored/i.test(h.runtime.calls.sent[0]?.text ?? ''), 'the message says restored')
+  assert.deepEqual(h.runtime.calls.launchAgent, [], 'a background worker is never started twice')
+  await h.effects.idle()
+  assert.deepEqual(h.runtime.calls.ensureWorkspace, [], 'and its worktree is not rebuilt')
+  await h.cleanup()
+})
+
 test('resume interrupts assignments whose terminal is gone and rebuilds them, oldest first, with the recovery note', async () => {
   const h = harness()
   h.seed(
@@ -1996,7 +2029,7 @@ test('resume interrupts a terminal that is alive but belongs to another worktree
   await h.cleanup()
 })
 
-test('resume interrupts an orphaned terminal', async () => {
+test('resume interrupts a disconnected terminal even when it is also marked orphaned', async () => {
   const h = resumeHarness()
   h.runtime.script.listTerminals = () => [
     {
