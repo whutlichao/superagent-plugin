@@ -285,3 +285,37 @@ describe('core does no I/O', () => {
     assert.equal(IO_SHAPES.some((shape) => comment.some((line) => shape.pattern.test(line))), false)
   })
 })
+
+describe('policy depends only on the domain and the minimal validator', () => {
+  // §C.2：`policy → core, app/settings-types`。这里再钉紧一点：Policy 只许 import 领域类型、
+  // 最小校验器 `infra/schema.ts` 与自己的文件——它不能反过来 import sources（那是环）。
+  const policyFiles = (): string[] => listSources('src/worker/policy')
+
+  test('the policy module has a file set to scan', () => {
+    assert.deepEqual(policyFiles(), [
+      'src/worker/policy/admission.ts',
+      'src/worker/policy/gate.ts',
+      'src/worker/policy/index.ts',
+      'src/worker/policy/schema.ts'
+    ])
+  })
+
+  test('no policy file imports the app layer, a source, the executor, the router or the runtime', () => {
+    const allowed = (file: string, specifier: string): boolean => {
+      if (specifier === 'node:crypto') return true
+      if (!specifier.startsWith('.')) return false
+      const resolved = resolveRelative(file, specifier)
+      return (
+        resolved.startsWith('src/worker/policy/') ||
+        resolved.startsWith('src/worker/core/') ||
+        resolved === 'src/worker/infra/schema.ts'
+      )
+    }
+    const offenders = policyFiles().flatMap((file) =>
+      importedModules(readFileSync(join(REPO_ROOT, file), 'utf8'))
+        .filter((specifier) => !allowed(file, specifier))
+        .map((specifier) => `${file}: ${specifier}`)
+    )
+    assert.deepEqual(offenders, [])
+  })
+})

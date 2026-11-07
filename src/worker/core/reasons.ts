@@ -13,6 +13,8 @@ export const REASONS = {
   routed: 'Routed to ticket {ticket}',
   forwarded: 'Forwarded to the worker of the Ticket already on this Thread',
   senderNotMember: 'The sender is not on the Source\'s list',
+  notHuman: 'The sender is not a person and is not on the Source\'s bots list',
+  noMention: 'The message does not address the agent',
   retried: 'Retried by a person',
   hostRestarted: 'The host restarted',
   stopUnknown: 'Stop target is unknown or already ended',
@@ -20,6 +22,7 @@ export const REASONS = {
   directionUnsettled:
     'Implementation intent or target direction is not established, or a product/design decision is still required',
   noRuleMatched: 'No enabled admission rule matched',
+  admissionIgnored: 'The admission table for this receiving scope does not admit it',
   ignoredFromCard: 'Ignored from its card, without a rule assessment',
   observed: 'Observe mode: would accept ({text})',
   reportMissing: 'The worker ended without a final report',
