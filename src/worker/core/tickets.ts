@@ -48,6 +48,13 @@ const readBefore = (input: Extract<TicketInput, { kind: 'trigger' }>, until: str
     ? (input.deliveredAt && input.deliveredAt > input.at ? input.deliveredAt : input.at) <= until
     : !!input.readAt && input.readAt < until
 
+/**
+ * 这条 Input 会不会唤醒一个已收起的 Assignment：真的输入（人的消息、attach 的 Trigger、
+ * 作业文本）会；`policy-changed` 与 `note` 只加语境，不唤醒（§K.5、§D.1 note）。
+ */
+const idleWaker = (input: TicketInput): boolean =>
+  input.kind === 'trigger' || input.kind === 'resumed' || input.kind === 'text'
+
 /** 人向 worker 要一次状态时投递的固定文本：只报状态，不做实现。 */
 const STATUS_REQUEST =
   'Report the current ticket status with the report command. This is a status-only request: do not resume implementation or perform external actions.'
@@ -264,16 +271,27 @@ export class Tickets extends EnginePart {
   }
 
   /**
-   * 重试一个可重试的未结束 Ticket：结束它卡住的 Assignment，新建一个并排队 launch。
+   * 重试一个可重试的未结束 Ticket：结束它卡住的 Assignment，新建一个并排队 launch。`note`
+   * 是给新 Assignment 的恢复说明（§E.5），随第一个投递交给 worker。
    * @throws UserError Ticket 未知或不可重试。
    */
-  retry(ticketId: string): Ticket {
+  retry(ticketId: string, note?: string): Ticket {
     const ticket = this.require(ticketId)
     const latest = latestAssignment(ticket)
     if (!canRetry(ticket) || !latest) throw new UserError('notRetryable')
     this.endAssignment(ticket, latest, 'retried')
     this.requeueUntaken(ticket, latest)
     const assignment = this.newAssignment(ticket)
+    if (note !== undefined) {
+      const input: TicketInput = {
+        id: key('input', ticket.id, 'retry', assignment.id),
+        kind: 'text',
+        text: note,
+        at: this.now()
+      }
+      ticket.inputs.push(input)
+      ticket.undelivered.push(input.id)
+    }
     ticket.updatedAt = this.now()
     this.repo.tickets.save(ticket)
     this.options.executor.stop(ticket, latest, 'retried')
@@ -367,7 +385,8 @@ export class Tickets extends EnginePart {
 
   /**
    * 幂等地加一条 Input，并请执行器投递它；若某个 pending Assignment 曾启动失败、且此刻
-   * 没在等人，就再 launch 它一次——单是 Policy 变更不会重新 launch。
+   * 没在等人，就再 launch 它一次。worker 在 `waiting` 里收起的 Assignment（§E.7）被一条
+   * 真的 Input 唤醒时新建一个——单是 Policy 变更或 note 不会重新 launch。
    */
   addInput(ticket: Ticket, input: TicketInput): void {
     if (ticket.inputs.some((existing) => existing.id === input.id)) return
@@ -383,6 +402,11 @@ export class Tickets extends EnginePart {
     if (running) this.options.executor.deliver(ticket, running)
     else if (latest?.state === 'pending' && !waitsForPerson(ticket)) {
       this.options.executor.start(ticket, latest)
+    } else if (latest?.state === 'ended' && idleWaker(input)) {
+      const next = this.newAssignment(ticket)
+      ticket.updatedAt = this.now()
+      this.repo.tickets.save(ticket)
+      this.options.executor.start(ticket, next)
     }
   }
 
@@ -549,13 +573,17 @@ export class Tickets extends EnginePart {
     ticket.updatedAt = this.now()
     delete ticket.attention
     delete ticket.delivery
-    // 结束停掉的 Assignment 也随它结束；原因由 Ticket 的结束说明。
+    // 结束停掉的 Assignment 也随它结束，记的是结局码（§E.5 的 `ended(reason: stopped)`）；
+    // 人写的说明留在 `ticket.ended.reason` 上。
     for (const assignment of stopping) {
       assignment.state = 'ended'
       assignment.endedAt = at
+      assignment.endedReason = outcome
     }
     this.repo.tickets.save(ticket)
     this.letGo(ticketId, waiting, left)
+    // 人停掉 Ticket 时的收尾消息，与结束在同一事务里排队（§E.5、§J.1）；已经结束的不再发。
+    if (outcome === 'stopped') this.replies.stopped(this.require(ticketId))
     this.emit('ticket.ended', { ticketId, by, outcome, ...why })
     for (const assignment of stopping) this.options.executor.stop(ticket, assignment, reason ?? outcome)
   }

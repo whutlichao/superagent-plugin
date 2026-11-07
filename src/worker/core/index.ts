@@ -6,7 +6,7 @@ export * from './reasons.ts'
 export * from './errors.ts'
 export * from './stage.ts'
 export { key } from './ids.ts'
-export { Engine, type EngineForExecutor, type EngineForMainSession, type EngineForPeople,
+export { Engine, type AssignmentLaunch, type EngineForExecutor, type EngineForMainSession, type EngineForPeople,
   type EngineForSettings, type EngineForSources, type Outcome, type Reply, type ReplyRequest,
   type WorkerReport } from './engine.ts'
 export { MemoryRepositories, WriterError, type MemoryReadView } from './memory.ts'

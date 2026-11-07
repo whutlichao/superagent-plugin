@@ -48,7 +48,11 @@ export type ThreadStage =
   | 'dormant'
   | 'unsubscribed'
 
-/** Source 实例的状态。 */
+/**
+ * Source 实例的状态：注册表的生命周期（`sources/registry.ts` 的 `SourceState`，前四档与健康
+ * 状态同值）外加 `setup`（§I.1 的 setup 问题：配置缺东西，轮询没启动）。`setup` 是面板自己
+ * 的展示档，不是健康状态。
+ */
 export type SourceState = 'ready' | 'starting' | 'paused' | 'error' | 'setup' | 'off' | 'missing'
 
 /** Decision 的类型（`core/model.ts` 的 `DECISION_KINDS`，外加 observe 模式下「本可接单」的忽略）。 */

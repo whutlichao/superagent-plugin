@@ -10,6 +10,7 @@ import { DatabaseSync, type SQLInputValue } from 'node:sqlite'
 import { statSync } from 'node:fs'
 import { join } from 'node:path'
 import type { LogLine, LogSink } from '../infra/log-line.ts'
+import { SILENT_LOG } from '../infra/log-line.ts'
 import { migrate, readSchemaVersion } from './migration.ts'
 import { SCHEMA_VERSION } from './schema.ts'
 import {
@@ -24,6 +25,7 @@ import {
 import type {
   DecisionRecord,
   DispositionRecord,
+  EffectKindCount,
   EffectRecord,
   OutboxRecord,
   PromptVersionRecord,
@@ -123,11 +125,28 @@ export interface DecisionRepository {
   byThread(threadKey: string): readonly DecisionRecord[]
 }
 
-/** Effect 仓储（§D.4 写者：`app/effects.ts`）。 */
+/**
+ * Effect 仓储（§D.4 写者：`app/effects.ts`）。队列还需要三件落库动作，`effect` 表的
+ * 写者仍是 `app/effects.ts`（本仓储只是它的 SQL 出口，不做业务判断）：
+ * `dueOfKind` 取一个 kind 的到期行，`bySeqOfKind` 取一个 kind 的最老一行（串行 kind 的
+ * 队头即使未到期也挡着后面，§J.2），`remove`/`reschedule` 是「跑完了」与「再等等」。
+ */
 export interface EffectRepository {
   put(record: EffectRecord): void
   get(kind: string, key: string): EffectRecord | null
   due(at: string): readonly EffectRecord[]
+  /** 一个 kind 的到期行，按 `seq` 升序（§J.2「按 seq 升序取 due 行」）。 */
+  dueOfKind(kind: string, at: string, limit?: number): readonly EffectRecord[]
+  /** 一个 kind 的最老一行（含未到期）：串行 kind 用它判「队头还挡着」。 */
+  oldestOfKind(kind: string): EffectRecord | null
+  /** 当前最大 `seq`：新的队列实例从它继续，重启不重排（§J.2）。 */
+  maxSeq(): number
+  /** 队列里所有 kind 的计数与最大尝试数：健康条目的 detail 用它（§J.3）。 */
+  kindCounts(): readonly EffectKindCount[]
+  /** 删掉一行（跑成功）。`seq` 与 `attempts` 一起匹配，防止删掉运行期间被替换的新行。 */
+  remove(kind: string, key: string, seq: number, attempts: number): boolean
+  /** 改一行的到期时刻与尝试数（失败退避 / `Later` / 再入队）。 */
+  reschedule(record: EffectRecord): void
 }
 
 /** Outbox 仓储（§D.4 写者：`app/outbox.ts`，唯一写者）。 */
@@ -177,6 +196,11 @@ export interface Store {
   kvKeys(): readonly string[]
   /** 一个写事务；抛错即整体回滚。嵌套调用复用外层事务（savepoint）。 */
   transaction<T>(work: () => T): T
+  /**
+   * 提交后才执行（§J.2 执行行）：在事务里排队、最外层事务提交后才跑；事务回滚则丢弃。
+   * 不在事务里调用就立即执行。回调抛错不影响已提交的事务（记一行日志）。
+   */
+  afterCommit(action: () => void): void
   /** 工作集：pass 只扫这四组活行。 */
   workingSet(): WorkingSet
   /**
@@ -230,6 +254,9 @@ export function openStore(options: StoreOptions): Store {
   db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`)
 
   let depth = 0
+  /** 每层事务的「提交后回调」；最外层提交时才真正执行（§J.2 执行行、§D.4）。 */
+  const committed: (() => void)[][] = []
+  const log = options.log ?? SILENT_LOG
   const sql = createSqlAccess(db)
 
   const store: Store = {
@@ -267,33 +294,52 @@ export function openStore(options: StoreOptions): Store {
       return sql.all('SELECT key FROM kv ORDER BY key').map((row) => String(field(row, 'key')))
     },
     transaction<T>(work: () => T): T {
-      if (depth > 0) {
-        depth += 1
-        db.exec('SAVEPOINT nested')
-        try {
-          const result = work()
-          db.exec('RELEASE nested')
-          return result
-        } catch (error) {
-          db.exec('ROLLBACK TO nested')
-          db.exec('RELEASE nested')
-          throw error
-        } finally {
-          depth -= 1
+      const level = depth
+      depth += 1
+      committed[level] = []
+      db.exec(level === 0 ? 'BEGIN IMMEDIATE' : 'SAVEPOINT nested')
+      let result: T
+      try {
+        result = work()
+        db.exec(level === 0 ? 'COMMIT' : 'RELEASE nested')
+      } catch (error) {
+        db.exec(level === 0 ? 'ROLLBACK' : 'ROLLBACK TO nested')
+        if (level > 0) db.exec('RELEASE nested')
+        // 回滚掉的层级，提交后回调一并丢弃：没写成的行不该有后续动作。
+        committed[level] = []
+        depth -= 1
+        throw error
+      }
+      const actions = committed[level]
+      committed[level] = []
+      depth -= 1
+      if (level > 0) {
+        // 内层只是保存点：回调交给外层，最外层提交后才真正执行。
+        committed[level - 1].push(...actions)
+      } else {
+        for (const action of actions) {
+          try {
+            action()
+          } catch (error) {
+            // 已提交的事务不能被回调的失败推翻；留一行日志（§N.5 不静默）。
+            log({
+              ts: new Date().toISOString(),
+              level: 'error',
+              msg: 'an afterCommit callback failed',
+              fields: { error: error instanceof Error ? error.message : String(error) }
+            })
+          }
         }
       }
-      depth = 1
-      db.exec('BEGIN IMMEDIATE')
-      try {
-        const result = work()
-        db.exec('COMMIT')
-        return result
-      } catch (error) {
-        db.exec('ROLLBACK')
-        throw error
-      } finally {
-        depth = 0
+      return result
+    },
+    afterCommit(action: () => void): void {
+      // 不在事务里：立即执行（调用方已经提交过了）。
+      if (depth === 0) {
+        action()
+        return
       }
+      committed[depth - 1].push(action)
     },
     workingSet(): WorkingSet {
       return readWorkingSet(sql.reader)
@@ -533,7 +579,10 @@ function createDecisionRepository(sql: SqlAccess): DecisionRepository {
   }
 }
 
-/** Effect 仓储（§J.2 的 due 行按 `seq` 升序取）。 */
+/**
+ * Effect 仓储（§J.2 的 due 行按 `seq` 升序取）。它是 `app/effects.ts` 的 SQL 出口：
+ * 队列负责规则（退避、`Later`、并发），这里只负责行。
+ */
 function createEffectRepository(sql: SqlAccess): EffectRepository {
   return {
     put(record: EffectRecord): void {
@@ -560,6 +609,51 @@ function createEffectRepository(sql: SqlAccess): EffectRepository {
     },
     due(at: string): readonly EffectRecord[] {
       return sql.all('SELECT * FROM effect WHERE due_at <= ? ORDER BY seq LIMIT 100', [at]).map(effectFrom)
+    },
+    /**
+     * 一个 kind 的到期行。`effect_due` 索引让 `due_at <= ?` 先缩小范围，再按 `seq` 取前
+     * `limit` 行；队列按需多取一些，避免运行中的行占满一页。
+     */
+    dueOfKind(kind: string, at: string, limit = 64): readonly EffectRecord[] {
+      return sql
+        .all('SELECT * FROM effect WHERE kind = ? AND due_at <= ? ORDER BY seq LIMIT ?', [kind, at, limit])
+        .map(effectFrom)
+    },
+    oldestOfKind(kind: string): EffectRecord | null {
+      const row = sql.one('SELECT * FROM effect WHERE kind = ? ORDER BY seq LIMIT 1', [kind])
+      return row === undefined ? null : effectFrom(row)
+    },
+    maxSeq(): number {
+      return Number(field(sql.one('SELECT COALESCE(MAX(seq), 0) AS seq FROM effect'), 'seq'))
+    },
+    kindCounts(): readonly EffectKindCount[] {
+      return sql
+        .all(
+          `SELECT kind, COUNT(*) AS waiting, SUM(CASE WHEN attempts > 0 THEN 1 ELSE 0 END) AS failed
+             FROM effect GROUP BY kind ORDER BY kind`
+        )
+        .map((row) => ({
+          kind: String(field(row, 'kind')),
+          waiting: Number(field(row, 'waiting')),
+          failed: Number(field(row, 'failed'))
+        }))
+    },
+    remove(kind: string, key: string, seq: number, attempts: number): boolean {
+      return (
+        sql.run('DELETE FROM effect WHERE kind = ? AND key = ? AND seq = ? AND attempts = ?', [
+          kind,
+          key,
+          seq,
+          attempts
+        ]) > 0
+      )
+    },
+    reschedule(record: EffectRecord): void {
+      sql.run(
+        `UPDATE effect SET due_at = ?, attempts = ?, last_error = ?
+          WHERE kind = ? AND key = ? AND seq = ?`,
+        [record.dueAt, record.attempts, record.lastError, record.kind, record.key, record.seq]
+      )
     }
   }
 }

@@ -197,8 +197,19 @@ export interface Repositories {
   }
 }
 
-/** 健康条目的状态（§N.4）：每个条目一个写者，重复 claim 由 HealthBoard 拒绝。 */
-export type HealthState = 'ready' | 'warning' | 'error'
+/**
+ * 健康条目的状态：设计 §J.3 与 §N.4 把它钉成四档 `starting | ready | paused | error`。
+ * `warning` **不是**健康状态——它是面板的语气（`MarkTone`）与条目 `detail` 的措辞；健康板
+ * 只回答「这个部件现在能不能干活」。每个条目一个写者，重复 claim 由 HealthBoard 拒绝。
+ *
+ * - `starting`：条目已 claim，写者还没报告过（注册后的初始值）；
+ * - `ready`：最近一次成功；
+ * - `paused`：不在跑——effect 条目在处理暂停时如此（§K.6 / §J.3），Source 条目只在它自己
+ *   暂停或关闭时如此（处理暂停期间 Sources 仍照常记录 Trigger，§K.6）。
+ * - `error`：达到设计写明的失败阈值（如连续 3 次失败），直到下一次成功。
+ */
+export const HEALTH_STATES = ['starting', 'ready', 'paused', 'error'] as const
+export type HealthState = (typeof HEALTH_STATES)[number]
 
 /** Source 报告给健康板的一条状态。 */
 export interface HealthEntry {

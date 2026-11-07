@@ -114,6 +114,26 @@ export interface WorkspaceInfo {
   readonly branch: string | null
 }
 
+/**
+ * 在一个工作区里跑一条一次性命令的规格（prepare，§E.3）。`command` 已经是插件替换完变量、
+ * 单引号转义过的最终文本（§E.3 的变量替换归 #13）；seam 只负责执行与收集输出。
+ */
+export interface CommandSpec {
+  readonly workspace: WorkspaceHandle
+  readonly command: string
+  /** 预算：prepare 是 10 分钟（§E.3），超时视为失败。 */
+  readonly timeoutMs: number
+  /** 终端标题（预留；实现可忽略）。 */
+  readonly title?: string
+}
+
+/** 一条一次性命令的结果：退出码（拿不到时为 null）、输出行与承载它的终端句柄。 */
+export interface CommandHandle {
+  readonly terminalId: string
+  readonly exitCode: number | null
+  readonly output: readonly string[]
+}
+
 /** 启动 agent 的规格：插件恒要求 terminal 面，才有 terminalId 可发可停。 */
 export interface AgentSpec {
   readonly workspace: WorkspaceHandle
@@ -207,6 +227,12 @@ export interface OrcaRuntime {
   // 2. Agent
   launchAgent(spec: AgentSpec, signal?: AbortSignal): Promise<AgentHandle>
   listAgents(): Promise<readonly AgentRow[]>
+  /**
+   * 在一个工作区里反查已启动的 agent 终端（§E.2 的兜底：回执缺句柄时按 `workspaceId` 反查）。
+   * 单独的 seam 方法而不是复用 `listAgents()`：宿主 `agents.list` 只投影当前聚焦工作区、
+   * 行里也没有 `workspaceId`（附录 C S2 实测），那条路做不到这件事。找不到返回 `null`。
+   */
+  findAgent(workspaceId: string): Promise<AgentHandle | null>
   listTerminals(): Promise<readonly TerminalRow[]>
   onAgentStatus(handler: (event: AgentStatusEvent) => void): () => void
 
@@ -221,6 +247,12 @@ export interface OrcaRuntime {
     options?: { readonly maxLines?: number }
   ): Promise<{ readonly lines: readonly string[]; readonly truncated: boolean }>
   closeTerminal(terminalId: string): Promise<void>
+  /**
+   * 在工作区里跑一条一次性命令并等它结束（prepare，§E.3）。宿主没有直接等价方法：实现用
+   * `orca terminal create --command …` 起终端，再 `orca terminal read` 收尾（附录 C S1/S3 的
+   * 实测 CLI 可用）。超时按 `timeoutMs` 交给 `cli_timeout`。
+   */
+  runCommand(spec: CommandSpec, signal?: AbortSignal): Promise<CommandHandle>
 
   // 4. Orca 侧副作用
   notify(input: { readonly title: string; readonly body?: string }): Promise<{

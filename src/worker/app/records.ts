@@ -126,6 +126,15 @@ export interface EffectRecord {
   readonly lastError: string | null
 }
 
+/** 一个 kind 的队列读数（健康条目的 `waiting N, failed M` 用它，§J.3）。 */
+export interface EffectKindCount {
+  readonly kind: string
+  /** 还在库里的行数（跑成功的行被删掉）。 */
+  readonly waiting: number
+  /** 已失败过（`attempts > 0`）的行数。 */
+  readonly failed: number
+}
+
 /** Outbox 行的状态（§D.2 `outbox.status`）。 */
 export type OutboxStatus = 'pending' | 'sent' | 'dropped'
 

@@ -10,10 +10,11 @@
 // - 给后续票提供查询面：`instances` / `instance` / `policyPart` / `channelAllowed` / `send` /
 //   `link` / `find` / `repliesTo` / `threadContext` / `declarations` / `environments`。
 //
-// 与 §N.4 的一处差异（coordinator 裁决：以 `core/ports.ts` 为准）：领域只定义
-// `HealthState = 'ready' | 'warning' | 'error'`，没有上游的 `starting` / `paused`。因此这里
-// 的 health 条目只写这三种状态；面板要的「生命周期」（missing/off/error/ready）由 `overview()`
-// 单独给出，不进 health 条目。
+// 健康状态用设计 §J.3 / §N.4 的四档 `starting | ready | paused | error`（`core/ports.ts`
+// 的 `HEALTH_STATES`）。注册表按这四档写自己 claim 的条目：刚 claim、kind 还没报告时是
+// `starting`；报告成功是 `ready`；该 Source 被暂停（不在跑）是 `paused`；达到设计的失败
+// 阈值是 `error`。面板要的「生命周期」（missing/off 之类）由 `overview()` 单独给出，
+// 那是面板的展示词汇，不是健康状态。
 import type {
   ChannelRef,
   HealthEntry,
@@ -75,8 +76,13 @@ export interface HealthClaims {
 /** 注册表自己持有的「Source 总览」条目名（§N.4）。 */
 export const SOURCES_HEALTH_ENTRY = 'sources'
 
-/** 面板上每个实例的生命周期（只由注册表能看到的四件事推导）。 */
-export type SourceState = 'missing' | 'off' | 'error' | 'ready'
+/**
+ * 面板上每个实例的生命周期。前四档就是健康状态（§J.3 的 `starting | ready | paused | error`，
+ * 与 `core/ports.ts` 的 `HEALTH_STATES` 同一组取值），后两档是注册表自己才知道、健康状态
+ * 表达不了的事实：kind 没装（`missing`）和被人关掉（`off`，面板的开关词汇，不是健康状态）。
+ * 面板的 `panel/marks.ts` 对六档各有一句措辞。
+ */
+export type SourceState = 'missing' | 'off' | 'starting' | 'paused' | 'error' | 'ready'
 
 /** 总览的一行：实例、标题、可用性与生命周期。 */
 export interface SourceOverview {
@@ -179,10 +185,11 @@ export class SourceRegistry implements SourceScope {
     this.#settings = options.settings ?? (() => EMPTY_SOURCE_SETTINGS)
     this.#board = options.health ?? new RegistryHealthBoard()
     this.#registered = options.registered ?? (() => () => {})
-    // 「Source 总览」由注册表独占（§N.4）。
+    // 「Source 总览」由注册表独占（§N.4）。第一次 `overview()` 之前没有任何读数，
+    // 所以初始状态是 `starting`——「已 claim、还没报告过」正是这一档的含义。
     this.#overview = this.#board.claim(SOURCES_HEALTH_ENTRY, {
-      state: 'ready',
-      detail: 'No sources'
+      state: 'starting',
+      detail: 'Not measured yet'
     })
   }
 
@@ -211,7 +218,8 @@ export class SourceRegistry implements SourceScope {
     for (const name of kind.health) {
       let claim: HealthClaim
       try {
-        claim = this.#board.claim(name, { state: 'ready', detail: 'Waiting for ' + kind.kind })
+        // 刚 claim、kind 还没报告过：这正是 `starting` 的含义（§J.3）。
+        claim = this.#board.claim(name, { state: 'starting', detail: 'Waiting for ' + kind.kind })
       } catch {
         releaseHealth()
         throw refused(name)
@@ -435,7 +443,10 @@ export class SourceRegistry implements SourceScope {
         return entry === undefined ? [] : [entry.state]
       })
       // 顺序即语义：没装是 missing；配置无效是 error（它不是人主动关的）；人关的是 off
-      // （即使它此前的 health 条目还留着 error）；其余按 health 报错，最后 ready。
+      // （即使它此前的 health 条目还留着 error）；否则就按健康状态本身说话——error 最重，
+      // 其次 paused（该 Source 不在跑），再次 starting（还没有任何一次成功），最后 ready。
+      // 一个 kind 可以声明多条 health，任一条 paused 即视为暂停；`starting` 只在整个 kind
+      // 都还没报告过时出现，否则一条成功过就足以说明它在跑。
       const state: SourceState = !instance.installed
         ? 'missing'
         : instance.configError !== undefined
@@ -444,7 +455,11 @@ export class SourceRegistry implements SourceScope {
             ? 'off'
             : states.includes('error')
               ? 'error'
-            : 'ready'
+              : states.includes('paused')
+                ? 'paused'
+                : states.length > 0 && states.every((entry) => entry === 'starting')
+                  ? 'starting'
+                  : 'ready'
       return {
         id: instance.id,
         kind: instance.kind,
@@ -513,13 +528,25 @@ export class SourceRegistry implements SourceScope {
     }
   }
 
-  /** 「Source 总览」条目：有 error 就是 error，否则 ready；明细写启用数与问题数。 */
+  /**
+   * 「Source 总览」条目：有 error 就是 error；处理暂停时是 paused（每个 Source 都不在跑）；
+   * 还没有任何一次成型读数时是 starting；否则 ready。明细写启用数与问题数。
+   */
   #reportOverview(rows: readonly SourceOverview[]): void {
     const installed = rows.filter((row) => row.installed)
     const enabled = installed.filter((row) => row.enabled)
     const problems = installed.filter((row) => row.state === 'error')
     this.#overview.set({
-      state: problems.length > 0 ? 'error' : 'ready',
+      state:
+        problems.length > 0
+          ? 'error'
+          : enabled.length === 0
+            ? 'ready'
+            : enabled.every((row) => row.state === 'paused')
+              ? 'paused'
+              : enabled.every((row) => row.state === 'starting' || row.state === 'paused')
+                ? 'starting'
+                : 'ready',
       detail: `${enabled.length} enabled, ${problems.length} problems`
     })
   }
