@@ -3,7 +3,7 @@
 // 工作集（活跃 Thread、开放 Ticket、活跃 Ticket、待发 Outbox）一律走生成列 + 部分索引：
 // 非活跃行根本不进索引，所以一次 pass 只扫活行。这里的 SQL 是唯一副本，`store.ts`
 // 负责执行，测试用 `plan()` 断言查询计划（§P.1 的可核验行为）。
-import type { TimelineCursor, TimelinePage, WorkingSet } from './records.ts'
+import type { TimelineCursor, TimelineItem, TimelinePage, WorkingSet } from './records.ts'
 
 /** 可绑定到 SQLite 参数的标量（与 `store.ts` 的驱动类型结构相同；type-only 依赖）。 */
 export type ReadParam = null | number | bigint | string | Uint8Array
@@ -94,6 +94,13 @@ export function workingSetPlan(reader: SqlReader): Readonly<Record<WorkingSetNam
   }
 }
 
+/** 一页往**更早**方向的时间线（`before` 读）或最新一页（`tail` 读）。 */
+export interface TimelineBackPage {
+  readonly items: readonly TimelineItem[]
+  /** 更早还有行时，把 `before` 传给下一次读的游标；读完是 `null`。 */
+  readonly before: TimelineCursor | null
+}
+
 /** 时间线分页的输入。 */
 export interface TimelineOptions {
   /** 每页行数（默认 50，面板一次最多 50 行，§M.4）。 */
@@ -131,17 +138,95 @@ export function readTimeline(
             LIMIT ?`,
           [threadKey, after.at, after.triggerId, limit + 1]
         )
-  const items = rows.slice(0, limit).map((row) => ({
-    at: String(field(row, 'at')),
-    triggerId: String(field(row, 'trigger_id')),
-    human: Number(field(row, 'human')) === 1,
-    primaryThread: Number(field(row, 'primary_thread')) === 1
-  }))
+  const items = rows.slice(0, limit).map(timelineItemOf)
   const last = items.at(-1)
   const next = rows.length > limit && last !== undefined
     ? { at: last.at, triggerId: last.triggerId }
     : null
   return { items, next }
+}
+
+/**
+ * Thread 时间线的**最新**一页：按 `(at, trigger_id)` 降序取 `limit + 1` 行再翻成升序，
+ * `before` 是这一页最早一行的游标（更早还有行时；与 `readTimeline` 的 `next` 对称）。
+ * 面板与 `read thread/<key>` 从最近的消息往回走。
+ */
+export function readTimelineTail(
+  reader: SqlReader,
+  threadKey: string,
+  limit = 50
+): TimelineBackPage {
+  return backPage(
+    reader.all(
+      `SELECT at, trigger_id, human, primary_thread
+         FROM trigger_thread
+        WHERE thread_key = ?
+        ORDER BY at DESC, trigger_id DESC
+        LIMIT ?`,
+      [threadKey, Math.max(1, limit) + 1]
+    ),
+    limit
+  )
+}
+
+/**
+ * 游标**之前**（更早）的一页：`(at, trigger_id) < (?, ?)`，升序返回，`before` 指向更早还有页的
+ * 游标。与 `readTimeline` 的 `after` 是同一张行值比较的两个方向，同一时刻的多条既不丢也不重。
+ */
+export function readTimelineBefore(
+  reader: SqlReader,
+  threadKey: string,
+  before: TimelineCursor,
+  limit = 50
+): TimelineBackPage {
+  return backPage(
+    reader.all(
+      `SELECT at, trigger_id, human, primary_thread
+         FROM trigger_thread
+        WHERE thread_key = ? AND (at, trigger_id) < (?, ?)
+        ORDER BY at DESC, trigger_id DESC
+        LIMIT ?`,
+      [threadKey, before.at, before.triggerId, Math.max(1, limit) + 1]
+    ),
+    limit
+  )
+}
+
+/** 时间线上恰好落在游标处的一行（`around` 的锚点）；不在就是 `undefined`。 */
+export function readTimelineItem(
+  reader: SqlReader,
+  threadKey: string,
+  cursor: TimelineCursor
+): TimelineItem | undefined {
+  const row = reader.all(
+    `SELECT at, trigger_id, human, primary_thread
+       FROM trigger_thread
+      WHERE thread_key = ? AND at = ? AND trigger_id = ?`,
+    [threadKey, cursor.at, cursor.triggerId]
+  )[0]
+  return row === undefined ? undefined : timelineItemOf(row)
+}
+
+/** 降序取回的 `limit + 1` 行 → 升序的一页 + 更早还有页的游标。 */
+function backPage(rows: readonly unknown[], limit: number): TimelineBackPage {
+  const size = Math.max(1, limit)
+  const more = rows.length > size
+  const items = rows.slice(0, size).map(timelineItemOf).reverse()
+  const first = items[0]
+  return {
+    items,
+    before: more && first !== undefined ? { at: first.at, triggerId: first.triggerId } : null
+  }
+}
+
+/** 一行 `trigger_thread` → 时间线项（列名只在上面几条查询里出现）。 */
+function timelineItemOf(row: unknown): TimelineItem {
+  return {
+    at: String(field(row, 'at')),
+    triggerId: String(field(row, 'trigger_id')),
+    human: Number(field(row, 'human')) === 1,
+    primaryThread: Number(field(row, 'primary_thread')) === 1
+  }
 }
 
 /** 取一列（`node:sqlite` 返回 null 原型对象）。 */

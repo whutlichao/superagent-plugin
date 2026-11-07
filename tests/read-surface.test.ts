@@ -628,7 +628,9 @@ describe('the read surface refuses before it pretends', () => {
     assert.equal(result.code, 'unknown_resource')
     assert.match(result.values?.['forms'] ?? '', /github\/issues\/<number>/)
     assert.equal(await readRefused(tools, { resource: 'feishu/om_x/nope', role: 'router' }), 'unknown_resource')
-    assert.equal(await readRefused(tools, { resource: 'overview', role: 'operator' }), 'unknown_resource')
+    // 视图资源（overview/threads/decisions…）不归 Source 读面：它们走 §G.3 的视图路由，
+    // 由 `app/views/read.ts` 服务（`read-views.test.ts`）。这里只认 `github/…` / `feishu/…`。
+    assert.equal(await readRefused(tools, { resource: 'nope', role: 'operator' }), 'unknown_resource')
     assert.equal(isSourceResource('overview'), false)
     assert.equal(isSourceResource('github/issues/12'), true)
   })

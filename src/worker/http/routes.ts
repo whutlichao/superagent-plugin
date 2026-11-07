@@ -149,17 +149,23 @@ export function assertTicketVisible(caller: RouteCaller, ticketId: string): void
  *   与 §G.2 的两条 worker 命令 `thread follow` / `thread unrelated`（同样从 token 取 Ticket）。
  * - `router`：§F.6 列出的 Router 命令（read 的各类资源、route/eval 之外的路由动作、
  *   settings/policy/prompts、ticket 三件、trigger requeue、thread unsubscribe）。
- * - `operator`：面板专属视图（overview/sources/search/policy 历史）、面板动作
+ * - `operator`：面板专属视图（search/policy 历史）与面板动作
  *   （dismiss、刷新 labels）、运维动作（pause、setup check、router restart、workspace open、doctor）。
  */
 export const ROUTE_TABLE: readonly RouteDefinition[] = [
   // ---- 读面
   { method: 'GET', path: 'state', command: 'status', minimumRole: 'assignment', handler: stub },
-  { method: 'GET', path: 'overview', command: 'read overview', minimumRole: 'operator', handler: stub },
-  { method: 'GET', path: 'sources', command: 'read sources', minimumRole: 'operator', handler: stub },
+  // 视图读面（§G.3 的 GET overview/sources/search/threads/thread/decisions）：§O 的角色是
+  // operator 全读、router 读状态与语境（overview/sources/threads/decisions/tickets/settings/
+  // models）、assignment 只读自己 Ticket 与相关 Thread。`overview`/`sources` 是 router 的读面
+  // （它们是状态与 Source 概况，不是面板专属动作）；`search` 仍是 operator（面板 Search 页）。
+  { method: 'GET', path: 'overview', command: 'read overview', minimumRole: 'router', handler: stub },
+  { method: 'GET', path: 'sources', command: 'read sources', minimumRole: 'router', handler: stub },
   { method: 'GET', path: 'search', command: 'read search', minimumRole: 'operator', handler: stub },
   { method: 'GET', path: 'threads', command: 'read threads', minimumRole: 'router', handler: stub },
-  { method: 'GET', path: 'threads/:key', command: 'read thread/<key>', minimumRole: 'router', handler: stub },
+  // 最低角色是 assignment：**归属在 handler 里判**（`mayReadThread`）——worker 要读自己
+  // Ticket 的来源 Thread 与跟随 Thread，别的 Thread 仍是 `not_permitted_role`（§O）。
+  { method: 'GET', path: 'threads/:key', command: 'read thread/<key>', minimumRole: 'assignment', handler: stub },
   { method: 'GET', path: 'decisions', command: 'read decisions', minimumRole: 'router', handler: stub },
   { method: 'GET', path: 'tickets', command: 'read tickets', minimumRole: 'router', handler: stub },
   { method: 'GET', path: 'tickets/:id', command: 'read ticket/<id>', minimumRole: 'assignment', handler: stub },

@@ -27,6 +27,7 @@ import { createReadHandlers, withReadHandlers } from '../src/worker/http/read'
 import { createReadTools } from '../src/worker/app/read'
 import { createEvalTools } from '../src/worker/app/eval'
 import { FakeCommands } from './support/fake-commands'
+import { createTestViewTools } from './support/view-host'
 import { createPromptHandlers, withPromptHandlers } from '../src/worker/http/prompts'
 import { createPromptVersions } from '../src/worker/app/prompts'
 import type { Store } from '../src/worker/app/store'
@@ -115,6 +116,13 @@ const WIRED: readonly (readonly [string, Case, Case])[] = [
     },
     // 未知资源名是固定拒绝（`unknown_resource`，退出 2），且**不发请求**：换一种写法是人的事。
     { argv: ['read', 'nope'], exit: 2, code: 'unknown_resource', offline: true }
+  ],
+  [
+    'read views',
+    // 视图读面（#59）：`read threads` 走 §G.3 的 GET threads，与面板同一份读模型。
+    { argv: ['read', 'threads', '--limit', '5'], exit: 0, resultKeys: ['items', 'next_offset'], token: 'router' },
+    // assignment 连设置全文都读不到（§O：`GET settings` 的最低角色是 router）。
+    { argv: ['read', 'settings'], exit: 2, code: 'not_permitted_role', token: 'assignment' }
   ],
   // 本票接线的 Worker 三条（§G.2 的 report / reply / ack）：打到真的领域 handler。
   [
@@ -578,7 +586,7 @@ function commandRoutes(
         ),
           createEvalHandlers({ tools: evalTools })
         ),
-        createReadHandlers({ tools: readTools })
+        createReadHandlers({ tools: readTools, views: createTestViewTools(store) })
       ),
       createPromptHandlers({
         versions: createPromptVersions({ store, now: () => AT }),
@@ -795,7 +803,7 @@ test('a request id makes a retried write return the first result, and only once'
 })
 
 test('read applies the documented page defaults and caps before it goes to the wire', async () => {
-  const server = await startTestServer()
+  const server = await startTestServer({ routes: commandRoutes })
   try {
     // §G.2 的 read 行：默认 20、上限 50。上限在客户端就判（`invalid_value`，退出 2），
     // 不发一次注定被拒的请求。
@@ -847,14 +855,16 @@ test('read applies the documented page defaults and caps before it goes to the w
     assert.ok(tooWide instanceof ApiError)
     if (tooWide instanceof ApiError) assert.equal(tooWide.code, 'invalid_value')
 
-    // 端到端：`read threads --limit 1` 打到未落地的视图路由 → 503 unavailable（退出 3）。
+    // 端到端：`read threads --limit 1` 打到 §G.3 的视图路由（真 handler、真 HTTP 查询串）。
     const result = await dispatch({
       parsed: parseArgs(['read', 'threads', '--limit', '1']),
       target: server.target()
     })
-    assert.equal(result.exit, 3)
-    assert.equal((result.envelope as { error: { code: string } }).error.code, 'unavailable')
+    assert.equal(result.exit, 0, JSON.stringify(result.envelope))
+    const page = (result.envelope as { readonly result?: { readonly items?: unknown } }).result
+    assert.deepEqual(page, { items: [], next_offset: null }, 'the query reached the threads read model')
     assert.equal(server.requests.length, 1, 'one request, to the real route')
+    assert.equal(server.requests[0]?.path, '/superagent/api/threads', 'the log keeps the path, not the query')
   } finally {
     server.close()
   }

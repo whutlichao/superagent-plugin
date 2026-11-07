@@ -219,8 +219,18 @@ export const CLI_COMMANDS: readonly CommandDefinition[] = [
   {
     name: ['read'],
     summary:
-      'read a resource: github/… or feishu/… (source reads), overview, sources, threads, decisions, tickets, settings, models…',
-    flags: PAGE_FLAGS,
+      'read a resource: github/… or feishu/… (source reads), overview, sources, search, threads, thread/<key>, decisions, tickets, ticket/<id>, settings, models…',
+    flags: [
+      ...PAGE_FLAGS,
+      { name: 'filter', kind: 'value', hint: 'threads: all | subscribed | evaluating | new (default all)' },
+      { name: 'before', kind: 'value', hint: 'thread: the "<at>|<triggerId>" cursor to page older' },
+      { name: 'around', kind: 'value', hint: 'thread: the "<at>|<triggerId>" cursor to center the page on' },
+      { name: 'kind', kind: 'value', hint: 'decisions: accept | stop | ignore | unavailable' },
+      { name: 'window', kind: 'value', hint: 'decisions: a relative window such as 24h, 1h, 30m or 7d' },
+      { name: 'state', kind: 'value', hint: 'tickets: open | person | working | idle | ended' },
+      { name: 'block', kind: 'value', hint: 'settings: policy | eval | executor | source:<id>' },
+      { name: 'q', kind: 'value', hint: 'search: text, a message id, a thread reference or a link' }
+    ],
     positionals: [{ name: 'resource', required: true }, { name: 'id', required: false }],
     write: false,
     available: true
@@ -1072,11 +1082,37 @@ export function readPath(resource: string, id: string | undefined): string {
 }
 
 /**
- * `read` 的分页参数（§G.2 的 read 行）。列表页默认 20、上限 50；Source 的文本页（一条长消息）
+ * `read <resource>` 的字符串参数：每个资源只认自己那一组（§G.3 的查询串同名），其余原样
+ * 交给服务端判（未知筛选值是 `invalid_value`，不在客户端猜）。`search` 必须有 `--q`，
+ * `thread` 的 `--before`/`--around` 二选一：这两条是参数形状，客户端先拒（不发注定失败的请求）。
+ */
+const READ_TEXT_FLAGS: Readonly<Record<string, readonly string[]>> = {
+  threads: ['filter'],
+  thread: ['before', 'around'],
+  decisions: ['kind', 'window'],
+  tickets: ['state'],
+  settings: ['block'],
+  search: ['q']
+}
+
+/**
+ * `read` 的查询串（§G.2 的 read 行）。列表页默认 20、上限 50；Source 的文本页（一条长消息）
  * `--limit` 是字符数，上限 8000——CLI 只判较宽的那个界，具体形状的上限由 `app/read.ts` 判。
  */
-export function readQuery(resource: string, args: CommandArgs): Record<string, number> {
-  const query: Record<string, number> = {}
+export function readQuery(resource: string, args: CommandArgs): Record<string, string | number> {
+  const query: Record<string, string | number> = {}
+  for (const flag of READ_TEXT_FLAGS[resource] ?? []) {
+    const value = valueArgs(args.flags, flag)
+    if (value !== undefined) query[flag] = value
+  }
+  if (resource === 'search' && query['q'] === undefined) {
+    throw new ApiError(ERROR_CODES.invalidParams, 'read search needs --q', { flag: 'q' })
+  }
+  if (resource === 'thread' && query['before'] !== undefined && query['around'] !== undefined) {
+    throw new ApiError(ERROR_CODES.invalidParams, 'read thread takes --before or --around, not both', {
+      flag: 'before'
+    })
+  }
   const offset = valueArgs(args.flags, 'offset')
   const limit = valueArgs(args.flags, 'limit')
   const source = isSourceResource(resource)

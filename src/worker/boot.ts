@@ -143,6 +143,7 @@ import { createEvalHandlers, withEvalHandlers } from './http/eval.ts'
 import { createEvalTools } from './app/eval.ts'
 import { createReadHandlers, withReadHandlers } from './http/read.ts'
 import { createReadTools } from './app/read.ts'
+import { createViewReadTools } from './app/views/read.ts'
 import { admissionSettingsOf } from './sources/admission-context.ts'
 import { createDecisionHandlers, withDecisionHandlers } from './http/decisions.ts'
 import { createPromptHandlers, withPromptHandlers } from './http/prompts.ts'
@@ -1118,6 +1119,31 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
     tickets: () => repo.tickets.list(),
     log: (message) => logger.info(message)
   })
+  // §G.3 的视图读面（`read overview/sources/search/threads/thread/decisions/models`）：数据来自
+  // 既有读模型（面板快照、注册表总览、角色解析、`find`、Ticket/Thread 仓储与时间线游标），
+  // 视图本身不另建查询。`now` 由组合根给，`window=24h` 与「New in 24 h」在服务端换算。
+  const viewReadTools = createViewReadTools({
+    reader: { sql: store.sql },
+    now,
+    panel: () => stateSource.snapshot(),
+    sources: () => registry.overview(),
+    roles: () => roles,
+    find: (query) => registry.find(query),
+    threads: () => repo.threads.list(),
+    thread: (key) => repo.threads.get(key),
+    timeline: {
+      tail: (key, limit) => store.triggerThreads.tail(key, limit),
+      before: (key, cursor, limit) => store.triggerThreads.before(key, cursor, limit),
+      after: (key, cursor, limit) => store.triggerThreads.timeline(key, { after: cursor, limit }),
+      item: (key, cursor) => store.triggerThreads.item(key, cursor)
+    },
+    trigger: (id) => repo.triggers.get(id),
+    disposition: (id) => repo.triggers.disposition(id),
+    threadDecisions: (key) => repo.decisions.byThread(key),
+    allDecisions: () => repo.decisions.list(),
+    tickets: () => repo.tickets.list(),
+    ticket: (id) => repo.tickets.get(id)
+  })
   // Prompt 配置的读/写面（§L.4、§L.5）：版本库、部署事实与「保存后通知 Router」都在这里接线。
   // 部署事实给的是**路径**（CLI 的绝对路径、调用者自己的 token 文件），绝不写 token 值（§D.6）；
   // 保存产生新版本时，Router 保活器把 revision 换成一条短消息排队——不重启会话（§F.4）。
@@ -1219,7 +1245,7 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
               ),
               createEvalHandlers({ tools: evalTools })
             ),
-            createReadHandlers({ tools: readTools })
+            createReadHandlers({ tools: readTools, views: viewReadTools })
           ),
           prompts
         ),
