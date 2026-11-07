@@ -147,3 +147,26 @@ test('the worker read model turns a real ticket into its Execution row', () => {
     ['Ship the payroll export', 'ended', 'completed']
   ])
 })
+
+test('the worker read model carries the system problem count the panel must surface (§J.3)', () => {
+  const source = createRefreshableStateSource({
+    tickets: () => [],
+    activity: () => ({ received: 0, evaluated: 0, accepted: 0, ignored: 0, ended: 0 }),
+    load: () => ({ running: 0, maxWorkers: 2 }),
+    hasError: () => false,
+    setupMissing: () => false,
+    paused: () => false,
+    problems: () => 2
+  })
+  assert.equal(source.snapshot().attention.problems, 2, 'the snapshot carries the unresolved count')
+  // 没有读口时保持 0：面板壳的夹具与桩不假装有系统问题。
+  const stub = createRefreshableStateSource({
+    tickets: () => [],
+    activity: () => ({ received: 0, evaluated: 0, accepted: 0, ignored: 0, ended: 0 }),
+    load: () => ({ running: 0, maxWorkers: 2 }),
+    hasError: () => false,
+    setupMissing: () => false,
+    paused: () => false
+  })
+  assert.equal(stub.snapshot().attention.problems, 0)
+})

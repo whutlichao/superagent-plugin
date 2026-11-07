@@ -39,6 +39,10 @@ export interface SeedPromptInput {
   readonly cliPath: string
   /** 本次 Assignment 的 token 文件绝对路径。 */
   readonly tokenFile: string
+  /** 组装后的全文所在文件（`<ticketDir>/.superagent/prompt.md`，§L.5）；长正文绝不进终端。 */
+  readonly promptPath: string
+  /** 写进那个文件的 prompt revision（§L.4）：开播语只说号，不说正文。 */
+  readonly revision: number
   /** 第一份输入的绝对路径（`inbox/0.md`）。 */
   readonly inboxPath: string
 }
@@ -57,6 +61,10 @@ export interface LaunchAgentOptions {
   readonly settings: LaunchSettings
   readonly cliPath: string
   readonly tokenFile: string
+  /** 组装后的全文所在文件（§L.5）；开播语只指向它。 */
+  readonly promptPath: string
+  /** 那个文件里的 prompt revision。 */
+  readonly revision: number
   readonly inboxPath: string
   /**
    * 这次 launch 要注入的环境（§E.11 + PATH/GIT_CONFIG_GLOBAL）：启动之前在钩子上登记，
@@ -75,25 +83,25 @@ const realWait = (milliseconds: number): Promise<void> =>
   new Promise((resolve) => setTimeout(resolve, milliseconds))
 
 /**
- * 开播语：角色声明 + Ticket id/短名 + 目录 + CLI 绝对路径与 token 文件 + 「先读第一份输入」。
- * 只写路径不写 token 值（§D.6）；**单行**且 ≤ 400 字符——终端不吞长文本，多行会被当成多次
- * 提交（附录 C S1）。
+ * 开播语：角色声明 + Ticket id/短名 + 目录 + CLI 绝对路径与 token 文件 + 「先读组装好的全文，
+ * 再读第一份输入」。只写路径不写 token 值（§D.6）；**单行**且 ≤ 400 字符——终端不吞长文本，
+ * 多行会被当成多次提交（附录 C S1）。
  */
 export function seedPrompt(input: SeedPromptInput): string {
   const role = `You are the superagent worker for ticket ${input.ticketId} (${input.short}).`
   const where = `Work only inside ${input.directory}.`
   const cli = `CLI: node "${input.cliPath}" --token-file "${input.tokenFile}".`
-  const task = `Read ${input.inboxPath} first and follow it.`
-  // 长部署路径下依次丢掉最不重要的部分：最后留下的必须是「先读哪份文件」这条指令。
+  // 全文在文件里（§L.5），开播语只给文件与号：这两项比其余任何一项都重要，永不丢掉。
+  const task = `Read ${input.promptPath} (prompt revision ${input.revision}) first, then ${input.inboxPath}.`
+  // 长部署路径下依次丢掉最不重要的部分：最后留下的必须是「先读哪份文件、哪一版」这条指令。
   const candidates = [
     [role, where, cli, task].join(' '),
     [where, cli, task].join(' '),
     [cli, task].join(' '),
-    [task, cli].join(' '),
     task
   ]
   const line = candidates.find((candidate) => candidate.length <= SEED_PROMPT_MAX) ?? task
-  // 只剩这一条也超限（极端路径）：截断它，任务正文在 inbox 文件里、不靠这一行携带。
+  // 只剩这一条也超限（极端路径）：截断它——文件指针在最前面，被截掉的只是后面的备份路径。
   return line.length <= SEED_PROMPT_MAX ? line : `${line.slice(0, SEED_PROMPT_MAX - 1)}…`
 }
 
@@ -168,6 +176,8 @@ export async function launchTicketAgent(
     directory: options.workspace.path,
     cliPath: options.cliPath,
     tokenFile: options.tokenFile,
+    promptPath: options.promptPath,
+    revision: options.revision,
     inboxPath: options.inboxPath
   })
   const base = {

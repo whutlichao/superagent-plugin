@@ -56,6 +56,7 @@ import {
 } from './app/kv.ts'
 import { createRefreshableStateSource, type RefreshableStateSource } from './app/state-source.ts'
 import { deliveredFollowups } from './app/views.ts'
+import { readEvalsHealth, readUnavailableProblems } from './app/views/attention.ts'
 import { statusBarView } from './app/status-bar.ts'
 import type { StatusBarView } from './app/status-bar.ts'
 import { Effects, ROUTER_EFFECT_KEY } from './app/effects.ts'
@@ -96,8 +97,11 @@ import { resumeAfterUpgrade, type ResumeReport } from './executor/resume.ts'
 import { DEFAULT_MAX_WORKERS } from './http/state.ts'
 import { createDomainHandlers, withDomainHandlers } from './http/domain.ts'
 import { createAssessmentHandlers, withAssessmentHandlers } from './http/assessment.ts'
+import { createDecisionHandlers, withDecisionHandlers } from './http/decisions.ts'
 import { createPromptHandlers, withPromptHandlers } from './http/prompts.ts'
 import { createPromptVersions } from './app/prompts.ts'
+import type { PromptEnvironment, PromptPolicy } from './app/prompts.ts'
+import { assembleLaunchPrompt } from './app/launch-prompt.ts'
 import { ENVIRONMENT_VARIABLES } from './executor/environment.ts'
 import type { RouteCaller } from './http/routes.ts'
 import { ROUTE_TABLE, type RouteDefinition } from './http/routes.ts'
@@ -113,6 +117,7 @@ import {
   type RouterTerminalState,
   type RouterWorkspaceState
 } from './router/supervision.ts'
+import { routerPrompt } from './router/prompt.ts'
 
 /** worker 侧一轮 pass 的周期（§N.1 的 2 s 巡检）。 */
 export const PASS_INTERVAL_MS = 2000
@@ -483,6 +488,30 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
   // ---- Router（§F.1–§F.5）：专用 worktree、terminal 面的常驻会话、relay 与保活监督
   const roles = resolveRoles(settings)
   const deploymentFacts = deployment(settings, { ...githubSetup, login: githubLogin() }, feishuSetup)
+  const cliPath = options.cliPath ?? defaultCliPath()
+  // Prompt 配置与版本的唯一读写面（§L.4、§L.5）：两个 launch 与 `prompts get --text` 都从这里读；
+  // 每次 launch 现读，所以保存过的团队段与 revision 在下一次 launch 就生效。
+  const promptVersions = createPromptVersions({ store, now })
+  /** 一次会话或一次请求的部署环境段（§G.5）：只给路径，绝不写 token 值（§D.6）。 */
+  const promptEnvironment = (tokenFile: string): PromptEnvironment => ({
+    variables: [...ENVIRONMENT_VARIABLES],
+    cliPath,
+    tokenFile,
+    stateDir: resolved,
+    repository: deploymentFacts.repository,
+    account: deploymentFacts.githubLogin
+  })
+  /** Router 的 Policy 段（§L.3 第 11 步）：跟**生效**的块走，与 Gate、复验同一个真相源。 */
+  const promptPolicy = (): PromptPolicy => {
+    const block = effectivePolicy()
+    return {
+      version: policy.version,
+      mode: block.acceptMode,
+      rules: block.rules
+        .filter((rule) => rule.enabled)
+        .map((rule) => ({ id: rule.id, name: rule.name, instruction: rule.instruction.en }))
+    }
+  }
   // setup 未完成（或没选 base repo）时 Router 保持 paused；`setup check` 之后会重新问这个函数。
   const routerEnabled = (): boolean => !setup.blocked('executor') && executorSettings.baseRepo !== undefined
   const relayDays = relayRetentionDays(settings)
@@ -499,15 +528,27 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
       ...(roles.router.model === undefined ? {} : { model: roles.router.model }),
       ...(roles.router.effort === undefined ? {} : { effort: roles.router.effort }),
       ...(executorSettings.baseRepo === undefined ? {} : { baseRepo: executorSettings.baseRepo }),
-      ...(executorSettings.baseBranch === undefined ? {} : { baseBranch: executorSettings.baseBranch }),
-      repository: deploymentFacts.repository,
-      acceptMode: acceptModeOf(settings),
-      policyVersion: policy.version
+      ...(executorSettings.baseBranch === undefined ? {} : { baseBranch: executorSettings.baseBranch })
     },
-    cliPath: options.cliPath ?? defaultCliPath(),
-    stateDir: resolved,
     rotateToken: () => issueRouterToken({ store, stateDir: resolved }).path,
     promptRevision: promptRevisionOf(store),
+    /**
+     * 组装 Router 的 launch prompt（§L.3、§L.5）：每次 launch 现读配置、当时的 Policy 与
+     * 部署事实，拼好后交出全文；监督只拿回文本与长度，不自己拼、也不缓存旧版本。
+     */
+    prompt: {
+      compose: ({ tokenFile, directory, revision }) => {
+        const assembled = assembleLaunchPrompt({
+          role: 'orchestrator',
+          revision,
+          config: promptVersions.config(),
+          environment: promptEnvironment(tokenFile),
+          policy: promptPolicy()
+        })
+        const text = routerPrompt({ text: assembled.text, cliPath, tokenFile, directory })
+        return { text, length: text.length }
+      }
+    },
     enabled: routerEnabled,
     // §F.3 的可观测事实：疑似空转时给出「N 个未决候选」（待评的 Thread）。
     undecidedCandidates: () => repo.threads.list().filter((thread) => thread.pending.length > 0).length,
@@ -589,9 +630,11 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
     records: repo,
     settings: executorSettings,
     stateDir: resolved,
-    cliPath: options.cliPath ?? defaultCliPath(),
+    cliPath,
     tokenFile: (assignmentId) => assignmentTokenFile(store, resolved, assignmentId),
     apiBase: '',
+    // Worker 的 launch 也是在启动那一刻现读配置与 revision（§L.5）。
+    prompts: promptVersions,
     wait: deliveryWait,
     log: (message) => logger.info(message)
   })
@@ -609,6 +652,9 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
   })
 
   // ---- 读模型 / 状态栏 / 面板
+  /** health 里报 error 的条目数（面板的 `health.error` 与 §J.3 的系统问题共用这一条读法）。 */
+  const healthErrors = (): number =>
+    Object.values(board.all()).filter((entry) => entry.state === 'error').length
   const stateSource: RefreshableStateSource = createRefreshableStateSource({
     tickets: () => repo.tickets.list(),
     activity: () => activityCounts(store, nowMs()),
@@ -616,9 +662,13 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
       const counts = store.assignmentCounts()
       return { running: counts.running, maxWorkers: executorSettings.maxWorkers }
     },
-    hasError: () => Object.values(board.all()).some((entry) => entry.state === 'error'),
+    hasError: () => healthErrors() > 0,
     setupMissing: () => setup.missing(),
-    paused: () => paused.paused()
+    paused: () => paused.paused(),
+    // §J.3 的系统问题 = health error 条目 + §K.7 判过四条件的 unavailable（窗口、最新决定、
+    // dismiss 与 Thread 是否在忙都在读模型里判）。回复连续失败那一项由 outbox 的计数补。
+    problems: () =>
+      healthErrors() + readUnavailableProblems({ sql: store.sql }, { now: now() }).length
   })
 
   function refresh(): PanelState {
@@ -696,45 +746,38 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
   // Prompt 配置的读/写面（§L.4、§L.5）：版本库、部署事实与「保存后通知 Router」都在这里接线。
   // 部署事实给的是**路径**（CLI 的绝对路径、调用者自己的 token 文件），绝不写 token 值（§D.6）；
   // 保存产生新版本时，Router 保活器把 revision 换成一条短消息排队——不重启会话（§F.4）。
-  const promptVersions = createPromptVersions({ store, now })
   const prompts = createPromptHandlers({
     versions: promptVersions,
     deployment: {
-      environment: ({ caller }) => ({
-        variables: [...ENVIRONMENT_VARIABLES],
-        cliPath: options.cliPath ?? defaultCliPath(),
-        tokenFile: callerTokenFile(caller, resolved),
-        stateDir: resolved,
-        repository: deploymentFacts.repository
-      }),
-      // Policy 段跟着**生效**的块走（保存过的设置优先，§K.5），与 Gate、复验同一个真相源。
-      policy: () => {
-        const block = effectivePolicy()
-        return {
-          version: policy.version,
-          mode: block.acceptMode,
-          rules: block.rules
-            .filter((rule) => rule.enabled)
-            .map((rule) => ({ id: rule.id, name: rule.name, instruction: rule.instruction.en }))
-        }
-      }
+      // 一个请求自己的 token 文件：与它实际会用的那个会话一致（§G.4、§G.5）。
+      environment: ({ caller }) => promptEnvironment(callerTokenFile(caller, resolved)),
+      policy: promptPolicy
     },
     onSaved: (revision) => routerSupervision.notifyPromptRevision(revision),
     afterWrite: () => {
       refresh()
     }
   })
-  const routes: readonly RouteDefinition[] = withPromptHandlers(
-    withAssessmentHandlers(
-      withDomainHandlers(ROUTE_TABLE, domain),
-      createAssessmentHandlers({
-        tools: routerTools,
-        afterWrite: () => {
-          refresh()
-        }
-      })
+  const routes: readonly RouteDefinition[] = withDecisionHandlers(
+    withPromptHandlers(
+      withAssessmentHandlers(
+        withDomainHandlers(ROUTE_TABLE, domain),
+        createAssessmentHandlers({
+          tools: routerTools,
+          afterWrite: () => {
+            refresh()
+          }
+        })
+      ),
+      prompts
     ),
-    prompts
+    createDecisionHandlers({
+      // 面板的 dismiss（§K.7）：领域只接受 unavailable 的 Decision，其余给固定拒绝。
+      dismiss: (decisionId) => engine.dismiss(decisionId),
+      afterWrite: () => {
+        refresh()
+      }
+    })
   )
 
   ensureApiToken(resolved)
@@ -982,6 +1025,8 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
       }
     },
     health: board,
+    // `evals` 条目（§N.4）：1 h 内未解决的 unavailable 数量，写者就是 pass（与设计写者表一致）。
+    evals: () => readEvalsHealth({ sql: store.sql }, now()),
     schedule: (run, milliseconds) => setTimeout(run, milliseconds),
     cancel: (handle) => clearTimeout(handle as ReturnType<typeof setTimeout>),
     closing: () => closing,
@@ -1169,12 +1214,6 @@ function callerTokenFile(caller: RouteCaller, stateDir: string): string {
     return join(stateDir, TOKENS_DIR, caller.assignmentId)
   }
   return join(stateDir, API_TOKEN_FILE)
-}
-
-/** `policy.acceptMode` 的三档；缺省 observe（§K.4、规格 000 的缺省）。 */
-function acceptModeOf(settings: Readonly<Record<string, unknown>>): 'off' | 'observe' | 'auto' {
-  const mode = block(settings['policy'])['acceptMode']
-  return mode === 'off' || mode === 'auto' ? mode : 'observe'
 }
 
 /** `retention.relayDays`（§F.2 缺省 7 天）：正整数才生效。 */

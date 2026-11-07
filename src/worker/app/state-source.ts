@@ -89,6 +89,12 @@ export interface WorkerStateInput {
   /** setup 是否缺东西。 */
   readonly setupMissing: () => boolean
   readonly paused: () => boolean
+  /**
+   * §J.3 的「系统问题」条数：health error 条目 + 24 h 内未解决且未 dismiss 的 unavailable
+   * （回复连续失败那一项由 outbox 的失败计数补，见 #30）。缺省 0——面板壳的夹具与桩不假装
+   * 有系统问题。
+   */
+  readonly problems?: () => number
   /** Execution 页最多几行（§M.4：无虚拟列表，一页 50 条）。 */
   readonly pageSize?: number
 }
@@ -158,7 +164,7 @@ export function createWorkerStateSource(input: WorkerStateInput): PanelStateSour
       attention: {
         answer,
         review,
-        problems: 0,
+        problems: input.problems?.() ?? 0,
         items: items.sort((left, right) => right.at - left.at)
       },
       tickets: tickets.slice(0, pageSize).map(panelTicket)
