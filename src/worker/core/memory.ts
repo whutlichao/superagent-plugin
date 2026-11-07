@@ -41,6 +41,8 @@ export interface MemoryReadView {
   readonly decisions: {
     get(id: string): Decision | undefined
     byThread(key: string): Decision[]
+    /** 全部 Decision，最新的在前（面板 Eval 页与 CLI 的 `read decisions` 共用）。 */
+    list(): Decision[]
   }
 }
 
@@ -61,6 +63,10 @@ const byAtThenId = (a: { at: string; id: string }, b: { at: string; id: string }
 /** Ticket 最新在前：`createdAt` 降序，同刻按 id 降序，保证读序确定。 */
 const newestFirst = (a: Ticket, b: Ticket): number =>
   a.createdAt === b.createdAt ? b.id.localeCompare(a.id) : b.createdAt.localeCompare(a.createdAt)
+
+/** Decision 最新在前：`(at, id)` 降序，与面板 Eval 页和「最新决定」的判定同序。 */
+const newestAtFirst = (a: { at: string; id: string }, b: { at: string; id: string }): number =>
+  a.at === b.at ? b.id.localeCompare(a.id) : b.at.localeCompare(a.at)
 
 /**
  * `Repositories` 的内存实现：克隆隔离、快照回滚、确定性排序、按 id 唯一。
@@ -120,7 +126,8 @@ export class MemoryRepositories implements MemoryReadView {
       [...this.#decisions.values()]
         .filter((decision) => decision.threadKey === key)
         .sort(byAtThenId)
-        .map(clone)
+        .map(clone),
+    list: () => [...this.#decisions.values()].sort(newestAtFirst).map(clone)
   }
 
   /**
@@ -185,7 +192,8 @@ export class MemoryRepositories implements MemoryReadView {
           guard()
           this.#decisions.set(decision.id, clone(decision))
         },
-        byThread: this.decisions.byThread
+        byThread: this.decisions.byThread,
+        list: this.decisions.list
       }
     }
   }

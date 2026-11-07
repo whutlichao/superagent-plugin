@@ -64,7 +64,9 @@ export function readSystemProblems(input: SystemProblemInput): readonly SystemPr
       id: `unavailable:${problem.decisionId}`,
       kind: 'unavailable',
       name: problem.threadKey,
-      detail: problem.reason
+      detail: problem.reason,
+      // Overview 点这一行时，Eval 页要打开的是这条决定（面板不解析上面的合成 id）。
+      decisionId: problem.decisionId
     }))
   return [...health, ...replies, ...unavailable]
 }

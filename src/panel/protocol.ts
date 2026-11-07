@@ -77,6 +77,11 @@ export interface SystemProblem {
   readonly name: string
   /** 一句话原因；回复类没有原因，只有「发不出去」这个事实（页面用固定措辞）。 */
   readonly detail?: string
+  /**
+   * 这条问题背后的 Decision（只有 `unavailable` 有，§K.7）：Overview 点行去 Eval 页时
+   * 要打开的那一条，页面因此不必解析 `unavailable:<id>` 这个合成 id。
+   */
+  readonly decisionId?: string
 }
 
 /**
@@ -159,6 +164,74 @@ export interface TicketListInput {
 export interface TicketListPage {
   readonly items: readonly PanelTicket[]
   readonly nextOffset: number | null
+}
+
+/**
+ * 一条 Decision 在面板上的原因（§D.2）：码 + 占位符 + 它属于哪条 Trigger。
+ * 面板按 `reason.<code>` 自己翻译（§M.5），因此 worker 只传结构，不传英文句子。
+ */
+export interface PanelReason {
+  readonly code: string
+  readonly values?: Readonly<Record<string, string>>
+  readonly triggerId?: string
+}
+
+/** Decision 的四种（§D.2，与 `core` 的 `DECISION_KINDS` 同值）。 */
+export type PanelDecisionKind = 'accept' | 'stop' | 'ignore' | 'unavailable'
+
+/** Eval 页的一行（§M.2：kind、reason、strength、policy version、at）。 */
+export interface PanelDecision {
+  readonly id: string
+  readonly kind: PanelDecisionKind
+  readonly reasons: readonly PanelReason[]
+  readonly strength: 'explicit' | 'inferred'
+  readonly policyVersion: string
+  /** 决定落库的时刻（epoch ms）；页面交给 `RelativeTime`，绝不自己计时。 */
+  readonly at: number
+}
+
+/** Eval 列表的一次请求：只有分页窗口（§M.4：无虚拟列表，一页 50 条）。 */
+export interface DecisionListInput {
+  readonly offset?: number
+  readonly limit?: number
+}
+
+/**
+ * 一页 Decision。`unresolved` 是 §K.7 的待人工条数（< 24 h、该 Thread 最新、未 dismiss、
+ * Thread 不在排队/评估中），与 Overview 的 System problems 用同一份读数。
+ */
+export interface DecisionListPage {
+  readonly items: readonly PanelDecision[]
+  readonly nextOffset: number | null
+  readonly unresolved: number
+}
+
+/** 一条 Decision 的详情（§M.2 的 Eval 详情）：字段、原因，以及到 Thread/Ticket 的链接。 */
+export interface DecisionDetailView {
+  readonly id: string
+  readonly kind: PanelDecisionKind
+  readonly reasons: readonly PanelReason[]
+  readonly strength: PanelDecision['strength']
+  readonly policyVersion: string
+  /** 决定落库的时刻（epoch ms）。 */
+  readonly at: number
+  /** 它评的是哪条 Thread（title 是 Source 给的 label，没有就是 key）。 */
+  readonly thread: { readonly key: string; readonly title: string }
+  /** 它开的 Ticket（accept 才有；Ticket 已不在时仍给 id 与一句说明）。 */
+  readonly ticket?: { readonly id: string; readonly title: string }
+  /** 这次评估持有的 Trigger（§D.2）。 */
+  readonly triggerIds: readonly string[]
+  /** 已被 dismiss 的问题（§K.7）；不再计入待人工，但记录仍在。 */
+  readonly dismissed: boolean
+  /** 现在是否仍要人：§K.7 的四个条件都成立。 */
+  readonly unresolved: boolean
+  /** 只有未 dismiss 的 unavailable 才有入口（领域允许重复 dismiss，面板不重复问）。 */
+  readonly canDismiss: boolean
+}
+
+/** 一次动作的对象：一条 Decision。 */
+export interface DecisionInput {
+  readonly decisionId: string
 }
 
 /** 一份 Report 的面板面（§E.8）：状态 + 摘要 + 时刻。 */
@@ -431,6 +504,9 @@ export const PLUGIN_REQUESTS = [
   'state',
   'pause',
   'check',
+  'decisions',
+  'decision.detail',
+  'decision.dismiss',
   'tickets',
   'ticket.detail',
   'ticket.retry',
@@ -506,6 +582,21 @@ declare module 'orca' {
     doctor: { output: DoctorView }
     /** 重跑 setup 探针（「检查一次」）：本来没问题时 `checked: false`。 */
     setupCheck: { output: SetupCheckView }
+    /**
+     * Eval 页的一页（§M.2 的 Decision 列表）：最新的在前，分页 50 条；
+     * `unresolved` 是 §K.7 的四条件判出的待人工条数（与 Overview 的 System problems 同一份读数）。
+     */
+    decisions: { input: DecisionListInput; output: DecisionListPage }
+    /**
+     * 一条 Decision 的详情（§M.2 的 Eval 详情）：字段、原因，以及到 Thread/Ticket 的链接。
+     * 未知决定按 `unknownDecision` 拒绝。
+     */
+    'decision.detail': { input: DecisionInput; output: DecisionDetailView }
+    /**
+     * 把一条 unavailable 决定暴露的问题标为已 dismiss（§K.7）：破坏性不高但不可逆，
+     * 面板先做行内二次确认；其它 kind 由领域按 `unknownProblem` 拒绝。返回写后的快照。
+     */
+    'decision.dismiss': { input: DecisionInput; output: PanelState }
     /** 轮换主 token（破坏性；面板先做行内二次确认）。 */
     rotateToken: { output: RotateTokenView }
     /** 人显式要求重启 Router（破坏性；面板先做行内二次确认）；返回重启后的读数。 */

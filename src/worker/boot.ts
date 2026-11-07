@@ -12,6 +12,9 @@
 import { mkdirSync } from 'node:fs'
 import { join } from 'node:path'
 import type {
+  DecisionDetailView,
+  DecisionListInput,
+  DecisionListPage,
   DeploymentView,
   PanelState,
   PanelTerminal,
@@ -78,11 +81,13 @@ import {
   type RefreshableStateSource
 } from './app/state-source.ts'
 import { deliveredFollowups, ticketDetail } from './app/views.ts'
+import { decisionDetail, decisionPage } from './app/views/decisions.ts'
 import {
   followupOwners,
   latestAssignment,
   runningAssignment,
   UserError,
+  type Decision,
   type Ticket
 } from './core/index.ts'
 import { readEvalsHealth, readUnavailableProblems } from './app/views/attention.ts'
@@ -254,6 +259,15 @@ export interface BootHandle {
   noteTicket(ticketId: string, text: string): PanelState
   /** 请求状态（§G.2 的 `ticket request-status`）：返回是否真的问了一条。 */
   requestStatus(ticketId: string): boolean
+  /** Eval 列表的一页（§M.2 的 Decision 列表）：最新在前，分页 50 条，带 §K.7 的待人工条数。 */
+  decisions(input: DecisionListInput): DecisionListPage
+  /**
+   * 一条 Decision 的详情（§M.2 的 Eval 详情）：字段、原因、到 Thread/Ticket 的链接，
+   * 以及它现在是否仍要人（§K.7）。未知决定抛 `unknownDecision`。
+   */
+  decisionDetail(decisionId: string): DecisionDetailView
+  /** 把一条 unavailable 决定暴露的问题 dismiss（§K.7）：面板先做行内二次确认。 */
+  dismissDecision(decisionId: string): PanelState
   /** 打开一张工单的 worktree（§M.2：面板没有 `workspace.open` 这个宿主方法）。 */
   openTicketWorkspace(ticketId: string): Promise<void>
   /** 移除一张工单的 worktree（§E.1「清理」，破坏性；面板先要人确认）。 */
@@ -406,6 +420,18 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
         })
       },
       requestStatus: () => {
+        throw Object.assign(new Error('another Superagent instance owns this state directory'), {
+          code: 'action_failed'
+        })
+      },
+      // follower 不读库：Eval 的读数与 dismiss 都属于拥有者（固定拒绝，不假装成功）。
+      decisions: () => ({ items: [], nextOffset: null, unresolved: 0 }),
+      decisionDetail: () => {
+        throw Object.assign(new Error('another Superagent instance owns this state directory'), {
+          code: 'unavailable'
+        })
+      },
+      dismissDecision: () => {
         throw Object.assign(new Error('another Superagent instance owns this state directory'), {
           code: 'action_failed'
         })
@@ -1621,6 +1647,27 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
       const asked = engine.requestStatus(ticketId)
       refresh()
       return asked
+    },
+    // Eval 页（§M.2、§K.7）：列表/详情的待人工判定与 Overview 的 System problems 同一份读数。
+    decisions: (input: DecisionListInput): DecisionListPage =>
+      decisionPage(
+        repo.decisions.list(),
+        input,
+        readUnavailableProblems({ sql: store.sql }, { now: now() })
+      ),
+    decisionDetail: (decisionId: string): DecisionDetailView => {
+      const decision = repo.decisions.get(decisionId)
+      if (decision === undefined) throw new UserError('unknownDecision', { decision: decisionId })
+      return decisionDetail(
+        decision,
+        { threads: repo.threads, tickets: repo.tickets },
+        readUnavailableProblems({ sql: store.sql }, { now: now() })
+      )
+    },
+    // §K.7：只有 unavailable 能被 dismiss（领域同一条规则）；写后刷新快照与面板推送。
+    dismissDecision: (decisionId: string): PanelState => {
+      engine.dismiss(decisionId)
+      return refresh()
     },
     // §M.2：面板没有打开/移除 worktree 的宿主方法，两者都由 worker 按 Ticket 记录的目录代理。
     openTicketWorkspace: async (ticketId: string): Promise<void> => {
