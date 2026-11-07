@@ -119,6 +119,7 @@ import { admissionSettingsOf } from './sources/admission-context.ts'
 import { createDecisionHandlers, withDecisionHandlers } from './http/decisions.ts'
 import { createPromptHandlers, withPromptHandlers } from './http/prompts.ts'
 import { createPromptVersions } from './app/prompts.ts'
+import { syncSkillFiles } from './app/skills.ts'
 import type { PromptEnvironment, PromptPolicy } from './app/prompts.ts'
 import { assembleLaunchPrompt } from './app/launch-prompt.ts'
 import { ENVIRONMENT_VARIABLES } from './executor/environment.ts'
@@ -447,7 +448,10 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
   // ---- 注册表与 kind
   const registry = new SourceRegistry({ health: board, settings: () => sourceSettings })
   registry.register(createGithubKind(String(githubSetup.config['cli'] ?? 'gh')))
-  registry.register(createFeishuKind())
+  // Feishu 的 kind 绑定配置的 CLI 与 stateDir：语境读/图片下载要它们（§I.3、§H.17）。
+  registry.register(
+    createFeishuKind(feishuSetup.cli === '' ? 'lark-cli' : feishuSetup.cli, { stateDir: resolved })
+  )
   const githubHealth = registry.healthEntries(['github']).get('github')
   const feishuHealth = registry.healthEntries(['feishu', 'history'])
   /**
@@ -565,8 +569,22 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
   const deploymentFacts = deployment(settings, { ...githubSetup, login: githubLogin() }, feishuSetup)
   const cliPath = options.cliPath ?? defaultCliPath()
   // Prompt 配置与版本的唯一读写面（§L.4、§L.5）：两个 launch 与 `prompts get --text` 都从这里读；
-  // 每次 launch 现读，所以保存过的团队段与 revision 在下一次 launch 就生效。
-  const promptVersions = createPromptVersions({ store, now })
+  // 每次 launch 现读，所以保存过的团队段与 revision 在下一次 launch 就生效。体量上限来自设置
+  // （§L.6 的 `promptMaxChars`）：保存配置与拼全文读同一个数。
+  const promptVersions = createPromptVersions({ store, now, maxChars: limits.promptMaxChars })
+  /**
+   * 技能文件（§L.6、§H.8）：把内置 skills 与团队技能写到 `<stateDir>/skills/`。启动时一次，
+   * 每次保存提示词配置后再一次（新建/编辑/删除都在那里生效）。写失败只记警告：技能文件缺失
+   * 是「agent 读不到」而不是「插件坏了」，但绝不假装写成功。
+   */
+  const syncSkills = (): void => {
+    try {
+      syncSkillFiles({ stateDir: resolved, config: promptVersions.config() })
+    } catch (error) {
+      logger.warn(`the skill files could not be written: ${stringOf(error)}`)
+    }
+  }
+  syncSkills()
   /** 一次会话或一次请求的部署环境段（§G.5）：只给路径，绝不写 token 值（§D.6）。 */
   const promptEnvironment = (tokenFile: string): PromptEnvironment => ({
     variables: [...ENVIRONMENT_VARIABLES],
@@ -618,7 +636,8 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
           revision,
           config: promptVersions.config(),
           environment: promptEnvironment(tokenFile),
-          policy: promptPolicy()
+          policy: promptPolicy(),
+          maxChars: promptVersions.maxChars()
         })
         const text = routerPrompt({ text: assembled.text, cliPath, tokenFile, directory })
         return { text, length: text.length }
@@ -909,7 +928,11 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
       environment: ({ caller }) => promptEnvironment(callerTokenFile(caller, resolved)),
       policy: promptPolicy
     },
-    onSaved: (revision) => routerSupervision.notifyPromptRevision(revision),
+    onSaved: (revision) => {
+      // 新版本可能改了团队技能（新建/编辑/删除），先在磁盘上落地，再通知 Router 重读（§F.4）。
+      syncSkills()
+      routerSupervision.notifyPromptRevision(revision)
+    },
     afterWrite: () => {
       refresh()
     }

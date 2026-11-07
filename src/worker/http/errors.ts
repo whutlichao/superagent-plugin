@@ -32,8 +32,13 @@ export const ERROR_CODES = {
   refused: 'refused',
   /** 设置/prompt 的 base revision 已过期。 */
   staleRevision: 'stale_revision',
-  /** 文本超过命令上限（100 词、600 字符等）。 */
+  /** 文本超过命令上限（100 词、600 字符等；也是 §L.6 提示词体量上限的固定码）。 */
   tooLong: 'too_long',
+  /**
+   * 团队技能用了内置技能的名字（§L.6）：内置技能是保留名、只读，不能被替换或删除。
+   * 字符集与长度不合格走 `invalid_skill_name`（`invalid_*` 前缀已按 400 处理）。
+   */
+  reservedSkillName: 'reserved_skill_name',
   /** 缺 token 或 token 无效（§G.3 第 3 条）。 */
   unauthorized: 'unauthorized',
   /** 角色不够（§G.1 角色表）。 */
@@ -159,6 +164,7 @@ export function statusForErrorCode(code: string): number {
     case ERROR_CODES.notSyncable:
     case ERROR_CODES.syncFailed:
     case ERROR_CODES.setupFailed:
+    case ERROR_CODES.reservedSkillName:
       return 400
     case ERROR_CODES.unauthorized:
       return 401

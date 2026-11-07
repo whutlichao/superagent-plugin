@@ -161,7 +161,12 @@ function saveView(result: PromptSaveResult): PromptSaveView {
  * 组装两个角色的全文：生成段的值来自注入的部署事实（`{variables}` 这类占位符只由部署填）。
  * 没有部署事实时固定 `unavailable`——「不知道」不能假装成一份可读的全文。
  */
-function textsOf(deployment: PromptDeployment | undefined, config: PromptConfig, caller: RouteCaller): PromptTextResult['texts'] {
+function textsOf(
+  deployment: PromptDeployment | undefined,
+  config: PromptConfig,
+  caller: RouteCaller,
+  maxChars: number
+): PromptTextResult['texts'] {
   if (deployment === undefined) {
     throw new ApiError(ERROR_CODES.unavailable, 'the deployment facts for the composed text are not wired', {
       reason: 'no_deployment'
@@ -173,11 +178,13 @@ function textsOf(deployment: PromptDeployment | undefined, config: PromptConfig,
       role: 'orchestrator',
       environment: deployment.environment({ role: 'orchestrator', caller }),
       policy,
+      maxChars,
       ...promptTextOf(config)
     }),
     worker: composePrompt({
       role: 'worker',
       environment: deployment.environment({ role: 'worker', caller }),
+      maxChars,
       ...promptTextOf(config)
     })
   }
@@ -198,6 +205,18 @@ export function withPromptHandlers(
 export function createPromptHandlers(options: PromptHandlerOptions): ReadonlyMap<string, RouteHandler> {
   const { versions } = options
   const handlers = new Map<string, RouteHandler>()
+
+  /**
+   * 拼两个角色的全文；拼超限（§L.6 的 `too_long`）与部署事实缺失一样是**固定拒绝**，不是
+   * 内部错误——所以在这里换成带状态码的 `ApiError`，而不是让 `PromptTextError` 掉进 500。
+   */
+  const textsFor = (config: PromptConfig, caller: RouteCaller): PromptTextResult['texts'] => {
+    try {
+      return textsOf(options.deployment, config, caller, versions.maxChars())
+    } catch (error) {
+      apiErrorOf(error)
+    }
+  }
 
   /** 写成功之后：通知 Router（只有真的产生新版本才通知）+ 面板刷新。 */
   const saved = (view: PromptSaveView): PromptSaveView => {
@@ -221,7 +240,7 @@ export function createPromptHandlers(options: PromptHandlerOptions): ReadonlyMap
       // 全文读的是「这个请求选中的配置」：`--defaults` 读默认，`--revision N` 读那一版，否则当前。
       const result: PromptTextResult = {
         revision: shown?.revision ?? 0,
-        texts: textsOf(options.deployment, config, caller)
+        texts: textsFor(config, caller)
       }
       return result
     }
@@ -279,7 +298,8 @@ export function createPromptHandlers(options: PromptHandlerOptions): ReadonlyMap
     const raw = request['config'] === undefined ? request : request['config']
     let validated: { readonly config: PromptConfig; readonly dropped: readonly string[] }
     try {
-      validated = validatePromptConfig(raw, versions.config())
+      // 预览与保存是同一份校验（含 §L.6 的体量上限），只是不写库。
+      validated = validatePromptConfig(raw, versions.config(), { maxChars: versions.maxChars() })
     } catch (error) {
       apiErrorOf(error)
     }
@@ -287,7 +307,7 @@ export function createPromptHandlers(options: PromptHandlerOptions): ReadonlyMap
       revision: versions.revision(),
       dropped: [...validated.dropped],
       config: validated.config as PromptConfigView,
-      texts: textsOf(options.deployment, validated.config, caller)
+      texts: textsFor(validated.config, caller)
     }
     return result
   })

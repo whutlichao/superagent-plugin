@@ -11,7 +11,9 @@
 // 依赖纪律（§C.2）：本文件只 import 同层的 `prompts.ts`（纯组装，无 I/O、无时钟），所以
 // Router 与 Executor 都可以用它，而 `app/` 不会反过来依赖它们。
 import {
+  assertWithinLimit,
   composePrompt,
+  DEFAULT_PROMPT_LIMITS,
   promptTextOf,
   type PromptConfig,
   type PromptEnvironment,
@@ -39,6 +41,11 @@ export interface LaunchPromptInput {
   readonly environment: PromptEnvironment
   /** Router 的 Policy 段；Worker 的组装顺序里没有它（§L.3 第 11 步只属于 Router）。 */
   readonly policy?: PromptPolicy
+  /**
+   * 这一份全文的体量上限（§L.6 的 `promptMaxChars`）；省略时用缺省 200 000。末尾的 revision
+   * 说明也算在全文里——交给会话的文本多长，就该比同一个上限。
+   */
+  readonly maxChars?: number
 }
 
 /**
@@ -50,6 +57,8 @@ export interface LaunchPromptSource {
   revision(): number
   /** 当前配置；还没存过时是默认配置（`{}`）。 */
   config(): PromptConfig
+  /** 这一份配置的体量上限（§L.6）；省略时组装用缺省 200 000。 */
+  maxChars?(): number
 }
 
 /** 这一版 revision 的说明，按角色给读法（§F.4、§L.5）。 */export function revisionLines(role: PromptRole, revision: number): readonly string[] {
@@ -77,6 +86,8 @@ export function assembleLaunchPrompt(input: LaunchPromptInput): LaunchPrompt {
     ...promptTextOf(input.config)
   })
   const text = [composed, '', '## Prompt revision', ...revisionLines(input.role, input.revision)].join('\n')
+  // 交给会话的全文受同一个上限（§L.6）：超了就拒绝启动，绝不交一份被截断的提示词。
+  assertWithinLimit(text.length, input.maxChars ?? DEFAULT_PROMPT_LIMITS.maxChars, 'launch prompt')
   return { role: input.role, revision: input.revision, text, length: text.length }
 }
 
