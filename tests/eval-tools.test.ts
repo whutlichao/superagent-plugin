@@ -24,6 +24,7 @@ import type {
 import { FakeCommands } from './support/fake-commands.ts'
 import { createEvalHandlers, withEvalHandlers } from '../src/worker/http/eval.ts'
 import { ROUTE_TABLE, stub } from '../src/worker/http/routes.ts'
+import { ApiError } from '../src/worker/http/errors.ts'
 import { dispatch } from '../src/worker/cli/commands.ts'
 import { parseArgs } from '../src/worker/cli/io.ts'
 import { startTestServer, type TestServer } from './support/cli-server.ts'
@@ -794,6 +795,97 @@ describe('the two routes are wired for router and operator only', () => {
     } finally {
       server.close()
       base.clean()
+    }
+  })
+})
+
+// ---------------------------------------------------------------- §O 的 handler 预算
+
+/**
+ * §O「超时」行：`eval` / `eval-read` 会同步等一次语境读取（单次读取自己有 15 s 的
+ * `admissionContextTimeoutMs`，但 handler 没有总预算）。这里把预算压到 40 ms，断言三件事：
+ * 到点就返回固定码 `unavailable`、取消传到了读取、没有假成功（结果对象根本不存在）。
+ */
+describe('the two eval reads carry the §O handler budgets', () => {
+  /** 一次 handler 调用的输入（与 server 的接线同形）。 */
+  const input = (id: string, query: Record<string, string> = {}) => ({
+    params: { id },
+    query,
+    body: undefined,
+    caller: { role: 'router' as const },
+    at: AT,
+    requestId: null
+  })
+
+  /** 断言一次调用被固定码拒绝（并返回继承下来的取消信号）。 */
+  const refusalOf = async (work: Promise<unknown>): Promise<{ code: string; status: number }> => {
+    try {
+      await work
+    } catch (error) {
+      assert.equal(error instanceof ApiError, true, String(error))
+      const api = error as ApiError
+      return { code: api.code, status: api.status }
+    }
+    throw new Error('expected the call to be refused')
+  }
+
+  test('a hanging eval window returns unavailable inside the budget and cancels the read', async () => {
+    let handed: AbortSignal | undefined
+    let refreshed = 0
+    const handlers = createEvalHandlers({
+      tools: {
+        window: (_id, options) => {
+          handed = options?.signal
+          return new Promise(() => undefined)
+        },
+        read: () => new Promise(() => undefined)
+      },
+      budget: { totalMs: 40 },
+      afterWrite: () => {
+        refreshed += 1
+      }
+    })
+    try {
+      const handler = handlers.get('GET eval/:id')
+      assert.ok(handler)
+      const started = Date.now()
+      const refusal = await refusalOf(Promise.resolve(handler(input('t1'))))
+      const elapsed = Date.now() - started
+      assert.equal(refusal.code, 'unavailable')
+      assert.equal(refusal.status, 503)
+      assert.ok(elapsed < 1_000, `the handler returned after ${elapsed} ms`)
+      // 取消传到了读：真实现把它交给 `CommandsHost.withSignal`（`gh`/`lark-cli` 被 SIGTERM）。
+      assert.equal(handed?.aborted, true, 'the budget signal is aborted')
+      // 超时不是一次读成功：没有刷新、没有部分结果。
+      assert.equal(refreshed, 0)
+    } finally {
+      // 没有要清理的句柄：用例只断言 handler 的预算。
+    }
+  })
+
+  test('a hanging eval-read returns unavailable inside the budget and cancels the read', async () => {
+    let handed: AbortSignal | undefined
+    const handlers = createEvalHandlers({
+      tools: {
+        window: () => new Promise(() => undefined),
+        read: (_id, _request, options) => {
+          handed = options?.signal
+          return new Promise(() => undefined)
+        }
+      },
+      budget: { totalMs: 40 }
+    })
+    try {
+      const handler = handlers.get('GET eval-read/:id')
+      assert.ok(handler)
+      const started = Date.now()
+      const refusal = await refusalOf(Promise.resolve(handler(input('t1', { part: 'thread' }))))
+      const elapsed = Date.now() - started
+      assert.equal(refusal.code, 'unavailable')
+      assert.ok(elapsed < 1_000, `the handler returned after ${elapsed} ms`)
+      assert.equal(handed?.aborted, true, 'the budget signal is aborted')
+    } finally {
+      // 同第一个用例。
     }
   })
 })

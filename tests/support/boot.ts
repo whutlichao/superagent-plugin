@@ -5,7 +5,7 @@
 import { mkdtempSync, readFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { bootPlugin, type BootHandle } from '../../src/worker/boot.ts'
+import { bootPlugin, type BootHandle, type BootOptions } from '../../src/worker/boot.ts'
 import { readRepoJson } from './repo.ts'
 import { FakeOrcaRuntime } from './fake-orca-runtime.ts'
 import { FakeCommands } from './fake-commands.ts'
@@ -73,6 +73,8 @@ export async function openBoot(options: {
    */
   readonly scripts?: (commands: FakeCommands) => void
   readonly boot?: (stateDir: string, runtime: FakeOrcaRuntime, commands: FakeCommands) => Promise<BootHandle>
+  /** §O 的 handler 预算（测试注入小预算；缺省是各 handler 的常量）。 */
+  readonly budgets?: BootOptions['budgets']
 } = {}): Promise<BootHarness> {
   const stateDir = options.stateDir ?? mkdtempSync(join(tmpdir(), 'superagent-boot-'))
   const worktrees = mkdtempSync(join(tmpdir(), 'superagent-worktrees-'))
@@ -103,7 +105,9 @@ export async function openBoot(options: {
       // 假 CLI 必须真的进组合根：否则 poll 会跑操作者机器上的真 `gh`（§I.6）。
       commands,
       stateDir,
-      disableTimers: true
+      disableTimers: true,
+      // §O 的预算：测试用小预算，面板与 HTTP 走同一份（面板请求也不能占住 worker）。
+      ...(options.budgets === undefined ? {} : { budgets: options.budgets })
     }))
   return {
     handle,

@@ -25,15 +25,27 @@ export interface ManualBackup {
 }
 
 /**
+ * 一次手工备份将落到哪个文件（§G.2 的 `admin backup`、§D.5 的 `backups/`）：文件名只由库版本
+ * 与这次备份的时刻决定，所以把 VACUUM 交给 effect 之后，命令仍能立刻告诉人它将要落到哪里。
+ * 与迁移前备份同形（`superagent-<version>-<timestamp>`），`pruneBackups` 一并管理。
+ */
+export function backupPath(store: Store, at: string): string {
+  const schema = store.schemaVersion()
+  return join(store.backupDir, `superagent-${schema}-${at.replaceAll(':', '-')}.sqlite`)
+}
+
+/**
  * 立刻把当前库复制到 `<stateDir>/backups/superagent-<schema>-<ts>.sqlite`，并保留最近五份。
  * 文件名与迁移前备份同形（`superagent-<version>-<timestamp>`），`pruneBackups` 一并管理。
  *
  * 失败抛 `Error`（`VACUUM INTO` 的失败原因只留错误名）：调用方是 CLI 的 `admin backup`，
  * 它把失败报成 `internal`，不把 SQL 细节回给调用者（§N.5）。
+ *
+ * VACUUM 是**同步**的（§O「长活进 effect」）：HTTP handler 不直接调它，而是入队一行 `backup`
+ * effect（`boot.ts` 的 handler）；本函数由那个 handler 与迁移路径调用。
  */
 export function backupNow(store: Store, at: string): ManualBackup {
-  const schema = store.schemaVersion()
-  const path = join(store.backupDir, `superagent-${schema}-${at.replaceAll(':', '-')}.sqlite`)
+  const path = backupPath(store, at)
   // 参数绑定：路径不参与 SQL 拼接（§O 命令注入的同一条纪律，只是这里是 SQL 不是 shell）。
   store.sql.run('VACUUM INTO ?', [path])
   const kept = pruneBackups(store.backupDir, KEEP_BACKUPS)

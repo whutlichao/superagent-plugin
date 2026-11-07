@@ -34,6 +34,7 @@ const GROUP_OF: Readonly<Record<string, HealthGroupKey>> = {
   notice: 'effects',
   reply: 'effects',
   return: 'effects',
+  backup: 'effects',
   worker: 'executor',
   router: 'router',
   sources: 'sources',

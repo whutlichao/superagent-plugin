@@ -60,6 +60,7 @@ import {
 } from './app/settings-view.ts'
 import type { SettingsSourceInput } from './app/settings-view.ts'
 import { ApiError } from './http/errors.ts'
+import { refuseOnDeadline } from './http/budget.ts'
 import { SETTINGS_HISTORY_LIMIT } from './http/api-types.ts'
 import type { SettingsSaveView } from './http/api-types.ts'
 import { runDoctor } from './app/doctor.ts'
@@ -126,7 +127,10 @@ import { notePluginVersion } from './app/upgrade.ts'
 import { createSourceContext } from './app/source-context.ts'
 import { createSetupState, issuesOf, runSetupChecks } from './app/setup.ts'
 import type { SetupBudget, SetupCheckInput, SetupIssue, SetupProblem, SetupReport } from './app/setup.ts'
-import type { ProbeBudget } from './infra/deadline.ts'
+import { withDeadline, type HandlerBudget, type ProbeBudget } from './infra/deadline.ts'
+import { backupNow, backupPath } from './app/backup.ts'
+import { DOCTOR_BUDGET, SETUP_CHECK_BUDGET, SOURCE_LABELS_BUDGET } from './http/ops.ts'
+import { POLICY_SYNC_BUDGET } from './http/settings.ts'
 import {
   SourceRegistry,
   type ResolvedSourceInstance,
@@ -241,6 +245,26 @@ export interface BootOptions {
   /** 覆盖 Source 的 `pollSeconds`（测试用；生产读配置）。 */
   readonly pollIntervalMs?: number
   readonly preferredPort?: number
+  /** §O 的面板路径预算（测试注入小预算；生产读各 handler 的缺省常量）。 */
+  readonly budgets?: BootBudgets
+}
+
+/**
+ * 面板 host 方法与 HTTP 共用的 §O 预算（§O「超时」行：面板请求同样不能占住 worker）。
+ * 每一项缺省就是对应 handler 的常量（`DOCTOR_BUDGET`、`SOURCE_LABELS_BUDGET`、
+ * `POLICY_SYNC_BUDGET`、`SETTINGS_SAVE_BUDGET`）；测试给一份小的，断言「到点就返回」。
+ */
+export interface BootBudgets {
+  /** 面板的「检查一次」（与 `POST setup/check` 同一份接线）。 */
+  readonly setupCheck?: HandlerBudget
+  /** 面板的 `doctor`（与 `POST doctor` 同一份接线）。 */
+  readonly doctor?: HandlerBudget
+  /** 面板的「刷新显示名」（与 `POST sources/:id/labels` 同一次读取）。 */
+  readonly sourceLabels?: HandlerBudget
+  /** 面板的「立即同步」（与 `POST policy-sync/:id` 同一个驱动器）。 */
+  readonly policySync?: HandlerBudget
+  /** 面板的「保存」（走 `PUT settings/:block`，包含它的账号探针预算）。 */
+  readonly settingsSave?: HandlerBudget
 }
 
 /** 组合根交给 `main.ts` 的句柄。 */
@@ -326,13 +350,13 @@ export interface BootHandle {
   /** 移除一张工单的 worktree（§E.1「清理」，破坏性；面板先要人确认）。 */
   removeTicketWorkspace(ticketId: string): Promise<void>
   /**
-   * `superagent setup check`（§G.2）：重跑探针、把结论应用到各部分并重新武装挂起的循环，
-   * **不重启 Orca**。`checked: false` 表示检查时本来就没有问题——没有可检查的东西。
+   * 面板的「检查一次」（§G.2 的 `setup check`）：重跑探针、把结论应用到各部分并重新武装挂起
+   * 的循环，**不重启 Orca**。`checked: false` 表示检查时本来就没有问题——没有可检查的东西。
    *
-   * `budget` 只在 HTTP handler 里给（§O 的时间预算）：探针到点被取消、整次检查随之放弃，
-   * 半份结论**不**会被 `apply`。
+   * 与 `POST setup/check` **同一份接线、同一条预算**（§O：一条探针 2 s、整次 9 s）：到点先
+   * 取消探针再回固定码 `unavailable`，半份结论**不**会被 `apply`（面板按钮同样不能占住 worker）。
    */
-  checkSetup(budget?: SetupBudget): Promise<SetupCheckOutcome>
+  checkSetup(): Promise<SetupCheckOutcome>
   /** Deployment 页的读数（§M.3）：setup 问题、状态目录、机器限额、暂停、health 与 Router。 */
   deployment(): DeploymentView
   /**
@@ -342,15 +366,21 @@ export interface BootHandle {
   sources(): SourcePageView
   /** 打开/关闭一个 Source（写 `source:<id>` 的 `enabled` 并立即生效），返回写后的读数。 */
   setSourceEnabled(sourceId: string, enabled: boolean): SourcePageView
-  /** 「立即同步」一个 Source 的允许名单（§I.3）；不能同步时拒绝。 */
+  /**
+   * 面板的「立即同步」（§I.3）：与 `superagent policy sync` 同一个驱动器；不能同步时拒绝。
+   * 与 HTTP 同一条 §O 预算：面板请求同样不能占住 worker（到点取消读并回 `unavailable`）。
+   */
   syncSource(sourceId: string): Promise<{ readonly allowed: number }>
-  /** 重读一个 Source 的行键显示名（§G.2 的 `source labels`）；Kind 没有这个能力时拒绝。 */
+  /**
+   * 重读一个 Source 的行键显示名（§G.2 的 `source labels`）；Kind 没有这个能力时拒绝。
+   * 与 HTTP 同一条 §O 预算（单条探针 2 s、整次 5 s）：到点取消读，名单原样留着。
+   */
   refreshSourceLabels(sourceId: string): Promise<{ readonly added: number; readonly total: number }>
   /**
-   * doctor 的八项诊断（§G.2、§N.4）：与 HTTP 的 `POST doctor` 同一份接线。`budget` 是这次请求的
-   * 探针上限与取消线（§O）；面板路径不给（探针不限时，与 #64 之前逐字一致）。
+   * doctor 的八项诊断（§G.2、§N.4）：与 HTTP 的 `POST doctor` 同一份接线与**同一条预算**
+   * （单条 CLI 探针 2 s、整次 9 s，§O）——面板请求同样不能占住 worker。
    */
-  doctor(budget?: ProbeBudget): Promise<DoctorResult>
+  doctor(): Promise<DoctorResult>
   /**
    * Prompts 组的一次读数（§M.3）：当前版本与配置、每个分片的内置正文与占位符、
    * default-updated 的详情、历史、技能文件，以及「已保存 / 默认」两份全文。
@@ -713,6 +743,40 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
   }
   const doctorNow = (budget?: ProbeBudget): Promise<DoctorResult> =>
     runDoctor(budget === undefined ? doctorOptions : { ...doctorOptions, budget })
+  /**
+   * 面板的「检查一次」（§G.2、§N.1、§O）：与 `POST setup/check` **同一份接线、同一条预算**
+   * （一条探针 2 s、整次 9 s）。面板按钮与命令走同一次重跑，没有总预算时一个挂住的 `gh`
+   * 就把这个请求按在 60 s 的命令超时上，而且这一轮结论一半都不会 `apply`。
+   */
+  const panelCheckSetup = (): Promise<SetupCheckOutcome> => {
+    const budget = options.budgets?.setupCheck ?? SETUP_CHECK_BUDGET
+    const probeMs = budget.probeMs
+    return refuseOnDeadline(
+      withDeadline(
+        (signal) =>
+          checkSetup({ ...(probeMs === undefined ? {} : { probeMs }), signal }),
+        { ms: budget.totalMs, what: 'the setup check' }
+      ),
+      { reason: 'timeout' }
+    )
+  }
+  /**
+   * 面板的 `doctor`（§M.3 的 Deployment 组）：与 `POST doctor` **同一份接线、同一条预算**
+   * （单条探针 2 s、整次 9 s，§O）。没有总预算时一个挂住的探针就把面板的「运行诊断」按在
+   * 那里的 60 s 命令超时上——面板与 HTTP 一样不能把 worker 占住。
+   */
+  const panelDoctor = (): Promise<DoctorResult> => {
+    const budget = options.budgets?.doctor ?? DOCTOR_BUDGET
+    const probeMs = budget.probeMs
+    return refuseOnDeadline(
+      withDeadline(
+        (signal) =>
+          doctorNow({ ...(probeMs === undefined ? {} : { probeMs }), signal }),
+        { ms: budget.totalMs, what: 'the doctor checks' }
+      ),
+      { reason: 'timeout' }
+    )
+  }
   const githubInstance = githubInstanceOf({ raw: settings, stored: githubStored })
   const feishuCli = feishuCliOf(rawSources)
   const setupInput = (): SetupCheckInput => ({
@@ -1017,6 +1081,17 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
   const relayHandlers = routerRelay.handlers()
   effects.handle('relay', relayHandlers.relay)
   effects.handle('notice', relayHandlers.notice)
+  // `backup` effect（§O「长活进 effect」、§G.2 的 `admin backup`）：VACUUM 是同步的，绝不在一
+  // 个 HTTP handler 里跑。handler 只入队一行，本 handler 在队列的调度里做；先让出一拍再动手，
+  // 让已经排好的 I/O（那一个响应）先写出去——否则同一条事件循环被 VACUUM 按住的时长一样长。
+  effects.handle('backup', async (payload) => {
+    await new Promise<void>((resolve) => {
+      setImmediate(() => {
+        resolve()
+      })
+    })
+    backupNow(store, payload.at)
+  })
   routerRelay.prune()
 
   const assessor = createDeterministicAssessor({
@@ -1310,8 +1385,16 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
     // 拒绝时整条命令落成固定码 `pr_mismatch`。没有 GitHub Source 时无从判归属，不接线。
     ...(githubReady
       ? {
-          claimPull: (ticketId: string, pull: { readonly number: number }) =>
-            claimReportedPull(pullHost, ticketId, pull.number)
+          claimPull: (ticketId: string, pull: { readonly number: number }, probe) =>
+            claimReportedPull(
+              // §O：这次 PR 读在 handler 的预算里跑——信号绑到一个只属于这次调用的 API 上
+              // （`gh` 因此被 SIGTERM）；没有预算时用启动时那一份，行为与 #64 之前一致。
+              probe?.signal === undefined
+                ? pullHost
+                : { ...pullHost, api: createGithubApi(commandPort.withSignal(probe.signal), githubCli) },
+              ticketId,
+              pull.number
+            )
         }
       : {}),
     idempotent,
@@ -1437,6 +1520,10 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
   let policySyncDriver: PolicySync | null = null
   const settingsHandlers = createSettingsHandlers({
     settings: settingsWriter,
+    // §O：面板的「保存」也走这条 handler，所以同一份预算兜住两条路（测试注入小的）。
+    ...(options.budgets?.settingsSave === undefined
+      ? {}
+      : { settingsSaveBudget: options.budgets.settingsSave }),
     validate: (name) => {
       if (parseSettingsBlock(name) === undefined) return undefined
       return (value: unknown) =>
@@ -1470,12 +1557,14 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
     },
     // 账号类字段的写前 setup 检查（§K.8）：按候选值跑 #44 的探针，只回 github 那一组问题
     // （repository / CLI 账号）；不写 gitconfig、不改任何设置。
-    checkAccount: async (candidate) => {
+    checkAccount: async (candidate, budget) => {
       const report = await runSetupChecks({
         ...setupInput(),
         ...(candidate.repository === undefined ? {} : { repository: candidate.repository }),
         ...(candidate.cli === undefined ? {} : { githubCli: candidate.cli }),
-        gitConfig: undefined
+        gitConfig: undefined,
+        // §O：handler 定的探针上限与取消线只加在这次写前检查上（启动路径没有预算）。
+        ...(budget === undefined ? {} : { budget })
       })
       return issuesOf(report.issues, 'github')
     },
@@ -1575,6 +1664,12 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
           }
           throw error
         }
+      },
+      // `admin backup`（§G.2、§O）：VACUUM 入队，handler 立刻回它将要落到的路径——
+      // 这条命令不再把 worker（和它自己的响应）按在磁盘上。
+      backup: (at) => {
+        effects.enqueue('backup', at, { at })
+        return { queued: true as const, path: backupPath(store, at), at }
       }
     },
     log: (line) => logger.info('http request', { method: line.method, path: line.path, status: line.status, ms: line.ms })
@@ -2056,7 +2151,13 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
     return sourcePage(sourceViewHost())
   }
 
-  /** 「立即同步」（§I.3）：与 `superagent policy sync` 同一个驱动器；不能同步时它自己拒绝。 */
+  /**
+   * 「立即同步」（§I.3）：与 `superagent policy sync` 同一个驱动器；不能同步时它自己拒绝。
+   *
+   * §O：与 `POST policy-sync/:id` 同一条预算（整次 8 s）。面板按钮与命令是同一次多页读取，
+   * 到点先取消（信号经驱动器的退避链进 kind 的 `lark-cli`），再回固定码 `unavailable`；
+   * 半份名单不落库（驱动只在读完后保存）。
+   */
   const syncSource = async (id: string): Promise<{ readonly allowed: number }> => {
     requireSource(id)
     if (policySyncDriver === null) {
@@ -2064,7 +2165,14 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
         code: 'invalid_params'
       })
     }
-    const part = await policySyncDriver.sync(id)
+    const budget = options.budgets?.policySync ?? POLICY_SYNC_BUDGET
+    const part = await refuseOnDeadline(
+      withDeadline((signal) => policySyncDriver.sync(id, signal), {
+        ms: budget.totalMs,
+        what: `the ${id} policy sync`
+      }),
+      { source: id, reason: 'timeout' }
+    )
     const allowed = Array.isArray(part['allowed']) ? part['allowed'].length : 0
     refresh()
     return { allowed }
@@ -2122,11 +2230,27 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
   const refreshSourceLabels = async (
     id: string
   ): Promise<{ readonly added: number; readonly total: number }> => {
+    // §O：与 `POST sources/:id/labels` 同一条预算（单条探针 2 s、整次 5 s）；到点先取消读，
+    // 再回固定码 `unavailable`（面板按 `code` 翻译），上一次的名单原样留着。
+    const budget = options.budgets?.sourceLabels ?? SOURCE_LABELS_BUDGET
+    const probeMs = budget.probeMs
     try {
-      const { added, total } = await refreshedLabels(id)
+      const { added, total } = await refuseOnDeadline(
+        withDeadline(
+          (signal) => refreshedLabels(id, signal),
+          {
+            // 与 `withinBudget` 同一条规则：探针上限比总预算更紧时，它就是真正到点的那条线。
+            ms: probeMs === undefined || probeMs >= budget.totalMs ? budget.totalMs : probeMs,
+            what: `the ${id} label read`
+          }
+        ),
+        { source: id, reason: 'timeout' }
+      )
       refresh()
       return { added, total }
     } catch (error) {
+      // 预算的固定拒绝（`unavailable`）原样上去：它不是「参数不对」，面板该说「稍后重试」。
+      if (error instanceof ApiError) throw error
       throw Object.assign(new Error(stringOf(error)), { code: 'invalid_params' })
     }
   }
@@ -2511,7 +2635,7 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
       const workspace = await ticketWorkspaceOf(ticketId)
       await options.runtime.removeWorkspace(workspace)
     },
-    checkSetup,
+    checkSetup: panelCheckSetup,
     // Source 页（§M.2）：每个配置过的 Source 一张卡，读数来自注册表、健康板与 outbox。
     sources: () => sourcePage(sourceViewHost()),
     setSourceEnabled,
@@ -2527,7 +2651,7 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
         health: board.all(),
         router: routerSupervision.snapshot()
       }),
-    doctor: doctorNow,
+    doctor: panelDoctor,
     // Prompts 组（§M.3）：读一份、预览草稿、保存、恢复——全部走 `app/prompt-view.ts` 的
     // 同一份校验，面板不重算任何规则。
     promptPanel: (): PanelPromptsView => promptPanelView(promptPanelOptions()),

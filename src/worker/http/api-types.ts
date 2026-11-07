@@ -48,11 +48,23 @@ export interface SourceLabelsResult {
   readonly labels: Readonly<Record<string, string>>
 }
 
-/** `admin backup` 的结果：备份文件与触发方式（§G.2 的 admin backup）。 */
+/**
+ * `admin backup` 的结果（§G.2 的 admin backup、§O）：
+ * - 同步做完（没有队列的裸服务器）：`path` / `at` / `bytes`；
+ * - 入队（组合根）：`queued: true` 与它将要落到的 `path`（文件名只由库版本与时刻决定），
+ *   `bytes` 省略——文件还没写（VACUUM 由 `backup` effect 跑）。
+ */
 export interface BackupResult {
   readonly path: string
   readonly at: string
-  readonly bytes: number
+  /**
+   * 已经落盘的大小（字节）；入队返回时不出现（文件还没写）。同样只在同步做完时给。
+   */
+  readonly bytes?: number
+  /** 清理后仍然保留的备份（从旧到新）；同步做完时给，入队返回时不出现。 */
+  readonly kept?: readonly string[]
+  /** `true` = VACUUM 已入队，稍后由 effect 跑完（§O：不在 handler 里跑）。 */
+  readonly queued?: true
 }
 
 /** `admin rotate-token` 的结果：写回的文件与旧 token 是否已作废（破坏性，需 `--yes`）。 */

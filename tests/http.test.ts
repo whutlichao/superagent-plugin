@@ -57,14 +57,21 @@ import { createRepositories } from '../src/worker/app/repositories'
 import { SCHEMA_VERSION } from '../src/worker/app/schema'
 import { runIdempotent } from '../src/worker/http/idempotency'
 import { createDecisionHandlers, withDecisionHandlers } from '../src/worker/http/decisions'
-import { POLICY_SYNC_BUDGET, createSettingsHandlers, withSettingsHandlers } from '../src/worker/http/settings'
+import {
+  POLICY_SYNC_BUDGET,
+  SETTINGS_SAVE_BUDGET,
+  createSettingsHandlers,
+  withSettingsHandlers
+} from '../src/worker/http/settings'
 import { DOCTOR_BUDGET, SETUP_CHECK_BUDGET, SOURCE_LABELS_BUDGET } from '../src/worker/http/ops'
 import type { OpsPorts } from '../src/worker/http/ops'
 import type { SetupBudget } from '../src/worker/app/setup-types'
 import { createSettings } from '../src/worker/app/settings'
 import type { Decision, Thread, Ticket } from '../src/worker/core/model'
 import type { Trigger } from '../src/worker/core/model'
-import { createReadHandlers, withReadHandlers } from '../src/worker/http/read'
+import { READ_BUDGET, createReadHandlers, withReadHandlers } from '../src/worker/http/read'
+import { EVAL_READ_BUDGET } from '../src/worker/http/eval'
+import { REPORT_BUDGET, createDomainHandlers } from '../src/worker/http/domain'
 import { createReadTools } from '../src/worker/app/read'
 import { FakeCommands, cliFailure } from './support/fake-commands'
 import { createTestViewTools } from './support/view-host'
@@ -896,6 +903,123 @@ test('a hanging source-labels read returns unavailable inside the budget, cancel
     assert.deepEqual(harness.store.kvKeys(), before)
   } finally {
     harness.close()
+  }
+})
+
+test('the eval, resource, report and settings budgets stay under the §O ceiling too', () => {
+  // 同一张表（`docs/design` §O 的超时行）：每个端点的预算都在 10 s 之下；有探针的比总预算更紧。
+  assert.ok(EVAL_READ_BUDGET.totalMs < 10_000, 'eval reads finish inside ten seconds')
+  assert.equal(EVAL_READ_BUDGET.probeMs, undefined, 'eval reads have one external call per load')
+  assert.ok(READ_BUDGET.totalMs < 10_000, 'resource reads finish inside ten seconds')
+  assert.equal(REPORT_BUDGET.probeMs, 2_000, 'the PR read gets the same 2 s probe cap')
+  assert.ok(REPORT_BUDGET.totalMs < 10_000, 'report finishes inside ten seconds')
+  assert.equal(SETTINGS_SAVE_BUDGET.probeMs, 2_000)
+  assert.ok(SETTINGS_SAVE_BUDGET.totalMs < 10_000, 'a settings save finishes inside ten seconds')
+})
+
+test('a hanging resource read returns unavailable inside the budget, cancels the read and writes nothing', async () => {
+  let handed: { readonly signal?: AbortSignal; readonly resource?: string } | undefined
+  const harness = await startHarness({
+    routes: (store) =>
+      withReadHandlers(
+        ROUTE_TABLE,
+        createReadHandlers({
+          // 一个永不返回的 Source 读（真实现里信号进 `execFile`，`gh`/`lark-cli` 被 SIGTERM）。
+          tools: {
+            read: (request) => {
+              handed = {
+                resource: request.resource,
+                ...(request.signal === undefined ? {} : { signal: request.signal })
+              }
+              return new Promise(() => undefined)
+            }
+          },
+          views: createTestViewTools(store),
+          budget: { totalMs: 40 }
+        })
+      )
+  })
+  try {
+    const before = [...harness.store.kvKeys()]
+    const started = Date.now()
+    // 资源名整段百分号编码（§G.3）：`github/issues/42` 是一个 `:resource`。
+    const observed = await harness.call('/superagent/api/read/github%2Fissues%2F42')
+    const elapsed = Date.now() - started
+    assert.equal(observed.status, 503)
+    const error = failureOf(observed)
+    assert.equal(error.code, 'unavailable')
+    assert.ok(error.message.includes('retry later'), error.message)
+    assert.ok(elapsed < 1_000, `the handler returned after ${elapsed} ms`)
+    // 取消传到了读取：真实现把它交给 `CommandsHost.withSignal`。
+    assert.equal(handed?.resource, 'github/issues/42')
+    assert.equal(handed?.signal?.aborted, true, 'the budget signal is aborted')
+    // 超时的读什么都不写（读面本来不写库；这里断言它也没有偷偷写）。
+    assert.deepEqual(harness.store.kvKeys(), before)
+  } finally {
+    harness.close()
+  }
+})
+
+test('a hanging PR read on report returns unavailable inside the budget, cancels the read and writes no report', async () => {
+  let handed: { readonly signal?: AbortSignal; readonly timeoutMs?: number } | undefined
+  // 只接 `report` 的领域接线：其余端口一律「不该被碰到」——被碰到就是红灯。
+  const unused = (): never => {
+    throw new Error('this port is not part of the report budget')
+  }
+  const domain = createDomainHandlers({
+    report: unused,
+    reply: unused,
+    note: unused,
+    requestStatus: unused,
+    handback: unused,
+    stop: unused,
+    retry: unused,
+    reevaluate: unused,
+    unsubscribe: unused,
+    markUnrelated: unused,
+    followForContext: unused,
+    threadOf: unused,
+    triggerOf: unused,
+    owners: unused,
+    ticketOf: unused,
+    tickets: unused,
+    claimPull: (_ticketId, _pull, options) => {
+      handed = { ...(options?.signal === undefined ? {} : { signal: options.signal }), ...(options?.timeoutMs === undefined ? {} : { timeoutMs: options.timeoutMs }) }
+      return new Promise(() => undefined)
+    },
+    reportBudget: { probeMs: 10, totalMs: 40 }
+  })
+  const handler = domain.get('POST report')
+  assert.ok(handler)
+  try {
+    const started = Date.now()
+    // `--pr-number` 的读先跑：它挂住，报告就不该写。
+    let refusal: ApiError | undefined
+    try {
+      await Promise.resolve(
+        handler({
+          params: {},
+          query: {},
+          body: { state: 'waiting', summary: 'waiting for the next request', prNumber: '7' },
+          caller: { role: 'assignment', ticketId: 'ticket-1' },
+          at: STARTED_AT,
+          requestId: null
+        })
+      )
+    } catch (error) {
+      assert.equal(error instanceof ApiError, true, String(error))
+      refusal = error as ApiError
+    }
+    const elapsed = Date.now() - started
+    assert.equal(refusal?.code, 'unavailable')
+    assert.equal(refusal?.status, 503)
+    assert.ok(refusal?.message.includes('retry later'), refusal?.message)
+    assert.ok(elapsed < 1_000, `the handler returned after ${elapsed} ms`)
+    // 取消与上限都传给了读（真实现把它们接到 `gh` 的 `execFile` 上）。
+    assert.equal(handed?.timeoutMs, 10)
+    assert.equal(handed?.signal?.aborted, true, 'the budget signal is aborted')
+  } finally {
+    // 没有句柄要关：这次调用没有落库、也没有起服务器。
   }
 })
 

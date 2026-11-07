@@ -192,7 +192,7 @@ export const CLI_COMMANDS: readonly CommandDefinition[] = [
   },
   {
     name: ['admin', 'backup'],
-    summary: 'back up the database now (before an upgrade)',
+    summary: 'back up the database now (before an upgrade); the copy is written right after the command returns',
     flags: [REQUEST_ID_FLAG],
     positionals: [],
     write: true,

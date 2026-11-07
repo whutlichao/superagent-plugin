@@ -106,6 +106,7 @@ const DESIGN_ENTRIES = [
   'notice',
   'reply',
   'return',
+  'backup',
   'worker',
   'router',
   'github',

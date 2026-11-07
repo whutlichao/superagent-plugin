@@ -14,7 +14,9 @@
 // 依赖纪律（§C.2）：本文件在 `http/`，只 import 同目录的 `ApiError`/路由类型与 `app/` 的读面；
 // 不读存储、不做 I/O、不 spawn。
 import { ApiError, ERROR_CODES } from './errors.ts'
+import { refuseOnDeadline } from './budget.ts'
 import type { RouteDefinition, RouteHandler, RouteInput } from './routes.ts'
+import { withDeadline, type HandlerBudget } from '../infra/deadline.ts'
 import {
   READ_SOURCE_RESOURCES,
   type ReadRefusal,
@@ -24,10 +26,22 @@ import {
 } from '../app/read.ts'
 import type { ViewReadTools } from '../app/views/read.ts'
 
+/**
+ * `read <resource>` 的时间预算（§O「超时」行）：整次 9 s。
+ *
+ * 一次读是**一条**外部读（`gh api …` 或 `lark-cli …`，命令级超时 60 s，但 handler 不能陪它等）：
+ * 到点先取消（信号经 `ReadRequest.signal` → `CommandsHost.withSignal` → `execFile`，子进程被
+ * SIGTERM），再返回固定码 `unavailable` + 「稍后重试」。读面没有部分结果（一次读要么给页要么
+ * 给固定拒绝），所以取消不会留下半页。图读（overview/sources/…）是本地库读，不进这条预算。
+ */
+export const READ_BUDGET: HandlerBudget = { totalMs: 9_000 }
+
 /** handler 的接线：Source 读面与视图读面（组合根注入各自的产物；测试用替身或真库）。 */
 export interface ReadHandlerOptions {
   readonly tools: ReadTools
   readonly views: ViewReadTools
+  /** `read <resource>` 的预算（§O）；缺省 `READ_BUDGET`，测试注入小预算。 */
+  readonly budget?: HandlerBudget
 }
 
 /** 一个查询参数：缺省或空串都是「没给」。 */
@@ -90,17 +104,27 @@ function readViewOf(result: ReadResult): ReadView {
  */
 export function createReadHandlers(options: ReadHandlerOptions): ReadonlyMap<string, RouteHandler> {
   const handlers = new Map<string, RouteHandler>()
+  const budget = options.budget ?? READ_BUDGET
 
   handlers.set('GET read/:resource', async (input) => {
     const offset = countParam(input.query, 'offset')
     const limit = countParam(input.query, 'limit')
-    const result = await options.tools.read({
-      resource: resourceOf(input),
-      role: input.caller.role,
-      ...(input.caller.ticketId === undefined ? {} : { ticketId: input.caller.ticketId }),
-      ...(offset === undefined ? {} : { offset }),
-      ...(limit === undefined ? {} : { limit })
-    })
+    const resource = resourceOf(input)
+    const result = await refuseOnDeadline(
+      withDeadline(
+        (signal) =>
+          options.tools.read({
+            resource,
+            role: input.caller.role,
+            signal,
+            ...(input.caller.ticketId === undefined ? {} : { ticketId: input.caller.ticketId }),
+            ...(offset === undefined ? {} : { offset }),
+            ...(limit === undefined ? {} : { limit })
+          }),
+        { ms: budget.totalMs, what: `the ${resource} read` }
+      ),
+      { resource, reason: 'timeout' }
+    )
     // 固定拒绝原样落成信封里的 `error.code`；状态码由码族决定（§G.3 第 8 条）。
     return readViewOf(result)
   })

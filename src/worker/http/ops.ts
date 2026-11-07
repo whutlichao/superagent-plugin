@@ -14,9 +14,10 @@
 // 依赖纪律（§C.2）：本文件在 `http/` 里，只 import `app/`、`infra/` 与同目录的兄弟模块；
 // 不 import `sources/`（Source 端口由组合根注入），也不起子进程（doctor 的 runner 同样注入）。
 import { ApiError, ERROR_CODES } from './errors.ts'
+import { refuseOnDeadline } from './budget.ts'
 import { runWrite } from './idempotency.ts'
 import type { RouteDefinition, RouteHandler } from './routes.ts'
-import { DeadlineError, withinBudget, withDeadline, type HandlerBudget, type ProbeBudget } from '../infra/deadline.ts'
+import { withinBudget, withDeadline, type HandlerBudget, type ProbeBudget } from '../infra/deadline.ts'
 import type { SetupBudget } from '../app/setup-types.ts'
 import { rotateApiToken } from '../infra/tokens.ts'
 import { backupNow } from '../app/backup.ts'
@@ -76,6 +77,12 @@ export interface OpsPorts {
   readonly doctorBudget?: HandlerBudget
   /** `source labels` 的时间预算（§O）；缺省 `SOURCE_LABELS_BUDGET`，测试注入小预算。 */
   readonly sourceLabelsBudget?: HandlerBudget
+  /**
+   * `admin backup` 的入队口（§O「长活进 effect」）：组合根把 VACUUM 放进 `backup` effect 并立刻
+   * 返回它将要落到的路径；缺省（没有队列的裸服务器与测试）照旧同步做一次——`app/backup.ts`
+   * 的同一份实现，不另写一条备份路径。
+   */
+  readonly backup?: (at: string) => BackupResult
 }
 
 /**
@@ -179,10 +186,15 @@ export function createOpsHandlers(options: {
   }
 
   // ---- admin backup（§G.2）：立即备份（升级前手工调用）。
+  // §O「长活进 effect」：VACUUM 是**同步**的，在 handler 里跑会把整个 worker（以及这一个
+  // 请求的响应）按在磁盘上。组合根给的 `backup` 端口只入队一行 `backup` effect 并回它将要
+  // 落到的路径；没有队列的裸服务器（测试）照旧同步做一次。两种情形都是同一份 `backupNow`。
+  const backup = options.ports?.backup
   handlers.set('POST admin/backup', ({ at, body, token, requestId }) =>
-    idempotent(options.store, requestId ?? requestIdFrom(body), at, token, () => {
-      const result: BackupResult = backupNow(options.store, at)
-      return result
+    idempotent(options.store, requestId ?? requestIdFrom(body), at, token, (): BackupResult => {
+      if (backup !== undefined) return backup(at)
+      const saved = backupNow(options.store, at)
+      return { path: saved.path, at: saved.at, bytes: saved.bytes, kept: saved.kept }
     })
   )
 
@@ -243,27 +255,21 @@ export function createOpsHandlers(options: {
   }
   const doctorPort = options.ports?.doctor
   const doctorBudget = options.ports?.doctorBudget ?? DOCTOR_BUDGET
-  handlers.set('POST doctor', async () => {
-    const probeMs = doctorBudget.probeMs
-    return withDeadline(
-      (signal) => {
-        const budget: ProbeBudget = { ...(probeMs === undefined ? {} : { probeMs }), signal }
-        return doctorPort === undefined
-          ? runDoctor({ ...doctorOptions, budget })
-          : doctorPort(budget)
-      },
-      { ms: doctorBudget.totalMs, what: 'the doctor checks' }
-    ).catch((error: unknown) => {
-      if (error instanceof DeadlineError) {
-        throw new ApiError(
-          ERROR_CODES.unavailable,
-          `The doctor checks did not finish within ${doctorBudget.totalMs} ms; retry later`,
-          { reason: 'timeout' }
-        )
-      }
-      throw error
-    })
-  })
+  const probeMs = doctorBudget.probeMs
+  handlers.set('POST doctor', () =>
+    refuseOnDeadline(
+      withDeadline(
+        (signal) => {
+          const budget: ProbeBudget = { ...(probeMs === undefined ? {} : { probeMs }), signal }
+          return doctorPort === undefined
+            ? runDoctor({ ...doctorOptions, budget })
+            : doctorPort(budget)
+        },
+        { ms: doctorBudget.totalMs, what: 'the doctor checks' }
+      ),
+      { reason: 'timeout' }
+    )
+  )
 
   return handlers
 }
@@ -295,23 +301,17 @@ function setupCheckWithin(
   budget: HandlerBudget
 ): ReturnType<SetupCheckPort> {
   const probeMs = budget.probeMs
-  return withDeadline(
-    (signal) =>
-      port({
-        signal,
-        ...(probeMs === undefined ? {} : { probeMs })
-      }),
-    { ms: budget.totalMs, what: 'the setup check' }
-  ).catch((error: unknown) => {
-    if (error instanceof DeadlineError) {
-      throw new ApiError(
-        ERROR_CODES.unavailable,
-        `The setup check did not finish within ${budget.totalMs} ms; retry later`,
-        { reason: 'timeout' }
-      )
-    }
-    throw error
-  })
+  return refuseOnDeadline(
+    withDeadline(
+      (signal) =>
+        port({
+          signal,
+          ...(probeMs === undefined ? {} : { probeMs })
+        }),
+      { ms: budget.totalMs, what: 'the setup check' }
+    ),
+    { reason: 'timeout' }
+  )
 }
 
 /**
@@ -328,16 +328,9 @@ function labelsWithin(
   budget: HandlerBudget
 ): Promise<Record<string, string>> {
   const what = `the ${source} label read`
-  const ms = budget.probeMs ?? budget.totalMs
-  return withinBudget((signal) => port(source, at, signal), budget, what).catch((error: unknown) => {
-    if (error instanceof DeadlineError) {
-      throw new ApiError(
-        ERROR_CODES.unavailable,
-        `The ${source} label read did not finish within ${ms} ms; retry later`,
-        { source, reason: 'timeout' }
-      )
-    }
-    throw error
+  return refuseOnDeadline(withinBudget((signal) => port(source, at, signal), budget, what), {
+    source,
+    reason: 'timeout'
   })
 }
 

@@ -105,6 +105,11 @@ export interface ReadRequest {
   readonly offset?: number | undefined
   /** 一页的大小：列表页是条数（≤ 50），文本页是字符数（≤ 8000）。 */
   readonly limit?: number | undefined
+  /**
+   * 这次读的取消线（§O）：HTTP handler 的预算到点就取消它，信号经 `CommandsHost.withSignal`
+   * 进 `execFile`（`gh` / `lark-cli` 因此被 SIGTERM）。CLI 与面板的读面不给（没有预算）。
+   */
+  readonly signal?: AbortSignal | undefined
 }
 
 /** 一条被拒的读：`values` 只放填槽值（`forms`、`limit`、`reason`…）。 */
@@ -560,7 +565,12 @@ async function readGithub(
   if ('ok' in paging) return paging
   let read: GithubResourceRead
   try {
-    read = await githubRead({ host: host.commands, cli, repository, resource: parsed.resource })
+    read = await githubRead({
+      host: scopedCommands(host, request),
+      cli,
+      repository,
+      resource: parsed.resource
+    })
   } catch (error) {
     // `githubRead` 自己把 401/403/404/410 折成状态；还抛出来的只有两种：资源名形状不认识
     // （`GithubResourceError`）与真正可重试的失败（限流、超时、没有 HTTP 码）。
@@ -605,6 +615,14 @@ async function readGithub(
   })
 }
 
+/**
+ * 这次的命令端口：有取消线就绑上它（§O），于是这次读的每一次 CLI 调用都带着同一个信号。
+ * 没有预算时原样用宿主端口（与 #65 之前逐字一致）。
+ */
+function scopedCommands(host: ReadToolHost, request: ReadRequest): CommandsHost {
+  return request.signal === undefined ? host.commands : host.commands.withSignal(request.signal)
+}
+
 /** Feishu 的一次读：Trigger 由调用方解析好，游标与页大小交给 `feishuRead`。 */
 async function readFeishu(
   host: ReadToolHost,
@@ -626,7 +644,7 @@ async function readFeishu(
   let read: FeishuReadResult
   try {
     read = await feishuRead({
-      host: host.commands,
+      host: scopedCommands(host, request),
       cli,
       trigger,
       section: parsed.section,
