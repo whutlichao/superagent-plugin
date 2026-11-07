@@ -51,8 +51,23 @@ function addressOf(address: Record<string, string>): { repo: string; issue: stri
   return repo.length > 0 && /^\d+$/.test(issue) ? { repo, issue } : undefined
 }
 
-/** Policy 部分里本票会读的字段：允许名单（§K.1）。 */
-const policySchema = object({ allowed: array(string()).default([]) })
+/**
+ * 名单上的一行：Source 自己的身份（GitHub login）+ 可选显示名（§K.1 的 `allowed`）。
+ * 大小写不敏感的重复检查在 `policy/schema.ts`（§K.8）。
+ */
+const allowedIdentitySchema = object({
+  id: string().trim().min(1).max(200),
+  name: string().trim().min(1).max(100).optional()
+}).strict()
+
+/** `bots` 名单的一行（§K.2 第 5 条）：可以提出推断候选，永远不能授权。 */
+const botIdentitySchema = object({ id: string().trim().min(1).max(200) }).strict()
+
+/** Policy 部分：允许名单 + bots 名单（准入表由 `rows()` 声明，配置由 Policy 块校验）。 */
+const policySchema = object({
+  allowed: array(allowedIdentitySchema).default([]),
+  bots: array(botIdentitySchema).default([])
+}).strict()
 
 /**
  * 造一个 GitHub kind。`cli` 是当前配置的 `gh`（或包装脚本）：Channel 发送需要它，而
@@ -121,13 +136,28 @@ export function createGithubKind(cli: string): SourceKind<GithubConfig> {
     ],
     health: ['github'],
     /**
-     * 监听范围（Gate 之前的第一层）：默认只听点名 agent 的消息；`observeComments` 打开时
-     * 一切评论都进（作为「观察」scope，准入仍由 Gate 决定是否给强度）。
+     * 监听范围（Gate 之前的第一层，§K.2 的输入）：准入行按事件类型分（§I.2）——`issues` /
+     * `pulls` / `comments` / `ci`。点名的消息总是被接收（但不算「观察」）；未点名的只有开了
+     * 对应 observe 开关才接收，并标 `observed`（准入表只对 receive-all 的行可用）。
+     * CI 没有发送者，只有 receive-all 的 `ci` 行会收它。
      */
     scope(trigger: Pick<Trigger, 'source' | 'meta'> | Trigger, config: GithubConfig): ScopeResult {
       const addressed = (trigger as Trigger).addressed
-      if (addressed !== undefined) return { listened: true, observed: false, row: 'comments' }
-      if (config.observeComments) return { listened: true, observed: true, row: 'comments' }
+      const kind = String(trigger.meta['kind'] ?? 'comment')
+      if (kind === 'ci') {
+        return config.observeCi
+          ? { listened: true, observed: true, row: 'ci' }
+          : { listened: false, reason: 'ci_not_observed' }
+      }
+      const row = kind === 'issue' ? 'issues' : kind === 'pull' ? 'pulls' : 'comments'
+      const observe =
+        kind === 'issue'
+          ? config.observeIssues
+          : kind === 'pull'
+            ? config.observePulls
+            : config.observeComments
+      if (addressed !== undefined) return { listened: true, observed: false, row }
+      if (observe) return { listened: true, observed: true, row }
       return { listened: false, reason: 'not_addressed' }
     },
     channel: {
@@ -186,7 +216,28 @@ export function createGithubKind(cli: string): SourceKind<GithubConfig> {
           label: both('允许名单', 'Allowed list'),
           columns: [
             {
-              key: 'login',
+              key: 'id',
+              type: 'text',
+              label: both('GitHub 账号', 'GitHub login'),
+              pattern: '^[\\w.-]+(\\[bot\\])?$'
+            },
+            { key: 'name', type: 'text', label: both('显示名', 'Display name'), optional: true }
+          ]
+        }
+      ],
+      explicit: both('点名 agent 的评论', 'A comment that mentions the agent'),
+      bots: [
+        {
+          key: 'bots',
+          type: 'rows',
+          label: both('机器人名单', 'Bots'),
+          hint: both(
+            '名单上的机器人只能提出推断候选，永远不能授权。',
+            'A listed bot may only propose an inferred candidate; it never authorizes.'
+          ),
+          columns: [
+            {
+              key: 'id',
               type: 'text',
               label: both('GitHub 账号', 'GitHub login'),
               pattern: '^[\\w.-]+(\\[bot\\])?$'
@@ -194,22 +245,68 @@ export function createGithubKind(cli: string): SourceKind<GithubConfig> {
           ]
         }
       ],
-      explicit: both('点名 agent 的评论', 'A comment that mentions the agent'),
-      rows: () => [
-        {
-          id: 'comments',
-          label: both('Issue 评论', 'Issue comments'),
-          note: both(
-            '评论的发送者按允许名单判定。',
-            'A comment sender is judged by the allowed list.'
-          ),
-          cells: {
-            listedUnaddressed: false,
-            unlistedAddressed: false,
-            unlistedUnaddressed: false
+      rows: (config) => {
+        // 行的可用性即「该 scope 是否 receive-all」（§K.2、§I.2）：只有开了对应开关才有
+        // 未点名的格子；点名的格子总是可用。CI 没有发送者，只有最后一格。
+        const issue = config['observeIssues'] === true
+        const pull = config['observePulls'] === true
+        const comment = config['observeComments'] === true
+        const ci = config['observeCi'] === true
+        return [
+          {
+            id: 'issues',
+            label: both('新 Issue', 'New Issues'),
+            note: both(
+              '仓库里新开的 Issue（未点名的也算观察，前提是开了观察开关）。',
+              'A new Issue in the repository (unaddressed ones only while observing).'
+            ),
+            cells: {
+              listedUnaddressed: issue,
+              unlistedAddressed: true,
+              unlistedUnaddressed: issue
+            }
+          },
+          {
+            id: 'pulls',
+            label: both('新 PR', 'New pull requests'),
+            note: both(
+              '仓库里新开的 PR（未点名的也算观察，前提是开了观察开关）。',
+              'A new pull request (unaddressed ones only while observing).'
+            ),
+            cells: {
+              listedUnaddressed: pull,
+              unlistedAddressed: true,
+              unlistedUnaddressed: pull
+            }
+          },
+          {
+            id: 'comments',
+            label: both('评论与评审', 'Comments and reviews'),
+            note: both(
+              'Issue / PR 下说出来的话；点名 agent 的评论总是被接收。',
+              'A remark under an Issue or pull request; one that mentions the agent is always received.'
+            ),
+            cells: {
+              listedUnaddressed: comment,
+              unlistedAddressed: true,
+              unlistedUnaddressed: comment
+            }
+          },
+          {
+            id: 'ci',
+            label: both('CI 检查', 'CI checks'),
+            note: both(
+              '默认分支的 CI 变化没有发送者，只用最后一格判定。',
+              'A default-branch CI change has no sender, so only the last cell speaks.'
+            ),
+            cells: {
+              listedUnaddressed: false,
+              unlistedAddressed: false,
+              unlistedUnaddressed: ci
+            }
           }
-        }
-      ]
+        ]
+      }
     },
   }
 }

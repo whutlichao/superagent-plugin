@@ -21,9 +21,15 @@ import { HealthBoard, claimModelsEntry } from './infra/health.ts'
 import { defaultStateDir, resolveStateDir, writeStateDirPointer } from './infra/paths.ts'
 import { ensureApiToken, issueAssignmentToken, issueRouterToken } from './infra/tokens.ts'
 import { createRepositories } from './app/repositories.ts'
+import {
+  createPolicy,
+  DEFAULT_POLICY,
+  UNVERSIONED_POLICY,
+  validatePolicy
+} from './policy/index.ts'
+import type { PolicyKindView } from './policy/index.ts'
 import { resolveRoles } from './app/roles.ts'
 import { ROUTER_RESTARTS_KEY, ROUTER_TERMINAL_KEY, ROUTER_WORKSPACE_KEY, PROMPT_REVISION_KEY } from './app/kv.ts'
-import { createMinimalPolicy } from './app/policy.ts'
 import { createDeterministicAssessor } from './app/assessor.ts'
 import { createOutbox, registerReplyEffects } from './app/outbox.ts'
 import { createPausedState } from './app/pause.ts'
@@ -258,12 +264,30 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
     }
   })
   const outbox = createOutbox({ store, effects, now })
-  const policy = createMinimalPolicy({
-    part: (source) => {
-      const part = registry.policyPart(source, sourceSettings)
-      const allowed = part?.['allowed']
-      return { allowed: Array.isArray(allowed) ? allowed.filter((item): item is string => typeof item === 'string') : [] }
-    },
+  // ---- Policy（§K.1、§K.2）：块从宿主设置里解析；Source 的 Policy 部分与准入行由 kind 认领。
+  // 校验失败时回落缺省块并记日志——授权面 fail closed（谁都不准入），错误由面板的设置页显示。
+  const policyKind = (source: string): PolicyKindView | undefined => {
+    const part = registry.kind(source)?.policy
+    if (part === undefined) return undefined
+    const config = registry.instance(source, sourceSettings)?.config ?? {}
+    return {
+      rows: () => part.rows?.(config) ?? [],
+      extras: (section) => part.schema.safeParse(section)
+    }
+  }
+  const policyRaw = block(settings['policy'])
+  const parsedPolicy = validatePolicy(policyRaw, { kinds: policyKind })
+  if (!parsedPolicy.success) {
+    logger.warn('the stored policy block is invalid; refusing every candidate until it is fixed', {
+      issues: parsedPolicy.issues.map((issue) => `${issue.path.join('.') || '(root)'}: ${issue.message}`)
+    })
+  }
+  const policyBlock = parsedPolicy.success ? parsedPolicy.data : DEFAULT_POLICY
+  const policy = createPolicy({
+    block: () => policyBlock,
+    sources: registry,
+    rows: (source) => policyKind(source)?.rows() ?? [],
+    version: () => UNVERSIONED_POLICY,
     paused: () => paused.paused()
   })
 

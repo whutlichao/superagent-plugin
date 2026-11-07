@@ -143,6 +143,8 @@ export class Evals extends EnginePart {
     for (const trigger of triggers) {
       const gate = policy.gate(trigger, thread, tickets)
       if (!gate.admissible) {
+        // §K.2：不产生候选，但要落一条可解释的被过滤记录（原因码）。
+        this.recordFiltered(trigger, gate.reason)
         reasons.push({ code: gate.reason, triggerId: trigger.id })
         continue
       }
@@ -185,6 +187,7 @@ export class Evals extends EnginePart {
     thread.pending = []
     this.repo.threads.save(thread)
     for (const trigger of triggers) {
+      this.clearFiltered(trigger.id)
       this.repo.triggers.saveDisposition(trigger.id, {
         ...(this.repo.triggers.disposition(trigger.id) ?? { fanout: [], at }),
         evalId
@@ -197,6 +200,24 @@ export class Evals extends EnginePart {
       strength: strongest.strength
     })
     this.options.assessor.request(this.candidateOf(thread))
+  }
+
+  /**
+   * 一条被 Gate 拒绝的 Trigger 落一条被过滤记录（§K.2：`ignore` 不产生候选，
+   * `disposition.filtered` 记原因码），面板据此解释「为什么它没理我」。
+   */
+  private recordFiltered(trigger: Trigger, reason: string): void {
+    const disposition = this.repo.triggers.disposition(trigger.id) ?? { fanout: [], at: this.now() }
+    if (disposition.filtered?.code === reason) return
+    this.repo.triggers.saveDisposition(trigger.id, { ...disposition, filtered: { code: reason } })
+  }
+
+  /** 一条 Trigger 被新的 Eval 准入：清掉早先的被过滤记录，不再说它没被理。 */
+  private clearFiltered(triggerId: string): void {
+    const disposition = this.repo.triggers.disposition(triggerId)
+    if (disposition?.filtered === undefined) return
+    const { filtered: _filtered, ...rest } = disposition
+    this.repo.triggers.saveDisposition(triggerId, rest)
   }
 
   /** 持有 `triggerId` 的那次 Eval 的候选；没有 Eval 持有它时 undefined。 */

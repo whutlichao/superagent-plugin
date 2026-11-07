@@ -21,6 +21,7 @@
 // 写命令的幂等（§G.1 幂等行）：CLI 的 `--request-id` 走 HTTP 的 `x-superagent-request-id`
 // 头；handler 用 `idempotency.ts` 的 `runIdempotent()` 包住真正的工作，同 id 一小时内
 // 重试返回首次结果。**失败不缓存**（重试有机会成功）。
+import { SETUP_FIELDS } from '../app/settings.ts'
 import { ApiError, ERROR_CODES } from './errors.ts'
 
 /** 三种 token 角色（与 `infra/tokens.ts` 的同名类型一致；这里只声明，不 import 实现）。 */
@@ -108,7 +109,7 @@ export function rolesFor(route: Pick<RouteDefinition, 'minimumRole'>): readonly 
 }
 
 /** setup 字段（§K.8：`stateDir`、`baseRepo`、`cli` 这类决定插件能否启动的字段）。 */
-export const SETUP_SETTING_FIELDS: readonly string[] = ['stateDir', 'baseRepo', 'cli', 'repository']
+export const SETUP_SETTING_FIELDS: readonly string[] = SETUP_FIELDS
 
 /**
  * `PUT settings/:block` 的角色细化（§K.8、§G.2 的 `origin_forbidden`）：

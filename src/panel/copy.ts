@@ -365,6 +365,14 @@ export const COPY = {
     zh: '发送者不在这个来源的名单里',
     en: "The sender is not on the Source's list"
   },
+  'reason.notHuman': {
+    zh: '发送者不是人，也不在这个来源的机器人名单里',
+    en: "The sender is not a person and is not on the Source's bots list"
+  },
+  'reason.noMention': {
+    zh: '消息没有点名 agent',
+    en: 'The message does not address the agent'
+  },
   'reason.retried': { zh: '人工重试', en: 'Retried by a person' },
   'reason.hostRestarted': { zh: '主机已重启', en: 'The host restarted' },
   'reason.stopUnknown': { zh: '要停止的工单不存在或已结束', en: 'Stop target is unknown or already ended' },
@@ -377,6 +385,10 @@ export const COPY = {
     en: 'Implementation intent or target direction is not established, or a product/design decision is still required'
   },
   'reason.noRuleMatched': { zh: '没有启用的准入规则匹配', en: 'No enabled admission rule matched' },
+  'reason.admissionIgnored': {
+    zh: '这个接收 scope 的准入表没有准入它',
+    en: 'The admission table for this receiving scope does not admit it'
+  },
   'reason.ignoredFromCard': {
     zh: '仅凭候选卡片忽略，未经规则研判',
     en: 'Ignored from its card, without a rule assessment'
