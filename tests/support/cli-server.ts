@@ -47,7 +47,11 @@ export interface TestServer {
 /** 起服务器的选项：与 `startHttpServer` 同名的开关，外加宽容的限流器。 */
 export interface TestServerOptions {
   readonly host?: Partial<HttpHost>
-  readonly routes?: readonly RouteDefinition[]
+  /**
+   * 路由表，或一个按**本服务器自己打开的库**造路由表的函数（prompt 版本、设置块这些 handler
+   * 拿不到 `startHttpServer` 里的 store，只能这样接线；与组合根同一份 handler）。
+   */
+  readonly routes?: readonly RouteDefinition[] | ((store: Store) => readonly RouteDefinition[])
   readonly rateLimiter?: RateLimiter
   /** 运维命令的接线（doctor 的子进程出口、source labels 的端口、时钟）。 */
   readonly ops?: OpsPorts
@@ -69,7 +73,12 @@ export async function startTestServer(options: TestServerOptions = {}): Promise<
     preferredPort: 0,
     // 限流另有用例；其余用例不该被 60/min 绊倒。
     rateLimiter: options.rateLimiter ?? createRateLimiter({ perMinute: 60_000, burst: 10_000 }),
-    routes: options.routes ?? ROUTE_TABLE,
+    routes:
+      options.routes === undefined
+        ? ROUTE_TABLE
+        : typeof options.routes === 'function'
+          ? options.routes(store)
+          : options.routes,
     ...(options.ops === undefined ? {} : { ops: options.ops }),
     log: (line) => void requests.push(line)
   })

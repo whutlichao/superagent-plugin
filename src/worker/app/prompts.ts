@@ -8,9 +8,14 @@
 // 3. **优先级**：弱→强的文本解析顺序（内置 < 团队段 < override < 部署事实），加上 §L.3 的
 //    强→弱五层（工具与宿主强制 > 内置与生成段 > 主动票的匹配规则 > 团队三段 > 外部文本）。
 //
-// 依赖纪律（§C.2）：`app → core` 允许；本文件只 import 领域类型与 `./prompt-text/*`，不碰
-// store、HTTP 或 runtime。版本、历史与 default-changed 属于 #33，团队技能与体量上限属于 #34：
-// 它们调用这里的注册表与 `composePrompt`，不另写一份文本。
+// 依赖纪律（§C.2）：`app → core` 允许；本文件不碰 HTTP 或 runtime。版本表与 KV 记账经
+// `PromptVersionStore`（`Store` 的结构子集）注入——版本、历史与 default-updated 是这里的
+// 第四节（§L.4），团队技能与体量上限属于 #34：它们调用这里的注册表与 `composePrompt`，
+// 不另写一份文本。
+import { createHash } from 'node:crypto'
+import { PROMPT_BUILTIN_BASE_KEY, PROMPT_REVISION_KEY, promptVersionKey } from './kv.ts'
+import type { PromptVersionRecord } from './records.ts'
+import type { Store } from './store.ts'
 import type { AcceptMode } from '../core/model.ts'
 import { SHARED_LINES } from './prompt-text/shared.ts'
 import { ORCHESTRATOR_LINES, WORKER_LINES } from './prompt-text/roles.ts'
@@ -297,6 +302,72 @@ export interface PromptTextConfig {
   readonly overrides?: Readonly<Partial<Record<PromptPartKey, string>>>
 }
 
+/**
+ * 一个 override：团队的正文，加上它编辑自的那份内置文本的键（§L.4）。键让「内置变了」可判：
+ * 保存时记 `base`，升级后拿它和当前内置文本的键比，不同就是 `default-updated`。
+ */
+export interface PromptOverride {
+  readonly text: string
+  readonly base?: string
+}
+
+/**
+ * 一次保存下来的配置（`prompt_version.config` 列）：团队三段按字段给，override 按分片键给。
+ * 与 `PromptTextConfig` 的差别只有一个：override 带着 `base`。组装只读 `text`，于是
+ * `promptTextOf` 是两者之间唯一的转换处（不在组装里再认一次 `base`）。
+ */
+export interface PromptConfig {
+  readonly team?: Readonly<Partial<Record<TeamSection, string>>>
+  /** 键是分片键；更早版本存过、本版本已经没有的分片也会留在这里，保存时丢弃并列出。 */
+  readonly overrides?: Readonly<Record<string, PromptOverride>>
+}
+
+/** 本版本的内置正文（模板未填值；生成段的正文就是模板）。 */
+const builtInText = (key: PromptPartKey): string => PROMPT_PARTS[key].lines.join('\n')
+
+/** 一个分片键的判定（字符串来自存下来的配置，可能是本版本已没有的分片）。 */
+export function isPromptPartKey(name: string): name is PromptPartKey {
+  return (PROMPT_PART_KEYS as readonly string[]).includes(name)
+}
+
+/**
+ * 一段内置文本的键（`prompt-builtin-base` 的键、override 的 `base`）：同一段文本恒得同一个键。
+ * 用内容哈希而不是分片名，是因为「内置变了」是文本的事实，不是版本号的事实；反过来，
+ * 两段恰好相同的文本共用一键也没有害处（它们本来就是同一份旧默认）。
+ */
+export function builtInBase(text: string): string {
+  return `b-${createHash('sha256').update(text).digest('hex').slice(0, 12)}`
+}
+
+/** 每个内置分片**当前**正文的键（面板的「旧默认 vs 新默认」与保存时的 re-base 都用它）。 */
+export function builtInBases(): Readonly<Record<PromptPartKey, string>> {
+  return Object.fromEntries(PROMPT_PART_KEYS.map((key) => [key, builtInBase(builtInText(key))])) as Record<
+    PromptPartKey,
+    string
+  >
+}
+
+/** 什么都没改的配置：每个分片跟随内置正文（也是「恢复默认」存下去的形状）。 */
+export function defaultPromptConfig(): PromptConfig {
+  return {}
+}
+
+/**
+ * 把一份保存下来的配置换成组装读的形状：override 只取正文（`base` 只属于版本记账）。
+ * 本版本已没有的分片被跳过——它在组装里没有位置，历史版本读出来也不会因此多出一段。
+ */
+export function promptTextOf(config: PromptConfig): PromptTextConfig {
+  const overrides: Partial<Record<PromptPartKey, string>> = {}
+  for (const [key, override] of Object.entries(config.overrides ?? {})) {
+    if (!isPromptPartKey(key)) continue
+    overrides[key] = override.text
+  }
+  return {
+    ...(config.team === undefined ? {} : { team: config.team }),
+    ...(Object.keys(overrides).length === 0 ? {} : { overrides })
+  }
+}
+
 /** 组装一份提示词需要的全部输入。 */
 export interface ComposeInput extends PromptTextConfig {
   readonly role: PromptRole
@@ -331,6 +402,142 @@ export class PromptTextError extends Error {
 /** 一个模板还缺哪些必保留占位符（顺序按注册表）。 */
 export function missingPlaceholders(key: PromptPartKey, text: string): readonly string[] {
   return PROMPT_PARTS[key].placeholders.filter((placeholder) => !text.includes(placeholder))
+}
+
+/**
+ * 版本与配置层面的拒绝（§L.4）：`stale_revision`（保存的基础版本号已过期）与
+ * `invalid_config`（不是一份能存的配置）。与 `PromptTextError` 的分工：那一个管**单个分片**
+ * 的正文，这一个管整份配置与版本号。
+ */
+export type PromptVersionErrorCode = 'stale_revision' | 'invalid_config' | 'missing'
+
+/** 一次版本/配置拒绝：固定码 + 填槽值（面板与 CLI 只看 `code`）。 */
+export class PromptVersionError extends Error {
+  readonly code: PromptVersionErrorCode
+  readonly values: Readonly<Record<string, string>>
+
+  constructor(code: PromptVersionErrorCode, message: string, values: Readonly<Record<string, string>> = {}) {
+    super(message)
+    this.name = 'PromptVersionError'
+    this.code = code
+    this.values = values
+  }
+}
+
+/** 一次校验的结果：能存的配置 + 本版本已没有、被丢弃的 override 键。 */
+export interface ValidatedPromptConfig {
+  readonly config: PromptConfig
+  readonly dropped: readonly string[]
+}
+
+/** 一个不是对象的配置值（数组不算对象：它没有可编辑的字段）。 */
+function configObject(value: unknown, label: string): Record<string, unknown> {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    throw new PromptVersionError('invalid_config', `${label} must be a JSON object`, { field: label })
+  }
+  return value as Record<string, unknown>
+}
+
+/** 团队三段的正文：未知段是「分片不存在」，空或有类型错误是「分片不合法」。 */
+function teamTextOf(value: unknown): Partial<Record<TeamSection, string>> {
+  const raw = configObject(value, 'team')
+  const kept: Partial<Record<TeamSection, string>> = {}
+  for (const [name, text] of Object.entries(raw)) {
+    const section = name as TeamSection
+    if (!(TEAM_SECTIONS as readonly string[]).includes(name)) {
+      throw new PromptTextError('unknown_part', `unknown prompt part: team/${name}`, { part: `team/${name}` })
+    }
+    if (typeof text !== 'string' || text.trim() === '') {
+      throw new PromptTextError('invalid_part', `prompt part team/${name} must be non-empty text`, {
+        part: `team/${name}`
+      })
+    }
+    kept[section] = text
+  }
+  return kept
+}
+
+/**
+ * 校验一份团队交来的配置（面板与 CLI、预览与保存共用这一处，§L.4）:
+ * - 根字段只有 `team` / `overrides`，其余整单拒绝（`invalid_config`）；
+ * - override 的正文非空、保留模板占位符（`invalid_part` / `missing_placeholder`）；
+ * - override 记下它编辑自的内置文本键：给 `base` 就用，否则沿用已保存的那一份，再否则就是
+ *   当前内置文本的键；
+ * - 本版本已没有的分片，只有在**已保存的配置**里才有资格被丢弃（升级移除），并列入 `dropped`；
+ *   其余未知键是打错了，拒绝（`unknown_part`）。
+ */
+export function validatePromptConfig(value: unknown, saved: PromptConfig = {}): ValidatedPromptConfig {
+  const raw = configObject(value, 'config')
+  const unknownRoot = Object.keys(raw).filter((key) => key !== 'team' && key !== 'overrides')
+  if (unknownRoot.length > 0) {
+    throw new PromptVersionError('invalid_config', `unknown config field: ${unknownRoot.join(', ')}`, {
+      field: unknownRoot.join(', ')
+    })
+  }
+  const config: { team?: Partial<Record<TeamSection, string>>; overrides?: Record<string, PromptOverride> } = {}
+  if (raw['team'] !== undefined) {
+    const team = teamTextOf(raw['team'])
+    const ordered: Partial<Record<TeamSection, string>> = {}
+    for (const section of TEAM_SECTIONS) {
+      const text = team[section]
+      if (text !== undefined) ordered[section] = text
+    }
+    if (Object.keys(ordered).length > 0) config.team = ordered
+  }
+  const savedOverrides = saved.overrides ?? {}
+  const currentBases = builtInBases()
+  const given = raw['overrides'] === undefined ? {} : configObject(raw['overrides'], 'overrides')
+  const overrides: Record<string, PromptOverride> = {}
+  const dropped: string[] = []
+  for (const [name, entry] of Object.entries(given)) {
+    if (!isPromptPartKey(name)) {
+      if (Object.hasOwn(savedOverrides, name)) {
+        dropped.push(name)
+        continue
+      }
+      throw new PromptTextError('unknown_part', `unknown prompt part: ${name}`, { part: name })
+    }
+    const override = configObject(entry, `override ${name}`)
+    const unknown = Object.keys(override).filter((field) => field !== 'text' && field !== 'base')
+    if (unknown.length > 0) {
+      throw new PromptVersionError('invalid_config', `override ${name} has unknown field: ${unknown.join(', ')}`, {
+        part: name,
+        field: unknown.join(', ')
+      })
+    }
+    const text = override['text']
+    if (typeof text !== 'string' || text.trim() === '') {
+      throw new PromptTextError('invalid_part', `prompt part ${name} must be non-empty text`, { part: name })
+    }
+    const missing = missingPlaceholders(name, text)
+    if (missing.length > 0) {
+      throw new PromptTextError(
+        'missing_placeholder',
+        `the ${name} template must keep ${missing.join(', ')}, which the system fills in`,
+        { part: name, placeholders: missing.join(', ') }
+      )
+    }
+    const base = override['base']
+    if (base !== undefined && typeof base !== 'string') {
+      throw new PromptVersionError('invalid_config', `override ${name} names a base that is not text`, {
+        part: name
+      })
+    }
+    overrides[name] = {
+      text,
+      base: base ?? savedOverrides[name]?.base ?? currentBases[name]
+    }
+  }
+  const orderedOverrides: Record<string, PromptOverride> = {}
+  for (const key of PROMPT_PART_KEYS) {
+    const override = overrides[key]
+    if (override !== undefined) orderedOverrides[key] = override
+  }
+  for (const key of Object.keys(overrides)) {
+    if (orderedOverrides[key] === undefined) orderedOverrides[key] = overrides[key] as PromptOverride
+  }
+  if (Object.keys(orderedOverrides).length > 0) config.overrides = orderedOverrides
+  return { config, dropped }
 }
 
 /**
@@ -455,4 +662,277 @@ export function composeSkill(name: string, config: PromptTextConfig = {}): strin
   const skill = name === 'github' || name === 'feishu' ? (`skill/${name}` as PromptPartKey) : undefined
   if (skill === undefined) return ''
   return [partText(skill, config), partText('runtime/cli', config)].join('\n\n')
+}
+
+
+// ---------------------------------------------------------------- 版本、历史与 default-updated（§L.4）
+
+/** 一次保存的来源：面板或 CLI（与 `prompt_version.origin` 的 CHECK 同值）。 */
+export type PromptOrigin = 'panel' | 'tool'
+
+/** 一个不可变的提示词版本（版本表的一行，§L.4）。 */
+export interface PromptVersion {
+  readonly revision: number
+  /** 保存时的当前版本；第一个版本是 `null`。 */
+  readonly predecessor: number | null
+  readonly at: string
+  readonly origin: PromptOrigin
+  readonly config: PromptConfig
+}
+
+/** 一次保存的输入：配置（未校验）+ 它基于的版本号 + 来源。 */
+export interface PromptSaveInput {
+  readonly config: unknown
+  readonly baseRevision: number
+  readonly origin: PromptOrigin
+}
+
+/** 一次保存的结果；`changed: false` 时没有写任何行（内容与当前版本相同）。 */
+export interface PromptSaveResult extends PromptVersion {
+  readonly changed: boolean
+  /** 本版本已没有、保存时被丢弃的 override 键（§L.4 第四条）。 */
+  readonly dropped: readonly string[]
+}
+
+/** 恢复一个版本（`revision: 0` = 恢复默认）的输入。 */
+export interface PromptRestoreInput {
+  readonly revision: number
+  readonly baseRevision: number
+  readonly origin: PromptOrigin
+}
+
+/** 历史的分页：缺省最新 20 个版本。 */
+export interface PromptHistoryOptions {
+  readonly limit?: number
+  readonly offset?: number
+}
+
+/** 版本、历史与 default-updated 的唯一读写面。 */
+export interface PromptVersions {
+  /** 当前版本号；还没存过是 0（= 内置默认）。 */
+  revision(): number
+  /** 当前版本；还没存过时 `undefined`。 */
+  current(): PromptVersion | undefined
+  /** 当前配置；还没存过时是默认配置（`{}`）。 */
+  config(): PromptConfig
+  /** 某个版本；没有这个版本号时 `undefined`（0 = 默认，不属于版本表）。 */
+  version(revision: number): PromptVersion | undefined
+  /** 版本历史，新→旧（面板 History 页与 `prompts get` 共用）。 */
+  history(options?: PromptHistoryOptions): readonly PromptVersion[]
+  /** 校验并追加一个版本；基础版本号不匹配 → `stale_revision`，什么都不写。 */
+  save(input: PromptSaveInput): PromptSaveResult
+  /** 恢复某个版本或默认：读出来当配置**再存一个新版本**（单向追加，不改历史）。 */
+  restore(input: PromptRestoreInput): PromptSaveResult
+  /** 每个 override 的内置文本自它编辑以来变了没有（旧默认 vs 新默认，§L.4）。 */
+  defaultChanged(config: PromptConfig): readonly PromptDefaultChange[]
+}
+
+/** 一条 `default-updated` 记录：分片、它编辑自的键、旧默认正文，以及「本版本已经没有它」。 */
+export interface PromptDefaultChange {
+  readonly part: string
+  readonly base?: string
+  /** 旧默认正文：本安装留下了它（`prompt-builtin-base`）时给。 */
+  readonly previous?: string
+  /** 本版本已经没有这个分片：保存时丢弃并列出。 */
+  readonly removed?: true
+}
+
+/** 版本读写要的那几个 `Store` 方法（真库与测试替身都满足它）。 */
+export type PromptVersionStore = Pick<Store, 'kvGet' | 'kvSet' | 'transaction' | 'promptVersions'>
+
+/** `prompt-builtin-base` 的行：一个坏掉的旧值不能让读面炸掉，只当没有记录。 */
+function storedBases(value: unknown): Record<string, string> {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return {}
+  const kept: Record<string, string> = {}
+  for (const [key, text] of Object.entries(value)) {
+    if (typeof text === 'string') kept[key] = text
+  }
+  return kept
+}
+
+/**
+ * 存下来的 `config` 列：只收本版本认得的形状（更早构建可能存过别的形状，读面不该因此炸掉，
+ * 保存时还会再校验一遍）。分片键原样保留——已移除的分片也要能读出来列给用户。
+ */
+function storedConfig(value: unknown): PromptConfig {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return {}
+  const record = value as Record<string, unknown>
+  const config: {
+    team?: Partial<Record<TeamSection, string>>
+    overrides?: Record<string, PromptOverride>
+  } = {}
+  const team = record['team']
+  if (typeof team === 'object' && team !== null && !Array.isArray(team)) {
+    const sections: Partial<Record<TeamSection, string>> = {}
+    for (const section of TEAM_SECTIONS) {
+      const text = (team as Record<string, unknown>)[section]
+      if (typeof text === 'string') sections[section] = text
+    }
+    if (Object.keys(sections).length > 0) config.team = sections
+  }
+  const overrides = record['overrides']
+  if (typeof overrides === 'object' && overrides !== null && !Array.isArray(overrides)) {
+    const kept: Record<string, PromptOverride> = {}
+    for (const [key, entry] of Object.entries(overrides as Record<string, unknown>)) {
+      if (typeof entry !== 'object' || entry === null || Array.isArray(entry)) continue
+      const text = (entry as Record<string, unknown>)['text']
+      const base = (entry as Record<string, unknown>)['base']
+      if (typeof text !== 'string') continue
+      kept[key] = { text, ...(typeof base === 'string' ? { base } : {}) }
+    }
+    if (Object.keys(kept).length > 0) config.overrides = kept
+  }
+  return config
+}
+
+/** 版本行 → 版本。 */
+function versionOf(record: PromptVersionRecord): PromptVersion {
+  return {
+    revision: record.revision,
+    predecessor: record.predecessor,
+    at: record.at,
+    origin: record.origin,
+    config: storedConfig(record.config)
+  }
+}
+
+/**
+ * 造一个版本库。`now` 注入（§P.1：领域与存储不读环境时钟）。
+ *
+ * 记账与 `settings.ts` 同一套（§D.3）：一行 `prompt_version`、递增 `prompt-revision`、
+ * 写 `prompt-version:<n>` 快照，同一个事务；另外每个 override 编辑自的内置正文按它的键
+ * 记在 `prompt-builtin-base` 里（`键 → 正文`），这样升级后「旧默认 vs 新默认」的旧半边
+ * 仍然可读，而不是让面板猜。
+ */
+export function createPromptVersions(input: {
+  readonly store: PromptVersionStore
+  readonly now: () => string
+}): PromptVersions {
+  const { store, now } = input
+
+  const revision = (): number => {
+    const value = store.kvGet<unknown>(PROMPT_REVISION_KEY)
+    return typeof value === 'number' && Number.isInteger(value) && value > 0 ? value : 0
+  }
+  const version = (number: number): PromptVersion | undefined => {
+    if (!Number.isInteger(number) || number <= 0) return undefined
+    const record = store.promptVersions.byRevision(number)
+    return record === null ? undefined : versionOf(record)
+  }
+  const current = (): PromptVersion | undefined => version(revision())
+  const config = (): PromptConfig => current()?.config ?? defaultPromptConfig()
+
+  /** 把每个 override 编辑自的内置正文记进 `prompt-builtin-base`（只记当前键，缺的才写）。 */
+  const recordBases = (
+    next: PromptConfig,
+    bases: Readonly<Record<string, string>>,
+    currentBases: Readonly<Record<PromptPartKey, string>>
+  ): Record<string, string> => {
+    const recorded: Record<string, string> = { ...bases }
+    for (const [key, override] of Object.entries(next.overrides ?? {})) {
+      if (!isPromptPartKey(key) || override.base === undefined) continue
+      if (override.base !== currentBases[key]) continue
+      if (recorded[override.base] === undefined) recorded[override.base] = builtInText(key)
+    }
+    return recorded
+  }
+
+  const save = (saveInput: PromptSaveInput): PromptSaveResult => {
+    // 1. 校验（面板与 CLI、预览与保存共用这一处）。
+    const validated = validatePromptConfig(saveInput.config, config())
+    // 2. 乐观并发：提交的基版本必须是当前版本（§L.4 第二条）。
+    const currentRevision = revision()
+    if (saveInput.baseRevision !== currentRevision) {
+      throw new PromptVersionError(
+        'stale_revision',
+        `Prompt version changed to ${currentRevision}; re-read it with superagent prompts get and save again`,
+        { currentRevision: String(currentRevision), baseRevision: String(saveInput.baseRevision) }
+      )
+    }
+    const existing = current()
+    // 3. 没有改动就不记新版本：`base` 的推进（保留我的文本）算改动，正文相同不算。
+    if (existing !== undefined && JSON.stringify(existing.config) === JSON.stringify(validated.config)) {
+      return { ...existing, changed: false, dropped: validated.dropped }
+    }
+    const at = now()
+    const origin = saveInput.origin
+    // 4. 记账：一行历史 + 一个 KV 指针 + 一个快照 + 内置正文的键，同一个事务。
+    return store.transaction(() => {
+      const currentBases = builtInBases()
+      const bases = storedBases(store.kvGet<unknown>(PROMPT_BUILTIN_BASE_KEY))
+      const recorded = recordBases(validated.config, bases, currentBases)
+      const nextRevision = currentRevision + 1
+      const record: PromptVersionRecord = {
+        revision: nextRevision,
+        predecessor: currentRevision === 0 ? null : currentRevision,
+        at,
+        origin,
+        config: validated.config
+      }
+      store.promptVersions.put(record)
+      store.kvSet(PROMPT_REVISION_KEY, nextRevision)
+      store.kvSet(promptVersionKey(nextRevision), {
+        at,
+        origin,
+        predecessor: record.predecessor
+      })
+      if (Object.keys(recorded).length !== Object.keys(bases).length) {
+        store.kvSet(PROMPT_BUILTIN_BASE_KEY, recorded)
+      }
+      return { ...versionOf(record), changed: true, dropped: validated.dropped }
+    })
+  }
+
+  return {
+    revision,
+    current,
+    config,
+    version,
+    history(options: PromptHistoryOptions = {}): readonly PromptVersion[] {
+      const limit = options.limit ?? 20
+      const offset = options.offset ?? 0
+      if (limit <= 0) return []
+      return store.promptVersions
+        .list(limit + offset)
+        .slice(offset)
+        .map((record) => versionOf(record))
+    },
+    save,
+    restore(restoreInput: PromptRestoreInput): PromptSaveResult {
+      const config = restoreInput.revision === 0 ? defaultPromptConfig() : version(restoreInput.revision)?.config
+      if (config === undefined) {
+        throw new PromptVersionError('missing', `no prompt version ${restoreInput.revision}`, {
+          revision: String(restoreInput.revision)
+        })
+      }
+      return save({ config, baseRevision: restoreInput.baseRevision, origin: restoreInput.origin })
+    },
+    defaultChanged(next: PromptConfig): readonly PromptDefaultChange[] {
+      const bases = storedBases(store.kvGet<unknown>(PROMPT_BUILTIN_BASE_KEY))
+      const currentBases = builtInBases()
+      const changes: PromptDefaultChange[] = []
+      for (const [part, override] of Object.entries(next.overrides ?? {})) {
+        if (!isPromptPartKey(part)) {
+          changes.push({
+            part,
+            ...(override.base === undefined ? {} : { base: override.base }),
+            ...(override.base !== undefined && bases[override.base] !== undefined
+              ? { previous: bases[override.base] as string }
+              : {}),
+            removed: true
+          })
+          continue
+        }
+        const base = override.base
+        if (base === undefined || base === currentBases[part]) continue
+        const previous = bases[base]
+        changes.push({
+          part,
+          base,
+          ...(previous === undefined ? {} : { previous })
+        })
+      }
+      return changes
+    }
+  }
 }

@@ -439,7 +439,7 @@ export const CLI_COMMANDS: readonly CommandDefinition[] = [
     ],
     positionals: [],
     write: false,
-    available: false
+    available: true
   },
   {
     name: ['prompts', 'save'],
@@ -452,7 +452,7 @@ export const CLI_COMMANDS: readonly CommandDefinition[] = [
     ],
     positionals: [],
     write: true,
-    available: false
+    available: true
   }
 ]
 
@@ -852,6 +852,46 @@ async function run(
         method: 'GET',
         query: readQuery(resource, args)
       })
+    }
+    // ---- prompts（§L.4、§L.5）：读配置/默认/全文，保存（存的是 `origin: 'tool'` 的新版本）与预览。
+    case 'prompts get': {
+      const query: Record<string, string> = {}
+      const revision = valueArgs(args.flags, 'revision')
+      if (revision !== undefined) {
+        if (!Number.isInteger(Number(revision)) || Number(revision) < 0) {
+          throw new ApiError(ERROR_CODES.invalidValue, '--revision must be a non-negative integer', {
+            flag: 'revision'
+          })
+        }
+        query['revision'] = revision
+      }
+      if (switched(args, 'defaults')) query['defaults'] = 'true'
+      if (switched(args, 'text')) query['text'] = 'true'
+      return call('prompts', { method: 'GET', query })
+    }
+    case 'prompts save': {
+      const preview = switched(args, 'preview')
+      const config = await jsonFlag(args, input, 'config')
+      if (config === undefined) {
+        throw new ApiError(ERROR_CODES.invalidParams, 'prompts save needs --config', { flag: 'config' })
+      }
+      // 预览不写库，也就不需要基础版本号；保存必须带上它（§L.4 第二条）。
+      if (preview) {
+        return call('prompts/preview', { method: 'POST', body: { config } })
+      }
+      const base = valueArgs(args.flags, 'base-revision')
+      if (base === undefined) {
+        throw new ApiError(ERROR_CODES.invalidParams, 'prompts save needs --base-revision', {
+          flag: 'base-revision'
+        })
+      }
+      const baseRevision = Number(base)
+      if (!Number.isInteger(baseRevision) || baseRevision < 0) {
+        throw new ApiError(ERROR_CODES.invalidValue, '--base-revision must be a non-negative integer', {
+          flag: 'base-revision'
+        })
+      }
+      return call('prompts', { method: 'PUT', body: { config, baseRevision, origin: 'tool' } })
     }
     case 'route':
       return call('route', { method: 'POST', body: { decisions: await routeDecisions(args, input) } })

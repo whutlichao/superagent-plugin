@@ -18,9 +18,12 @@ import { parseArgs } from '../src/worker/cli/io'
 import { main } from '../src/worker/cli/main'
 import { createDomainHandlers, withDomainHandlers } from '../src/worker/http/domain'
 import { createAssessmentHandlers, withAssessmentHandlers } from '../src/worker/http/assessment'
+import { createPromptHandlers, withPromptHandlers } from '../src/worker/http/prompts'
+import { createPromptVersions } from '../src/worker/app/prompts'
+import type { Store } from '../src/worker/app/store'
 import { createRouterTools } from '../src/worker/app/assessment'
 import type { Candidate, Decision, Ticket } from '../src/worker/core/index'
-import { ROUTE_TABLE } from '../src/worker/http/routes'
+import { ROUTE_TABLE, type RouteDefinition } from '../src/worker/http/routes'
 import { UserError } from '../src/worker/core/index'
 import { AT, tempStateDir } from './support/state'
 import { startTestServer, type TestServer } from './support/cli-server'
@@ -148,6 +151,24 @@ const WIRED: readonly (readonly [string, Case, Case])[] = [
     // 没有 assignment token 的调用者不能替某个 Ticket 确认（§O）。
     { argv: ['ack', '--trigger', 'trigger-1', '--text', 'On it'], exit: 2, code: 'not_permitted_role' }
   ],
+  // Prompt 配置（§L.4）：保存是带基础版本号的写，读面给出配置、内置分片与历史。
+  [
+    'prompts get',
+    { argv: ['prompts', 'get'], exit: 0, resultKeys: ['revision', 'config', 'parts', 'default_changed', 'history'], token: 'router' },
+    { argv: ['prompts', 'get', '--revision', 'nope'], exit: 2, code: 'invalid_value' }
+  ],
+  [
+    'prompts save',
+    {
+      argv: ['prompts', 'save', '--config', '-', '--base-revision', '0'],
+      exit: 0,
+      resultKeys: ['revision', 'changed', 'dropped'],
+      token: 'router',
+      stdin: '{"team":{"scope":"Settings only."}}'
+    },
+    // 保存必须带基础版本号：缺了是参数错误，不是 fixed unavailable。
+    { argv: ['prompts', 'save', '--config', '-'], exit: 2, code: 'invalid_params', stdin: '{}' }
+  ],
   [
     'report',
     {
@@ -215,9 +236,7 @@ const PENDING: readonly string[][] = [
   ['thread', 'unrelated', 'k'],
   ['settings', 'get'],
   ['settings', 'save', '--block', 'executor', '--value={}', '--revision', '1'],
-  ['policy', 'sync', 'github'],
-  ['prompts', 'get'],
-  ['prompts', 'save']
+  ['policy', 'sync', 'github']
 ]
 
 /** 一个能通过领域 handler 形状检查的最小 Ticket（handler 只读它来组 view）。 */
@@ -297,39 +316,58 @@ function commandRouterTools() {
   })
 }
 
-/** 真领域 handler 的接线：report/reply/ack 的写入口换成记录用的替身（它们各自有专门测试）。 */
-function commandRoutes(): ReturnType<typeof withDomainHandlers> {
+/**
+ * 真领域 handler 的接线：report/reply/ack 的写入口换成记录用的替身（它们各自有专门测试）。
+ * Prompt 配置的 handler 用**服务器自己打开的库**（版本表与 KV 都在里面），于是 `prompts save`
+ * 在这里是一次真的写、`prompts get` 读得到它。
+ */
+function commandRoutes(store: Store): readonly RouteDefinition[] {
   const ticket = ticketForCommands()
-  return withAssessmentHandlers(
-    withDomainHandlers(
-      ROUTE_TABLE,
-      createDomainHandlers({
-        report: () => ticket,
-        reply: () => ({ id: 'reply-1', status: 'pending', reused: false }),
-        note: () => ticket,
-        requestStatus: () => true,
-        handback: (ticketId, triggerId) => {
-          // 到达过这张 Ticket 的消息可以交回；其余的给核心的固定拒绝（`not_owned`）。
-          if (triggerId !== 'trigger-1') throw new UserError('notReached')
-          return ticketId === ticket.id
-        },
-        // 停止与重试的可用性由领域判定：这里只替身「能不能」与「是否已结束」两个事实。
-        stop: () => ticket,
-        retry: (ticketId) => {
-          if (ticketId === ticket.id) return ticket
-          if (ticketId === 'ticket-ended') throw new UserError('notRetryable')
-          throw new UserError('unknownTicket')
-        },
-        ticketOf: (id) =>
-          id === ticket.id
-            ? ticket
-            : id === 'ticket-ended'
-              ? { ...ticket, ended: { at: AT, by: 'human', outcome: 'stopped' } }
-              : undefined,
-        tickets: () => [ticket]
-      })
+  return withPromptHandlers(
+    withAssessmentHandlers(
+      withDomainHandlers(
+        ROUTE_TABLE,
+        createDomainHandlers({
+          report: () => ticket,
+          reply: () => ({ id: 'reply-1', status: 'pending', reused: false }),
+          note: () => ticket,
+          requestStatus: () => true,
+          handback: (ticketId, triggerId) => {
+            // 到达过这张 Ticket 的消息可以交回；其余的给核心的固定拒绝（`not_owned`）。
+            if (triggerId !== 'trigger-1') throw new UserError('notReached')
+            return ticketId === ticket.id
+          },
+          // 停止与重试的可用性由领域判定：这里只替身「能不能」与「是否已结束」两个事实。
+          stop: () => ticket,
+          retry: (ticketId) => {
+            if (ticketId === ticket.id) return ticket
+            if (ticketId === 'ticket-ended') throw new UserError('notRetryable')
+            throw new UserError('unknownTicket')
+          },
+          ticketOf: (id) =>
+            id === ticket.id
+              ? ticket
+              : id === 'ticket-ended'
+                ? { ...ticket, ended: { at: AT, by: 'human', outcome: 'stopped' } }
+                : undefined,
+          tickets: () => [ticket]
+        })
+      ),
+      createAssessmentHandlers({ tools: commandRouterTools() })
     ),
-    createAssessmentHandlers({ tools: commandRouterTools() })
+    createPromptHandlers({
+      versions: createPromptVersions({ store, now: () => AT }),
+      deployment: {
+        environment: () => ({
+          variables: ['SUPERAGENT_CLI', 'SUPERAGENT_TOKEN_FILE'],
+          cliPath: '/opt/superagent/src/bin/superagent.mjs',
+          tokenFile: '/tmp/state/tokens/router',
+          stateDir: '/tmp/state',
+          repository: 'acme/widgets'
+        }),
+        policy: () => ({ version: 'v1', mode: 'observe', rules: [] })
+      }
+    })
   )
 }
 
@@ -382,7 +420,7 @@ test('every command that is wired has a success case and a fixed refusal', async
       now: () => '2026-11-07T03:26:00.000Z',
       portOpen: async () => true
     },
-    routes: commandRoutes()
+    routes: commandRoutes
   })
   try {
     for (const [name, success, refusal] of WIRED) {
@@ -426,7 +464,7 @@ test('every command that has not landed yet refuses with a fixed unavailable, of
 })
 
 test('route accepts its decisions from stdin too, not only repeated --item', async () => {
-  const server = await startTestServer({ routes: commandRoutes() })
+  const server = await startTestServer({ routes: commandRoutes })
   try {
     const decisions = JSON.stringify([
       { kind: 'ignore', trigger_id: 'trigger-1', reason: 'chatter' }
@@ -607,7 +645,7 @@ test('stdout and stderr never carry the token, and the error line carries the fi
 })
 
 test('--text as a command value keeps the JSON envelope (it is not the output switch)', async () => {
-  const server = await startTestServer({ routes: commandRoutes() })
+  const server = await startTestServer({ routes: commandRoutes })
   try {
     const out: string[] = []
     const result = await main({
