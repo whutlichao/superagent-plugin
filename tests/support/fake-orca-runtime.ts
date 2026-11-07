@@ -54,6 +54,9 @@ export interface FakeOrcaScript {
   focusTerminal?: (terminalId: string) => void | Promise<void>
   runCommand?: (spec: CommandSpec) => CommandHandle | Promise<CommandHandle>
   listTerminals?: () => readonly TerminalRow[] | Promise<readonly TerminalRow[]>
+  removeWorkspace?: (
+    workspace: Pick<WorkspaceInfo, 'workspaceId' | 'path'>
+  ) => void | Promise<void>
   listRepos?: () => readonly RepoRow[] | Promise<readonly RepoRow[]>
   searchRefs?: (selector: RepoSelector, query: string) => readonly string[] | Promise<readonly string[]>
 }
@@ -69,6 +72,7 @@ export interface FakeOrcaCalls {
   readonly focusTerminal: string[]
   readonly runCommand: CommandSpec[]
   readonly listWorkspaces: number[]
+  readonly removeWorkspace: Pick<WorkspaceInfo, 'workspaceId' | 'path'>[]
   readonly listAgents: number[]
   readonly listTerminals: number[]
   readonly listRepos: number[]
@@ -99,6 +103,7 @@ export class FakeOrcaRuntime implements OrcaRuntime {
     focusTerminal: [],
     runCommand: [],
     listWorkspaces: [],
+    removeWorkspace: [],
     listAgents: [],
     listTerminals: [],
     listRepos: [],
@@ -174,6 +179,12 @@ export class FakeOrcaRuntime implements OrcaRuntime {
   }
 
   async openWorkspace(): Promise<void> {}
+
+  async removeWorkspace(workspace: Pick<WorkspaceInfo, 'workspaceId' | 'path'>): Promise<void> {
+    this.calls.removeWorkspace.push(workspace)
+    if (this.script.removeWorkspace) return await this.script.removeWorkspace(workspace)
+    this.workspaces = this.workspaces.filter((row) => row.workspaceId !== workspace.workspaceId)
+  }
 
   async launchAgent(spec: AgentSpec): Promise<AgentHandle> {
     this.calls.launchAgent.push(spec)
