@@ -1,9 +1,10 @@
 // 存储内核的第一个红灯（§D.2、§P.1）：`<stateDir>/superagent.sqlite` 是真的 SQLite，
 // 打开后四条 PRAGMA 生效，且 KV 能存能读。先失败，再实现 `app/store.ts`。
 import { assert, test } from 'orca/testing'
-import { existsSync } from 'node:fs'
+import { existsSync, rmSync } from 'node:fs'
 import { join } from 'node:path'
-import { AT, isoAfter, openTempStore } from './support/state'
+import { openStore } from '../src/worker/app/store'
+import { AT, isoAfter, openTempStore, tempStateDir } from './support/state'
 import { githubCursorKey, KV_KEY_LITERALS, SETTINGS_REVISION_KEY } from '../src/worker/app/kv'
 import { listFiles, readRepoFile } from './support/repo'
 
@@ -495,5 +496,90 @@ test('a decision keeps the four kinds and refuses anything else', () => {
     )
   } finally {
     cleanup()
+  }
+})
+
+test('afterCommit runs a callback only once the outermost transaction commits', () => {
+  const { store, cleanup } = openTempStore()
+  const ran: string[] = []
+  try {
+    // 未提交前什么也不跑（§J.2 执行行：副作用在提交后才执行）。
+    store.transaction(() => {
+      store.kvSet('committed-key', 1)
+      store.afterCommit(() => ran.push('committed'))
+      assert.deepEqual(ran, [], 'nothing runs inside the transaction')
+    })
+    assert.deepEqual(ran, ['committed'])
+
+    // 回滚的事务：回调丢弃，一次也不跑。
+    assert.throws(() =>
+      store.transaction(() => {
+        store.afterCommit(() => ran.push('rolled back'))
+        throw new Error('rolled back')
+      })
+    )
+    assert.deepEqual(ran, ['committed'])
+
+    // 事务外调用：立即执行（调用方已经提交过了）。
+    store.afterCommit(() => ran.push('direct'))
+    assert.deepEqual(ran, ['committed', 'direct'])
+  } finally {
+    cleanup()
+  }
+})
+
+test('afterCommit callbacks of a nested savepoint run only with the outer commit, and die with its rollback', () => {
+  const { store, cleanup } = openTempStore()
+  const ran: string[] = []
+  try {
+    store.transaction(() => {
+      store.afterCommit(() => ran.push('outer'))
+      store.transaction(() => {
+        store.afterCommit(() => ran.push('inner'))
+      })
+      assert.deepEqual(ran, [], 'a released savepoint is not a commit')
+    })
+    assert.deepEqual(ran, ['outer', 'inner'])
+
+    ran.length = 0
+    store.transaction(() => {
+      try {
+        store.transaction(() => {
+          store.afterCommit(() => ran.push('inner rolled back'))
+          throw new Error('inner')
+        })
+      } catch {
+        // 外层继续
+      }
+      store.afterCommit(() => ran.push('outer again'))
+    })
+    assert.deepEqual(ran, ['outer again'], 'the rolled-back savepoint’s callback never ran')
+  } finally {
+    cleanup()
+  }
+})
+
+test('a failing afterCommit callback is logged and does not fail the committed transaction', () => {
+  const stateDir = tempStateDir()
+  const lines: { level: string; msg: string }[] = []
+  const store = openStore({ stateDir, log: (line) => void lines.push({ level: line.level, msg: line.msg }) })
+  try {
+    const result = store.transaction(() => {
+      store.kvSet('kept', 1)
+      store.afterCommit(() => {
+        throw new Error('callback blew up')
+      })
+      return 'committed'
+    })
+    assert.equal(result, 'committed')
+    assert.equal(store.kvGet('kept'), 1, 'the write stayed committed')
+    // 迁移本身会留一行 info；这里只断言回调失败的那一行在（§N.5 不静默）。
+    assert.deepEqual(
+      lines.filter((line) => line.level === 'error').map((line) => line.msg),
+      ['an afterCommit callback failed']
+    )
+  } finally {
+    store.close()
+    rmSync(stateDir, { recursive: true, force: true })
   }
 })
