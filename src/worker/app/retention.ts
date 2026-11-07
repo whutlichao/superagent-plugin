@@ -4,8 +4,10 @@
 // 阈值：Trigger / Disposition / Decision 默认 90 天；已结算（sent/dropped）Outbox 30 天。
 // 版本快照族只删「非当前」的旧快照（当前 = `settings-revision` / `prompt-revision` 指向的版本）。
 //
-// `trigger_thread` 没有外键（关联表两侧都可先出现），所以清理 Trigger 时按时间显式删关联行；
+// `trigger_thread` 没有外键（关联表两侧都可先出现），所以清理 Trigger 时显式删它的关联行；
 // Disposition 靠 `ON DELETE CASCADE` 跟着走，明细里的数量是「级联会带走多少」的预读数。
+// 哪些行算「到期」由 `retention-sql.ts` 的豁免谓词决定：未结束 Ticket 的 Thread 上的
+// Trigger/Decision（及其关联行）不删，见 #63。
 import { SILENT_LOG, type LogSink } from '../infra/log-line'
 import { LAST_PRUNE_KEY, PROMPT_REVISION_KEY, SETTINGS_REVISION_KEY } from './kv'
 import {

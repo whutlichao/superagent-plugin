@@ -539,8 +539,8 @@ CREATE TABLE kv (
 2. **生成列 + 部分索引**：pass 只扫「活」行。`json_extract` 与 `json_array_length` 在 SQLite 生成列里是确定性的，合法。
 3. **迁移**：`kv['schema-version']` 是唯一版本源；`app/migration.ts` 是步骤数组 `{ from, to, run(db) }`，逐级执行、每级一个事务。打开时：版本更高 → 拒绝启动（`locked` 语义，日志说明）；更低 → 先备份再迁移。首版 `SCHEMA_VERSION = 1`（新库直接建表，无历史包袱）；`2` 只修一处：`settings_version.origin` 的 CHECK 补上 §K.8 的第四种来源 `operator`（`operator` 与 `panel` 都有人工权限，但审计要分得清是谁动的手；整表重建后逐行复制，不丢历史）。
 4. **升级前备份**：迁移前把库复制到 `<stateDir>/backups/superagent-<from>-<ts>.sqlite`，保留最近 5 份。
-5. **保留策略**：`retention.days` 默认 90。维护 pass 每天一次：删 `trigger`/`disposition`/`decision` 中早于阈值的行（连同级联），删已 `sent`/`dropped` 且早于 30 天的 `outbox` 行，删 `kv` 中早于阈值的 `settings-version:*` / `prompt-version:*` 中的**非当前**快照。删除前写一条 health detail（`pruned: …`），不静默。
-6. **不删**：未结束的 Ticket、其 Thread、其 worktree 记录永不自动清理。
+5. **保留策略**：`retention.days` 默认 90。维护 pass 每天一次：删 `trigger`/`disposition`/`decision` 中早于阈值的行（连同级联），但**落在未结束 Ticket 视野里的不删**——判定在 `app/retention-sql.ts`：Trigger 关联的某条 Thread 仍被未结束 Ticket 订阅，或它是某个未结束 Ticket 的起源/输入 Trigger（Ticket 页的 Trigger→Ticket 历史，用户故事 32）；Decision 的 Thread 仍被未结束 Ticket 订阅。关联行（`trigger_thread`）与 disposition 跟着它的 Trigger 一起留。另删已 `sent`/`dropped` 且早于 30 天的 `outbox` 行，删 `kv` 中早于阈值的 `settings-version:*` / `prompt-version:*` 中的**非当前**快照。删除前写一条 health detail（`pruned: …`），不静默。
+6. **不删**：未结束的 Ticket、其 Thread、其 worktree 记录，以及它们视野里的 Trigger/Decision 永不自动清理。
 
 ### D.3 KV 键（单一命名处 `app/kv.ts`）
 
