@@ -4,6 +4,7 @@ import { assert, test } from 'orca/testing'
 import { existsSync, rmSync } from 'node:fs'
 import { join } from 'node:path'
 import { openStore } from '../src/worker/app/store'
+import { SCHEMA_VERSION } from '../src/worker/app/schema'
 import { AT, isoAfter, openTempStore, tempStateDir } from './support/state'
 import { githubCursorKey, KV_KEY_LITERALS, SETTINGS_REVISION_KEY } from '../src/worker/app/kv'
 import { listFiles, readRepoFile } from './support/repo'
@@ -221,7 +222,11 @@ test('KV stores JSON values, lists keys in order and deletes one key', () => {
     assert.equal(store.kvDelete(githubCursorKey('n-1')), true)
     assert.equal(store.kvDelete(githubCursorKey('n-1')), false)
     assert.deepEqual(store.kvKeys(), ['schema-version', 'settings-revision'])
-    assert.equal(store.kvGet<number>('schema-version'), 1, 'the schema version is readable through KV')
+    assert.equal(
+      store.kvGet<number>('schema-version'),
+      SCHEMA_VERSION,
+      'the schema version is readable through KV'
+    )
   } finally {
     cleanup()
   }

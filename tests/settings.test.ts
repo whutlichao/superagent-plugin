@@ -5,6 +5,7 @@
 import { describe, test } from 'node:test'
 import assert from 'node:assert/strict'
 import { createSettings, SETUP_FIELDS, SettingsError } from '../src/worker/app/settings.ts'
+import type { SettingsPolicyPort } from '../src/worker/app/settings.ts'
 import {
   SETTINGS_REVISION_KEY,
   settingsBlockRevisionKey,
@@ -12,6 +13,15 @@ import {
 } from '../src/worker/app/kv.ts'
 import { number, object } from '../src/worker/infra/schema.ts'
 import { openTempStore, AT } from './support/state.ts'
+
+/** 一个固定的 Policy 接线：簿记测试只关心「保存时记了什么」，不关心哈希怎么算。 */
+function fixedPolicy(): SettingsPolicyPort {
+  return {
+    version: () => 'abc123def456',
+    effects: () => new Map(),
+    apply: () => undefined
+  }
+}
 
 /** 一个可用的设置块校验器（真实模块用 policy/schema 或 kind 的 schema，这里只要一个能失败的）。 */
 const evalBlock = object({
@@ -54,15 +64,16 @@ describe('settings origin rules', () => {
       // 拒绝时一行都没写。
       assert.equal(store.kvGet(SETTINGS_REVISION_KEY), null)
       assert.equal(store.settingsVersions.latest(), null)
-      // panel 与 operator 可以改同样的字段（值不同，否则第二次是无改动保存）。
-      // §K.8 的 operator 与 panel 是同一个人工路径：存储只有三列（§C.1 / §D.2 的 CHECK）。
+      // panel 与 operator 可以改同样的字段（值不同，否则第二次是无改动保存），并且审计
+      // 如实记下是谁动的手（§K.8 的四种来源；schema v2 起 CHECK 收 operator）。
       for (const origin of ['panel', 'operator'] as const) {
         const saved = settings.save({
           block: 'executor',
           origin,
           value: { baseRepo: `acme/${origin}` }
         })
-        assert.equal(saved.origin, 'panel')
+        assert.equal(saved.origin, origin)
+        assert.equal(store.settingsVersions.byRevision(saved.revision)?.origin, origin)
       }
     } finally {
       cleanup()
@@ -141,15 +152,14 @@ describe('settings version bookkeeping', () => {
   test('records the revision, the block revision and the snapshot with its origin', () => {
     const { store, cleanup } = openTempStore()
     try {
-      const settings = createSettings({ store, now: () => AT })
+      const settings = createSettings({ store, now: () => AT, policy: fixedPolicy() })
       assert.equal(settings.revision(), 0)
       assert.equal(settings.block('policy'), undefined)
 
       const first = settings.save({
         block: 'policy',
         origin: 'panel',
-        value: { acceptMode: 'observe' },
-        policyVersion: 'abc123def456'
+        value: { acceptMode: 'observe' }
       })
       assert.deepEqual(first, {
         block: 'policy',
@@ -159,7 +169,8 @@ describe('settings version bookkeeping', () => {
         origin: 'panel',
         config: { acceptMode: 'observe' },
         policyVersion: 'abc123def456',
-        changed: true
+        changed: true,
+        affectedTickets: []
       })
       assert.deepEqual(store.settingsVersions.byRevision(1), {
         revision: 1,
@@ -174,17 +185,18 @@ describe('settings version bookkeeping', () => {
         at: AT,
         origin: 'panel',
         block: 'policy',
-        policyVersion: 'abc123def456'
+        policyVersion: 'abc123def456',
+        affectedTickets: []
       })
       assert.equal(store.kvGet(SETTINGS_REVISION_KEY), 1)
       assert.equal(store.kvGet(settingsBlockRevisionKey('policy')), 1)
-      const { changed: _changed, ...stored } = first
+      const { changed: _changed, affectedTickets: _affected, ...stored } = first
       assert.deepEqual(settings.block('policy'), stored)
 
       const second = settings.save({ block: 'policy', origin: 'tool', value: { acceptMode: 'auto' } })
       assert.equal(second.revision, 2)
       assert.equal(second.predecessor, 1)
-      assert.equal(second.policyVersion, null, 'only the caller that computes the hash records one')
+      assert.equal(second.policyVersion, 'abc123def456', 'the version is the content hash, not the caller\'s word')
       assert.equal(settings.blockRevision('policy'), 2)
       assert.equal(settings.revision(), 2)
     } finally {

@@ -9,7 +9,7 @@
 //   kind 的 `policy.rows()` 声明过的接收 scope。`admission` 的键与 Feishu 的「已配置群 / other /
 //   direct」是同一件事——行的来源就是 Source 的配置，所以它们由同一条检查覆盖。
 //
-// `version` 不在这里：它是内容哈希（§K.5），由 #25 计算；设置保存只把它记进版本历史。
+// `version` 不在这里：它是内容哈希（§K.5，`version.ts`）；设置保存现算它并记进版本历史。
 import { array, boolean, enumOf, number, object, record, string } from '../infra/schema.ts'
 import type { SafeParse, SchemaIssue } from '../infra/schema.ts'
 import type { AcceptMode } from '../core/index.ts'

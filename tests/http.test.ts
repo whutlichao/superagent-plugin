@@ -52,6 +52,7 @@ import {
 } from '../src/worker/http/server'
 import type { HttpHost } from '../src/worker/http/state'
 import { openStore } from '../src/worker/app/store'
+import { SCHEMA_VERSION } from '../src/worker/app/schema'
 import { runIdempotent } from '../src/worker/http/idempotency'
 import { tempStateDir } from './support/state'
 
@@ -834,7 +835,7 @@ test('GET state answers the process/store/http/loops/health/setup/paused/load sh
     const storeView = state['store'] as Record<string, unknown>
     assert.deepEqual(Object.keys(storeView).sort(), ['journalMode', 'path', 'schemaVersion'])
     assert.equal(storeView['path'], join(harness.stateDir, 'superagent.sqlite'))
-    assert.equal(storeView['schemaVersion'], 1)
+    assert.equal(storeView['schemaVersion'], SCHEMA_VERSION)
     assert.equal(storeView['journalMode'], 'wal')
 
     assert.deepEqual(state['http'], {

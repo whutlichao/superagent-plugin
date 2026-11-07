@@ -116,6 +116,33 @@ export function repliesToOf(trigger: Trigger | undefined): string | undefined {
   return address === '' ? `${channel.source}:${channel.thread}` : `${channel.source}:${channel.thread} (${address})`
 }
 
+/**
+ * `policy-changed` 的正文（§K.5 第 3 条）：旧版本 → 新版本，加上这次变更怎么影响这个
+ * Ticket——哪条匹配规则被停用或改写（附新文本），主动工作是否还接受，发起人是否还能发起。
+ * 只说这一份影响面里的东西，不把整份 Policy 灌给 worker。
+ */
+function policyChangeText(input: Extract<TicketInput, { kind: 'policy-changed' }>): string {
+  const lines = [`policy changed ${input.from} → ${input.to}`]
+  const { effect } = input
+  if (effect === undefined) return lines.join('\n')
+  for (const rule of effect.rules ?? []) {
+    lines.push(
+      rule.change === 'disabled'
+        ? `- rule "${rule.name}" (${rule.id}) is disabled`
+        : `- rule "${rule.name}" (${rule.id}) now reads: ${rule.instruction ?? ''}`
+    )
+  }
+  if (effect.proactive === false) {
+    lines.push('- proactive work is no longer accepted: finish only what these rules already allowed')
+  }
+  if (effect.requesterAllowed === false) {
+    lines.push(
+      `- ${effect.requester === undefined ? 'the requester' : `${effect.requester.id} (${effect.requester.source})`} can no longer start work here`
+    )
+  }
+  return lines.join('\n')
+}
+
 /** 一条 Input 的类型标签（文件里的 `# Input #n — <kind>`）。 */
 function kindOf(input: TicketInput): string {
   return input.kind
@@ -148,7 +175,7 @@ function bodyOf(
       }
     case 'policy-changed':
       return {
-        text: `policy changed ${input.from} → ${input.to}`,
+        text: policyChangeText(input),
         original: input.id,
         source: 'policy'
       }

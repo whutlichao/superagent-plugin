@@ -295,9 +295,13 @@ describe('policy depends only on the domain and the minimal validator', () => {
     assert.deepEqual(policyFiles(), [
       'src/worker/policy/admission.ts',
       'src/worker/policy/assessment.ts',
+      'src/worker/policy/effects.ts',
       'src/worker/policy/gate.ts',
       'src/worker/policy/index.ts',
-      'src/worker/policy/schema.ts'
+      'src/worker/policy/lists.ts',
+      'src/worker/policy/revalidate.ts',
+      'src/worker/policy/schema.ts',
+      'src/worker/policy/version.ts'
     ])
   })
 

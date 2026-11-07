@@ -24,16 +24,16 @@ import { createRepositories } from './app/repositories.ts'
 import {
   createPolicy,
   DEFAULT_POLICY,
-  UNVERSIONED_POLICY,
   validatePolicy
 } from './policy/index.ts'
-import type { PolicyKindView } from './policy/index.ts'
+import type { PolicyBlock, PolicyKindView } from './policy/index.ts'
 import { resolveRoles } from './app/roles.ts'
 import { ROUTER_RESTARTS_KEY, ROUTER_TERMINAL_KEY, ROUTER_WORKSPACE_KEY, PROMPT_REVISION_KEY } from './app/kv.ts'
 import { createDeterministicAssessor } from './app/assessor.ts'
 import { createRouterTools } from './app/assessment.ts'
 import { createOutbox, registerReplyEffects } from './app/outbox.ts'
 import { createPausedState } from './app/pause.ts'
+import { savedSettingsVersion } from './app/settings.ts'
 import {
   feishuChatsKey,
   feishuCursorKey,
@@ -419,11 +419,21 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
     })
   }
   const policyBlock = parsedPolicy.success ? parsedPolicy.data : DEFAULT_POLICY
+  /**
+   * 生效的 Policy 块：保存过就以存下来的那份为准，否则是启动时读到的那份。Policy 的保存
+   * （§K.5）因此立刻改变 Gate、复验与版本——不必等重启，也不需要第二个真相源。
+   */
+  const effectivePolicy = (): PolicyBlock => {
+    const stored = savedSettingsVersion(store, 'policy')?.config
+    if (stored === undefined) return policyBlock
+    const parsed = validatePolicy(stored, { kinds: policyKind })
+    if (!parsed.success) return policyBlock
+    return parsed.data
+  }
   const policy = createPolicy({
-    block: () => policyBlock,
+    block: effectivePolicy,
     sources: registry,
     rows: (source) => policyKind(source)?.rows() ?? [],
-    version: () => UNVERSIONED_POLICY,
     paused: () => paused.paused()
   })
 
@@ -615,10 +625,13 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
     }
   })
   // Router 的两条命令（§G.2 的 `route` / `eval-decide`）：策略判断在 `policy/assessment.ts`，
-  // 领域写入经 Engine；版本与块取组合根持有的那一份（#25 把版本换成内容哈希）。
+  // 领域写入经 Engine；版本是块的内容哈希（§K.5），块从设置里读（保存立刻生效）。
   const routerTools = createRouterTools({
     candidate: (triggerId) => engine.candidate(triggerId),
-    policy: () => ({ acceptMode: policyBlock.acceptMode, rules: policyBlock.rules }),
+    policy: () => {
+      const block = effectivePolicy()
+      return { acceptMode: block.acceptMode, rules: block.rules }
+    },
     policyVersion: () => policy.version,
     decide: (triggerId, outcome) => engine.decide(triggerId, outcome),
     attach: (ticketId, triggerId, note) => engine.attach(ticketId, triggerId, note),
