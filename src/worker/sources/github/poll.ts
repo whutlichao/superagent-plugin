@@ -17,6 +17,8 @@ import { issueNumberOf, rateLimited, type GithubApi } from './api.ts'
 import type { GithubBodySource } from './translate.ts'
 import {
   bodyFingerprint,
+  branchCiFingerprint,
+  branchCiTrigger,
   ciFingerprint,
   ciTrigger,
   commentTrigger,
@@ -35,6 +37,12 @@ export const FAILURES_BEFORE_ERROR = 3
  * Ticket 结束后继续轮询两周；超过就标为过期、停止轮询，但 Thread 记录保留。
  */
 export const POLL_HORIZON_MS = 14 * 24 * 3600_000
+
+/**
+ * 仓库级事件流的游标往回让 5 秒（与上游 `cursorAt` 同）：同一次推送里的条目时刻只到秒，
+ * 正好卡在游标上的那条下一轮可能漏读；重读的代价由 Trigger id 的幂等吃掉。
+ */
+export const CURSOR_OVERLAP_MS = 5000
 
 /** 轮询端口：组合根接 `app/source-context.ts`，测试接一个记录收到的 Trigger 的替身。 */
 export type GithubPollHost = Pick<SourceContext, 'receive' | 'state' | 'report' | 'threads'>
@@ -90,6 +98,15 @@ export interface GithubPollerOptions {
    * `app/kv.ts`，由组合根注入。缺省时不轮询 CI（与 `bodyKey` 同一条约定）。
    */
   readonly ciKey?: (pull: number, headSha: string) => string
+  /**
+   * 一条仓库级事件流的读位置键（`githubStreamKey(stream)`，§I.2 receive-all 行）：键名只活在
+   * `app/kv.ts`，由组合根注入。缺省时不读 receive-all 的仓库流（与 `bodyKey` 同一条约定）。
+   */
+  readonly streamKey?: (stream: string) => string
+  /**
+   * 默认分支 CI 的基线键（`githubBranchCiKey`，§I.2 receive-all 行）：缺省时不读默认分支 CI。
+   */
+  readonly branchCiKey?: string
   /** 时钟（毫秒，水位线判定用）；缺省 `Date.now`。 */
   readonly now?: () => number
   readonly log?: (message: string) => void
@@ -275,6 +292,229 @@ export function createGithubPoller(options: GithubPollerOptions): GithubPoller {
   }
 
   /**
+   * 仓库级事件流的读位置（§I.2 receive-all 行）：`since` 是下一轮从哪读起，`started` 记录每个
+   * 条目种类是什么时候被打开的——开关打开之前的条目不读，否则第一次打开就会灌进整个历史。
+   */
+  interface StreamState {
+    readonly since: string
+    readonly started: Readonly<Record<string, string>>
+  }
+
+  /** 一条仓库级事件流：它覆盖哪些条目种类、什么时候被观察、读哪个端点。 */
+  interface StreamSpec {
+    readonly id: 'issues' | 'comments' | 'review-comments'
+    readonly observed: (config: GithubConfig) => boolean
+    /** 这条流里可能出现的条目种类（`issues` 流同时有新 Issue 与新 PR）。 */
+    readonly kinds: (config: GithubConfig) => readonly StreamKind[]
+  }
+
+  /** 仓库级流的条目种类：每个种类一个「什么时候打开的」时刻。 */
+  type StreamKind = 'issues' | 'pulls' | 'comments'
+
+  /**
+   * 三条仓库级流（§I.2 receive-all 行）。GitHub 的 `/issues` 同时返回 Issue 与 PR，所以一条流
+   * 服务 `observeIssues` 与 `observePulls` 两个开关；评论分红两条端点（会话评论与行内评审评论）。
+   */
+  const STREAMS: readonly StreamSpec[] = [
+    {
+      id: 'issues',
+      observed: (config) => config.observeIssues || config.observePulls,
+      kinds: (config) => [
+        ...(config.observeIssues ? (['issues'] as const) : []),
+        ...(config.observePulls ? (['pulls'] as const) : [])
+      ]
+    },
+    { id: 'comments', observed: (config) => config.observeComments, kinds: () => ['comments'] },
+    { id: 'review-comments', observed: (config) => config.observeComments, kinds: () => ['comments'] }
+  ]
+
+  /** 读一个流位置；畸形值当作没有（宁可重读一条流，也不跳过错过的评论）。 */
+  const streamStateOf = (value: unknown): StreamState | null => {
+    if (typeof value !== 'object' || value === null) return null
+    const since = (value as { since?: unknown }).since
+    const started = (value as { started?: unknown }).started
+    if (typeof since !== 'string' || typeof started !== 'object' || started === null) return null
+    const entries = Object.entries(started as Record<string, unknown>).filter(
+      (entry): entry is [string, string] => typeof entry[1] === 'string'
+    )
+    return { since, started: Object.fromEntries(entries) }
+  }
+
+  /** 默认分支 CI 的基线：分支名 + 失败集合的指纹。 */
+  const branchStateOf = (value: unknown): { branch: string; fingerprint: string } | null => {
+    if (typeof value !== 'object' || value === null) return null
+    const branch = (value as { branch?: unknown }).branch
+    const fingerprint = (value as { fingerprint?: unknown }).fingerprint
+    return typeof branch === 'string' && typeof fingerprint === 'string'
+      ? { branch, fingerprint }
+      : null
+  }
+
+  /** 两个 ISO 时刻里较晚的那个（ISO 8601 的字典序即时间序）。 */
+  const laterOf = (left: string, right: string): string => (left > right ? left : right)
+
+  /** 一个提交的页面地址（默认分支 CI 的 Trigger 链接用）。 */
+  const commitUrl = (repository: string, sha: string): string =>
+    `https://github.com/${repository}/commit/${sha}`
+
+  /**
+   * 正文指纹（`github-body:<n>`，与通知路径同一个键，§I.2「issue-body 编辑」）：同一正文不
+   * 重复出 Trigger。流按 `updated_at` 升序读，改标签之类也会让同一条重新出现；正文没变就不是
+   * 新版本。`bodyKey` 缺省时不做这层（靠 Trigger id 幂等）。
+   */
+  const unchangedBody = (number: number, body: string): boolean => {
+    if (options.bodyKey === undefined) return false
+    const key = options.bodyKey(number)
+    const fingerprint = bodyFingerprint(body)
+    const seen = options.host.state.get(key)
+    options.host.state.set(key, fingerprint)
+    return typeof seen === 'string' && seen === fingerprint
+  }
+
+  /**
+   * 读一条仓库级事件流（§I.2 receive-all 行）：从它自己的游标读到最新，翻成 Trigger 交出去。
+   * 一条畸形条目只计数；开关打开之前的条目、agent 自己的话、没有正文的评论都不产 Trigger。
+   * 成功了才推进游标（失败由调用方记进这一轮，下一轮重读）。
+   */
+  const readStream = async (
+    spec: StreamSpec,
+    skip: (count: number) => void
+  ): Promise<number> => {
+    const key = options.streamKey
+    if (key === undefined) return 0
+    const stored = streamStateOf(options.host.state.get(key(spec.id)))
+    const nowText = new Date(nowMs()).toISOString()
+    const horizon = new Date(nowMs() - POLL_HORIZON_MS).toISOString()
+    const kinds = spec.kinds(options.config)
+    const started: Record<string, string> = {}
+    for (const kind of kinds) started[kind] = stored?.started[kind] ?? nowText
+    const since = laterOf(stored?.since ?? nowText, horizon)
+    /** 这一条属于这一轮吗：只收开关打开之后的（并且不越过水位线）。 */
+    const fresh = (at: string, kind: StreamKind): boolean => {
+      const from = started[kind]
+      if (from === undefined) return false
+      const time = Date.parse(at)
+      return Number.isFinite(time) && time >= Date.parse(laterOf(from, horizon))
+    }
+    const repository = options.config.repository
+    let newest = 0
+    const note = (at: string): void => {
+      const time = Date.parse(at)
+      if (Number.isFinite(time)) newest = Math.max(newest, time)
+    }
+    let received = 0
+    if (spec.id === 'issues') {
+      const read = await options.api.repoIssues(repository, since)
+      skip(read.skipped)
+      for (const issue of read.items) {
+        note(issue.updatedAt)
+        if (isSelf(issue, options.login)) continue
+        if (!fresh(issue.createdAt, issue.isPull ? 'pulls' : 'issues')) continue
+        const trigger = issueBodyTrigger({
+          repository,
+          number: issue.number,
+          isPull: issue.isPull,
+          source: issue,
+          login: options.login
+        })
+        if (trigger.text.length === 0) continue
+        if (unchangedBody(issue.number, issue.body)) continue
+        if (options.host.receive(trigger) !== 'duplicate') received += 1
+      }
+    } else {
+      const read =
+        spec.id === 'comments'
+          ? await options.api.repoComments(repository, since)
+          : await options.api.repoReviewComments(repository, since)
+      skip(read.skipped)
+      for (const comment of read.items) {
+        note(comment.updatedAt)
+        if (isSelf(comment, options.login)) continue
+        if (!fresh(comment.updatedAt, 'comments')) continue
+        const trigger =
+          spec.id === 'comments'
+            ? commentTrigger({
+                repository,
+                issue: comment.issue,
+                comment,
+                login: options.login,
+                observeComments: options.config.observeComments
+              })
+            : reviewCommentTrigger({
+                repository,
+                pull: comment.issue,
+                comment,
+                login: options.login
+              })
+        // 空正文的评论没有可读内容（与评审同：没有话就不叫事件）。
+        if (trigger.text.length === 0) continue
+        if (options.host.receive(trigger) !== 'duplicate') received += 1
+      }
+    }
+    const moved = newest === 0 ? since : new Date(newest - CURSOR_OVERLAP_MS).toISOString()
+    options.host.state.set(key(spec.id), { since: laterOf(moved, since), started })
+    return received
+  }
+
+  /**
+   * 默认分支的 CI（§I.2 receive-all 行）：先读仓库的默认分支，再读它最新的工作流运行的 head
+   * 提交（没有工作流运行时退回这个分支的 head），最后读那个提交的检查与状态。
+   *
+   * 只有**失败集合**变了才出 Trigger（`branchCiFingerprint`）：默认分支每个新提交都跑 CI，
+   * 通过不是新闻；坏了或者修好了才是。换了默认分支就从新基线开始，不把旧分支的失败当变化。
+   */
+  const readBranchCi = async (hooks: {
+    readonly skip: (count: number) => void
+    readonly defer: () => void
+  }): Promise<number> => {
+    const key = options.branchCiKey
+    if (key === undefined) return 0
+    const repository = options.config.repository
+    try {
+      const info = await options.api.repositoryInfo(repository)
+      hooks.skip(info.skipped)
+      const branch = info.items[0]?.defaultBranch ?? ''
+      if (branch.length === 0) return 0
+      const runs = await options.api.workflowRuns(repository, branch)
+      hooks.skip(runs.skipped)
+      let headSha = runs.items[0]?.headSha ?? ''
+      if (headSha.length === 0) {
+        // 没有工作流运行（仓库不用 Actions）：退回分支 head，提交状态仍然算 CI。
+        const head = await options.api.branchHead(repository, branch)
+        hooks.skip(head.skipped)
+        headSha = head.items[0]?.headSha ?? ''
+      }
+      if (headSha.length === 0) return 0
+      const read = await options.api.checks(repository, headSha)
+      hooks.skip(read.skipped)
+      const checks = read.items[0]
+      if (checks === undefined) return 0
+      const previous = branchStateOf(options.host.state.get(key))
+      const fingerprint = branchCiFingerprint(checks)
+      let received = 0
+      if (previous !== null && previous.branch === branch && previous.fingerprint !== fingerprint) {
+        const trigger = branchCiTrigger({
+          repository,
+          branch,
+          checks,
+          at: new Date(nowMs()).toISOString(),
+          url: commitUrl(repository, headSha)
+        })
+        if (options.host.receive(trigger) !== 'duplicate') received += 1
+      }
+      options.host.state.set(key, { branch, fingerprint })
+      return received
+    } catch (error) {
+      // 限流会自己恢复：记一次、下一轮重读，不进连续失败（与 PR 的 CI 同）。
+      if (!rateLimited(error)) throw error
+      const detail = error instanceof Error ? error.message : String(error)
+      log(`default-branch CI is rate limited; retrying next round: ${detail.slice(0, 200)}`)
+      hooks.defer()
+      return 0
+    }
+  }
+
+  /**
    * 读一个 Thread 的会话：Issue/PR 本体、会话评论，PR 再读评审与评审评论（#18 只读不翻）。
    * `pull` 已知时（通知的 subject.type 就是 PullRequest）跳过 issues/<n> 的探测读取。
    */
@@ -423,7 +663,25 @@ export function createGithubPoller(options: GithubPollerOptions): GithubPoller {
         noteFailure(error)
       }
 
-      // 2) 订阅 Thread：凡有活 Ticket 订阅的都每轮读一次；超出水位线的标为过期、不再读。
+      // 2) receive-all（§I.2 receive-all 行）：四个开关各自拉仓库级的新 Issue/PR、新评论与
+      //    默认分支 CI。每个开关只管自己那条流；一条流的失败不挡别的步骤，也不推进它的游标。
+      for (const spec of STREAMS) {
+        if (options.streamKey === undefined || !spec.observed(options.config)) continue
+        try {
+          triggers += await readStream(spec, addSkipped)
+        } catch (error) {
+          noteFailure(error)
+        }
+      }
+      if (options.branchCiKey !== undefined && options.config.observeCi) {
+        try {
+          triggers += await readBranchCi({ skip: addSkipped, defer: addDeferred })
+        } catch (error) {
+          noteFailure(error)
+        }
+      }
+
+      // 3) 订阅 Thread：凡有活 Ticket 订阅的都每轮读一次；超出水位线的标为过期、不再读。
       const subscribed = options.subscribed?.() ?? []
       for (const thread of subscribed) {
         if (!withinHorizon(thread, nowMs())) {
@@ -448,7 +706,7 @@ export function createGithubPoller(options: GithubPollerOptions): GithubPoller {
         }
       }
 
-      // 3) CI：订阅的 PR 读一次 head 提交的检查与状态，只在指纹变化时出 Trigger（§I.2 CI 行）。
+      // 4) CI：订阅的 PR 读一次 head 提交的检查与状态，只在指纹变化时出 Trigger（§I.2 CI 行）。
       //    只有还活着的 Ticket 需要 CI 反馈（上游只轮询 open ticket 的 PR）：结束的 Ticket 不再读。
       for (const thread of subscribed) {
         if (!thread.live) continue
@@ -462,7 +720,7 @@ export function createGithubPoller(options: GithubPollerOptions): GithubPoller {
         }
       }
 
-      // 4) 整轮成功才推进游标：被中断的一轮重读，而不是漏读（§I.2 / §I.6）。
+      // 5) 整轮成功才推进游标：被中断的一轮重读，而不是漏读（§I.2 / §I.6）。
       if (failed) {
         failRound(firstError)
       } else {

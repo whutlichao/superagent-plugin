@@ -411,6 +411,10 @@ test('the PR read keeps the PR state a later ticket needs for the closing rule',
         url: 'https://github.com/acme/widgets/pull/45',
         state: 'closed',
         merged: true,
+        // 草稿与分支名供资源读说明这条 PR 从哪来（#36）；草稿不为真时不当作可合并的改动。
+        draft: false,
+        headRef: 'agent/fix-login',
+        baseRef: 'main',
         // CI 读这个 head 提交的检查与状态（#19）。
         headSha: CI_SHA,
         updatedAt: '2026-11-07T03:09:36Z',
@@ -2214,6 +2218,11 @@ test('the composition root reads CI for a subscribed PR when CI observation is o
       )
       commands.script(['api', `repos/acme/widgets/commits/${CI_SHA}/statuses`, '--paginate'], () =>
         JSON.stringify([])
+      )
+      // observeCi 也开着：receive-all 会读默认分支的 CI（#36），这两条脚本让这一轮真的成功。
+      commands.script('gh api repos/acme/widgets', () => JSON.stringify({ default_branch: 'main' }))
+      commands.script(['api', 'repos/acme/widgets/actions/runs', '--method'], () =>
+        JSON.stringify({ workflow_runs: [{ head_sha: CI_SHA }] })
       )
     }
   })

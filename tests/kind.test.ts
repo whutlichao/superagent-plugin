@@ -285,6 +285,7 @@ describe('the sources type surface', () => {
       'src/worker/sources/github/index.ts',
       'src/worker/sources/github/kind.ts',
       'src/worker/sources/github/poll.ts',
+      'src/worker/sources/github/read.ts',
       'src/worker/sources/github/translate.ts',
       'src/worker/sources/kind.ts',
       'src/worker/sources/registry.ts'
