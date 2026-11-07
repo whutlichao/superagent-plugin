@@ -421,7 +421,11 @@ test('the plugin check scenario opens on the Deployment group with a real read',
     host: mockHost({ requests: scenario.requests, storage: scenario.storage }),
     locale: 'en'
   })
-  assert.equal(mounted.valueOf({ type: 'Tabs' }), 'settings', 'the scenario opens Settings')
+  assert.equal(
+    mounted.valueOf({ type: 'Tabs', label: COPY['panel.title'].en }),
+    'settings',
+    'the scenario opens Settings'
+  )
   assert.ok(mounted.find({ text: COPY['deployment.stateDir'].en }), 'the deployment read is on screen')
   assert.ok(mounted.find({ text: `${COPY['deployment.setup'].en} · 1` }), 'setup problems too')
   assert.deepEqual(mounted.refusals, [])

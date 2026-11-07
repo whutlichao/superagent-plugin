@@ -11,6 +11,7 @@ import { createStatusBarPublisher } from './app/status-bar'
 import { Commands } from './sources/commands'
 import { LAUNCH_HOOK_EVENT, launchHook, type LaunchHookEvent } from './executor/launch-hook'
 import { REPLY_WORD_LIMIT, wordCount } from './http/domain'
+import { PromptTextError, PromptVersionError } from './app/prompts.ts'
 import {
   EXECUTION_FILTERS,
   isExecutionFilter,
@@ -78,6 +79,29 @@ function codeOf(error: unknown, fallback: string): string {
 /** 面板动作的固定拒绝（形状不对就是 `invalid_params`，与其它面板请求同一口径）。 */
 function invalidParams(message: string): Error & { code: string } {
   return Object.assign(new Error(message), { code: 'invalid_params' })
+}
+
+/** 一个非负整数面板参数（版本号与基版本）；形状不对就是 `invalid_params`，不猜。 */
+function baseRevisionOf(value: unknown, name: string, field = 'baseRevision'): number {
+  if (typeof value !== 'number' || !Number.isInteger(value) || value < 0) {
+    throw invalidParams(`${name} needs { ${field}: a non-negative integer }`)
+  }
+  return value
+}
+
+/**
+ * 一个提示词拒绝 → 面板的宿主错误：固定码 + 填槽值（§G.2 的 `missing_placeholder` /
+ * `stale_revision` / `reserved_skill_name` / `too_long`）。文案不在这里拼——面板按码翻译。
+ */
+function promptRefusal(error: unknown): Error & { code: string; values?: Record<string, string> } {
+  const known =
+    error instanceof PromptTextError || error instanceof PromptVersionError ? error : undefined
+  const code = codeOf(error, 'invalid_params')
+  const values = known === undefined ? undefined : { ...known.values }
+  return Object.assign(new Error(messageOf(error)), {
+    code,
+    ...(values === undefined ? {} : { values })
+  })
 }
 
 /** 一次面板请求里的 `{ ticketId: string }`。 */
@@ -409,6 +433,37 @@ export default function activate(orca: OrcaWorkerApi): void {
     const booted = await ready()
     await booted.restartRouter()
     return booted.deployment().router
+  })
+  // Prompts 组（§M.3）：一份读数、一次预览、一次保存、一次恢复。预览与保存共用 worker 的
+  // 同一份校验；被拒时把固定码与填槽值一并带出（面板按码翻译），不把原因写成一句散文。
+  host.handleRequest('prompts', async () => (await ready()).promptPanel())
+  host.handleRequest('prompts.preview', async (input) => {
+    const config = (input as { config?: unknown } | null)?.config
+    if (config === undefined) throw invalidParams('prompts.preview needs { config: object }')
+    const booted = await ready()
+    return booted.previewPrompts(config)
+  })
+  host.handleRequest('prompts.save', async (input) => {
+    const request = (input ?? {}) as { config?: unknown; baseRevision?: unknown }
+    if (request.config === undefined) throw invalidParams('prompts.save needs { config: object }')
+    const baseRevision = baseRevisionOf(request.baseRevision, 'prompts.save')
+    const booted = await ready()
+    try {
+      return booted.savePrompts({ config: request.config, baseRevision })
+    } catch (error) {
+      throw promptRefusal(error)
+    }
+  })
+  host.handleRequest('prompts.restore', async (input) => {
+    const request = (input ?? {}) as { revision?: unknown; baseRevision?: unknown }
+    const revision = baseRevisionOf(request.revision, 'prompts.restore', 'revision')
+    const baseRevision = baseRevisionOf(request.baseRevision, 'prompts.restore')
+    const booted = await ready()
+    try {
+      return booted.restorePrompts({ revision, baseRevision })
+    } catch (error) {
+      throw promptRefusal(error)
+    }
   })
 
   host.register(COMMANDS.pause, () => {

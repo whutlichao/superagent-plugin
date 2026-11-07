@@ -36,7 +36,7 @@ import {
   type PanelContext
 } from 'orca'
 import { GLOSSARY_GROUPS, translate, type CopyKey } from './copy'
-import { Deployment, loadDeployment, openDeployment, resetDeployment } from './deployment'
+import { openSettings, resetSettings, SettingsGroups } from './settings-groups'
 import { problemDecisionId, reasonText, reasonsText } from './eval'
 import { executionMark, executionRow } from './execution'
 import {
@@ -291,7 +291,7 @@ export function setup(ctx: PanelContext): () => void {
       void load()
       // 部署页读的是另一份读数（限额、health、Router）：停留在这页时跟着推送刷新，但不重跑
       // doctor（那是人要的时候才跑的 `gh`/`lark-cli` 诊断）。
-      if (read(page) === 'settings') void loadDeployment()
+      if (read(page) === 'settings') void openSettings()
       // Execution 页读的是自己的那条请求：详情重读那一张，列表重读已经读到的那几页。
       if (read(page) === 'execution') {
         const focused = read(focus)
@@ -318,7 +318,7 @@ export function setup(ctx: PanelContext): () => void {
   if (read(ctx.visible)) {
     void load()
     // 重开面板时停在 Deployment 组：这一页的读数也要读一次（渲染里不发请求）。
-    if (startPage === 'settings') void openDeployment()
+    if (startPage === 'settings') void openSettings()
     // 停在 Execution：焦点指向一张工单就是详情，否则是列表。
     if (startPage === 'execution') enterExecution()
     // 停在 Eval：同理（焦点指向一条决定就是详情，否则是列表）。
@@ -328,7 +328,7 @@ export function setup(ctx: PanelContext): () => void {
   } else set(phase, 'starting')
   return () => {
     disposed = true
-    resetDeployment()
+    resetSettings()
     if (retryTimer !== null) {
       clearTimeout(retryTimer)
       retryTimer = null
@@ -2331,9 +2331,9 @@ function PageBody(props: {
   const state = read(snapshot)
   const stage = read(phase)
   if (props.current === 'settings') {
-    // Settings 页的其余四组（Sources/Eval/Execution/Prompts）由 #42/#43 填进同一页；
-    // 本票交付的是 Deployment 组，它自己管读取、错误态与动作。
-    return <Deployment locale={locale} />
+    // Settings 页的分组在 `settings-groups.tsx`：每组自己管读取、错误态与动作（§M.3）。
+    // Sources/Eval/Execution 三组由 #42 填进同一张表，Prompts 是 #43，Deployment 是 #47。
+    return <SettingsGroups locale={locale} />
   }
   if (props.current === 'trigger') {
     // Trigger 页的三态在自己的 `Table` 上（§M.2：加载是 `Table loading`、读失败是行内错误 +
@@ -2438,7 +2438,7 @@ export default function Panel(): OrcaElement {
           if (!isNavPage(next)) return
           set(page, next)
           // Deployment 组、Execution 列表与 Eval 列表打开时才读（隐藏与未打开的页面不发请求，§M.6）。
-          if (next === 'settings') void openDeployment()
+          if (next === 'settings') void openSettings()
           if (next === 'execution') enterExecution()
           if (next === 'eval') enterEval()
           if (next === 'trigger') enterTriggers()
