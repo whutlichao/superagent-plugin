@@ -163,6 +163,11 @@ export const ROUTE_TABLE: readonly RouteDefinition[] = [
   { method: 'GET', path: 'decisions', command: 'read decisions', minimumRole: 'router', handler: stub },
   { method: 'GET', path: 'tickets', command: 'read tickets', minimumRole: 'router', handler: stub },
   { method: 'GET', path: 'tickets/:id', command: 'read ticket/<id>', minimumRole: 'assignment', handler: stub },
+  // Source 资源读面（§G.2 的 read 行、§I.2 的「资源读取」行、§I.3 的读法）：资源名是一整段
+  // （`github%2Fissues%2F12`，服务端整段解码），于是 `github/…` 与 `feishu/…` 共用一条路由。
+  // 最低角色是 assignment：**角色细化在 handler 里**——assignment 只读自己 Ticket 相关的资源
+  // （其余是 `not_permitted_role` / `refused`），router/operator 全读（§O 角色行）。
+  { method: 'GET', path: 'read/:resource', command: 'read <resource>', minimumRole: 'assignment', handler: stub },
   { method: 'GET', path: 'settings', command: 'settings get', minimumRole: 'router', handler: stub },
   { method: 'GET', path: 'prompts', command: 'prompts get', minimumRole: 'router', handler: stub },
   { method: 'GET', path: 'policy/history', command: 'settings get --history', minimumRole: 'operator', handler: stub },

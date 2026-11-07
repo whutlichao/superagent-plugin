@@ -456,6 +456,33 @@ test('a path segment is percent-encoded once for thread keys with slashes and sp
   assert.equal(encodePathSegment('gh:o/r#1'), 'gh%3Ao%2Fr%231')
 })
 
+test('read maps source resources onto one whole path segment and keeps paging flags intact', async () => {
+  // `read github/issues/12` 是一条命令 + 一个资源名：资源名整段编码，`/` 不改变分段（#57）。
+  const { readPath, readQuery } = await import('../src/worker/cli/commands')
+  const args = (flags: Record<string, string>) => ({ positionals: [], flags, repeated: {}, text: false })
+  assert.equal(readPath('github/issues/12/comments/2', undefined), 'read/github%2Fissues%2F12%2Fcomments%2F2')
+  assert.equal(readPath('feishu/om_1/thread/cursor%3Dx', undefined), 'read/feishu%2Fom_1%2Fthread%2Fcursor%253Dx')
+  assert.throws(
+    () => readPath('github/issues/12', 'extra'),
+    (error: unknown) => error instanceof ApiError && error.code === 'invalid_params'
+  )
+  assert.deepEqual(readQuery('feishu/om_1/thread', args({ offset: '3', limit: '10' })), {
+    offset: 3,
+    limit: 10
+  })
+  // 文本页的上限是 8000（列表页仍是 50）；超过在客户端就是 `invalid_value`。
+  assert.deepEqual(readQuery('github/issues/12', args({ limit: '8000' })), { limit: 8000 })
+  assert.throws(
+    () => readQuery('github/issues/12', args({ limit: '8001' })),
+    (error: unknown) =>
+      error instanceof ApiError && error.code === 'invalid_value' && error.values?.['max'] === '8000'
+  )
+  assert.throws(
+    () => readQuery('threads', args({ limit: '51' })),
+    (error: unknown) => error instanceof ApiError && error.values?.['max'] === '50'
+  )
+})
+
 test('an unreachable worker is retried exactly once, after the fixed 200 ms', async () => {
   // 一个真实但已经没人监听的端口：`not_ready` 必须来自一次真实连接失败，不是假成功。
   // 端口取自内核临时区间之外的窄带（#53），不会被别的测试或另一轮测试半途绑定。
