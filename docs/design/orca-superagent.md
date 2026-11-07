@@ -568,7 +568,7 @@ CREATE TABLE kv (
 | Prompt 版本 | `app/prompts.ts` |
 | effect 行 | `app/effects.ts` |
 | outbox receipt | `app/outbox.ts`（运行时唯一写者；已结算行的过期删除归下一行的维护 pass，§D.2 第 5 条） |
-| 过期删除：`trigger` / `disposition` / `decision`（默认 90 天）、已结算 `outbox`（30 天）、非当前版本快照 | `app/retention-sql.ts`（`app/retention.ts` 在维护 pass 的一天一次事务里执行；它只**删**旧行，不创建任何状态，§D.2 第 5 条） |
+| 过期删除：`trigger` / `disposition` / `decision`（默认 90 天，未结束 Ticket 视野里的不删）、已结算 `outbox`（30 天）、非当前版本快照 | `app/retention-sql.ts`（`app/retention.ts` 在维护 pass 的一天一次事务里执行；它只**删**旧行，不创建任何状态，§D.2 第 5 条） |
 | 每个 health 条目 | 在 HealthBoard 上 claim 它的那个部件（重复 claim 直接抛） |
 | router 快照（terminal/workspace/restarts） | `router/supervision.ts` |
 
@@ -1754,7 +1754,7 @@ $ orca plugin types <dir> --json
 
 ### P.2 测试套件（`orca plugin test .` 会跑所有 `*.test.ts(x)`）
 
-快照（本机 Orca 1.4.251、Node 25）：**88 个文件、1560 条测试、169 个 suite、fail 0**。下表按模块
+快照（本机 Orca 1.4.251、Node 25；截至 #64 合并，`scripts/check.sh` 的实测读数）：**89 个文件、1574 条测试、170 个 suite、fail 0**。下表按模块
 分组，每行都是 `tests/` 下的真实文件；「对应上游」写上游同名测试面，合并与改名的地方直接写出
 去向（§R.2 是同一件事的反向对照）。**没有落地的一项**单独列在表末。
 
@@ -1816,13 +1816,13 @@ $ orca plugin types <dir> --json
 | `manifest-budget.test.ts` / `license.test.ts` / `check-script.test.ts` / `shutdown.test.ts` | 清单形态与每类上限；MIT 与署名句；`scripts/check.sh` 的四道门禁与 `types` 缺陷探针；关停屏障 | `bundle-patch.spec.ts`（删除：改由 `plugin validate` 承担） |
 | `source-state.test.ts` / `log.test.ts` / `schema.test.ts` / `status-bar.test.ts` | Source 只经端口写自己的状态；日志滚动、脱敏、`orca.log`；零依赖校验器的 `strict`/`safeParse`/错误路径；状态栏文本、语气与 2 s 节流 | 无（Orca 专有） |
 | `docs.test.ts` | 本地链接、无冲突标记、编号文档、§C.1 模块表覆盖 `src/` 每个目录、§P.2 ↔ §R.2 互相对得上、README 的十一项限制与 attribution | `docs.spec.ts` |
+| `class-docs.test.ts` | 注释纪律：`src/worker/**` 与 `src/panel/**` 的每个导出类、每个导出具名函数上方都有 JSDoc，每个模块首部都有一段说明（`//` 散文或 JSDoc 都算）；规则配灵敏度自测，豁免表为空 | `class-docs.spec.ts` |
 | `src/panel/panel.check.ts`（不在 `tests/`） | `plugin check` 的 17 个情景（§M.7） | 无（Orca 专有） |
 
 #### 没有落地的上游测试面（记为差异，不是笔误）
 
 | 上游测试面 | 现在的状态 | 归属 |
 | --- | --- | --- |
-| `class-docs.spec.ts` | **没有** `class-docs.test.ts`：仓库里没有「每个类前必须有 JSDoc」的自动断言，这条纪律今天靠审阅 | 无票。§H 之外的一处实现差异，#50 在此记明；要补需要一张新票 |
 | `runtime-concurrency` 的独立文件 | 断言并入 `passes.test.ts`（pass 期间到达的请求）与 `core-engine.test.ts`（Thread 串行 Eval + 合并待评估的 Trigger） | #15 T1 |
 | `delivery.spec.ts` | 投递去重（request id）的断言在 `effects.test.ts` 与 `tools.test.ts`（幂等），没有单独文件 | #11 F6A |
 
@@ -2069,7 +2069,7 @@ manifest + types + tsconfig + boot + lock + sqlite(trigger/thread/ticket/decisio
 | `panel-overview` / `panel-source` / `panel-trigger` / `panel-eval` / `panel-execution` / `panel-settings` / `panel-prompts` / `panel-deployment` | `panel-overview` … `panel-deployment`（10 个文件） | 一对一 |
 | `draft` / `prompt-config` / `markdown` / `marks` / `locales` / `styles` | 同名（`prompt-config` → `prompts` + `panel-prompts` + `diff`） | 一对一 / 合并 |
 | `docs` | `docs` | 一对一（「模块表/测试表完整」改为针对本文 §C 与 §P） |
-| `class-docs` | 未落地 | 没有 `class-docs.test.ts`；§P.2 表末记为差异（要补需要一张新票） |
+| `class-docs` | `class-docs` | 一对一（`tests/class-docs.test.ts`：导出类/具名函数的 JSDoc + 模块首部的一段说明 + 灵敏度自测） |
 | （无） | `runtime-seam` / `host-methods` / `types-surface` / `executor-orca` / `router-orca` / `cli-contract` / `host-runtime` / `kind` / `read-surface` / `read-views` / `route` | 新增（Orca 专有） |
 
 **没有遗漏的核对方式**：本表每一行的「Orca 对应」都必须在 §P.2 出现，`docs.test.ts` 断言这一点；
@@ -2121,9 +2121,10 @@ README 的已知限制段读 `limitation.<id>.*` 文案（中英各一份），�
 
 ### B.2 十一项之外的一处实现差异（不属 §H）
 
-`class-docs.test.ts`（上游 `class-docs.spec.ts`，断言「每个类前有 JSDoc」）**没有落地**：仓库里没有
-这条自动断言，纪律靠审阅。它不是行为差异（§H 记的是行为），所以只写在这里与 §P.2 的表末；要补需要
-一张新票。
+今天没有。`class-docs.test.ts`（上游 `class-docs.spec.ts`）已落地（#62）：导出类与导出具名函数
+必须是 JSDoc，模块首部的一段说明 `//` 散文与 JSDoc 都算——理由写在测试头部（187 个文件的既有
+风格是文件顶上一段散文，统一改写成 JSDoc 只带来冲突，不带来信息）。`export const` 上的箭头函数
+不在射程（值不是具名函数声明）。它不是行为差异（§H 记的是行为），所以不占 §H 的一行。
 
 ## 附录 C：spike 台账（不是「待定」，是「已定方向 + 需实测的参数」）
 
