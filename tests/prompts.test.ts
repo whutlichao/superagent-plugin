@@ -12,6 +12,8 @@
 // 使用提示词的一方只用 `composePrompt` / `promptSections`：本文件的断言不碰私有函数。
 import { describe, test } from 'node:test'
 import assert from 'node:assert/strict'
+import { existsSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { join } from 'node:path'
 import {
   composePrompt,
   composeSkill,
@@ -32,8 +34,14 @@ import {
   type PromptPolicy,
   type PromptPartKey
 } from '../src/worker/app/prompts.ts'
+import { syncSkillFiles, TEAM_EDITED_MARKER } from '../src/worker/app/skills.ts'
+import { BUILT_IN_SKILLS, configChars, skillFilePath } from '../src/worker/app/prompts.ts'
 import { mandateInstructions } from '../src/worker/executor/mandate.ts'
 import { assembleLaunchPrompt, promptLogLine } from '../src/worker/app/launch-prompt.ts'
+
+/** 一个技能文件的内容（测试只看文件正文，不看实现）。 */
+const readFile = (path: string): string => readFileSync(path, 'utf8')
+const writeFile = (path: string, text: string): void => writeFileSync(path, text, 'utf8')
 
 /** 部署事实（§G.5 的字面量形状；路径里有空格，和插件安装目录一样）。 */
 const ENVIRONMENT: PromptEnvironment = {
@@ -525,6 +533,91 @@ describe('skills', () => {
   })
 })
 
+// ------------------------------------------------------------------ 技能文件（§L.6、§H.8）
+//
+// 断言口径（票面验收第一、三条）：
+// - 内置 skills 落盘到 `<stateDir>/skills/<name>/SKILL.md`，正文来自分片常量（含命令行用法）；
+// - 已存在且带 `<!-- team-edited -->` 标记的文件不被覆盖（升级不吞掉人改的正文）；
+// - 团队技能是同一目录下的文件：新建写盘、编辑改写同一个稳定路径、从配置删掉即删除目录；
+// - 两个内置技能是保留名，不能被团队技能替换或删除（`reserved_skill_name`）。
+describe('the skill files under the state directory', () => {
+  test('writes both built-in skills to their stable path and leaves a team-edited file alone', () => {
+    const stateDir = tempStateDir()
+    try {
+      const first = syncSkillFiles({ stateDir, config: {} })
+      assert.deepEqual([...first.written].sort(), ['superagent-feishu', 'superagent-github'])
+      assert.deepEqual(first.kept, [])
+      for (const skill of BUILT_IN_SKILLS) {
+        const path = join(stateDir, 'skills', skill.name, 'SKILL.md')
+        assert.equal(path, skillFilePath(stateDir, skill.name), 'the prompt and the file agree on the path')
+        assert.equal(readFile(path), composeSkill(skill.kind, {}))
+      }
+      // 一次同步之后再同步：正文没变，不重写（不制造无意义的 mtime 变化）。
+      assert.deepEqual(syncSkillFiles({ stateDir, config: {} }).written, [])
+      // 人改过的文件带标记：同步不覆盖它。
+      const githubPath = skillFilePath(stateDir, 'superagent-github')
+      const edited = `${TEAM_EDITED_MARKER}\n${readFile(githubPath)}\nTeam addition.`
+      writeFile(githubPath, edited)
+      const second = syncSkillFiles({ stateDir, config: { overrides: { 'skill/github': { text: 'A new default.' } } } })
+      assert.deepEqual(second.written, [])
+      assert.deepEqual(second.kept, ['superagent-github'])
+      assert.equal(readFile(githubPath), edited, 'the team-edited file survives the override')
+      // 没有标记时，override 改写内置文件；正文仍是分片常量 + 命令行用法，不是一份手写文本。
+      rmSync(githubPath)
+      const third = syncSkillFiles({ stateDir, config: { overrides: { 'skill/github': { text: 'A new default.' } } } })
+      assert.deepEqual(third.written, ['superagent-github'])
+      assert.equal(readFile(githubPath), composeSkill('github', { overrides: { 'skill/github': 'A new default.' } }))
+      assert.ok(readFile(githubPath).includes(PROMPT_PARTS['runtime/cli'].lines[0]!), 'the CLI usage follows the skill')
+    } finally {
+      rmSync(stateDir, { recursive: true, force: true })
+    }
+  })
+
+  test('adds, edits and deletes a team skill at its stable path, and never touches a built-in file', () => {
+    const stateDir = tempStateDir()
+    try {
+      syncSkillFiles({ stateDir, config: {} })
+      const builtIn = readFile(skillFilePath(stateDir, 'superagent-github'))
+      const added = syncSkillFiles({ stateDir, config: { skills: { 'acme-deploy': 'Deploy rules, v1.' } } })
+      assert.deepEqual(added.written, ['acme-deploy'])
+      const path = join(stateDir, 'skills', 'acme-deploy', 'SKILL.md')
+      assert.equal(skillFilePath(stateDir, 'acme-deploy'), path, 'the path is stable across edits')
+      assert.equal(readFile(path), 'Deploy rules, v1.')
+      const edited = syncSkillFiles({ stateDir, config: { skills: { 'acme-deploy': 'Deploy rules, v2.' } } })
+      assert.deepEqual(edited.written, ['acme-deploy'])
+      assert.equal(readFile(path), 'Deploy rules, v2.')
+      assert.equal(readFile(skillFilePath(stateDir, 'superagent-github')), builtIn, 'the built-in file is untouched')
+      // 从配置里删掉 = 删文件：目录也不留残留。
+      const removed = syncSkillFiles({ stateDir, config: {} })
+      assert.deepEqual(removed.removed, ['acme-deploy'])
+      assert.equal(existsSync(path), false)
+      assert.equal(existsSync(skillFilePath(stateDir, 'superagent-github')), true)
+    } finally {
+      rmSync(stateDir, { recursive: true, force: true })
+    }
+  })
+
+  test('the prompt names every skill by absolute path and asks for it before that work', () => {
+    const teamSkills = { 'acme-deploy': 'Deploy rules, v1.' }
+    for (const role of ['orchestrator', 'worker'] as const) {
+      const text = composePrompt({ role, environment: ENVIRONMENT, policy: POLICY, skills: teamSkills })
+      assert.match(text, /## Skills/)
+      assert.match(text, /read the matching one before you start that work/i)
+      for (const skill of BUILT_IN_SKILLS) {
+        const path = skillFilePath(ENVIRONMENT.stateDir, skill.name)
+        assert.ok(text.includes(`${skill.label}: read "${path}"`), `${role} names ${skill.name} absolutely`)
+      }
+      assert.ok(
+        text.includes(`Team skill acme-deploy: read "${skillFilePath(ENVIRONMENT.stateDir, 'acme-deploy')}"`),
+        `${role} names the team skill's path`
+      )
+      // 技能是文件：正文不拼进提示词（否则每次 launch 都带着全部技能）。
+      assert.equal(text.includes('Deploy rules, v1.'), false)
+      assert.equal(text.includes(PROMPT_PARTS['skill/github'].lines[0]!), false)
+    }
+  })
+})
+
 // ------------------------------------------------------------------ 版本、历史与 default-updated（§L.4、§L.5）
 //
 // 断言口径（票面验收第一至六条）：
@@ -550,9 +643,9 @@ import { ApiError } from '../src/worker/http/errors.ts'
 import { ROUTE_TABLE, stub } from '../src/worker/http/routes.ts'
 import type { RouteInput } from '../src/worker/http/routes.ts'
 import { draftReducer, initialDraft, saveBar, barShown } from '../src/panel/draft.ts'
-import { openTempStore, AT, isoAfter } from './support/state.ts'
+import { openTempStore, AT, isoAfter, tempStateDir } from './support/state.ts'
 import { startTestServer, type TestServer } from './support/cli-server.ts'
-import { openBoot } from './support/boot.ts'
+import { openBoot, settingsOf } from './support/boot.ts'
 import type { FakeOrcaRuntime } from './support/fake-orca-runtime.ts'
 import { dispatch } from '../src/worker/cli/commands.ts'
 import { parseArgs } from '../src/worker/cli/io.ts'
@@ -594,13 +687,25 @@ describe('the built-in base keys an override records', () => {
 })
 
 /** 断言一次拒绝是那个固定码（不解析文案）。 */
-function refusalOf(work: () => unknown): { readonly code: string; readonly values: Readonly<Record<string, string>> } {
+function refusalOf(work: () => unknown): {
+  readonly code: string
+  readonly values: Readonly<Record<string, string>>
+  readonly message: string
+} {
   try {
     work()
   } catch (error) {
-    const typed = error as { readonly code?: unknown; readonly values?: Readonly<Record<string, string>> }
+    const typed = error as {
+      readonly code?: unknown
+      readonly values?: Readonly<Record<string, string>>
+      readonly message?: unknown
+    }
     assert.equal(typeof typed.code, 'string', `a fixed code, got ${String(error)}`)
-    return { code: typed.code as string, values: typed.values ?? {} }
+    return {
+      code: typed.code as string,
+      values: typed.values ?? {},
+      message: typeof typed.message === 'string' ? typed.message : ''
+    }
   }
   throw new Error('expected a refusal')
 }
@@ -661,6 +766,190 @@ describe('validating a saved config', () => {
     assert.deepEqual(Object.keys(saved.config.overrides ?? {}), ['runtime/shared'])
     // 保存的版本里没有的分片名就不是「已移除」，是打错了。
     assert.equal(refusalOf(() => validatePromptConfig({ overrides: { 'runtime/legacy': { text: 'x' } } })).code, 'unknown_part')
+  })
+
+  test('takes a team skill, and refuses the built-in names, bad names and empty text', () => {
+    const saved = validatePromptConfig({ skills: { 'acme-deploy': 'Deploy rules.' } })
+    assert.deepEqual(saved.config.skills, { 'acme-deploy': 'Deploy rules.' })
+    // 名字在保存的配置里按名字排：提示词与版本 diff 不因输入顺序抖动。
+    const two = validatePromptConfig({ skills: { 'b-skill': 'B.', 'a-skill': 'A.' } })
+    assert.deepEqual(Object.keys(two.config.skills ?? {}), ['a-skill', 'b-skill'])
+    // 保留名：内置技能只读，不能被团队技能替换。
+    for (const skill of BUILT_IN_SKILLS) {
+      const refused = refusalOf(() => validatePromptConfig({ skills: { [skill.name]: 'Mine.' } }))
+      assert.equal(refused.code, 'reserved_skill_name', skill.name)
+      assert.equal(refused.values.skill, skill.name)
+    }
+    // 字符集与长度（§L.6：1–64 字符，只允许 a-z 0-9 -）。
+    for (const name of ['', 'Acme-Deploy', 'acme_deploy', 'acme deploy', 'a'.repeat(65)]) {
+      const refused = refusalOf(() => validatePromptConfig({ skills: { [name]: 'Text.' } }))
+      assert.equal(refused.code, 'invalid_skill_name', JSON.stringify(name))
+      assert.equal(refused.values.skill, name)
+    }
+    assert.ok(validatePromptConfig({ skills: { ['a'.repeat(64)]: 'Text.' } }).config.skills, '64 characters are fine')
+    // 空正文不是一份技能；`skills` 本身不是对象是配置形状错误。
+    for (const text of ['', '   ', 1, null]) {
+      const refused = refusalOf(() => validatePromptConfig({ skills: { 'acme-deploy': text } }))
+      assert.equal(refused.code, 'invalid_part', JSON.stringify(text))
+      assert.equal(refused.values.part, 'skills/acme-deploy')
+    }
+    assert.equal(refusalOf(() => validatePromptConfig({ skills: ['x'] })).code, 'invalid_config')
+  })
+})
+
+
+// ------------------------------------------------------------------ 体量上限（§L.6、§L.3）
+//
+// 断言口径（票面验收第四条）：
+// - 总大小上限 `promptMaxChars` 含全部 override 与团队技能；超限**拒绝保存**并给出固定码
+//   `too_long` 与两个可读的数字（上限、实际），绝不静默截断；
+// - 拒绝发生在写库之前：版本号、当前配置、历史都不变（全有或全无）；
+// - 预览（不写库的那条路）与保存在同一处校验；CLI 得到同一个固定码与退出码 2；
+// - 拼好的全文也受同一个上限：超过就拒绝组装，而不是交一份被截断的提示词给 agent。
+describe('the prompt size limit (§L.6)', () => {
+  test('a config over promptMaxChars is refused with a readable too_long, and nothing is written', () => {
+    const { store, cleanup } = openTempStore()
+    try {
+      const versions = createPromptVersions({ store, now: () => AT, maxChars: 400 })
+      assert.equal(versions.maxChars(), 400, 'the limit comes from the machine settings')
+      const first = versions.save({ config: { team: { scope: 'A'.repeat(300) } }, baseRevision: 0, origin: 'panel' })
+      assert.equal(first.revision, 1)
+      // 300 字符的团队段 + 150 字符的团队技能 = 450：超过 400。
+      const tooBig = { team: { scope: 'B'.repeat(300) }, skills: { 'acme-deploy': 'C'.repeat(150) } }
+      assert.equal(configChars(tooBig), 450, 'team text and skill text both count')
+      const refused = refusalOf(() => versions.save({ config: tooBig, baseRevision: 1, origin: 'tool' }))
+      assert.equal(refused.code, 'too_long')
+      assert.deepEqual(refused.values, { limit: '400', actual: '450' })
+      assert.match(refused.message, /450/)
+      assert.match(refused.message, /400/)
+      assert.match(refused.message, /shorten/i, 'a readable refusal says what to do')
+      // 什么都没写：版本号、当前配置与历史都不变（不截断、不半存）。
+      assert.equal(versions.revision(), 1)
+      assert.deepEqual(versions.config(), { team: { scope: 'A'.repeat(300) } })
+      assert.equal(versions.history().length, 1)
+      // override 与默认文本也计入同一份总量。
+      assert.equal(
+        configChars({ overrides: { 'runtime/worker': { text: 'x'.repeat(10) } }, skills: { a: '12345' } }),
+        15
+      )
+    } finally {
+      cleanup()
+    }
+  })
+
+  test('the handler refuses a too-large save and its preview with the same fixed code', async () => {
+    const { store, cleanup } = openTempStore()
+    try {
+      const versions = createPromptVersions({ store, now: () => AT, maxChars: 200 })
+      const handlers = createPromptHandlers({ versions, deployment: DEPLOYMENT })
+      const tooBig = { team: { scope: 'A'.repeat(201) } }
+      const refused = await apiRefusal(() => handlers.get('PUT prompts')!(promptInput({ config: tooBig, baseRevision: 0 })))
+      assert.equal(refused.code, 'too_long')
+      assert.equal(refused.status, 400, '§G.3 maps too_long to 400')
+      assert.deepEqual(refused.values, { limit: '200', actual: '201' })
+      assert.equal(versions.revision(), 0)
+      // 预览是同一条校验，只是不写库。
+      const previewed = await apiRefusal(() => handlers.get('POST prompts/preview')!(promptInput({ config: tooBig })))
+      assert.equal(previewed.code, 'too_long')
+      assert.equal(versions.revision(), 0)
+      // 刚好等于上限可以存（上限是「不超过」）。
+      const saved = (await handlers.get('PUT prompts')!(
+        promptInput({ config: { team: { scope: 'A'.repeat(200) } }, baseRevision: 0 })
+      )) as { revision: number }
+      assert.equal(saved.revision, 1)
+    } finally {
+      cleanup()
+    }
+  })
+
+  test('the CLI reports the same too_long refusal with exit code 2', async () => {
+    const server = await startTestServer({
+      routes: (store) =>
+        withPromptHandlers(
+          ROUTE_TABLE,
+          createPromptHandlers({
+            versions: createPromptVersions({ store, now: () => AT, maxChars: 200 }),
+            deployment: DEPLOYMENT
+          })
+        )
+    })
+    try {
+      const saved = await runCli(
+        cliTargetOf(server),
+        ['prompts', 'save', '--config', '-', '--base-revision', '0'],
+        JSON.stringify({ skills: { 'acme-deploy': 'D'.repeat(201) } })
+      )
+      assert.equal(saved.exit, 2)
+      assert.deepEqual((saved.error as { code: string; values?: unknown }).code, 'too_long')
+      assert.deepEqual((saved.error as { values?: unknown }).values, { limit: '200', actual: '201' })
+      const read = await runCli(cliTargetOf(server), ['prompts', 'get'])
+      assert.equal((read.result as { revision: number }).revision, 0, 'the refusal wrote nothing')
+    } finally {
+      server.close()
+    }
+  })
+
+  test('assembling a prompt over the limit is refused, never truncated', () => {
+    const composed = composePrompt({ role: 'worker', environment: ENVIRONMENT })
+    assert.ok(composed.length > 0)
+    // 刚好等于上限是合法的（上限是「不超过」）；少一个字符就拒绝，且拒绝里两个数字都可读。
+    assert.equal(
+      composePrompt({ role: 'worker', environment: ENVIRONMENT, maxChars: composed.length }),
+      composed
+    )
+    const refused = refusalOf(() =>
+      composePrompt({ role: 'worker', environment: ENVIRONMENT, maxChars: composed.length - 1 })
+    )
+    assert.equal(refused.code, 'too_long')
+    assert.equal(refused.values.limit, String(composed.length - 1))
+    assert.equal(refused.values.actual, String(composed.length))
+    assert.match(refused.message, /assembled/i)
+    assert.match(refused.message, /shorten/i)
+    // launch prompt（全文 + revision 说明）也受同一个上限：说明也算在交给会话的文本里。
+    const launch = refusalOf(() =>
+      assembleLaunchPrompt({ role: 'worker', revision: 1, config: {}, environment: ENVIRONMENT, maxChars: composed.length })
+    )
+    assert.equal(launch.code, 'too_long')
+    assert.equal(launch.values.limit, String(composed.length))
+  })
+})
+
+
+// ------------------------------------------------------------------ 与默认相同的 override（§L.6）
+//
+// 票面验收第五条：override 与默认逐字相同 → 保存时丢弃，以便跟随未来默认。丢弃发生在校验里，
+// 于是预览、保存与 CLI 三条路的行为一致；丢弃不是「丢掉用户的字」，那份字本来就是默认文本。
+describe('an override that matches the default', () => {
+  test('is dropped on save, so the part follows future defaults', () => {
+    const { store, cleanup } = openTempStore()
+    try {
+      const versions = createPromptVersions({ store, now: () => AT })
+      const defaultWork = PROMPT_PARTS['runtime/work'].lines.join('\n')
+      const first = versions.save({
+        config: {
+          overrides: {
+            'runtime/work': { text: defaultWork },
+            'runtime/shared': { text: 'Mine, and different from the default.' }
+          }
+        },
+        baseRevision: 0,
+        origin: 'panel'
+      })
+      assert.equal(first.revision, 1)
+      assert.deepEqual(Object.keys(versions.config().overrides ?? {}), ['runtime/shared'], 'only the real edit is stored')
+      assert.deepEqual(first.dropped, [], 'matching the default is not a removed part')
+      assert.deepEqual(versions.defaultChanged(versions.config()), [], 'nothing to re-base')
+      // 以前存过一段，现在把默认文本存回去：同样丢弃，之后内置文本变了也不报 default-updated。
+      const second = versions.save({
+        config: { overrides: { 'runtime/shared': { text: PROMPT_PARTS['runtime/shared'].lines.join('\n') } } },
+        baseRevision: 1,
+        origin: 'tool'
+      })
+      assert.equal(second.revision, 2)
+      assert.deepEqual(versions.config(), {}, 'both overrides now follow the defaults')
+    } finally {
+      cleanup()
+    }
   })
 })
 
@@ -1000,6 +1289,29 @@ describe('the prompt handlers', () => {
       }
       // 没写任何行：被拒的正文不在库里。
       assert.equal(versions.config().team, undefined)
+    } finally {
+      cleanup()
+    }
+  })
+
+  test('a team skill named like a built-in is a reserved_skill_name refusal, not a 500', async () => {
+    const { store, cleanup } = openTempStore()
+    try {
+      const versions = createPromptVersions({ store, now: () => AT })
+      const put = createPromptHandlers({ versions }).get('PUT prompts')!
+      const reserved = await apiRefusal(() =>
+        put(promptInput({ config: { skills: { 'superagent-github': 'Mine.' } }, baseRevision: 0 }))
+      )
+      assert.equal(reserved.code, 'reserved_skill_name')
+      assert.equal(reserved.status, 400, 'a name refusal is a validation refusal, not an internal error')
+      assert.deepEqual(reserved.values, { skill: 'superagent-github' })
+      // 字符集与长度走同一条拒绝路径（面板按码翻译，不解析文案）。
+      const bad = await apiRefusal(() =>
+        put(promptInput({ config: { skills: { 'Acme Deploy': 'Text.' } }, baseRevision: 0 }))
+      )
+      assert.equal(bad.code, 'invalid_skill_name')
+      assert.equal(bad.status, 400)
+      assert.equal(versions.revision(), 0, 'a refused save writes nothing')
     } finally {
       cleanup()
     }
@@ -1373,6 +1685,99 @@ describe('the prompts CLI', () => {
       assert.ok(prompt.includes('Prompt revision 1'))
       // §F.3：仍然有自检命令（Router 自己的尾部，不靠手写角色文本）。
       assert.ok(/First action: run node ".*" status --json/.test(prompt))
+    } finally {
+      await h.cleanup()
+    }
+  })
+})
+
+
+// ---------------------------------------------------------------- 落盘与提示词（组合根 → 真文件）
+//
+// 票面验收第一、二条：启动时把内置 skills 写到状态目录，且 prompt 里给绝对路径与「开工前读」
+// 的指令。这里不看内部调用，只看两件可观察的事实：磁盘上的文件、交给会话的 launch prompt。
+describe('the skills a booted plugin leaves on disk (§L.6)', () => {
+  test('writes both built-in skills at startup, and the router prompt names their absolute paths', async () => {
+    const h = await openBoot()
+    try {
+      for (const skill of BUILT_IN_SKILLS) {
+        const path = skillFilePath(h.stateDir, skill.name)
+        assert.equal(existsSync(path), true, `${skill.name} is on disk after boot`)
+        assert.equal(readFile(path), composeSkill(skill.kind, {}), 'the file body is the built-in text')
+      }
+      const prompt = routerLaunches(h.runtime).at(-1)?.prompt ?? ''
+      for (const skill of BUILT_IN_SKILLS) {
+        assert.ok(
+          prompt.includes(`read "${skillFilePath(h.stateDir, skill.name)}"`),
+          `the launch prompt names ${skill.name} by absolute path`
+        )
+      }
+      assert.match(prompt, /read the matching one before you start that work/i)
+    } finally {
+      await h.cleanup()
+    }
+  })
+
+  test('a saved team skill becomes a file at its stable path; deleting it removes the file', async () => {
+    const h = await openBoot()
+    try {
+      const target = routerCliTarget(h.stateDir, h.handle.port()!)
+      const saved = await runCli(
+        target,
+        ['prompts', 'save', '--config', '-', '--base-revision', '0'],
+        JSON.stringify({ skills: { 'acme-deploy': 'Deploy rules, v1.' } })
+      )
+      assert.equal(saved.exit, 0, JSON.stringify(saved.error))
+      const path = skillFilePath(h.stateDir, 'acme-deploy')
+      assert.equal(readFile(path), 'Deploy rules, v1.')
+      // prompt 里给的是路径（不是正文），两个角色都有。
+      const text = await runCli(target, ['prompts', 'get', '--text'])
+      assert.equal(text.exit, 0, JSON.stringify(text.error))
+      const texts = (text.result as { texts: { orchestrator: string; worker: string } }).texts
+      assert.ok(texts.orchestrator.includes(`read "${path}"`))
+      assert.ok(texts.worker.includes(`read "${path}"`))
+      assert.equal(texts.worker.includes('Deploy rules, v1.'), false, 'skill text lives in the file, not the prompt')
+      // 下一次 launch 的全文同样只有路径。
+      await h.handle.restartRouter()
+      assert.ok((routerLaunches(h.runtime).at(-1)?.prompt ?? '').includes(`read "${path}"`))
+      // 从配置删掉 → 文件跟着消失（团队技能的真相源是配置）。
+      const removed = await runCli(
+        target,
+        ['prompts', 'save', '--config', '-', '--base-revision', '1'],
+        JSON.stringify({})
+      )
+      assert.equal(removed.exit, 0, JSON.stringify(removed.error))
+      assert.equal(existsSync(path), false)
+    } finally {
+      await h.cleanup()
+    }
+  })
+
+  test('promptMaxChars from the settings refuses an oversized save and an oversized assembly', async () => {
+    const stateDir = tempStateDir()
+    const h = await openBoot({
+      stateDir,
+      settings: { ...settingsOf(stateDir), promptMaxChars: 400 }
+    })
+    try {
+      const target = routerCliTarget(h.stateDir, h.handle.port()!)
+      const tooBig = await runCli(
+        target,
+        ['prompts', 'save', '--config', '-', '--base-revision', '0'],
+        JSON.stringify({ team: { scope: 'A'.repeat(401) } })
+      )
+      assert.equal(tooBig.exit, 2)
+      assert.equal((tooBig.error as { code: string }).code, 'too_long')
+      assert.deepEqual((tooBig.error as { values?: unknown }).values, { limit: '400', actual: '401' })
+      // 拒绝保存：没有版本，文件也没被写。
+      assert.equal(
+        ((await runCli(target, ['prompts', 'get'])).result as { revision: number }).revision,
+        0
+      )
+      // 组装（全文）受同一个上限：400 字符装不下任何一份完整提示词，于是固定拒绝而不是截断。
+      const text = await runCli(target, ['prompts', 'get', '--text'])
+      assert.equal(text.exit, 2)
+      assert.equal((text.error as { code: string }).code, 'too_long')
     } finally {
       await h.cleanup()
     }

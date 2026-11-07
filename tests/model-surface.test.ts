@@ -11,10 +11,11 @@ import assert from 'node:assert/strict'
 import {
   composePrompt,
   composeSkill,
+  configChars,
   PROMPT_BUDGETS,
   PROMPT_PART_KEYS,
   PROMPT_PARTS,
-  type ComposeInput,
+  type PromptConfig,
   type PromptEnvironment
 } from '../src/worker/app/prompts.ts'
 import { CLI_COMMANDS, commandFor } from '../src/worker/cli/commands.ts'
@@ -336,16 +337,18 @@ describe('size budgets', () => {
     assert.ok(HELP.length <= PROMPT_BUDGETS.promptMaxChars, `help is ${HELP.length}`)
   })
 
-  test('the default configuration stays inside the save limit of §L.6', () => {
-    const config: ComposeInput & { skills: Record<string, string> } = {
-      role: 'orchestrator',
-      environment: ENVIRONMENT,
-      policy: POLICY,
-      team: {},
-      overrides: {},
-      skills: Object.fromEntries(Object.entries(SKILLS))
-    }
-    assert.ok(JSON.stringify(config).length <= PROMPT_BUDGETS.configMaxChars)
+  test('the default configuration stays inside the save limit of §L.6, skill text included', () => {
+    const saved: PromptConfig = { skills: Object.fromEntries(Object.entries(SKILLS)) }
+    // §L.6 的总量含团队技能文本：技能正文虽然不进提示词，但它是团队要读的文本，计入同一个上限。
+    assert.equal(
+      configChars(saved),
+      SKILLS.github.length + SKILLS.feishu.length,
+      'every skill character counts toward the limit'
+    )
+    assert.ok(configChars(saved) <= PROMPT_BUDGETS.configMaxChars, `config is ${configChars(saved)}`)
+    // 拼好的全文也都在上限之下（§L.6 的另一个强制点）。
+    assert.ok(ORCHESTRATOR.length <= PROMPT_BUDGETS.configMaxChars)
+    assert.ok(WORKER.length <= PROMPT_BUDGETS.configMaxChars)
   })
 
   test('the mandate that narrows a proactive ticket keeps the local-only line', () => {
