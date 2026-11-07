@@ -213,7 +213,7 @@ interface Reads {
   readonly messages: Map<string, ContextMessage>
   readonly cursors: Set<string>
   context?: AdmissionContext
-  loading?: Promise<AdmissionContext>
+  loading: Promise<AdmissionContext> | undefined
 }
 
 /** 读工具需要的宿主端口（组合根注入；测试用替身）。 */
@@ -254,6 +254,12 @@ function stubPreview(text: string): string {
   return text.replace(/\s+/g, ' ').trim().slice(0, EVAL_STUB_CHARS)
 }
 
+/** 相关 Ticket 的排序：开着的在前，同组内新的在前（上游 `relatedTickets` 的规则）。 */
+function relatedOrder(left: EvalTicketInput, right: EvalTicketInput): number {
+  if (Number(!left.ended) !== Number(!right.ended)) return left.ended ? 1 : -1
+  return right.createdAt.localeCompare(left.createdAt)
+}
+
 /**
  * 相关 Ticket：开着的在前、同组内新的在前，最多 `EVAL_TICKETS_LIMIT` 条（上游 `relatedTickets`
  * 的排序规则），另给总数让模型知道还有多少。
@@ -262,13 +268,7 @@ export function evalTicketLines(tickets: readonly EvalTicketInput[]): {
   readonly relatedTickets: readonly EvalTicketLine[]
   readonly ticketsTotal: number
 } {
-  const order = [...tickets].sort((left, right) =>
-    Number(!left.ended) === Number(!right.ended)
-      ? right.createdAt.localeCompare(left.createdAt)
-      : left.ended
-        ? 1
-        : -1
-  )
+  const order = [...tickets].sort(relatedOrder)
   return {
     relatedTickets: order.slice(0, EVAL_TICKETS_LIMIT).map((ticket) => ({
       ticketId: ticket.id,
@@ -536,7 +536,12 @@ export function createEvalTools(host: EvalToolHost): EvalTools {
       ...(trigger.human ? {} : { bot: true as const }),
       ...(trigger.url === undefined ? {} : { url: trigger.url })
     })
-    const reads: Reads = { evalId: candidate.evalId, messages, cursors: new Set() }
+    const reads: Reads = {
+      evalId: candidate.evalId,
+      messages,
+      cursors: new Set(),
+      loading: undefined
+    }
     cache.byEval.set(candidate.evalId, reads)
     // 忙碌时按插入顺序淘汰最旧的一次评估。
     for (const key of cache.byEval.keys()) {
@@ -560,7 +565,7 @@ export function createEvalTools(host: EvalToolHost): EvalTools {
         return context
       })
       .finally(() => {
-        delete reads.loading
+        reads.loading = undefined
       })
     return reads.loading
   }
@@ -619,8 +624,8 @@ export function createEvalTools(host: EvalToolHost): EvalTools {
   return {
     async window(triggerId: string): Promise<EvalWindowResult> {
       const found = live(triggerId)
-      if ('ok' in found && found.ok !== true) return found
-      const { candidate, trigger } = found as { candidate: Candidate; trigger: Trigger }
+      if (!found.ok) return found
+      const { candidate, trigger } = found
       const source = host.threadContext(trigger)
       const images = (messageId: string, text: string): readonly string[] =>
         (source?.images(text) ?? []).map((key) => `${messageId}/${key}`)
@@ -659,8 +664,8 @@ export function createEvalTools(host: EvalToolHost): EvalTools {
       const invalid = validateEvalRead(request)
       if (invalid !== undefined) return invalid
       const found = live(triggerId)
-      if ('ok' in found && found.ok !== true) return found
-      const { candidate, trigger } = found as { candidate: Candidate; trigger: Trigger }
+      if (!found.ok) return found
+      const { candidate, trigger } = found
       const source = host.threadContext(trigger)
       const images = (messageId: string, text: string): readonly string[] =>
         (source?.images(text) ?? []).map((key) => `${messageId}/${key}`)

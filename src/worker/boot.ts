@@ -780,8 +780,11 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
   // （§H.22），语境经 kind 的 `threadContext`（§I.1），`--path` 只允许 base repo 与 Ticket
   // worktree（§O）。候选、Trigger 与 worktree 都现读，重启后不必重建。
   const evalAdmission = admissionSettingsOf(settings)
+  // base repo 的选择器可能只给了 name/id（§E.1）：能解析成路径就解析一次，解析不了就只认
+  // Ticket worktree——`--path` 因此仍然 fail closed（§O），而不是猜一个目录。
+  const baseRepoPath = await baseRepoPathOf(options.runtime, executorSettings.baseRepo)
   const evalRoots = (): readonly string[] => [
-    ...(executorSettings.baseRepo?.path === undefined ? [] : [executorSettings.baseRepo.path]),
+    ...(baseRepoPath === undefined ? [] : [baseRepoPath]),
     ...repo.tickets
       .list()
       .flatMap((ticket) => (ticket.execution === undefined ? [] : [ticket.execution.directory]))
@@ -1404,6 +1407,29 @@ interface FeishuSetup {
   readonly botId: string
   readonly appId: string
   readonly problem?: { readonly place: string; readonly code: string; readonly detail?: string }
+}
+
+/**
+ * `executor.baseRepo` 的本地路径（`eval-read --path` 的根，§O）：`path:` 选择器直接用；
+ * `name:`/`id:` 去 `orca repo list` 里找一次。找不到或 CLI 不可用就返回 undefined——
+ * 根的缺失只会让 `--path` 拒绝，不会让 worker 启动失败。
+ */
+async function baseRepoPathOf(
+  runtime: Pick<OrcaRuntime, 'listRepos'>,
+  selector: { readonly path?: string; readonly name?: string; readonly id?: string } | undefined
+): Promise<string | undefined> {
+  if (selector === undefined) return undefined
+  if (selector.path !== undefined) return selector.path
+  try {
+    const repos = await runtime.listRepos()
+    return repos.find(
+      (repo) =>
+        (selector.id !== undefined && repo.id === selector.id) ||
+        (selector.name !== undefined && repo.name === selector.name)
+    )?.path
+  } catch {
+    return undefined
+  }
 }
 
 /** 部署派生的事实（§E.11 的变量源）：仓库与账号来自设置与 setup 探针。 */

@@ -125,7 +125,7 @@ export function readRepoPath(input: {
   if (stats.isDirectory()) {
     const names = readdirSync(found.real)
       .filter((name) => !name.startsWith('.') && name !== 'node_modules')
-      .sort()
+      .sort((left, right) => left.localeCompare(right))
     const text = names.join('\n')
     if (text.length > limit) {
       throw new RepoReadError('too_large', `The directory listing is larger than ${limit} bytes`, {
