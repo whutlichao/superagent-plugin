@@ -7,10 +7,11 @@
 import { assert, test } from 'orca/testing'
 import { HealthBoard } from '../src/worker/infra/health'
 import { PASS_INTERVAL_MS, Passes } from '../src/worker/app/passes'
+import type { HealthEntry } from '../src/worker/core/index.ts'
 import { createGate, until } from './support/queue'
 
-/** 夹具：记录调用顺序的假 effects/engine、真健康板、手动调度器。 */
-function harness() {
+/** 夹具：记录调用顺序的假 effects/engine、真健康板、手动调度器。`evals` 可选：`evals` 条目的读数。 */
+function harness(evals?: () => HealthEntry) {
   const board = new HealthBoard()
   const calls: string[] = []
   const kicks: number[] = []
@@ -51,7 +52,8 @@ function harness() {
     },
     cancel: () => {
       cancelled += 1
-    }
+    },
+    ...(evals === undefined ? {} : { evals })
   })
   return {
     board,
@@ -213,4 +215,30 @@ test('closing stops a pass before it evaluates, leaving the effects it already r
   assert.deepEqual(h.calls, ['effects'])
   // 关停不是失败（不报 error），但这一轮没做完：条目说 `paused`（§J.3 四档）。
   assert.deepEqual(h.board.all().passes, { state: 'paused', detail: 'closing' })
+})
+
+test('the evals entry reports the unresolved unavailable count on every pass (§N.4)', async () => {
+  let reading: HealthEntry = { state: 'ready', detail: 'unavailable 2 in the last hour' }
+  const h = harness(() => reading)
+  // 条目在构造时占住：第一次读数之前是 `starting`（还没跑过一轮）。
+  assert.deepEqual(h.board.all().evals, { state: 'starting', detail: 'not counted yet' })
+  h.passes.request()
+  await h.passes.idle()
+  assert.deepEqual(h.board.all().evals, reading, 'the entry follows the read model after the pass')
+  // 读模型变了：下一次 pass 跟着变（不是缓存）。
+  reading = { state: 'ready', detail: 'unavailable 0 in the last hour' }
+  h.passes.request()
+  await h.passes.idle()
+  assert.deepEqual(h.board.all().evals, reading)
+  // 一轮失败不刷新这个读数：`passes` 自己报错，上一次已知的读数留着。
+  h.failEvaluateWith(new Error('database is locked'))
+  reading = { state: 'ready', detail: 'unavailable 9 in the last hour' }
+  h.passes.request()
+  await h.passes.idle()
+  assert.deepEqual(h.board.all().evals, { state: 'ready', detail: 'unavailable 0 in the last hour' })
+})
+
+test('without a reader the scheduler claims no evals entry', () => {
+  const h = harness()
+  assert.deepEqual(h.board.claimed(), ['passes'], 'this scheduler is the writer of passes only')
 })

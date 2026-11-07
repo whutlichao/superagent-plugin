@@ -4,16 +4,22 @@
 // 状态栏、Overview 与状态退出码必须说的是同一件事。这里读的是**真库里的 Ticket 行**，
 // 不是面板壳的常量零——#45 之前状态栏的计数一直是 stub 的 0。
 //
+// 本文件还落 §K.7 的面板待人工四条件（`readUnavailableProblems`）与健康项 `evals` 的读数
+// （`readEvalsHealth`，§N.4）：两者共用同一个判定，只差窗口（面板 24 h、健康项 1 h）。
+// 面板、状态栏与健康看板因此永远说的是同一件事。
+//
 // 依赖纪律（§C.2）：app → core 是允许的方向；这里只经 `Store.sql.all` 这条受控出口读库，
 // 不 import runtime / sources / executor。
+import type { HealthEntry, JsonValue } from '../../core/ports.ts'
+import { reasonText, type Reason } from '../../core/reasons.ts'
 import type { Ticket } from '../../core/model.ts'
-import type { JsonValue } from '../../core/ports.ts'
 import { ticketStage } from '../../core/stage.ts'
+import type { ReadParam } from '../store-read.ts'
 
 /** 读模型需要的最小 SQL 出口（`Store.sql.all` 结构上满足它）。 */
 export interface AttentionReader {
   readonly sql: {
-    all(sql: string): readonly unknown[]
+    all(sql: string, params?: readonly ReadParam[]): readonly unknown[]
   }
 }
 
@@ -64,4 +70,138 @@ function parseBody(value: JsonValue): Partial<Ticket> | undefined {
   } catch {
     return undefined
   }
+}
+
+/** 面板待人工的窗口（§K.7：24 小时内未解决的 unavailable）。 */
+export const PROBLEM_WINDOW_MS = 24 * 60 * 60 * 1000
+
+/** 健康项 `evals` 的窗口（§N.4：1 小时内未解决的 unavailable）。 */
+export const EVALS_WINDOW_MS = 60 * 60 * 1000
+
+/**
+ * 一条仍未解决的 unavailable Decision（§K.7 的面板待人工行）：只带「把它当成系统问题展示」
+ * 所需的最小事实，不是 Decision 的全部内容。
+ */
+export interface UnavailableProblem {
+  readonly decisionId: string
+  readonly evalId: string
+  readonly threadKey: string
+  /** Decision 落库的时刻（§D.2 的时间形态：ISO 文本）。 */
+  readonly at: string
+  /** 原因的一句话（面板与状态栏 tooltip 直接显示）。 */
+  readonly reason: string
+  readonly triggerIds: readonly string[]
+}
+
+/**
+ * 待人工的 unavailable：同时满足 §K.7 的四个条件——窗口内、是该 Thread 的最新决定、
+ * 没被 dismiss、该 Thread 不在排队或评估中。
+ *
+ * 健康项 `evals` 用同一个判定、窗口收窄到 1 h（§N.4）：「一小时未解决」与「面板现在要人看」
+ * 必须是同一件事，否则两处会各说一套。
+ */
+export function readUnavailableProblems(
+  reader: AttentionReader,
+  options: { readonly now: string; readonly windowMs?: number }
+): readonly UnavailableProblem[] {
+  const now = options.now
+  const windowMs = options.windowMs ?? PROBLEM_WINDOW_MS
+  const cutoff = new Date(Date.parse(now) - windowMs).toISOString()
+  const problems: UnavailableProblem[] = []
+  // 先按窗口与 kind 取行；dismiss、最新与否、Thread 是否在忙都在行上判，不猜。
+  const rows = reader.sql.all(
+    'SELECT id, thread_key, at, body FROM decision WHERE kind = ? AND at >= ? ORDER BY at, id',
+    ['unavailable', cutoff]
+  )
+  for (const row of rows) {
+    const decisionId = textOf(row, 'id')
+    const threadKey = textOf(row, 'thread_key')
+    const at = textOf(row, 'at')
+    if (decisionId === '' || threadKey === '' || at < cutoff || at > now) continue
+    const body = jsonObject(bodyOf(row))
+    // 已被 dismiss 的决定不再是问题（§K.7：dismiss 对该决定永久有效）。
+    if (body === undefined || body['dismissed'] === true) continue
+    // 不是该 Thread 的最新决定：后来的决定已经回答了同一条 Thread 的问题。
+    if (latestDecision(reader, threadKey) !== decisionId) continue
+    // Thread 正在排队或评估中：下一次评估会给出新的答案，旧问题不再要人。
+    if (threadIsBusy(reader, threadKey)) continue
+    problems.push({
+      decisionId,
+      evalId: typeof body['evalId'] === 'string' ? body['evalId'] : '',
+      threadKey,
+      at,
+      reason: reasonText(reasonsOf(body['reason'])),
+      triggerIds: stringsOf(body['triggerIds'])
+    })
+  }
+  return problems
+}
+
+/**
+ * `evals` 健康条目的读数（§N.4）：1 h 内未解决的 unavailable 数量。
+ * 只报计数，不报错误——一条失败的评估是「要人看的事实」，不是部件坏了（§J.3）。
+ */
+export function readEvalsHealth(reader: AttentionReader, now: string): HealthEntry {
+  const count = readUnavailableProblems(reader, { now, windowMs: EVALS_WINDOW_MS }).length
+  return { state: 'ready', detail: `unavailable ${count} in the last hour` }
+}
+
+/** 一个 Thread 的最新 Decision（`(at, id)` 序的最后一个；与仓储读序同一条）。 */
+function latestDecision(reader: AttentionReader, threadKey: string): string {
+  const row = reader.sql.all(
+    'SELECT id FROM decision WHERE thread_key = ? ORDER BY at DESC, id DESC LIMIT 1',
+    [threadKey]
+  )[0]
+  return textOf(row, 'id')
+}
+
+/** 一个 Thread 是否在排队或评估中（`thread` 行的 `queued` / `eval`，与生成列同一份投影）。 */
+function threadIsBusy(reader: AttentionReader, threadKey: string): boolean {
+  const row = reader.sql.all('SELECT body FROM thread WHERE key = ?', [threadKey])[0]
+  const body = row === undefined ? undefined : jsonObject(bodyOf(row))
+  if (body === undefined) return false
+  if (body['eval'] !== undefined && body['eval'] !== null) return true
+  for (const name of ['queued', 'pending']) {
+    const value = body[name]
+    if (Array.isArray(value) && value.length > 0) return true
+  }
+  return false
+}
+
+/** 一行里的一个文本列（取不到就是空串：坏行不抛）。 */
+function textOf(row: unknown, column: string): string {
+  if (typeof row !== 'object' || row === null) return ''
+  const value = (row as Record<string, unknown>)[column]
+  return typeof value === 'string' ? value : ''
+}
+
+/** 库里的 JSON 文本 → 普通对象；解不开就不是对象（坏行不抛）。 */
+function jsonObject(value: JsonValue): Record<string, unknown> | undefined {
+  if (typeof value === 'object' && value !== null) return value as Record<string, unknown>
+  if (typeof value !== 'string') return undefined
+  try {
+    const parsed: unknown = JSON.parse(value)
+    return typeof parsed === 'object' && parsed !== null ? (parsed as Record<string, unknown>) : undefined
+  } catch {
+    return undefined
+  }
+}
+
+/** 一条结构化原因（`{code, values?, triggerId?}`）；只认带 code 的对象。 */
+function isReason(value: unknown): value is Reason {
+  return (
+    typeof value === 'object' &&
+    value !== null &&
+    typeof (value as { code?: unknown }).code === 'string'
+  )
+}
+
+/** 一个 Decision 的原因：数组就逐条保留；不是数组就是没有。 */
+function reasonsOf(value: unknown): readonly Reason[] {
+  return Array.isArray(value) ? value.filter(isReason) : []
+}
+
+/** 一个字符串数组（取不到就是空数组）。 */
+function stringsOf(value: unknown): readonly string[] {
+  return Array.isArray(value) ? value.filter((item): item is string => typeof item === 'string') : []
 }

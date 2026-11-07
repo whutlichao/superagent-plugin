@@ -51,6 +51,7 @@ import {
 } from './app/kv.ts'
 import { createRefreshableStateSource, type RefreshableStateSource } from './app/state-source.ts'
 import { deliveredFollowups } from './app/views.ts'
+import { readEvalsHealth, readUnavailableProblems } from './app/views/attention.ts'
 import { statusBarView } from './app/status-bar.ts'
 import type { StatusBarView } from './app/status-bar.ts'
 import { Effects, ROUTER_EFFECT_KEY } from './app/effects.ts'
@@ -91,6 +92,7 @@ import { resumeAfterUpgrade, type ResumeReport } from './executor/resume.ts'
 import { DEFAULT_MAX_WORKERS } from './http/state.ts'
 import { createDomainHandlers, withDomainHandlers } from './http/domain.ts'
 import { createAssessmentHandlers, withAssessmentHandlers } from './http/assessment.ts'
+import { createDecisionHandlers, withDecisionHandlers } from './http/decisions.ts'
 import { createPromptHandlers, withPromptHandlers } from './http/prompts.ts'
 import { createPromptVersions } from './app/prompts.ts'
 import { ENVIRONMENT_VARIABLES } from './executor/environment.ts'
@@ -581,6 +583,9 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
   })
 
   // ---- 读模型 / 状态栏 / 面板
+  /** health 里报 error 的条目数（面板的 `health.error` 与 §J.3 的系统问题共用这一条读法）。 */
+  const healthErrors = (): number =>
+    Object.values(board.all()).filter((entry) => entry.state === 'error').length
   const stateSource: RefreshableStateSource = createRefreshableStateSource({
     tickets: () => repo.tickets.list(),
     activity: () => activityCounts(store, nowMs()),
@@ -588,9 +593,13 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
       const counts = store.assignmentCounts()
       return { running: counts.running, maxWorkers: executorSettings.maxWorkers }
     },
-    hasError: () => Object.values(board.all()).some((entry) => entry.state === 'error'),
+    hasError: () => healthErrors() > 0,
     setupMissing: () => setup.missing(),
-    paused: () => paused.paused()
+    paused: () => paused.paused(),
+    // §J.3 的系统问题 = health error 条目 + §K.7 判过四条件的 unavailable（窗口、最新决定、
+    // dismiss 与 Thread 是否在忙都在读模型里判）。回复连续失败那一项由 outbox 的计数补。
+    problems: () =>
+      healthErrors() + readUnavailableProblems({ sql: store.sql }, { now: now() }).length
   })
 
   function refresh(): PanelState {
@@ -696,17 +705,26 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
       refresh()
     }
   })
-  const routes: readonly RouteDefinition[] = withPromptHandlers(
-    withAssessmentHandlers(
-      withDomainHandlers(ROUTE_TABLE, domain),
-      createAssessmentHandlers({
-        tools: routerTools,
-        afterWrite: () => {
-          refresh()
-        }
-      })
+  const routes: readonly RouteDefinition[] = withDecisionHandlers(
+    withPromptHandlers(
+      withAssessmentHandlers(
+        withDomainHandlers(ROUTE_TABLE, domain),
+        createAssessmentHandlers({
+          tools: routerTools,
+          afterWrite: () => {
+            refresh()
+          }
+        })
+      ),
+      prompts
     ),
-    prompts
+    createDecisionHandlers({
+      // 面板的 dismiss（§K.7）：领域只接受 unavailable 的 Decision，其余给固定拒绝。
+      dismiss: (decisionId) => engine.dismiss(decisionId),
+      afterWrite: () => {
+        refresh()
+      }
+    })
   )
 
   ensureApiToken(resolved)
@@ -904,6 +922,8 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
       }
     },
     health: board,
+    // `evals` 条目（§N.4）：1 h 内未解决的 unavailable 数量，写者就是 pass（与设计写者表一致）。
+    evals: () => readEvalsHealth({ sql: store.sql }, now()),
     schedule: (run, milliseconds) => setTimeout(run, milliseconds),
     cancel: (handle) => clearTimeout(handle as ReturnType<typeof setTimeout>),
     closing: () => closing,
