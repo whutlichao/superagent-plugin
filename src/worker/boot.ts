@@ -150,8 +150,7 @@ import {
   type FeishuBackfill,
   type FeishuConfig,
   type FeishuKeys,
-  type FeishuRoundResult,
-  type FeishuStream
+  type FeishuRoundResult
 } from './sources/feishu/index.ts'
 import type { Deployment } from './sources/kind.ts'
 import { OrcaExecutor, registerExecutorEffects, registerExecutorLifecycle, resolveExecutorSettings } from './executor/orca-executor.ts'
@@ -161,6 +160,7 @@ import { WORKTREE_PREFIX } from './executor/workspace.ts'
 import { resumeAfterUpgrade, type ResumeReport } from './executor/resume.ts'
 import { DEFAULT_MAX_WORKERS } from './http/state.ts'
 import { createDomainHandlers, withDomainHandlers } from './http/domain.ts'
+import { ApiError } from './http/errors.ts'
 import { createSettingsHandlers, withSettingsHandlers } from './http/settings.ts'
 import { runWrite } from './http/idempotency.ts'
 import { MACHINE_LIMITS_BLOCK, parseSettingsBlock, validateSettingsBlock } from './app/settings-blocks.ts'
@@ -397,6 +397,12 @@ function settingsView(
       }
     }
   }
+}
+
+/** 组合根持有的 Source 运行时（§M.2 的开关）：轮询与事件流的生命周期只在 boot（§C.1）。 */
+interface SourceRuntime {
+  /** 设置里一个 Source 的 `enabled` 变了（已写入）：停或起它的轮询/事件流。 */
+  notify(id: string, enabled: boolean): void
 }
 
 /** 一个 Source 实例的配置与 setup 问题（缺 repository/cli 时不轮询，§I.2）。 */
@@ -669,12 +675,13 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
     login: fallbackLogin
   }
   const feishuStored = storedSource(FEISHU_KIND)
+  const feishuSetupCommands: CommandsHost =
+    options.commands ??
+    new Commands({ configuredPrograms: () => [text(settings['feishuCli'])] })
   const feishuSetup = await setupFeishu({
     raw: settings,
     stored: feishuStored,
-    commands:
-      options.commands ??
-      new Commands({ configuredPrograms: () => [text(settings['feishuCli'])] }),
+    commands: feishuSetupCommands,
     log: (message) => logger.info(message)
   })
   const setup = createSetupState(await runSetupChecks(setupInput()))
@@ -692,6 +699,16 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
   )
   const githubHealth = registry.healthEntries(['github']).get('github')
   const feishuHealth = registry.healthEntries(['feishu', 'history'])
+
+  /**
+   * 这个 Source 实例现在是否真的在跑（§I.2/I.3 的启动条件、§M.2 的开关）：设置启用、配置有效。
+   * 与注册表 `overview()` 的 `off`/`error` 同一口径——面板看到的那一档，就是轮询/事件流用的
+   * 那一档。开关只改设置（`sourceSettings`），`core/` 不存任何开关状态（§D.4）。
+   */
+  const sourceLive = (id: string): boolean => {
+    const instance = registry.instance(id)
+    return instance !== undefined && instance.enabled && instance.configError === undefined
+  }
   /**
    * 把 setup 结论落到各部分：Source 的 setup 问题写 `starting`（**不是** error，§N.4），
    * `orca` CLI 缺失才是 runtime error（§I.4：其余 setup 问题都不该让插件看起来「坏了」）。
@@ -793,7 +810,31 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
       openTickets: () => repo.tickets.list(),
       changed: (from, to, effects) => engine.policyChanged(from, to, effects),
       current: effectivePolicy
-    })
+    }),
+    /**
+     * 开关立即生效（§M.2）：任何 `source:<id>` 块的保存（Source 页的开关、Settings 页）
+     * 都把新的 `enabled` 交给 Source 运行时——不必重启插件。其余字段仍是「重启后生效」
+     * （§N.2）：`cli`/`repository` 只影响下一次启动。
+     */
+    saved: (record) => {
+      const parsed = parseSettingsBlock(record.block)
+      if (parsed?.kind !== 'source') return
+      const config =
+        typeof record.config === 'object' && record.config !== null
+          ? (record.config as { enabled?: unknown })
+          : {}
+      if (typeof config.enabled !== 'boolean') return
+      const previous = sourceFlag(parsed.id)
+      try {
+        applySourceEnabled(parsed.id, config.enabled)
+        // 只改配置（开关没变）不降级健康：下一轮轮询/事件流会自己重新报告。
+        if (previous !== config.enabled) sourceRuntime.notify(parsed.id, config.enabled)
+      } catch (error) {
+        // 保存已经提交：通知失败不能把“已写入”变成“没写入”（面板会重试出冲突）。
+        logger.warn(`the ${parsed.id} Source switch could not be applied: ${stringOf(error)}`)
+      }
+      refresh()
+    }
   })
   const policy = createPolicy({
     block: effectivePolicy,
@@ -1428,7 +1469,22 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
       run: (program, args) => commandPort.run(program, args),
       cliPath: options.cliPath ?? defaultCliPath(),
       setupCheck: () => checkSetup(),
-      doctor: doctorNow
+      doctor: doctorNow,
+      // `source labels`（§G.2）：与面板的「刷新显示名」同一次读取（`refreshedLabels`），
+      // 拒绝码用命令面的 `missing`/`not_syncable`（§G.2 的固定拒绝）。
+      sourceLabels: async (id) => {
+        try {
+          const { labels } = await refreshedLabels(id)
+          refresh()
+          return labels
+        } catch (error) {
+          const code = (error as { code?: unknown }).code
+          if (code === 'missing' || code === 'not_syncable') {
+            throw new ApiError(code, stringOf(error), { source: id })
+          }
+          throw error
+        }
+      }
     },
     log: (line) => logger.info('http request', { method: line.method, path: line.path, status: line.status, ms: line.ms })
   })
@@ -1454,11 +1510,12 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
     logger.error('the router supervision could not start', { error: stringOf(error) })
   }
 
-  // ---- Source 轮询（§I.2）：只有 setup 完成且实例启用时才启动
-  // 轮询器只要**配置**完整就建：setup 问题（账号读不到等）由 `pollOnce` 的门挡住，
-  // 于是 `setup check` 把它们修好之后，下一轮轮询就真的开始了——不必重启 Orca（§N.1）。
+  // ---- Source 轮询（§I.2）：只要**配置**完整就把轮询器建起来，每一轮再问一次「这个 Source
+  // 现在是否在跑」。setup 问题（账号读不到等）由 `pollOnce` 的门挡住，于是 `setup check`
+  // 把它们修好之后，下一轮轮询就真的开始了——不必重启 Orca（§N.1）。面板的开关同理：
+  // 关掉的 Source 在下一轮之前不再发一个 `gh` 调用、不再产生 Trigger（§M.2）。
   const poller: GithubPoller | null =
-    githubSetup.enabled && githubInstance.repository !== '' && githubInstance.cli !== ''
+    githubInstance.repository !== '' && githubInstance.cli !== ''
       ? createGithubPoller({
           api: githubApi,
           config: {
@@ -1524,21 +1581,24 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
       : feishuInstance.config
   )
   const feishuApi = createFeishuApi(feishuCommands, feishuConfig.cli)
-  // setup 完成、实例启用、配置有效、机器人身份读到了：四件齐了才读（§I.3 配置行）。
-  const feishuReady =
+  // setup 完成、配置有效、机器人身份读到了：三件齐了才读（§I.3 配置行）；开关另算。
+  /**
+   * 机器人身份（§I.3 配置行）：启动时禁用的 Source 不跑身份探针（`setupFeishu` 的合同是
+   * 「关掉的 Source 不发 CLI」），因此面板重新打开它时由 `probeFeishuBot()` 补读一次。
+   */
+  let feishuBot = { botId: feishuDeployment.feishuBotId, appId: feishuDeployment.feishuAppId }
+  const feishuUsable = (): boolean =>
     feishuProblem() === undefined &&
-    feishuSetup.enabled &&
     feishuInstance !== undefined &&
-    feishuInstance.enabled &&
     feishuInstance.configError === undefined &&
-    feishuDeployment.feishuBotId.length > 0
+    feishuBot.botId.length > 0
   const feishuHost = createSourceContext({
     engine,
     store,
     commands: feishuCommands,
     instance: {
       id: FEISHU_KIND,
-      enabled: feishuReady,
+      enabled: feishuUsable() && sourceLive(FEISHU_KIND),
       config: feishuConfig,
       health: Object.fromEntries(registry.healthEntries(['feishu', 'history']))
     },
@@ -1548,50 +1608,151 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
     notify: (input) => options.notify?.(input)
   })
   const feishuAbort = new AbortController()
-  const feishuBot = { botId: feishuDeployment.feishuBotId, appId: feishuDeployment.feishuAppId }
-  // 事件流：禁用（关停）后看门狗 5 s 内停掉子进程（§I.3）。
-  const feishuStream: FeishuStream | null = feishuReady
-    ? createFeishuStream({
-        commands: feishuCommands,
-        cli: feishuConfig.cli,
-        bot: feishuBot,
-        host: feishuHost,
-        keys: feishuKeys,
-        enabled: () => !closing,
-        signal: feishuAbort.signal,
-        now: nowMs,
-        schedule: (run, milliseconds) => {
-          const timer = setTimeout(run, milliseconds)
-          return () => clearTimeout(timer)
-        },
-        log: (message) => logger.info(message)
-      })
-    : null
-  const feishuBackfill: FeishuBackfill | null =
-    feishuStream === null
-      ? null
-      : createFeishuBackfill({
-          api: feishuApi,
-          bot: feishuBot,
-          config: feishuConfig,
-          host: feishuHost,
-          keys: feishuKeys,
-          now: nowMs,
-          signal: feishuAbort.signal,
-          log: (message) => logger.info(message),
-          // 水位线要的两个只读面：订阅了 Feishu 的 Thread 与 Ticket 的结束时刻（§I.3 话题轮询）。
-          subscribed: () =>
-            repo.threads
-              .list()
-              .filter((thread) => thread.ref.source === FEISHU_KIND)
-              .map((thread) => ({
-                ref: thread.ref,
-                ...(thread.lastAt === undefined ? {} : { lastAt: thread.lastAt }),
-                subscriptions: thread.subscriptions,
-                meta: thread.meta
-              })),
-          ticket: (id) => repo.tickets.get(id)
-        })
+  /** 一条正在跑的事件流：自己的取消信号 + 它的结束读数（关停屏障要等它）。 */
+  let feishuStreaming: { readonly controller: AbortController; readonly done: Promise<void> } | null = null
+  let feishuBackfill: FeishuBackfill | null = null
+
+  /** 回填/话题/群名的一轮：身份读到之后建一次（禁用时 `feishuOnce` 直接返回，不发 CLI）。 */
+  const createFeishuBackfillOnce = (): FeishuBackfill =>
+    createFeishuBackfill({
+      api: feishuApi,
+      bot: feishuBot,
+      config: feishuConfig,
+      host: feishuHost,
+      keys: feishuKeys,
+      now: nowMs,
+      signal: feishuAbort.signal,
+      log: (message) => logger.info(message),
+      // 水位线要的两个只读面：订阅了 Feishu 的 Thread 与 Ticket 的结束时刻（§I.3 话题轮询）。
+      subscribed: () =>
+        repo.threads
+          .list()
+          .filter((thread) => thread.ref.source === FEISHU_KIND)
+          .map((thread) => ({
+            ref: thread.ref,
+            ...(thread.lastAt === undefined ? {} : { lastAt: thread.lastAt }),
+            subscriptions: thread.subscriptions,
+            meta: thread.meta
+          })),
+      ticket: (id) => repo.tickets.get(id)
+    })
+
+  /**
+   * 起一次事件流（§I.3 实时事件）：`enabled` 绑实例开关（退避中的循环也会自己退出），
+   * `signal` 是这一轮的取消信号——面板关掉时 `stopFeishuStream()` 立即停（§I.3：5 s 内）。
+   */
+  const startFeishuStream = (): void => {
+    if (closing || feishuStreaming !== null || !feishuUsable() || !sourceLive(FEISHU_KIND)) return
+    const controller = new AbortController()
+    const stream = createFeishuStream({
+      commands: feishuCommands,
+      cli: feishuConfig.cli,
+      bot: feishuBot,
+      host: feishuHost,
+      keys: feishuKeys,
+      enabled: () => !closing && sourceLive(FEISHU_KIND),
+      signal: controller.signal,
+      now: nowMs,
+      schedule: (run, milliseconds) => {
+        const timer = setTimeout(run, milliseconds)
+        return () => clearTimeout(timer)
+      },
+      log: (message) => logger.info(message)
+    })
+    const done = stream.run().catch((error: unknown) => {
+      logger.warn('the Feishu event stream ended with an error', { error: stringOf(error) })
+    })
+    const run = { controller, done }
+    feishuStreaming = run
+    void done.then(() => {
+      if (feishuStreaming === run) feishuStreaming = null
+    })
+  }
+
+  /** 停一次事件流：取消这一轮的信号，子进程立刻收到退出（§I.3：禁用后 5 s 内停）。 */
+  const stopFeishuStream = (): void => {
+    const run = feishuStreaming
+    feishuStreaming = null
+    run?.controller.abort()
+  }
+
+  /**
+   * 补读机器人身份（只在「启动时被禁用、面板后来打开」时用得上）：失败只写 health
+   * （`starting` + 原因码），面板停在「等 setup」，不假装在听。
+   */
+  const probeFeishuBot = async (): Promise<boolean> => {
+    if (feishuBot.botId !== '') return true
+    if (feishuSetup.cli === '') return false
+    const probed = await setupFeishu({
+      raw: settings,
+      stored: { ...feishuStored, enabled: true },
+      commands: feishuSetupCommands,
+      log: (message) => logger.info(message)
+    })
+    if (probed.botId === '') {
+      const detail = probed.problem?.code ?? 'bot_unreadable'
+      for (const claim of registry.healthEntries(registry.kind(FEISHU_KIND)?.health ?? []).values()) {
+        claim.set({ state: 'starting', detail })
+      }
+      logger.warn(`the Feishu bot identity could not be read: ${detail}`)
+      return false
+    }
+    feishuBot = { botId: probed.botId, appId: probed.appId }
+    return true
+  }
+
+  /**
+   * 打开 Feishu 读侧（启动时与面板重新打开走同一条路）：先确保身份读到了，再建回填、起事件流。
+   */
+  const openFeishu = async (): Promise<void> => {
+    if (closing || !sourceLive(FEISHU_KIND)) return
+    if (!feishuUsable() && !(await probeFeishuBot())) return
+    // 探针是异步的：等待期间可能已经关停或被再次关掉。
+    if (closing || !sourceLive(FEISHU_KIND)) return
+    if (feishuBackfill === null) feishuBackfill = createFeishuBackfillOnce()
+    startFeishuStream()
+  }
+
+  /**
+   * 把 `source:<id>` 的新开关换成本进程的 Source 视图：注册表、Channel 与环境都读它。
+   * 其余配置原样保留（这个动作不改 setup 字段，§N.2：写它们仍要重启）。
+   */
+  const applySourceEnabled = (id: string, enabled: boolean): void => {
+    if (id === GITHUB_KIND) githubSetup.enabled = enabled
+    else if (id === FEISHU_KIND) feishuSetup.enabled = enabled
+    sourceSettings = settingsView(settings, githubSetup, feishuSetup)
+  }
+
+  /** 这个 Source 在本进程里的开关值（设置写入之前的旧值，用来判「开关真的变了吗」）。 */
+  function sourceFlag(id: string): boolean | undefined {
+    if (id === GITHUB_KIND) return githubSetup.enabled
+    if (id === FEISHU_KIND) return feishuSetup.enabled
+    return undefined
+  }
+
+  /**
+   * Source 运行时（§I.2、§I.3、§M.2）：轮询、事件流与回填的生命周期只在这里，`core/` 不存任何
+   * 开关状态（§D.4）。开关写完（`source:<id>`）后由 `notify()` 通知：关掉的 Source 在下一轮
+   * 之前不再发 CLI 调用、不再产生 Trigger（已在跑的一轮允许跑完）；打开的 Source 立刻恢复。
+   */
+  const sourceRuntime: SourceRuntime = {
+    notify(id: string, enabled: boolean): void {
+      const entries = registry.healthEntries(registry.kind(id)?.health ?? [])
+      for (const claim of entries.values()) {
+        claim.set(
+          enabled
+            ? { state: 'starting', detail: 'Waiting for the next pass' }
+            : { state: 'paused', detail: 'disabled' }
+        )
+      }
+      if (id !== FEISHU_KIND) return
+      if (!enabled) {
+        stopFeishuStream()
+        return
+      }
+      void openFeishu()
+    }
+  }
 
   // ---- 名单同步（§I.3「同步」行、§N.4 的 `sync:<id>` 健康条目）：启动时一次、手动
   // 「立即同步」、失败按 1 min→1 h 退避。能同步的条件：setup 完成、实例启用、part 点名了
@@ -1665,7 +1826,10 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
 
   const pollOnce = async (): Promise<GithubPollResult> => {
     // setup 未完成：循环在跑，但一轮都不读（Source 停在 setup/starting，不是 error）。
-    if (poller === null || githubBlocked()) return { notifications: 0, triggers: 0, skipped: 0 }
+    // 面板关掉的 Source 同理：这一轮不发一个 `gh` 调用、不产生 Trigger（§M.2）。
+    if (poller === null || githubBlocked() || !sourceLive(GITHUB_KIND)) {
+      return { notifications: 0, triggers: 0, skipped: 0 }
+    }
     const result = await poller.poll()
     refresh()
     return result
@@ -1680,7 +1844,8 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
     }
   }
   const feishuOnce = async (): Promise<FeishuRoundResult | null> => {
-    if (feishuBackfill === null) return null
+    // 关掉（或还没读到身份）：这一轮一个 `lark-cli` 调用都不发（§M.2 的开关、§I.3 配置行）。
+    if (feishuBackfill === null || !sourceLive(FEISHU_KIND)) return null
     await refreshFeishuNames()
     const result = await feishuBackfill.round()
     refresh()
@@ -1724,8 +1889,9 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
       }, pollMs)
       timers.push(pollTimer)
     }
-    if (feishuBackfill !== null) {
+    if (feishuConfig.cli !== '') {
       // 第一轮立刻跑一次（安装完就能补上安装前一刻之后的），之后每分钟一轮。
+      // 入口自己看开关：关闭的 Source 这一轮直接返回，不发 CLI（§M.2）。
       trackRound(feishuOnce())
       const feishuTimer = setInterval(() => {
         trackRound(feishuOnce())
@@ -1734,8 +1900,12 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
     }
     for (const timer of timers) timer.unref?.()
   }
-  // 事件流不靠定时器：配置好了就长驻监听（§I.3 实时事件）。
-  const streaming = feishuStream === null ? null : feishuStream.run()
+  // 事件流不靠定时器：身份读到了、实例开着就长驻监听（§I.3 实时事件）。
+  // 回填对象只在身份读到之后建一次；禁用/启用走 `openFeishu()`/`stopFeishuStream()`。
+  if (feishuUsable()) {
+    feishuBackfill = createFeishuBackfillOnce()
+    startFeishuStream()
+  }
   // 名单同步的「启动时一次」：不等它（一次 CLI 读最多 60 s，不该挡住首屏），失败只写健康与日志。
   const startupSync = policySync.start()
   trackRound(startupSync)
@@ -1762,17 +1932,6 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
     trigger: (id) => repo.triggers.get(id),
     thread: (key) => repo.threads.get(key)
   })
-
-  /**
-   * 面板的「打开/关闭」（§M.2 的主操作）：写 `source:<id>` 的 `enabled`（下一个作业周期起按新
-   * 状态判定监听与回复），并把本进程的 Source 视图换成新状态——注册表、Channel 与环境都读它。
-   * 其余配置原样写回，这个动作不改 setup 字段。
-   */
-  const applySourceEnabled = (id: string, enabled: boolean): void => {
-    if (id === GITHUB_KIND) githubSetup.enabled = enabled
-    else if (id === FEISHU_KIND) feishuSetup.enabled = enabled
-    sourceSettings = settingsView(settings, githubSetup, feishuSetup)
-  }
 
   /** 一个 Source 必须已安装（面板只对已装的实例给开关）。 */
   const requireSource = (id: string): ResolvedSourceInstance => {
@@ -1802,7 +1961,6 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
       expectedRevision: settingsWriter.blockRevision(name),
       validate: sourceValidator(id)
     })
-    applySourceEnabled(id, enabled)
     refresh()
     return sourcePage(sourceViewHost())
   }
@@ -1822,16 +1980,21 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
   }
 
   /**
-   * 「刷新显示名」（§G.2 的 `source labels`）：kind 自己重读行键显示名并写进它的 kv；
-   * 这里只数新增了几条（同步前那份名单来自同一个键）。Kind 没有这个能力时拒绝。
+   * 刷新一个 Source 的行键显示名（§G.2 的 `source labels`）：接线到 kind 的 `refreshLabels`
+   * （Feishu 的群名，#41）。未知 Source 给 `missing`、kind 没有这个能力给 `not_syncable`
+   * （§G.2 的固定拒绝）——绝不编一个空标签表假装刷新成功。
+   * 函数声明（而不是 `const`）：HTTP 的 `ops.sourceLabels` 在启动中就能到达。
    */
-  const refreshSourceLabels = async (
+  async function refreshedLabels(
     id: string
-  ): Promise<{ readonly added: number; readonly total: number }> => {
-    const instance = requireSource(id)
+  ): Promise<{ labels: Record<string, string>; added: number; total: number }> {
+    const instance = registry.instance(id)
+    if (instance === undefined) {
+      throw Object.assign(new Error(`The ${id} Source is not installed`), { code: 'missing' })
+    }
     if (!registry.canRefreshLabels(id)) {
       throw Object.assign(new Error(`The ${id} Source has no display names to refresh`), {
-        code: 'invalid_params'
+        code: 'not_syncable'
       })
     }
     const before = store.kvGet<Record<string, string>>(sourceLabelsKey(id)) ?? {}
@@ -1847,9 +2010,27 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
         notify: (input) => options.notify?.(input)
       })
     )
-    const added = Object.keys(labels).filter((key) => !(key in before)).length
-    refresh()
-    return { added, total: Object.keys(labels).length }
+    return {
+      labels,
+      added: Object.keys(labels).filter((key) => !(key in before)).length,
+      total: Object.keys(labels).length
+    }
+  }
+
+  /**
+   * 面板的「刷新显示名」（§G.2 的 `source labels`）：与 CLI/HTTP 同一次读取；面板请求的固定
+   * 拒绝沿用 `invalid_params`（`main.ts` 的面板口径），命令面的码由 HTTP 端口给。
+   */
+  const refreshSourceLabels = async (
+    id: string
+  ): Promise<{ readonly added: number; readonly total: number }> => {
+    try {
+      const { added, total } = await refreshedLabels(id)
+      refresh()
+      return { added, total }
+    } catch (error) {
+      throw Object.assign(new Error(stringOf(error)), { code: 'invalid_params' })
+    }
   }
 
   const shutdown = async (): Promise<void> => {
@@ -1863,8 +2044,11 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
     // 名单同步的待重试先取消；再关事件流（看门狗与 abort 都会停子进程）。
     lifetimeAbort.abort()
     policySync.stop()
+    // 事件流是长驻子进程：先收走它的结束读数，再取消这一轮（§I.3：禁用后 5 s 内停）。
+    const streamDone = feishuStreaming?.done ?? null
     feishuAbort.abort()
-    if (streaming !== null) await streaming
+    stopFeishuStream()
+    if (streamDone !== null) await streamDone
     options.statusBar?.dispose()
     await passes.stop()
     await effects.drain()
