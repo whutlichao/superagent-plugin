@@ -629,6 +629,7 @@ pending ──launch 成功──▶ running ──report(ready|dropped) / stop 
 | `done` | agent 进程结束 | Assignment `ended(done)`；有 `ready`/`dropped` 的 report 按 §E.9 结束 Ticket；无 report → `failed`（`report_missing`），可 retry |
 
 事件是**唯一**的 worker 生命周期真源；`terminal.read` 只用于取证与 `blocked` 摘要，绝不阻塞等待（无 `terminal wait` 依赖）。
+实测（附录 C S7/S9，Orca 1.4.251）：`done` 不只表示进程结束，**每一轮结束与会话启动**都会到达；`terminal close` 不产生事件，而是静默清掉该 pane 的状态行。因此「报告缺失」只对**没有最终 Report**（无 report 或只有 `progress`）判定，有 `waiting`/`blocked`/`failed` 报告的一轮按 §E.8 处理。
 
 ### E.8 与上游 Report / Ticket stage 的对应表
 
@@ -2133,3 +2134,69 @@ return { ...e, command: a.command, ...s ? { env: s } : {} }             // ← �
 （`node -e` 读 `/Applications/Orca.app/Contents/Resources/app.asar` 后按字符串定位
 `agent.launch.before`，上下文里能看到 `env: {}` 与 `{ ...e.env, ...a.env }`）；耗时用
 `process.hrtime.bigint()` 对 `createLaunchHook().handle` 与 `environmentOf` 各采 2 000 次取分位。
+### S7/S9 实测记录（#12，2026-11-07）
+
+**实测环境**：arm64 macOS 27.0.1，Node 25.0.0，Orca CLI 1.4.251。两条证据并用：
+
+1. **只读宿主契约**：`orca skills get orca-plugin-authoring --reference references/events.md`
+   （生成源），`/Applications/Orca.app/Contents/Resources/app.asar.unpacked/out/shared/plugins/events/plugin-events.js`
+   的 Zod payload schema，`app.asar` 里的插件事件发射路径（`P2r` → `JZr`）与 agent 状态存储
+   （`orcad-migration-source-retention-*.js` 的 `dropStatusEntry` / `reconcileEndedProcessForPaneKeys`
+   / `emitEnrichedStatus`）。
+2. **临时 dev 插件**：`/tmp` 下一个只申请 `agent:read` 的 `trusted-worker` 插件订阅
+   `agent.status.changed`，把原样 payload 写进 `orca plugin logs`；在临时 worktree 里用
+   `orca terminal create --command pi` 起一个 terminal 面的 agent，观察启动、空转与
+   `orca terminal close`。测完 `orca plugin dev unload` 并删掉 worktree 与插件目录，未留任何
+   dev 插件或 worktree（`orca worktree list` / `terminal list` 复核为空）。
+
+**实测 payload 两例（原样，id 截断）**：
+
+```json
+{"workspaceId":"5e134f6e-…::/…/s7probe","paneKey":"9c2210ef-…:cabb1693-…",
+ "terminalId":"term_c50f61af-…","state":"done","receivedAt":1794020539288,
+ "mainAgent":{"state":"done","stateStartedAt":1794020539280},
+ "worktreeId":"5e134f6e-…::/…/s7probe"}
+```
+
+```json
+{"workspaceId":"5e134f6e-…::/…/ticket-08-f3b",
+ "paneKey":"structured-agent-session-8cac030a-…:00910d3d-…","state":"working",
+ "receivedAt":1794020460670,"mainAgent":{"state":"working","stateStartedAt":1794008824294},
+ "worktreeId":"5e134f6e-…::/…/ticket-08-f3b"}
+```
+
+| 项 | 实测值 | 影响 / 已落地的决定 |
+| --- | --- | --- |
+| `state` | 四态 `working`/`blocked`/`waiting`/`done`；payload 另带 `mainAgent{state, outcome?, stateStartedAt}`，`state` 是**合并**状态（「主 agent 或任一活着的子 agent 在跑就是 working」） | §E.9 用合并 `state`（后台子 agent 继续占 slot）；`mainAgent.outcome` 不参与（Ticket 的结局只认 Report，§E.8） |
+| `terminalId` | **可选**：只在 `workspaceId` 非空、且能在该工作区的 `terminal list` 里匹配到 pane 时出现；chat 面（`paneKey` 以 `structured-agent-session-` 开头）**没有** | §E.2 已强制 `--surface terminal`；§E.7 的定位以 `terminalId` 为主键，见下 |
+| `paneKey` | 形状是 `<tabId>:<leafId>`（terminal 面）或 `structured-agent-session-<id>:<paneId>`（chat 面）；**不是** terminal 句柄 | 不能把 `paneKey` 当 `terminalId` 用；`terminalId` 缺失时只能用 `workspaceId` + `listTerminals()` 反查，且只认唯一命中 |
+| 其他字段 | `worktreeId`（与 `workspaceId` 同值，未写进 `[skill]` 的 payload 说明）、`title?`；`receivedAt` 是宿主毫秒时间 | 领域里用注入时钟，不读 `receivedAt` |
+| 事件顺序与重复 | 宿主按到达顺序逐个投递（发射器把每个事件串在 promise 链上，`terminal list` 的异步查询在链内）；**没有去重**：同一个 pane 的相同 `working` 在几秒内可重复到达；worker 启动后还会先收到一次当前状态的补发 | 映射必须幂等：`working` 什么都不改；已结束的 Assignment 忽略后续事件（S7 的「事件只作幂等补偿」） |
+| S7：`terminal close` 之后有 `done` 吗 | **没有**。`orca terminal close --terminal term_c50f61af-…` 回 `{ptyKilled:true}`，随后 3 s 该 pane 没有任何 `agent.status.changed`；宿主路径是 `dropStatusEntry` / `reconcileEndedProcessForPaneKeys` → `clearPaneState` + `emitStatusDropped`，不发 enriched status | stop/retry **不等事件**：领域先 `ended`，关闭终端只是副作用；迟到的 `done` 因 Assignment 已结束而被忽略（`executor-orca.test.ts` 断言） |
+| `done` 的真正含义 | **一轮结束**（provider 的 Stop/`agent_end`，以及 `SessionStart`）。实测一个 terminal 面的 `pi`：启动后只收到一条 `state:"done"`，而 TUI 进程仍在；关闭终端时才没有事件 | §E.7 的「agent 进程结束」在 1.4.251 上不成立。`report_missing` 只对**没有最终 Report**（无 report 或只有 `progress`）判定；`waiting`/`blocked`/`failed` 报告的一轮按 §E.8 处理（`waiting` → idle），否则每一轮结束都会把工单误判为失败 |
+| S9：`blocked` 是否总有可见的终端提示 | 不保证。`blocked` 有两个来源：agent hook 的 `PermissionRequest`/`interactivePrompt`（主进程 chunk 的 hook 归一化），以及宿主对 Codex/Cursor 等 TUI 的**终端文本探测器**（例如 `run this command?` / `to allowlist?` → `blocked`，reason `agent-approval-prompt`）。探测器命中的情形必然有可见文本；hook 来源不保证提示落在最后 20 行（重绘、备用屏、滚动出窗口都可能）。事件本身**没有**提示文本 | Attention 的摘要只能取 `terminal.read`：最后 20 行；读不到或为空时明确写 `terminal shows no prompt`（`status.ts` 的 `NO_PROMPT`，两条测试覆盖空终端与读取失败） |
+
+**结论**：
+
+1. **`done` 是回合结束，不是进程结束**：一个空闲的 worker 也会定期收到 `done`（每轮结束一次）。
+   把「无 report → 报告缺失」按字面实现会在每一轮后误伤；实现改为「无**最终** report」。
+   `terminal close` 既不保证也不产生 `done`，所以停止/重试的清理顺序必须由领域状态决定。
+2. **`terminalId` 不能当作必然存在**：chat 面没有，`workspaceId` 为 null 时也没有；`paneKey`
+   不是句柄。定位顺序因此是 `terminalId` → （旧宿主的）`paneKey` 直匹配 → `workspaceId` +
+   `listTerminals()` 唯一命中；都不成立就不猜（宁可不处理，也不改错 Ticket）。
+3. **重复与补发是常态**：同一状态可重复到达（实测同 pane 1 s 内多条 `working`），worker 启动
+   还会有一次当前状态补发。四态映射全部幂等：`working` 保持运行、`waiting` 只在没有待投 Input
+   与 pending Assignment 时结束、`done` 只处理仍在跑的 Assignment、`blocked` 不覆盖 worker 已
+   提出的结构化问题。
+4. **S9 的回落即设计**：事件不带提示文本，Attention 的质量只能和 `terminal.read` 一样好；空
+   读数必须显式说出来，不能编造一个「问题」。
+
+**复现方式（脚本未入库）**：把上面的 manifest（`execution: trusted-worker`、`main`、
+`capabilities: [agent:read]`、`contributes.events: [agent.status.changed]`）与一个只 `orca.log`
+payload 的 worker 放到 `/tmp/<probe>/`，`orca plugin dev load /tmp/<probe> --json`（按提示
+`--approve <fingerprint>`）；在临时 worktree 里 `orca terminal create --command pi --json` 拿
+`handle`/`paneKey`，`orca plugin logs <pluginKey> --json` 看事件，`orca terminal close --terminal
+<handle> --json` 后再看一次日志；最后 `orca plugin dev unload /tmp/<probe>` 并
+`orca worktree rm --worktree <path> --force --delete-branch`。宿主侧证据用
+`grep -a "agent.status.changed" /Applications/Orca.app/Contents/Resources/app.asar` 与
+`..../app.asar.unpacked/out/shared/plugins/events/plugin-events.js` 的 schema 复核（只读）。

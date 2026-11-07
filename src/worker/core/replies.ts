@@ -61,6 +61,22 @@ export class Replies extends EnginePart {
     this.options.outbox.withdraw(key('attention-reply', attentionId))
   }
 
+  /**
+   * 人停掉一个未结束的 Ticket 时的收尾消息（§E.5）：排到它开始时的 Channel。id 固定，
+   * 重复停止不会再发一条；没有 Channel（例如面板里直接建的工作）就什么都不发。
+   */
+  stopped(ticket: Ticket): void {
+    const channel = this.sourceChannel(ticket)
+    if (!channel) return
+    this.options.outbox.send({
+      id: key('stopped', ticket.id),
+      channel,
+      text: `Stopped by a person: ${ticket.title} (${ticket.id}).`,
+      kind: 'notice',
+      ticketId: ticket.id
+    })
+  }
+
   private acknowledge(request: Extract<ReplyRequest, { purpose: 'acknowledgement' }>): Reply {
     const ticket = this.require(request.ticketId)
     if (!liveTicket(ticket)) throw new UserError('ackEnded')

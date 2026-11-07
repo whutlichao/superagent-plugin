@@ -22,6 +22,7 @@ import { createLaunchHook, type LaunchHook } from '../src/worker/executor/launch
 import {
   OrcaExecutor,
   registerExecutorEffects,
+  registerExecutorLifecycle,
   resolveExecutorSettings
 } from '../src/worker/executor/orca-executor'
 import {
@@ -32,6 +33,13 @@ import {
   mayWake,
   slotState
 } from '../src/worker/executor/slots'
+import {
+  BACKGROUND_LIMIT_MS,
+  createBackgroundTracker
+} from '../src/worker/executor/background'
+import { resumeAssignments, type ResumeReport } from '../src/worker/executor/resume'
+import { retryTicket } from '../src/worker/executor/retry'
+import { createStatusHandler, NO_PROMPT } from '../src/worker/executor/status'
 import { ensureTicketWorkspace } from '../src/worker/executor/workspace'
 import {
   Engine,
@@ -39,8 +47,12 @@ import {
   type Assessor,
   type Assignment,
   type Outbox,
+  type OutboundMessage,
   type Policy,
   type Ticket,
+  UserError,
+  canRetry,
+  ticketStage,
   type TicketInput,
   type Trigger
 } from '../src/worker/core/index.ts'
@@ -697,7 +709,16 @@ function harness(
   }
   const policyProvider = (): Policy => policy
   const assessor: Assessor = { request: () => undefined }
-  const outbox: Outbox = { send: () => undefined, status: () => undefined, withdraw: () => undefined }
+  /** 已排队的对外消息（§J.1）：stop 的收尾消息、attention 的撤回都在这里断言。 */
+  const outboxMessages: OutboundMessage[] = []
+  const outbox: Outbox = {
+    send: (message) => {
+      if (!outboxMessages.some((item) => item.id === message.id)) outboxMessages.push(message)
+    },
+    status: (id) =>
+      outboxMessages.some((item) => item.id === id) ? 'pending' : undefined,
+    withdraw: () => undefined
+  }
   const executor = new OrcaExecutor({ effects: queue.effects, runtime, log: (line) => logs.push(line) })
   const engine = new Engine({
     repo,
@@ -737,6 +758,7 @@ function harness(
     repo.atomic(() => repo.triggers.save(value))
   }
   const read = (id: string): Ticket | undefined => repo.tickets.get(id)
+  const readAll = (): readonly Ticket[] => repo.tickets.list()
   // 关库之前先把在跑的 effect 任务收干净：否则迟到的一次派发会在关掉的库上抛错。
   const cleanup = async (): Promise<void> => {
     await queue.effects.idle().catch(() => undefined)
@@ -753,7 +775,9 @@ function harness(
     seed,
     seedTrigger,
     read,
+    readAll,
     logs,
+    outboxMessages,
     worktreeRoot
   }
 }
@@ -1136,5 +1160,871 @@ test('a failing prepare records its output and fails the ticket without starting
   assert.ok(/lockfile is out of date/.test(stored.assignments[0]?.report?.summary ?? ''))
   const log = readFileSync(join(h.stateDir, 'logs', 'prepare-ticket-11-a-1.log'), 'utf8')
   assert.ok(log.includes('lockfile is out of date'), 'the output is kept for the person')
+  await h.cleanup()
+})
+
+// ---- 停止（§E.5）：撤回 Mandate、收尾消息、关闭终端、保留 worktree ---------------------
+
+/** Ticket 开始时的 Channel：收尾消息回到这里。 */
+const CHANNEL = {
+  source: 'github',
+  thread: 'acme/widgets#42',
+  address: { repo: 'acme/widgets', issue: '42' }
+}
+
+test('a human stop sends the closing notice, closes the terminal, keeps the worktree and takes no input', async () => {
+  const h = harness()
+  const runningTicket = ticket({
+    channels: [CHANNEL],
+    execution: {
+      name: 'fix-the-login-flow',
+      directory: '/w/superagent-fix-the-login-flow',
+      assignment: 'the brief'
+    },
+    assignments: [
+      { id: 'a-1', state: 'running', createdAt: AT, terminalId: 'term_1', startedAt: AT }
+    ]
+  })
+  h.seed(runningTicket)
+  h.seedTrigger(trigger())
+  withTerminal(h.runtime)
+  h.engine.bindThread('ticket-11', { source: 'github', id: 'acme/widgets#42' }, false)
+
+  h.engine.stopTicket('ticket-11', 'Human asked to stop')
+  await h.effects.idle()
+
+  const stopped = h.read('ticket-11')!
+  assert.equal(stopped.ended?.by, 'human')
+  assert.equal(stopped.ended?.outcome, 'stopped')
+  assert.equal(stopped.ended?.reason, 'Human asked to stop')
+  assert.deepEqual(stopped.assignments.map((item) => item.state), ['ended'])
+  assert.equal(stopped.assignments[0]?.endedReason, 'stopped')
+  assert.deepEqual(
+    h.runtime.calls.closeTerminal,
+    ['term_1'],
+    'the assignment terminal is closed with `orca terminal close`'
+  )
+  assert.equal(
+    stopped.execution?.directory,
+    '/w/superagent-fix-the-login-flow',
+    'the worktree is kept, never removed'
+  )
+
+  const notices = h.outboxMessages.filter((message) => message.kind === 'notice')
+  assert.equal(notices.length, 1, 'exactly one closing message')
+  assert.equal(notices[0]?.ticketId, 'ticket-11')
+  assert.deepEqual(notices[0]?.channel, CHANNEL, 'the closing message goes to the ticket channel')
+  assert.ok((notices[0]?.text ?? '').includes('Fix the login flow'), 'it names the ticket')
+
+  // 停止之后：人写的消息不再到达，note 被拒，终端里一条也不投。
+  h.engine.receive(trigger({ id: 'trigger-2' }))
+  await h.effects.idle()
+  assert.deepEqual(h.runtime.calls.sent, [], 'a stopped ticket delivers no input')
+  assert.throws(
+    () => h.engine.note('ticket-11', 'too late'),
+    (error: unknown) => error instanceof UserError && error.code === 'ticketEnded'
+  )
+
+  // 幂等：再停止一次不再关闭终端，也不发第二条收尾消息。
+  h.engine.stopTicket('ticket-11')
+  await h.effects.idle()
+  assert.deepEqual(h.runtime.calls.closeTerminal, ['term_1'])
+  assert.equal(h.outboxMessages.filter((message) => message.kind === 'notice').length, 1)
+  await h.cleanup()
+})
+
+// ---- 重试（§E.5）：结束当前 Assignment、同一 worktree 上新建、带恢复说明 ---------------
+
+test('a retry ends the assignment, closes its terminal and relaunches on the same worktree with the recovery note', async () => {
+  const h = harness()
+  const pending = ticket({
+    follows: [{ thread: 'github:9', own: true }],
+    assignments: [assignment('a-1', 'pending')]
+  })
+  h.seed(pending)
+  h.seedTrigger(trigger())
+  h.executor.start(pending, pending.assignments[0]!)
+  await h.effects.idle()
+  assert.equal(h.runtime.calls.ensureWorkspace.length, 1, 'the first launch built the worktree')
+  const first = h.read('ticket-11')!
+  assert.equal(first.assignments[0]?.terminalId, 'term_1')
+
+  h.engine.report('ticket-11', { state: 'failed', summary: 'the build is broken' })
+  retryTicket(h.engine, 'ticket-11')
+  await h.effects.idle()
+
+  const retried = h.read('ticket-11')!
+  assert.deepEqual(retried.assignments.map((item) => item.state), ['ended', 'running'])
+  assert.equal(retried.assignments[0]?.endedReason, 'retried')
+  assert.deepEqual(h.runtime.calls.closeTerminal, ['term_1'], 'the replaced terminal is closed')
+  assert.equal(h.runtime.calls.ensureWorkspace.length, 1, 'the same worktree is reused')
+  assert.equal(h.runtime.calls.launchAgent.length, 2, 'one new worker launched')
+  assert.equal(retried.assignments[1]?.terminalId, 'term_2')
+  assert.equal(retried.execution?.directory, first.execution?.directory, 'same directory')
+  assert.equal(retried.execution?.name, first.execution?.name, 'same branch short name')
+  assert.deepEqual(retried.follows, [{ thread: 'github:9', own: true }], 'the same pull request stays followed')
+
+  const note = retried.inputs.find(
+    (input) => input.kind === 'text' && input.text.includes('git history and GitHub')
+  )
+  assert.ok(note, 'the recovery note is a stored input of the new assignment')
+  assert.ok(
+    h.runtime.calls.sent.some(
+      (sent) => sent.terminalId === 'term_2' && sent.text.includes('git history and GitHub')
+    ),
+    'the new worker is told to check the worktree, git history and GitHub'
+  )
+  await h.cleanup()
+})
+
+test('a retried launch keeps the same worktree and the documented 5 s -> 10 s backoff', async () => {
+  const h = harness()
+  const pending = ticket({ assignments: [assignment('a-1', 'pending')] })
+  h.seed(pending)
+  h.seedTrigger(trigger())
+  h.executor.start(pending, pending.assignments[0]!)
+  await h.effects.idle()
+  h.engine.report('ticket-11', { state: 'failed', summary: 'the build is broken' })
+
+  h.runtime.script.launchAgent = () => {
+    throw new OrcaRuntimeError('cli_failed', 'the agent binary is gone')
+  }
+  retryTicket(h.engine, 'ticket-11')
+  await h.effects.idle()
+  assert.equal(h.runtime.calls.ensureWorkspace.length, 1, 'retry never builds a second worktree')
+  assert.equal(h.runtime.calls.launchAgent.length, 2, 'the retried launch starts immediately')
+
+  h.clock.advance(5_000)
+  await h.effects.idle()
+  assert.equal(h.runtime.calls.launchAgent.length, 3, 'retried after 5 s')
+  h.clock.advance(10_000)
+  await h.effects.idle()
+  assert.equal(h.runtime.calls.launchAgent.length, 4, 'retried after 10 s')
+
+  const stored = h.read('ticket-11')!
+  assert.equal(stored.assignments[1]?.report?.state, 'failed', 'three failed launches fail the assignment')
+  assert.equal(h.effects.pending('launch', 'ticket-11'), false, 'the launch row is given up')
+  await h.cleanup()
+})
+
+// ---- agent 状态映射（§E.7）：事件是唯一真源 ------------------------------------------
+
+/** 把状态处理器接到已建好的执行器夹具上（§E.7 的唯一入口）。 */
+function statusOf(h: ReturnType<typeof harness>) {
+  return createStatusHandler({
+    engine: h.engine,
+    records: { tickets: { get: (id) => h.read(id), list: () => h.readAll() } },
+    runtime: h.runtime,
+    log: (line) => h.logs.push(line)
+  })
+}
+
+/** 一个带终端的运行中 Ticket（状态事件要能按句柄找到它）。 */
+function runningWithTerminal(): Ticket {
+  return ticket({
+    assignments: [
+      { id: 'a-1', state: 'running', createdAt: AT, terminalId: 'term_1', startedAt: AT }
+    ]
+  })
+}
+
+/** 一条 agent 状态事件（宿主 payload 的投影）。 */
+function event(
+  state: 'working' | 'blocked' | 'waiting' | 'done',
+  overrides: { readonly terminalId?: string } = {}
+): Parameters<ReturnType<typeof createStatusHandler>>[0] {
+  return {
+    workspaceId: 'ws:superagent-fix-the-login-flow',
+    paneKey: 'pane-1',
+    ...(overrides.terminalId === undefined ? {} : { terminalId: overrides.terminalId }),
+    state,
+    receivedAt: 1
+  }
+}
+
+test('agent status: working keeps the running assignment and adds no attention', async () => {
+  const h = harness()
+  h.seed(runningWithTerminal())
+  withTerminal(h.runtime)
+  await statusOf(h)(event('working', { terminalId: 'term_1' }))
+
+  const stored = h.read('ticket-11')!
+  assert.equal(stored.assignments[0]?.state, 'running', 'the assignment keeps running')
+  assert.equal(stored.assignments[0]?.endedAt, undefined)
+  assert.equal(stored.attention, undefined, 'working raises no question')
+  assert.deepEqual(h.runtime.calls.readTerminal, [], 'working needs no evidence read')
+  assert.deepEqual(h.runtime.calls.closeTerminal, [])
+  assert.deepEqual(h.runtime.calls.launchAgent, [])
+
+  // 「清等待标记」：domain 里没有单独的 flag，stage 用 live 的 agentState 判定，
+  // 所以一条 waiting 报告之后的 working 事件让 Ticket 回到 working（§E.8）。
+  h.seed(
+    ticket({
+      assignments: [
+        {
+          id: 'a-1',
+          state: 'running',
+          createdAt: AT,
+          terminalId: 'term_1',
+          startedAt: AT,
+          report: { state: 'waiting', summary: 'idle for now', at: AT }
+        }
+      ]
+    })
+  )
+  await statusOf(h)(event('working', { terminalId: 'term_1' }))
+  const resumed = h.read('ticket-11')!
+  assert.deepEqual(ticketStage(resumed, 'working'), { stage: 'working' })
+  assert.equal(resumed.assignments[0]?.state, 'running')
+  await h.cleanup()
+})
+
+test('agent status: blocked raises an Attention from the last twenty terminal lines, via terminal', async () => {
+  const h = harness()
+  h.seed(runningWithTerminal())
+  withTerminal(h.runtime)
+  for (let line = 1; line <= 25; line += 1) {
+    await h.runtime.sendText('term_1', `prompt line ${line}`, { enter: false })
+  }
+  h.runtime.calls.readTerminal.length = 0
+
+  await statusOf(h)(event('blocked', { terminalId: 'term_1' }))
+
+  const stored = h.read('ticket-11')!
+  assert.equal(stored.assignments[0]?.report?.state, 'blocked', 'the report says blocked')
+  assert.equal(stored.attention?.via, 'terminal', 'the Attention names its source: the terminal')
+  assert.equal(stored.attention?.at, AT, 'the question carries its time')
+  const question = stored.attention?.question ?? ''
+  assert.ok(question.includes('prompt line 25'), 'the summary carries the newest line')
+  assert.ok(question.includes('prompt line 6'), 'the summary keeps the last twenty lines')
+  assert.equal(question.includes('prompt line 5'), false, 'older lines fall out of the summary')
+  assert.equal(h.runtime.calls.readTerminal.length, 1)
+  assert.equal(h.runtime.calls.readTerminal[0]?.maxLines, 20, 'exactly the last twenty lines')
+  assert.equal(stored.assignments[0]?.state, 'running', 'a blocked agent keeps its assignment')
+  await h.cleanup()
+})
+
+test('agent status: blocked with an empty or unreadable terminal writes that no prompt is shown', async () => {
+  const empty = harness()
+  empty.seed(runningWithTerminal())
+  withTerminal(empty.runtime)
+  await statusOf(empty)(event('blocked', { terminalId: 'term_1' }))
+  assert.equal(empty.read('ticket-11')?.attention?.question, NO_PROMPT)
+  assert.equal(empty.read('ticket-11')?.attention?.via, 'terminal')
+  await empty.cleanup()
+
+  const broken = harness()
+  broken.seed(runningWithTerminal())
+  withTerminal(broken.runtime)
+  broken.runtime.script.readTerminal = () => {
+    throw new OrcaRuntimeError('agent_gone', 'the terminal went away')
+  }
+  await statusOf(broken)(event('blocked', { terminalId: 'term_1' }))
+  const stored = broken.read('ticket-11')!
+  assert.equal(stored.attention?.question, NO_PROMPT, 'a failed read still becomes a question')
+  assert.equal(stored.assignments[0]?.report?.state, 'blocked', 'the evidence never blocks the event')
+  await broken.cleanup()
+})
+
+test('agent status: blocked keeps a structured question the worker already asked', async () => {
+  const h = harness()
+  h.seed(runningWithTerminal())
+  withTerminal(h.runtime)
+  h.engine.report('ticket-11', { state: 'blocked', summary: 'need a decision', question: 'Which branch?' })
+
+  await statusOf(h)(event('blocked', { terminalId: 'term_1' }))
+
+  const stored = h.read('ticket-11')!
+  assert.equal(stored.attention?.question, 'Which branch?', 'the structured question wins over a terminal summary')
+  assert.equal(stored.attention?.via, undefined)
+  assert.deepEqual(h.runtime.calls.readTerminal, [], 'no evidence read replaces a real question')
+  await h.cleanup()
+})
+
+test('agent status: waiting ends the idle assignment as ended(waiting)', async () => {
+  const h = harness()
+  h.seed(runningWithTerminal())
+  withTerminal(h.runtime)
+
+  await statusOf(h)(event('waiting', { terminalId: 'term_1' }))
+
+  const stored = h.read('ticket-11')!
+  assert.equal(stored.assignments[0]?.state, 'ended')
+  assert.equal(stored.assignments[0]?.endedReason, 'waiting')
+  assert.equal(stored.ended, undefined, 'the ticket stays open for a later trigger')
+  assert.deepEqual(h.runtime.calls.closeTerminal, [], 'a waiting worker keeps its terminal')
+  await h.cleanup()
+})
+
+test('agent status: waiting keeps the assignment while an Input or a pending assignment waits', async () => {
+  const h = harness()
+  h.seed(
+    ticket({
+      assignments: [
+        { id: 'a-1', state: 'running', createdAt: AT, terminalId: 'term_1', startedAt: AT },
+        { id: 'a-2', state: 'pending', createdAt: AT }
+      ],
+      inputs: [triggerInput()],
+      undelivered: ['input-1']
+    })
+  )
+  withTerminal(h.runtime)
+
+  await statusOf(h)(event('waiting', { terminalId: 'term_1' }))
+
+  const stored = h.read('ticket-11')!
+  assert.equal(stored.assignments[0]?.state, 'running', 'an undelivered Input still needs the worker')
+  assert.equal(stored.assignments[0]?.endedReason, undefined)
+  await h.cleanup()
+})
+
+test('agent status: an event without a terminal handle is located by paneKey or the machine-wide terminal list', async () => {
+  const h = harness()
+  h.seed(runningWithTerminal())
+  withTerminal(h.runtime)
+
+  // paneKey 直接是终端句柄（宿主某些版本如此，附录 C S7/S9）。
+  await statusOf(h)({
+    workspaceId: 'ws:superagent-fix-the-login-flow',
+    paneKey: 'term_1',
+    state: 'working',
+    receivedAt: 1
+  })
+  assert.equal(h.read('ticket-11')?.assignments[0]?.state, 'running')
+
+  // 两者都不是句柄：用 `listTerminals()`（全机）按 workspaceId 反查，`listAgents()` 不参与。
+  await statusOf(h)({
+    workspaceId: 'ws:superagent-fix-the-login-flow',
+    paneKey: 'pane:1',
+    state: 'waiting',
+    receivedAt: 2
+  })
+  assert.equal(h.read('ticket-11')?.assignments[0]?.endedReason, 'waiting')
+  assert.deepEqual(h.runtime.calls.listAgents, [], 'the focused-workspace agent list is never the truth')
+  await h.cleanup()
+})
+
+test('agent status: done without a final report ends the assignment and marks the report missing', async () => {
+  const h = harness()
+  h.seed(runningWithTerminal())
+  withTerminal(h.runtime)
+
+  await statusOf(h)(event('done', { terminalId: 'term_1' }))
+
+  const stored = h.read('ticket-11')!
+  assert.equal(stored.assignments[0]?.state, 'ended')
+  assert.equal(stored.assignments[0]?.endedReason, 'done')
+  assert.equal(stored.assignments[0]?.report?.state, 'failed', 'a failure shows on the ticket')
+  assert.ok(/final report/.test(stored.assignments[0]?.report?.summary ?? ''), 'the reason is report_missing')
+  assert.equal(canRetry(stored), true, 'the failed ticket can be retried')
+  assert.deepEqual(ticketStage(stored, 'done'), { stage: 'person', action: 'failed' })
+  assert.equal(stored.ended, undefined, 'done alone does not end the ticket')
+  assert.deepEqual(h.runtime.calls.closeTerminal, [])
+  await h.cleanup()
+})
+
+test('agent status: done with a final report keeps it and ends the ticket by the report rules', async () => {
+  const h = harness()
+  h.seed(
+    ticket({
+      follows: [{ thread: 'github:9', own: false }],
+      assignments: [
+        {
+          id: 'a-1',
+          state: 'running',
+          createdAt: AT,
+          terminalId: 'term_1',
+          startedAt: AT,
+          report: { state: 'ready', summary: 'PR #9 is ready', at: AT }
+        }
+      ]
+    })
+  )
+  withTerminal(h.runtime)
+
+  await statusOf(h)(event('done', { terminalId: 'term_1' }))
+
+  const stored = h.read('ticket-11')!
+  assert.equal(stored.assignments[0]?.state, 'ended')
+  assert.equal(stored.assignments[0]?.endedReason, 'done')
+  assert.equal(stored.assignments[0]?.report?.state, 'ready', 'the final report is never overwritten')
+  assert.equal(stored.ended, undefined, 'the ready report waits for its pull request to close')
+  await h.cleanup()
+})
+
+test('agent status: a done event after a human stop is idempotent compensation, not a new lifecycle', async () => {
+  const h = harness()
+  h.seed(runningWithTerminal())
+  withTerminal(h.runtime)
+  h.engine.stopTicket('ticket-11')
+  await h.effects.idle()
+  const before = h.read('ticket-11')!
+
+  await statusOf(h)(event('done', { terminalId: 'term_1' }))
+
+  const after = h.read('ticket-11')!
+  assert.deepEqual(after.assignments, before.assignments, 'the stopped assignment keeps its ending')
+  assert.deepEqual(h.runtime.calls.launchAgent, [], 'no assignment is started by a done event')
+  assert.deepEqual(h.runtime.calls.closeTerminal, ['term_1'], 'the stop already closed it exactly once')
+  await h.cleanup()
+})
+
+// ---- 崩溃 / 重启恢复（§E.5、§E.10）：全机终端枚举，认领或重建 -------------------------
+
+/** 恢复夹具：一个仍在跑的 Assignment 与它记录下来的 worktree。 */
+function resumeHarness(options: {
+  readonly directory?: string
+  readonly terminalId?: string
+  readonly created?: string
+  readonly id?: string
+} = {}) {
+  const h = harness()
+  const directory = options.directory ?? '/w/superagent-fix-the-login-flow'
+  h.runtime.workspaces = [
+    workspace('superagent-fix-the-login-flow', directory, 'agent/fix-the-login-flow')
+  ]
+  h.runtime.registerAgent('ws:superagent-fix-the-login-flow', {
+    terminalId: options.terminalId ?? 'term_1',
+    workspaceId: 'ws:superagent-fix-the-login-flow',
+    launchedAt: 1
+  })
+  h.seed(
+    ticket({
+      id: options.id ?? 'ticket-11',
+      execution: { name: 'fix-the-login-flow', directory, assignment: 'the brief' },
+      assignments: [
+        {
+          id: `${options.id ?? 'ticket-11'}-a1`,
+          state: 'running',
+          createdAt: options.created ?? AT,
+          startedAt: AT,
+          terminalId: options.terminalId ?? 'term_1'
+        }
+      ]
+    })
+  )
+  const resume = (): Promise<ResumeReport> =>
+    resumeAssignments({
+      runtime: h.runtime,
+      engine: h.engine,
+      records: { tickets: { list: () => h.readAll() } },
+      log: (line) => h.logs.push(line)
+    })
+  return { ...h, resume }
+}
+
+test('resume adopts a live terminal whose worktree is this ticket and says restored', async () => {
+  const h = resumeHarness()
+
+  const report = await h.resume()
+
+  const stored = h.read('ticket-11')!
+  assert.deepEqual(stored.assignments.map((item) => item.state), ['running'], 'the assignment is adopted')
+  assert.equal(h.runtime.calls.sent.length, 1, 'the worker is told it was restored')
+  const sent = h.runtime.calls.sent[0]!
+  assert.equal(sent.terminalId, 'term_1')
+  assert.equal(sent.enter, true)
+  assert.ok(/restored/i.test(sent.text), `the message says restored: ${sent.text}`)
+  assert.equal(sent.text.includes('\n'), false, 'one line, never a multi-line seed')
+  assert.deepEqual(h.runtime.calls.launchAgent, [], 'no worker is started over an adopted one')
+  assert.deepEqual(h.runtime.calls.listAgents, [], 'the focused-workspace agent list is never the truth')
+  assert.deepEqual(report.assignments.map((item) => item.outcome), ['adopted'])
+  await h.cleanup()
+})
+
+test('resume interrupts assignments whose terminal is gone and rebuilds them, oldest first, with the recovery note', async () => {
+  const h = harness()
+  h.seed(
+    ticket({
+      id: 'ticket-12',
+      title: 'Older work',
+      assignments: [
+        { id: 'a-old', state: 'running', createdAt: '2026-11-07T03:00:00.000Z', terminalId: 'term_gone' }
+      ]
+    })
+  )
+  h.seed(
+    ticket({
+      id: 'ticket-11',
+      assignments: [
+        { id: 'a-new', state: 'running', createdAt: '2026-11-07T03:10:00.000Z', terminalId: 'term_also_gone' }
+      ]
+    })
+  )
+
+  const report = await resumeAssignments({
+    runtime: h.runtime,
+    engine: h.engine,
+    records: { tickets: { list: () => h.readAll() } }
+  })
+  assert.deepEqual(
+    report.assignments.map((item) => `${item.ticketId}:${item.outcome}`),
+    ['ticket-12:interrupted', 'ticket-11:interrupted'],
+    'oldest assignment first'
+  )
+  for (const id of ['ticket-11', 'ticket-12']) {
+    const ticket = h.read(id)!
+    assert.deepEqual(ticket.assignments.map((item) => item.state), ['ended', 'pending'])
+    assert.equal(ticket.assignments[0]?.endedReason, 'interrupted')
+    const note = ticket.inputs.find(
+      (input) => input.kind === 'text' && input.text.includes('git history and GitHub')
+    )
+    assert.ok(note, `${id} restarts with the recovery note`)
+  }
+
+  await h.effects.idle()
+  assert.deepEqual(
+    h.runtime.calls.ensureWorkspace.map((spec) => spec.name),
+    ['superagent-older-work', 'superagent-fix-the-login-flow'],
+    'the rebuilds keep the oldest-first order'
+  )
+  await h.cleanup()
+})
+
+test('resume interrupts a terminal that is alive but belongs to another worktree', async () => {
+  const h = resumeHarness({ directory: '/w/someone-elses-checkout' })
+  h.runtime.workspaces = [
+    workspace('other', '/w/someone-elses-checkout', 'other/work')
+  ]
+
+  const report = await h.resume()
+
+  assert.deepEqual(report.assignments.map((item) => item.outcome), ['interrupted'])
+  assert.equal(h.read('ticket-11')?.assignments[0]?.endedReason, 'interrupted')
+  assert.deepEqual(h.runtime.calls.sent, [], 'the wrong terminal is never written to')
+  await h.cleanup()
+})
+
+test('resume interrupts an orphaned terminal', async () => {
+  const h = resumeHarness()
+  h.runtime.script.listTerminals = () => [
+    {
+      handle: 'term_1',
+      worktreeId: 'ws:superagent-fix-the-login-flow',
+      worktreePath: '/w/superagent-fix-the-login-flow',
+      title: null,
+      connected: false,
+      orphaned: true
+    }
+  ]
+
+  const report = await h.resume()
+
+  assert.deepEqual(report.assignments.map((item) => item.outcome), ['interrupted'])
+  assert.deepEqual(h.runtime.calls.sent, [])
+  await h.cleanup()
+})
+
+// ---- 30 分钟后台工作（§E.9 的近似）：计时、收尾指令、清除标记 -------------------------
+
+/** 把后台计时器接到夹具上（面板读的就是 `state()`）。 */
+function backgroundOf(h: ReturnType<typeof harness>) {
+  return createBackgroundTracker({
+    records: { tickets: { get: (id) => h.read(id) } },
+    runtime: h.runtime,
+    now: () => h.clock.now(),
+    log: (line) => h.logs.push(line)
+  })
+}
+
+/** 一个已 report 过的运行中 Ticket（§E.9 第 1 步的前置）。 */
+function reportedWorking(state: 'progress' | 'ready' | 'waiting' = 'progress'): Ticket {
+  return ticket({
+    follows: state === 'ready' ? [{ thread: 'github:9', own: false }] : undefined,
+    assignments: [
+      {
+        id: 'a-1',
+        state: 'running',
+        createdAt: AT,
+        terminalId: 'term_1',
+        startedAt: AT,
+        report: { state, summary: 'still going', at: AT }
+      }
+    ]
+  })
+}
+
+test('background work: a progress report followed by working starts the clock, and 30 min sends the wrap-up', async () => {
+  const h = harness()
+  h.seed(reportedWorking())
+  withTerminal(h.runtime)
+  const background = backgroundOf(h)
+
+  background.observed('ticket-11', 'working')
+  assert.deepEqual(background.state('ticket-11'), { since: h.clock.now(), expired: false })
+
+  h.clock.advance(BACKGROUND_LIMIT_MS - 1_000)
+  await background.poll()
+  assert.deepEqual(h.runtime.calls.sent, [], 'nothing is sent before the limit')
+
+  h.clock.advance(1_000)
+  await background.poll()
+  const sent = h.runtime.calls.sent[0]!
+  assert.equal(sent.terminalId, 'term_1')
+  assert.equal(sent.enter, true)
+  assert.ok(/30 minutes/.test(sent.text), `the wrap-up names the limit: ${sent.text}`)
+  assert.ok(/report waiting/.test(sent.text), 'it tells the worker how to end the turn')
+  assert.equal(sent.text.includes('\n'), false, 'one line')
+  assert.equal(background.state('ticket-11')?.expired, true, 'the ticket is marked as past 30 minutes')
+  assert.deepEqual(h.runtime.calls.closeTerminal, [], 'the process is never killed')
+
+  h.clock.advance(BACKGROUND_LIMIT_MS)
+  await background.poll()
+  assert.equal(h.runtime.calls.sent.length, 1, 'the wrap-up is sent once')
+  await h.cleanup()
+})
+
+test('background work: a waiting agent or a person\'s message clears the flags', async () => {
+  const h = harness()
+  h.seed(reportedWorking())
+  withTerminal(h.runtime)
+  const background = backgroundOf(h)
+  background.observed('ticket-11', 'working')
+  h.clock.advance(BACKGROUND_LIMIT_MS)
+  await background.poll()
+  assert.equal(background.state('ticket-11')?.expired, true)
+
+  background.observed('ticket-11', 'waiting')
+  assert.equal(background.state('ticket-11'), undefined, 'waiting ends the background turn')
+
+  // 人的消息之后，旧起点不再算数。
+  h.clock.advance(1_000)
+  background.observed('ticket-11', 'working')
+  assert.ok(background.state('ticket-11'))
+  h.clock.advance(60_000)
+  const withPerson = h.read('ticket-11')!
+  h.seed({
+    ...withPerson,
+    inputs: [
+      ...withPerson.inputs,
+      {
+        id: 'human-1',
+        kind: 'trigger',
+        triggerId: 'trigger-1',
+        at: new Date(h.clock.now()).toISOString(),
+        human: true
+      }
+    ]
+  })
+  assert.equal(background.state('ticket-11'), undefined, 'a person\'s message clears the flag')
+  h.clock.advance(BACKGROUND_LIMIT_MS * 2)
+  await background.poll()
+  assert.equal(h.runtime.calls.sent.length, 1, 'a cleared flag sends nothing more')
+  await h.cleanup()
+})
+
+test('background work: only progress or ready reports start the clock', async () => {
+  const h = harness()
+  h.seed(reportedWorking('waiting'))
+  withTerminal(h.runtime)
+  const background = backgroundOf(h)
+
+  background.observed('ticket-11', 'working')
+  assert.equal(background.state('ticket-11'), undefined, 'a waiting report is not background work')
+
+  const ready = harness()
+  ready.seed(reportedWorking('ready'))
+  withTerminal(ready.runtime)
+  const readyBackground = backgroundOf(ready)
+  readyBackground.observed('ticket-11', 'working')
+  assert.ok(readyBackground.state('ticket-11'), 'a ready report followed by working starts the clock')
+  await h.cleanup()
+  await ready.cleanup()
+})
+
+// ---- 阻塞与失败（§E.5 / §H.4）：三次失败后不再自动输入，工具仍可用 ----------------------
+
+test('three failed launches stop automatic input, and the failure shows on the ticket', async () => {
+  const h = harness()
+  h.runtime.script.ensureWorkspace = () => {
+    throw new OrcaRuntimeError('cli_failed', 'worktree create failed')
+  }
+  h.seed(ticket({ assignments: [assignment('a-1', 'pending')] }))
+  h.seedTrigger(trigger())
+  h.engine.bindThread('ticket-11', { source: 'github', id: 'acme/widgets#42' }, false)
+  h.executor.start(h.read('ticket-11')!, h.read('ticket-11')!.assignments[0]!)
+  await h.effects.idle()
+  h.clock.advance(5_000)
+  await h.effects.idle()
+  h.clock.advance(10_000)
+  await h.effects.idle()
+
+  const failed = h.read('ticket-11')!
+  assert.equal(failed.assignments[0]?.report?.state, 'failed')
+  assert.deepEqual(ticketStage(failed, 'done'), { stage: 'person', action: 'failed' }, 'the panel shows it')
+  assert.equal(h.effects.pending('launch', 'ticket-11'), false, 'no fourth attempt')
+
+  // CI / bot 消息到了：记在 Ticket 上，但不投递、也不再唤醒它。
+  h.clock.advance(60_000)
+  const bot = trigger({
+    id: 'trigger-ci',
+    human: false,
+    addressed: undefined,
+    actor: { source: 'github', id: 'ci-bot' }
+  })
+  assert.equal(h.engine.receive(bot), 'stored')
+  await h.effects.idle()
+  const after = h.read('ticket-11')!
+  assert.ok(after.inputs.some((input) => input.kind === 'trigger' && input.triggerId === 'trigger-ci'))
+  assert.deepEqual(after.undelivered, [], 'an automatic Input stays undelivered')
+  assert.deepEqual(h.runtime.calls.sent, [], 'nothing is written to a worker that failed')
+  assert.equal(h.effects.pending('launch', 'ticket-11'), false, 'the bot message does not relaunch')
+  await h.cleanup()
+})
+
+test('a failed worker keeps its terminal and tools, and a person\'s message releases the hold', async () => {
+  const h = harness()
+  h.seed(runningWithTerminal())
+  withTerminal(h.runtime)
+  h.seedTrigger(trigger())
+  h.engine.bindThread('ticket-11', { source: 'github', id: 'acme/widgets#42' }, false)
+  h.engine.report('ticket-11', { state: 'failed', summary: 'the build could not be fixed' })
+
+  h.clock.advance(60_000)
+  const bot = trigger({
+    id: 'trigger-ci',
+    human: false,
+    addressed: undefined,
+    actor: { source: 'github', id: 'ci-bot' }
+  })
+  assert.equal(h.engine.receive(bot), 'stored')
+  await h.effects.idle()
+  assert.deepEqual(h.runtime.calls.sent, [], 'automatic input waits while the worker is failed')
+  assert.deepEqual(h.runtime.calls.closeTerminal, [], 'its terminal stays open: the tools stay available')
+  assert.deepEqual(ticketStage(h.read('ticket-11')!, 'done'), { stage: 'person', action: 'failed' })
+
+  // 人的消息结束这个 hold：它被投递给仍在跑的 worker。
+  h.clock.advance(60_000)
+  h.engine.receive(
+    trigger({ id: 'trigger-human-2', text: 'Try the other branch instead.' })
+  )
+  await h.effects.idle()
+  assert.ok(h.runtime.calls.sent.length > 0, 'a person can continue the ticket directly')
+  const released = h.read('ticket-11')!
+  assert.equal(released.assignments[0]?.state, 'running', 'the session is still the same worker')
+  assert.deepEqual(ticketStage(released, 'working'), { stage: 'working' })
+  await h.cleanup()
+})
+
+test('the executor lifecycle wires agent status into the background clock and resume', async () => {
+  const h = harness()
+  const directory = '/w/superagent-fix-the-login-flow'
+  h.runtime.workspaces = [workspace('superagent-fix-the-login-flow', directory, 'agent/fix-the-login-flow')]
+  h.seed({ ...reportedWorking(), execution: { name: 'fix-the-login-flow', directory, assignment: 'brief' } })
+  withTerminal(h.runtime)
+  const lifecycle = registerExecutorLifecycle({
+    runtime: h.runtime,
+    engine: h.engine,
+    records: { tickets: { get: (id) => h.read(id), list: () => h.readAll() }, triggers: { get: () => undefined } },
+    now: () => h.clock.now(),
+    log: (line) => h.logs.push(line)
+  })
+
+  await lifecycle.status(event('working', { terminalId: 'term_1' }))
+  assert.ok(lifecycle.background.state('ticket-11'), 'a working event starts the background clock')
+  h.clock.advance(BACKGROUND_LIMIT_MS)
+  await lifecycle.background.poll()
+  assert.equal(h.runtime.calls.sent.filter((sent) => /30 minutes/.test(sent.text)).length, 1)
+
+  const resumed = await lifecycle.resume()
+  assert.deepEqual(resumed.assignments.map((item) => item.outcome), ['adopted'])
+  lifecycle.background.stop()
+  assert.equal(lifecycle.background.state('ticket-11'), undefined)
+  await h.cleanup()
+})
+
+test('a later trigger wakes an idle assignment that waiting ended', async () => {
+  const h = harness()
+  h.seed(runningWithTerminal())
+  h.seedTrigger(trigger())
+  h.engine.bindThread('ticket-11', { source: 'github', id: 'acme/widgets#42' }, false)
+  withTerminal(h.runtime)
+
+  await statusOf(h)(event('waiting', { terminalId: 'term_1' }))
+  assert.equal(h.read('ticket-11')?.assignments[0]?.endedReason, 'waiting')
+
+  h.clock.advance(60_000)
+  assert.equal(
+    h.engine.receive(trigger({ id: 'trigger-followup', text: 'Now also update the docs.' })),
+    'stored'
+  )
+  const woken = h.read('ticket-11')!
+  assert.deepEqual(
+    woken.assignments.map((item) => item.state),
+    ['ended', 'pending'],
+    'a new assignment carries the follow-up'
+  )
+  assert.equal(woken.ended, undefined, 'the ticket itself stays open')
+
+  await h.effects.idle()
+  const started = h.read('ticket-11')!
+  assert.equal(started.assignments[1]?.state, 'running', 'the new assignment is launched')
+  assert.ok(started.assignments[1]?.terminalId, 'the new assignment has its own terminal')
+  assert.equal(h.runtime.calls.launchAgent.length, 1, 'only the follow-up launches a worker')
+  assert.ok(
+    h.runtime.calls.sent.some((sent) => sent.text.includes('Now also update the docs.')),
+    'the follow-up reaches the new worker'
+  )
+  assert.deepEqual(h.runtime.calls.ensureWorkspace.length, 1, 'the worktree is reused')
+  await h.cleanup()
+})
+
+test('agent status: done after a waiting report is an idle turn, not a missing report', async () => {
+  const h = harness()
+  h.seed(
+    ticket({
+      assignments: [
+        {
+          id: 'a-1',
+          state: 'running',
+          createdAt: AT,
+          terminalId: 'term_1',
+          startedAt: AT,
+          report: { state: 'waiting', summary: 'nothing left to do', at: AT }
+        }
+      ]
+    })
+  )
+  withTerminal(h.runtime)
+
+  await statusOf(h)(event('done', { terminalId: 'term_1' }))
+
+  const stored = h.read('ticket-11')!
+  assert.equal(stored.assignments[0]?.state, 'ended')
+  assert.equal(stored.assignments[0]?.endedReason, 'done')
+  assert.equal(
+    stored.assignments[0]?.report?.state,
+    'waiting',
+    'a reported turn end keeps its waiting report (Orca reports `done` for every finished turn)'
+  )
+  assert.deepEqual(ticketStage(stored, 'done'), { stage: 'idle' })
+  assert.equal(canRetry(stored), false, 'an idle turn is not a failure to retry')
+  await h.cleanup()
+})
+
+test('agent status: done after only a progress report still counts as a missing final report', async () => {
+  const h = harness()
+  h.seed(
+    ticket({
+      assignments: [
+        {
+          id: 'a-1',
+          state: 'running',
+          createdAt: AT,
+          terminalId: 'term_1',
+          startedAt: AT,
+          report: { state: 'progress', summary: 'still going', at: AT }
+        }
+      ]
+    })
+  )
+  withTerminal(h.runtime)
+
+  await statusOf(h)(event('done', { terminalId: 'term_1' }))
+
+  const stored = h.read('ticket-11')!
+  assert.equal(stored.assignments[0]?.report?.state, 'failed')
+  assert.ok(/final report/.test(stored.assignments[0]?.report?.summary ?? ''))
+  assert.equal(canRetry(stored), true)
   await h.cleanup()
 })

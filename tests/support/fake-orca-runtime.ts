@@ -50,6 +50,7 @@ export interface FakeOrcaScript {
   }>
   closeTerminal?: (terminalId: string) => void | Promise<void>
   runCommand?: (spec: CommandSpec) => CommandHandle | Promise<CommandHandle>
+  listTerminals?: () => readonly TerminalRow[] | Promise<readonly TerminalRow[]>
 }
 
 /** 逐次调用的记录；测试按它断言顺序、次数与参数。 */
@@ -63,6 +64,7 @@ export interface FakeOrcaCalls {
   readonly runCommand: CommandSpec[]
   readonly listWorkspaces: number[]
   readonly listAgents: number[]
+  readonly listTerminals: number[]
 }
 
 /** 终端在替身里的内容：按行存，`sendText` 追加，`readTerminal` 截取尾部。 */
@@ -88,7 +90,8 @@ export class FakeOrcaRuntime implements OrcaRuntime {
     closeTerminal: [],
     runCommand: [],
     listWorkspaces: [],
-    listAgents: []
+    listAgents: [],
+    listTerminals: []
   }
 
   /** 下一次 `ensureWorkspace` 返回 `created: true` 时用的路径（确定性，测试可断言）。 */
@@ -189,6 +192,8 @@ export class FakeOrcaRuntime implements OrcaRuntime {
   }
 
   async listTerminals(): Promise<readonly TerminalRow[]> {
+    this.calls.listTerminals.push(this.terminals.size)
+    if (this.script.listTerminals) return await this.script.listTerminals()
     return [...this.terminals.values()].map((terminal) => ({
       handle: terminal.handle,
       worktreeId: terminal.workspaceId,

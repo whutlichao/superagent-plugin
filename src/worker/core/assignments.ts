@@ -39,9 +39,15 @@ export interface AssignmentLaunch {
   }
 }
 
-/** 主机重启打断 Assignment 时投递的恢复说明：先看现场，别重复已做的外部动作。 */
-const RECOVERY_NOTE =
-  'The host restarted during this ticket. Inspect the current worktree, git history and GitHub state before continuing. Do not repeat an already completed external operation. Finish the original assignment and report its status.'
+/**
+ * 重建 Assignment 时投递的恢复说明里的核心指令（§E.5 retry、§E.10 restart）：先看现场，
+ * 别重复已做的外部动作。原因由调用方拼在最前面，指令只写一次。
+ */
+export const RECOVERY_INSTRUCTION =
+  'Inspect the current worktree, git history and GitHub state before continuing. Do not repeat an already completed external operation. Finish the original assignment and report its status.'
+
+/** 主机重启打断 Assignment 时投递的恢复说明。 */
+const RECOVERY_NOTE = `The host restarted during this ticket. ${RECOVERY_INSTRUCTION}`
 
 /**
  * Assignments 记录执行器与 worker 对运行 Ticket 的 Assignment 说过的话：一个启动了、Input
@@ -128,6 +134,33 @@ export class Assignments extends EnginePart {
     if (!ticket) return
     ticket.delivery = { error: error.slice(0, 300), at: this.now() }
     this.repo.tickets.save(ticket)
+  }
+
+  /**
+   * 执行器报告：运行中的 Assignment 结束了（agent 的 `waiting`/`done`），Ticket 仍然开着。
+   * 只认当前正在跑的那个，重复的事件是幂等的；`reason` 是 `waiting` / `done` 这类结局码。
+   */
+  ended(ticketId: string, assignmentId: string, reason: string): void {
+    const ticket = this.running(ticketId, assignmentId)
+    if (!ticket) return
+    const assignment = runningAssignment(ticket)!
+    assignment.state = 'ended'
+    assignment.endedAt = this.now()
+    assignment.endedReason = reason
+    ticket.updatedAt = this.now()
+    this.repo.tickets.save(ticket)
+    this.emit('assignment.ended', { ticketId, assignmentId, reason })
+  }
+
+  /**
+   * 执行器报告：这个 Assignment 的终端已经不在（插件或应用重启、人被关掉终端）。会话无法
+   * 再认领，所以**无条件**结束它并按恢复说明重建（§E.10）；与 `interrupted` 的区别是后者
+   * 认为宿主的会话还在，`waiting`/`ready` 之类的报告可以保留。
+   */
+  lost(ticketId: string, assignmentId: string): void {
+    const ticket = this.running(ticketId, assignmentId)
+    if (!ticket) return
+    this.tickets.restart(ticket, runningAssignment(ticket)!, 'interrupted', RECOVERY_NOTE)
   }
 
   /**
