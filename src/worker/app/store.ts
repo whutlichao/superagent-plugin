@@ -179,6 +179,8 @@ export interface SettingsVersionRepository {
   put(record: SettingsVersionRecord): void
   byRevision(revision: number): SettingsVersionRecord | null
   latest(): SettingsVersionRecord | null
+  /** 版本历史，新→旧；`limit` 是页大小（面板 History 页与 `settings get --history`，缺省 50）。 */
+  list(limit?: number): readonly SettingsVersionRecord[]
 }
 
 /** Prompt 版本仓储（§D.4 写者：`app/prompts.ts`）。 */
@@ -815,6 +817,11 @@ function createSettingsVersionRepository(sql: SqlAccess): SettingsVersionReposit
     latest(): SettingsVersionRecord | null {
       const row = sql.one('SELECT * FROM settings_version ORDER BY revision DESC LIMIT 1')
       return row === undefined ? null : settingsVersionFrom(row)
+    },
+    list(limit = 50): readonly SettingsVersionRecord[] {
+      return sql
+        .all('SELECT * FROM settings_version ORDER BY revision DESC LIMIT ?', [limit])
+        .map((row) => settingsVersionFrom(row))
     }
   }
 }

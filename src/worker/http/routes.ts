@@ -145,7 +145,8 @@ export function assertTicketVisible(caller: RouteCaller, ticketId: string): void
  *
  * 最低角色的依据：
  * - `assignment`：`state`（worker 的 `status --json` 自检，§G.5）、`tickets/:id`（只读自己的），
- *   以及 worker 自己的 `report`/`reply`/`ack`/`trigger handback`（Ticket 来自它的 token）。
+ *   以及 worker 自己的 `report`/`reply`/`ack`/`trigger handback`（Ticket 来自它的 token），
+ *   与 §G.2 的两条 worker 命令 `thread follow` / `thread unrelated`（同样从 token 取 Ticket）。
  * - `router`：§F.6 列出的 Router 命令（read 的各类资源、route/eval 之外的路由动作、
  *   settings/policy/prompts、ticket 三件、trigger requeue、thread unsubscribe）。
  * - `operator`：面板专属视图（overview/sources/search/policy 历史）、面板动作
@@ -183,6 +184,10 @@ export const ROUTE_TABLE: readonly RouteDefinition[] = [
   // `trigger handback` 是 worker 的命令（§G.2）：Ticket 来自 assignment token，不是参数。
   { method: 'POST', path: 'triggers/:id/handback', command: 'trigger handback', minimumRole: 'assignment', handler: stub },
   { method: 'POST', path: 'threads/:key/unsubscribe', command: 'thread unsubscribe', minimumRole: 'router', handler: stub },
+  // §G.2 的两条 worker 命令（Ticket 来自 assignment token，不是参数）：按理由跟随一条它不
+  // 拥有的 Thread，或把一条它跟随的 Thread 标为无关并交回上面的人消息。
+  { method: 'POST', path: 'threads/:key/follow', command: 'thread follow', minimumRole: 'assignment', handler: stub },
+  { method: 'POST', path: 'threads/:key/unrelated', command: 'thread unrelated', minimumRole: 'assignment', handler: stub },
   { method: 'POST', path: 'tickets/:id/retry', command: 'ticket retry', minimumRole: 'router', handler: stub },
   { method: 'POST', path: 'tickets/:id/stop', command: 'ticket stop', minimumRole: 'router', handler: stub },
   { method: 'POST', path: 'tickets/:id/note', command: 'ticket note', minimumRole: 'router', handler: stub },

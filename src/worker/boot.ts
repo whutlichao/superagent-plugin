@@ -64,6 +64,7 @@ import {
 } from './app/kv.ts'
 import { createRefreshableStateSource, type RefreshableStateSource } from './app/state-source.ts'
 import { deliveredFollowups } from './app/views.ts'
+import { followupOwners } from './core/index.ts'
 import { readEvalsHealth, readUnavailableProblems } from './app/views/attention.ts'
 import { readSystemProblems, replyTarget } from './app/views/problems.ts'
 import { statusBarView } from './app/status-bar.ts'
@@ -105,6 +106,9 @@ import { retryTicket } from './executor/retry.ts'
 import { resumeAfterUpgrade, type ResumeReport } from './executor/resume.ts'
 import { DEFAULT_MAX_WORKERS } from './http/state.ts'
 import { createDomainHandlers, withDomainHandlers } from './http/domain.ts'
+import { createSettingsHandlers, withSettingsHandlers } from './http/settings.ts'
+import { runWrite } from './http/idempotency.ts'
+import { parseSettingsBlock, validateSettingsBlock } from './app/settings-blocks.ts'
 import { createAssessmentHandlers, withAssessmentHandlers } from './http/assessment.ts'
 import { createEvalHandlers, withEvalHandlers } from './http/eval.ts'
 import { createEvalTools } from './app/eval.ts'
@@ -822,6 +826,12 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
   }
 
   // ---- 命令面（HTTP + CLI 共用同一份 handler）
+  /** 写命令的幂等（§G.1 幂等行）：窗口/键/清理只有 `http/idempotency.ts` 一份。 */
+  const idempotent = (
+    input: { readonly token?: string; readonly requestId?: string | null; readonly at: string },
+    work: () => unknown | Promise<unknown>
+  ): Promise<unknown> =>
+    runWrite({ store, token: input.token, requestId: input.requestId ?? null, at: input.at }, work)
   const domain = createDomainHandlers({
     report: (ticketId, report) => engine.report(ticketId, report),
     reply: (request) => engine.reply(request),
@@ -832,10 +842,20 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
     // 拼一次（`executor/retry.ts`），这里只把 Ticket 交给它——避免第二个说法。
     stop: (ticketId, reason) => engine.stopTicket(ticketId, reason),
     retry: (ticketId) => retryTicket(engine, ticketId),
+    // 本票的四条领域命令（§G.2 的 trigger requeue / thread follow / thread unrelated /
+    // thread unsubscribe）：语义全在 Engine，HTTP 层只判固定码。
+    reevaluate: (triggerId) => engine.reevaluate(triggerId),
+    unsubscribe: (thread) => engine.unsubscribe(thread),
+    markUnrelated: (ticketId, thread, reason) => engine.markUnrelated(ticketId, thread, reason),
+    followForContext: (ticketId, ref, reason) => engine.followForContext(ticketId, ref, reason),
+    threadOf: (key) => repo.threads.get(key),
+    triggerOf: (id) => repo.triggers.get(id),
+    owners: (trigger) => followupOwners(trigger, repo),
     ticketOf: (id) => repo.tickets.get(id),
     tickets: () => repo.tickets.list(),
     // 读模型里的「已投递到该 Ticket」：归属判定与扇出/交回同一份记录（`followupOwners`）。
     followups: (ticket) => deliveredFollowups(ticket, repo),
+    idempotent,
     afterWrite: () => {
       refresh()
     }
@@ -891,30 +911,99 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
       refresh()
     }
   })
-  const routes: readonly RouteDefinition[] = withDecisionHandlers(
-    withPromptHandlers(
-      withEvalHandlers(
-        withAssessmentHandlers(
-          withDomainHandlers(ROUTE_TABLE, domain),
-          createAssessmentHandlers({
-            tools: routerTools,
-            afterWrite: () => {
-              refresh()
-            }
-          })
+  // ---- 设置与名单同步的写面（§G.2 的 settings get/save 与 policy sync、§K.8）：写入器是
+  // #20 的 `settingsWriter`，块的 strict schema 由 Policy（含各 Source 的 extras）与各 kind 的
+  // config schema 提供，账号类字段（`cli`/`repository`）的写前检查是 #44 的探针，名单同步是
+  // #23 的驱动器（`policySync` 在下面创建：端口用晚绑定的 holder，请求只会在启动之后到达）。
+  let policySyncDriver: PolicySync | null = null
+  const settingsHandlers = createSettingsHandlers({
+    settings: settingsWriter,
+    validate: (name) => {
+      if (parseSettingsBlock(name) === undefined) return undefined
+      return (value: unknown) =>
+        validateSettingsBlock(name, value, {
+          // Policy 块的字段表与跨 Source 的 extras 在 `policy/schema.ts`（§K.1）。
+          policy: (candidate) => validatePolicy(candidate, { kinds: policyKind }),
+          // Source 块的 config 键属于该 kind（§I.1）：只把它的 issues 接进同一份结果。
+          sourceConfig: (id) => {
+            const schema = registry.kind(id)?.schema
+            return schema === undefined ? undefined : (config: unknown) => schema.safeParse(config)
+          }
+        }) ?? { success: true as const, data: value }
+    },
+    blocks: () => [
+      'policy',
+      'eval',
+      'executor',
+      ...Object.keys(sourceSettings.sources).map((id) => `source:${id}`)
+    ],
+    effective: (name) => {
+      if (name === 'policy') return effectivePolicy()
+      if (name === 'eval') return block(settings['eval'])
+      if (name === 'executor') return block(settings['executor'])
+      const parsed = parseSettingsBlock(name)
+      return parsed?.kind === 'source'
+        ? (sourceSettings.sources[parsed.id] ?? { enabled: false, config: {} })
+        : null
+    },
+    // 账号类字段的写前 setup 检查（§K.8）：按候选值跑 #44 的探针，只回 github 那一组问题
+    // （repository / CLI 账号）；不写 gitconfig、不改任何设置。
+    checkAccount: async (candidate) => {
+      const report = await runSetupChecks({
+        ...setupInput(),
+        ...(candidate.repository === undefined ? {} : { repository: candidate.repository }),
+        ...(candidate.cli === undefined ? {} : { githubCli: candidate.cli }),
+        gitConfig: undefined
+      })
+      return issuesOf(report.issues, 'github')
+    },
+    idempotent,
+    policySync: {
+      syncable: () => policySyncDriver?.syncable() ?? [],
+      sync: (id) => {
+        if (policySyncDriver === null) {
+          throw new Error('the policy sync driver is not wired yet')
+        }
+        return policySyncDriver.sync(id)
+      },
+      // 同步前的名单：影响面从「现在生效的那份 Policy」算起（保存过就以存下来的为准）。
+      allowed: (id) => effectivePolicy().sources[id]?.allowed ?? [],
+      policy: () => ({
+        revision: settingsWriter.blockRevision('policy'),
+        version: savedSettingsVersion(store, 'policy')?.policyVersion ?? null
+      })
+    },
+    afterWrite: () => {
+      refresh()
+    }
+  })
+  const routes: readonly RouteDefinition[] = withSettingsHandlers(
+    withDecisionHandlers(
+        withPromptHandlers(
+          withEvalHandlers(
+            withAssessmentHandlers(
+              withDomainHandlers(ROUTE_TABLE, domain),
+              createAssessmentHandlers({
+                tools: routerTools,
+                afterWrite: () => {
+                  refresh()
+                }
+              })
+            ),
+            createEvalHandlers({ tools: evalTools })
+          ),
+          prompts
         ),
-        createEvalHandlers({ tools: evalTools })
+        createDecisionHandlers({
+          // 面板的 dismiss（§K.7）：领域只接受 unavailable 的 Decision，其余给固定拒绝。
+          dismiss: (decisionId) => engine.dismiss(decisionId),
+          afterWrite: () => {
+            refresh()
+          }
+        })
       ),
-      prompts
-    ),
-    createDecisionHandlers({
-      // 面板的 dismiss（§K.7）：领域只接受 unavailable 的 Decision，其余给固定拒绝。
-      dismiss: (decisionId) => engine.dismiss(decisionId),
-      afterWrite: () => {
-        refresh()
-      }
-    })
-  )
+      settingsHandlers
+    )
 
   ensureApiToken(resolved)
   const http: HttpServerHandle = await startHttpServer({
@@ -1153,6 +1242,7 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
     signal: lifetimeAbort.signal,
     log: (message) => logger.info(message)
   })
+  policySyncDriver = policySync
 
   // ---- passes：先做 effect，再评估，再把确定性评估的决定落库
   const passes = createPasses({

@@ -151,6 +151,11 @@ export interface DomainEvents {
   'assignment.started': { ticketId: string; assignmentId: string }
   'assignment.ended': { ticketId: string; assignmentId: string; reason: string }
   'thread.subscribed': { threadKey: string; ticketId: string }
+  /**
+   * worker 按理由把一条它不拥有的 Thread 跟随为只读语境（§G.2 的 `thread follow`）。
+   * `reason` 是那条命令的可选说明：只进事件，不改变任何授权。
+   */
+  'thread.followed': { threadKey: string; ticketId: string; reason?: string }
   'thread.unsubscribed': {
     threadKey: string
     ticketId: string

@@ -302,10 +302,11 @@ export class Tickets extends EnginePart {
   /**
    * 丢弃某 Ticket 对一个它认为无关的 Thread 的订阅，并把该 Ticket 决定的、那条 Thread 上的
    * 人的消息交回 Eval（带 `reason`）。
+   * @returns 交回了几条：已在等或正被评估的不再重复排队，也不算一条。
    * @throws UserError Ticket 未知；`thread` 是它开始的 Thread、Source 绑定的 `follows`
    * Thread，或它没订阅。
    */
-  markUnrelated(ticketId: string, thread: string, reason: string): void {
+  markUnrelated(ticketId: string, thread: string, reason: string): number {
     const ticket = this.require(ticketId)
     if (this.source(ticket)?.threads.some((ref) => threadKey(ref) === thread)) {
       throw new UserError('sourceThread')
@@ -317,14 +318,16 @@ export class Tickets extends EnginePart {
       throw new UserError('notFollowing')
     }
     this.dropSubscriptions(thread, 'executor', ticketId, reason)
+    let handedBack = 0
     for (const trigger of this.triggersOf(ticket)) {
       if (
         trigger.threads.some((ref) => threadKey(ref) === thread) &&
         this.owners(trigger).includes(ticketId)
       ) {
-        this.handBack(ticketId, trigger, reason)
+        if (this.handBack(ticketId, trigger, reason)) handedBack += 1
       }
     }
+    return handedBack
   }
 
   /**
@@ -649,16 +652,22 @@ export class Tickets extends EnginePart {
 
   /**
    * 把一个未结束的 Ticket 订阅到执行器发现相关的 Thread，只作语境（见 `Thread.context`）。
+   * `reason` 只进 `thread.followed` 事件（§G.2 的 `thread follow --reason`），不改变订阅语义。
    * @returns 已经跟随该 Thread 时返回 false。
    * @throws UserError Ticket 未知或已结束。
    */
-  followForContext(ticketId: string, ref: ThreadRef): boolean {
+  followForContext(ticketId: string, ref: ThreadRef, reason?: string): boolean {
     if (!liveTicket(this.require(ticketId))) throw new UserError('ticketEnded')
     if (this.thread(ref).subscriptions.includes(ticketId)) return false
     this.subscribe(ticketId, ref)
     const thread = this.thread(ref)
     thread.context = [...(thread.context ?? []), ticketId]
     this.repo.threads.save(thread)
+    this.emit('thread.followed', {
+      threadKey: thread.key,
+      ticketId,
+      ...(reason === undefined || reason.length === 0 ? {} : { reason })
+    })
     return true
   }
 

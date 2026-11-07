@@ -280,12 +280,11 @@ export class Engine {
   /**
    * worker 认为 attach 给它的某个 Thread 与本 Ticket 无关，请求只丢它自己的 Subscription，
    * 带 `reason`。
+   * @returns 交回 Eval 的 Trigger 数（§G.2 的 `thread unrelated` 的 `handedBack`）。
    * @throws UserError Ticket 未知；或那是它开始的 Thread、Source 绑定的 Thread、它没跟随的。
    */
-  markUnrelated(ticketId: string, thread: string, reason: string): void {
-    this.repo.atomic(() => {
-      this.tickets.markUnrelated(ticketId, thread, reason)
-    })
+  markUnrelated(ticketId: string, thread: string, reason: string): number {
+    return this.repo.atomic(() => this.tickets.markUnrelated(ticketId, thread, reason))
   }
 
   /**
@@ -303,8 +302,8 @@ export class Engine {
    * @returns Ticket 已经跟随该 Thread 时返回 false。
    * @throws UserError Ticket 未知或已结束。
    */
-  followForContext(ticketId: string, thread: ThreadRef): boolean {
-    return this.repo.atomic(() => this.tickets.followForContext(ticketId, thread))
+  followForContext(ticketId: string, thread: ThreadRef, reason?: string): boolean {
+    return this.repo.atomic(() => this.tickets.followForContext(ticketId, thread, reason))
   }
 
   /**

@@ -5,7 +5,7 @@
 // 依赖方向（§C.2）：`cli → http/handlers`；doctor 的三档类型在 `app/doctor-types.ts`，
 // 由这里再导出，于是 CLI 只认这一个入口。
 //
-// 纪律：**没有 `any`**；跨边界的 JSON 形状用 `unknown` 的受控别名 `JsonValue`（§C.2）。
+// 纪律：**没有 `any`**；跨边界的 JSON 值就写 `unknown`（读面在 handler 里按形状收窄，§C.2）。
 // 所有时间字段是 ISO-8601 文本（与库一致，§D.2 要点 1）。
 import type { HealthEntry, LoadView, SetupProblem, StateView } from './state.ts'
 import type { SetupIssue } from '../app/setup-types.ts'
@@ -16,9 +16,6 @@ export type {
   DoctorResult,
   DoctorState
 } from '../app/doctor-types.ts'
-
-/** 受控的 JSON 别名（这个模块里唯一的 `unknown` 逃逸点；与 core 的同名别名各自定义）。 */
-export type JsonValue = unknown
 
 /** `GET state` 的读数（`status` 命令与面板首屏共用，§G.2 的 status 行）。 */
 export type StatusResult = StateView
@@ -181,9 +178,81 @@ export const READ_RESOURCES: readonly string[] = [
 
 /** 一页读结果（`next_offset` 为 `null` 表示没有下一页）。 */
 export interface ReadPage {
-  readonly items: readonly JsonValue[]
+  readonly items: readonly unknown[]
   readonly next_offset: number | null
 }
 
 /** 负载（`state.load`）的再导出：`status --text` 与面板都能直接用。 */
 export type { LoadView }
+
+// ---------------------------------------------------------------- settings / policy（§G.2、§K.8）
+
+/** 设置历史的页大小（与 `read` 的缺省 20 不同：历史是审计面，一页 50）。 */
+export const SETTINGS_HISTORY_LIMIT = 50
+
+/** 一条设置版本摘要（面板 History 页与 `settings get --history` 共用）。 */
+export interface SettingsVersionView {
+  readonly revision: number
+  readonly predecessor: number | null
+  readonly at: string
+  readonly origin: 'panel' | 'tool' | 'sync' | 'operator'
+  readonly block: string
+  /** Policy 块的内容哈希；其余块是 `null`（§K.5）。 */
+  readonly policyVersion: string | null
+}
+
+/** 一个设置块的读数（`settings get`）：块修订号 + 当前生效的值 + 产生它的那版记录。 */
+export interface SettingsBlockView {
+  /** 块名（`policy` / `eval` / `executor` / `source:<id>`）。 */
+  readonly block: string
+  /**
+   * 这个块的修订号（`settings-block-revision:<block>`）：`settings save --revision` 要带的
+   * 就是它；没存过是 0。它是**块**的修订号，不是全局 `revision`（§K.8 的乐观并发按块）。
+   */
+  readonly revision: number
+  /** 当前生效的值：保存过的用那一份，否则是运行时那份（§K.8）。 */
+  readonly value: unknown
+  /** 产生当前值的记录；没存过时 `null`。 */
+  readonly saved: SettingsVersionView | null
+}
+
+/** `settings get` 的读数：全局修订号 + 一个或多个块。 */
+export interface SettingsResult {
+  /** 全局设置版本（`settings-revision`）。 */
+  readonly revision: number
+  readonly blocks: readonly SettingsBlockView[]
+}
+
+/** `settings get --history`（`GET policy/history`）的读数：版本摘要，新→旧。 */
+export interface SettingsHistoryResult {
+  readonly revision: number
+  readonly history: readonly SettingsVersionView[]
+}
+
+/** 一次设置保存的读数（§G.2 的 `settings save`）。 */
+export interface SettingsSaveView {
+  readonly block: string
+  /** 保存后的**块**修订号（下次保存的 `--revision`）。 */
+  readonly revision: number
+  /** 保存后的全局设置修订号（面板的总修订号）。 */
+  readonly settings_revision: number
+  /** Policy 块的内容哈希变了（其他块恒为 false）。 */
+  readonly policy_changed: boolean
+  /** 这次保存是否需要重启插件才生效（§H.12：`stateDir`）。 */
+  readonly restarting: boolean
+  /** 内容与当前版本相同：没有写新版本。 */
+  readonly changed: boolean
+  readonly origin: 'panel' | 'tool' | 'sync' | 'operator'
+}
+
+/** `policy sync <source>` 的读数（§G.2）：同步后的 Policy 版本与名单差异。 */
+export interface PolicySyncResult {
+  /** 同步之后的 Policy 块读数（revision 与内容哈希）。 */
+  readonly policy: { readonly revision: number; readonly version: string | null }
+  /** 同步读到的允许名单（原样，形状由 Source 决定）。 */
+  readonly allowed: readonly unknown[]
+  /** 新增的名单 id（大小写敏感的比较：id 是 Source 的原生标识）。 */
+  readonly added: readonly string[]
+  /** 消失的名单 id。 */
+  readonly removed: readonly string[]
+}

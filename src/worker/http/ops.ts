@@ -14,9 +14,9 @@
 // 依赖纪律（§C.2）：本文件在 `http/` 里，只 import `app/`、`infra/` 与同目录的兄弟模块；
 // 不 import `sources/`（Source 端口由组合根注入），也不起子进程（doctor 的 runner 同样注入）。
 import { ApiError, ERROR_CODES } from './errors.ts'
-import { runIdempotentAsync } from './idempotency.ts'
+import { runWrite } from './idempotency.ts'
 import type { RouteDefinition, RouteHandler } from './routes.ts'
-import { hashToken, rotateApiToken } from '../infra/tokens.ts'
+import { rotateApiToken } from '../infra/tokens.ts'
 import { backupNow } from '../app/backup.ts'
 import { createPausedState, type PausedState } from '../app/pause.ts'
 import { runDoctor, type CommandsRunner, type DoctorOptions } from '../app/doctor.ts'
@@ -78,11 +78,6 @@ export function routeKey(route: Pick<RouteDefinition, 'method' | 'path'>): strin
   return `${route.method} ${route.path}`
 }
 
-/** 调用方的幂等标识：token 的哈希（不是 token 原文，§D.6）。 */
-function callerKey(token: string): string {
-  return hashToken(token)
-}
-
 /**
  * 组装本票接线的 handler。`store`/`stateDir` 从 server 的 host 传入（那里只有一个真库）。
  */
@@ -99,7 +94,7 @@ export function createOpsHandlers(options: {
 
   // ---- pause / resume（§K.6）：写命令，`--request-id` 幂等。
   handlers.set('POST executor/pause', ({ body, at, token, requestId }) =>
-    idempotent(options.store, token === undefined ? 'unknown' : callerKey(token), requestId ?? requestIdFrom(body), at, () => {
+    idempotent(options.store, requestId ?? requestIdFrom(body), at, token, () => {
       const wanted = pausedFlag(body)
       const outcome = paused.setPaused(wanted, at, 'operator')
       const result: PauseResult = {
@@ -117,7 +112,7 @@ export function createOpsHandlers(options: {
     handlers.set('POST sources/:id/labels', ({ params, at, body, token, requestId }) => {
       const source = params['id'] ?? ''
       if (source.length === 0) throw new ApiError(ERROR_CODES.invalidParams, 'a source id is required')
-      return idempotent(options.store, token === undefined ? 'unknown' : callerKey(token), requestId ?? requestIdFrom(body), at, async () => {
+      return idempotent(options.store, requestId ?? requestIdFrom(body), at, token, async () => {
         const refreshed = await labels(source, at)
         const result: SourceLabelsResult = { source, labels: refreshed }
         return result
@@ -127,7 +122,7 @@ export function createOpsHandlers(options: {
 
   // ---- admin backup（§G.2）：立即备份（升级前手工调用）。
   handlers.set('POST admin/backup', ({ at, body, token, requestId }) =>
-    idempotent(options.store, token === undefined ? 'unknown' : callerKey(token), requestId ?? requestIdFrom(body), at, () => {
+    idempotent(options.store, requestId ?? requestIdFrom(body), at, token, () => {
       const result: BackupResult = backupNow(options.store, at)
       return result
     })
@@ -142,7 +137,7 @@ export function createOpsHandlers(options: {
         { reason: 'confirmation_required' }
       )
     }
-    return idempotent(options.store, token === undefined ? 'unknown' : callerKey(token), requestId ?? requestIdFrom(body), at, () => {
+    return idempotent(options.store, requestId ?? requestIdFrom(body), at, token, () => {
       const rotated = rotateApiToken(options.stateDir)
       const result: RotateTokenResult = { tokenFile: rotated.path, rotated: true }
       return result
@@ -153,7 +148,7 @@ export function createOpsHandlers(options: {
   const setupCheck = options.ports?.setupCheck
   if (setupCheck !== undefined) {
     handlers.set('POST setup/check', async ({ token, requestId, body, at }) =>
-      idempotent(options.store, token === undefined ? 'unknown' : callerKey(token), requestId ?? requestIdFrom(body), at, async () => {
+      idempotent(options.store, requestId ?? requestIdFrom(body), at, token, async () => {
         const outcome = await setupCheck()
         if (!outcome.checked) {
           throw new ApiError(
@@ -237,17 +232,14 @@ function requestIdFrom(body: unknown): string | null {
  * 幂等包装（§G.1 幂等行）：有 request id 时同 id 一小时内返回首次结果；`caller` 用 token
  * 的哈希，两个调用者不会互相顶掉；**失败不缓存**（重试有机会成功）。
  *
- * 直接复用 `runIdempotentAsync`：同步与异步的工作走同一套窗口/键/清理逻辑，
- * 于是「一次写只发生一次」只有一处实现。
+ * 窗口、键与清理只有 `http/idempotency.ts` 的 `runWrite` 一份：本文件不再重写一遍。
  */
 function idempotent<T>(
   store: Store,
-  caller: string,
   requestId: string | null,
   at: string,
+  token: string | undefined,
   work: () => T | Promise<T>
 ): Promise<T> {
-  return runIdempotentAsync({ store, caller, requestId, at, run: work }).then(
-    (run) => run.outcome.result as T
-  )
+  return runWrite({ store, at, requestId, ...(token === undefined ? {} : { token }) }, work)
 }

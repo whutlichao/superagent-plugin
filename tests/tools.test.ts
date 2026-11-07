@@ -34,7 +34,8 @@ import {
   resolveToken
 } from '../src/worker/cli/target'
 import { RETRY_DELAY_MS, parseResponse, requestJson } from '../src/worker/cli/transport'
-import { dispatch } from '../src/worker/cli/commands'
+import { dispatch, ticketListQuery } from '../src/worker/cli/commands'
+import type { CliTarget } from '../src/worker/cli/target'
 import {
   envelopeForError,
   failureEnvelope,
@@ -662,4 +663,174 @@ test('the envelopes and exit codes are the §G.1 ones', () => {
   assert.equal(render(failureEnvelope({ code: 'missing', message: 'gone' }), { text: true }), 'error: missing: gone')
   assert.equal(render(successEnvelope('hi'), { text: true }), 'hi')
   assert.equal(render(successEnvelope([1, 2]), { text: true }), '- 1\n- 2')
+})
+
+// ---------------------------------------------------------------- 命令面收尾（#56）
+
+/**
+ * 一台**只记录**的 loopback 服务器：返回固定的成功信封，把收到的 method/path/body/请求头记下来。
+ * 这是「CLI 只做传输」的直接断言面——命令的语义由 worker 的 handler 决定（§G「同一份 handler」），
+ * 客户端只该把参数放对位置、方法放对、幂等键放对。
+ */
+async function recordingServer(): Promise<{
+  readonly target: CliTarget
+  readonly calls: { method: string; path: string; body: unknown; requestId: string | null }[]
+  close(): Promise<void>
+}> {
+  const { createServer } = await import('node:http')
+  const calls: { method: string; path: string; body: unknown; requestId: string | null }[] = []
+  const server = createServer((request, response) => {
+    const chunks: string[] = []
+    request.setEncoding('utf8')
+    request.on('data', (chunk: string) => chunks.push(chunk))
+    request.on('end', () => {
+      const text = chunks.join('')
+      calls.push({
+        method: request.method ?? 'GET',
+        path: request.url ?? '/',
+        body: text.length === 0 ? undefined : (JSON.parse(text) as unknown),
+        requestId: (request.headers['x-superagent-request-id'] as string | undefined) ?? null
+      })
+      response.writeHead(200, { 'content-type': 'application/json' })
+      response.end(JSON.stringify({ ok: true, result: {} }))
+    })
+  })
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', () => resolve()))
+  const address = server.address()
+  const port = typeof address === 'object' && address !== null ? address.port : 0
+  return {
+    target: {
+      stateDir: '/tmp/unused',
+      stateDirSource: 'argument',
+      port,
+      baseUrl: `http://127.0.0.1:${port}/superagent/api`,
+      token: 'operator-token',
+      tokenSource: 'argument',
+      tokenFile: null
+    },
+    calls,
+    close: () =>
+      new Promise<void>((resolve) => {
+        server.closeAllConnections()
+        server.close(() => resolve())
+      })
+  }
+}
+
+test('ticket list carries --state and the documented page numbers to the read model', async () => {
+  const server = await recordingServer()
+  try {
+    const run = async (argv: readonly string[], stdin?: string) =>
+      dispatch({
+        parsed: parseArgs(argv),
+        target: server.target,
+        sleep: async () => undefined,
+        ...(stdin === undefined ? {} : { stdin: async () => stdin })
+      })
+    const listed = await run(['ticket', 'list', '--state', 'idle', '--limit', '3'])
+    assert.equal(listed.exit, 0, JSON.stringify(listed.envelope))
+    const [call] = server.calls
+    assert.equal(call?.method, 'GET')
+    const [pathname, search] = (call?.path ?? '/').split('?')
+    assert.equal(pathname, '/superagent/api/tickets')
+    // 查询串按 `&` 拆开（没有 URL 全局类型：tsconfig 不引入 DOM）。
+    assert.deepEqual(
+      Object.fromEntries((search ?? '').split('&').map((pair) => pair.split('='))),
+      { limit: '3', state: 'idle' }
+    )
+    // `ticketListQuery` 是那个读法的单一实现（默认 20，与 `read tickets` 同）。
+    assert.deepEqual(ticketListQuery({ positionals: [], flags: {}, repeated: {}, text: false }), { limit: 20 })
+  } finally {
+    await server.close()
+  }
+})
+
+test('each closeout command puts its arguments where §G.3 says, and writes carry the request id', async () => {
+  const server = await recordingServer()
+  try {
+    const run = async (argv: readonly string[], stdin?: string) =>
+      dispatch({
+        parsed: parseArgs(argv),
+        target: server.target,
+        sleep: async () => undefined,
+        ...(stdin === undefined ? {} : { stdin: async () => stdin })
+      })
+
+    // 两条 thread 命令：键作为一段路径（含 `:`、`/`、`#`、空格），reason 进 body。
+    await run(['thread', 'follow', 'gh:o/r #1', '--reason=Related', '--request-id=r-9'])
+    assert.deepEqual(server.calls.at(-1), {
+      method: 'POST',
+      path: '/superagent/api/threads/gh%3Ao%2Fr%20%231/follow',
+      body: { reason: 'Related' },
+      requestId: 'r-9'
+    })
+    await run(['thread', 'unrelated', 'gh:o/r #1', '--reason=Not this'])
+    assert.deepEqual(server.calls.at(-1)?.body, { reason: 'Not this' })
+    await run(['thread', 'unsubscribe', 'gh:o/r #1'])
+    assert.equal(server.calls.at(-1)?.path, '/superagent/api/threads/gh%3Ao%2Fr%20%231/unsubscribe')
+
+    // trigger requeue 与 policy sync：路径参数、空 body。
+    await run(['trigger', 'requeue', 't-1'])
+    assert.deepEqual(server.calls.at(-1), {
+      method: 'POST',
+      path: '/superagent/api/triggers/t-1/requeue',
+      body: {},
+      requestId: null
+    })
+    await run(['policy', 'sync', 'feishu'])
+    assert.equal(server.calls.at(-1)?.path, '/superagent/api/policy-sync/feishu')
+
+    // settings get：一个块进查询串；`--history` 走 history 路由。
+    await run(['settings', 'get', '--block', 'policy'])
+    assert.equal(server.calls.at(-1)?.path, '/superagent/api/settings?block=policy')
+    await run(['settings', 'get', '--history'])
+    assert.equal(server.calls.at(-1)?.path, '/superagent/api/policy/history')
+
+    // settings save：`--value` 从 stdin 读 JSON，块名作为一段路径，来源恒为 tool（§K.8）。
+    await run(
+      ['settings', 'save', '--block', 'source:github', '--value', '-', '--revision', '4'],
+      '{"enabled":true,"config":{"repository":"acme/widgets"}}'
+    )
+    assert.deepEqual(server.calls.at(-1), {
+      method: 'PUT',
+      path: '/superagent/api/settings/source%3Agithub',
+      body: {
+        value: { enabled: true, config: { repository: 'acme/widgets' } },
+        revision: 4,
+        origin: 'tool'
+      },
+      requestId: null
+    })
+  } finally {
+    await server.close()
+  }
+})
+
+test('settings save refuses a bad revision or a missing value before the wire', async () => {
+  // 参数形状先在客户端判（退出 2、零请求），服务端仍会再判一次（§K.8）。
+  const target = {
+    stateDir: '/tmp/unused',
+    stateDirSource: 'argument' as const,
+    port: 1,
+    baseUrl: 'http://127.0.0.1:1/superagent/api',
+    token: 'operator-token',
+    tokenSource: 'argument' as const,
+    tokenFile: null
+  }
+  for (const argv of [
+    ['settings', 'save', '--block', 'eval', '--value=-', '--revision', 'nope'],
+    ['settings', 'save', '--block', 'eval', '--revision', '1']
+  ]) {
+    const result = await dispatch({
+      parsed: parseArgs(argv),
+      target,
+      sleep: async () => undefined,
+      stdin: async () => '{}'
+    })
+    assert.ok(result.exit === 2, `${argv.join(' ')} exits 2`)
+    assert.equal(result.envelope.ok, false)
+    if (!result.envelope.ok) {
+      assert.ok(['invalid_value', 'invalid_params'].includes(result.envelope.error.code))
+    }
+  }
 })
