@@ -68,7 +68,6 @@ import {
   type PanelSubscription,
   type PanelTicket,
   type PanelDecision,
-  type PanelReason,
   type PanelThread,
   type PanelTimelineCursor,
   type PanelTriggerCard,
@@ -2354,7 +2353,7 @@ function PageBody(props: {
   const stage = read(phase)
   if (props.current === 'settings') {
     // Settings 页的五组框架与 Sources/Eval/Execution/Deployment 由 #42 提供；Prompts 组的内容
-    // 归 #43（占位见 `settings.tsx` 的 `SETTINGS_GROUP_BODIES`）。
+    // 归 #43（`settings.tsx` 的 `SETTINGS_GROUP_BODIES.prompts` 指向 `prompts.tsx`）。
     return <Settings locale={locale} />
   }
   if (props.current === 'source') {

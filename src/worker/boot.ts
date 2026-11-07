@@ -173,6 +173,14 @@ import { admissionSettingsOf } from './sources/admission-context.ts'
 import { createDecisionHandlers, withDecisionHandlers } from './http/decisions.ts'
 import { createPromptHandlers, withPromptHandlers } from './http/prompts.ts'
 import { createPromptVersions } from './app/prompts.ts'
+import {
+  previewPromptDraft,
+  promptPanelView,
+  restorePromptVersion,
+  savePromptConfig,
+  type PromptPanelOptions
+} from './app/prompt-view.ts'
+import type { PanelPromptPreview, PanelPromptsView } from '../panel/protocol'
 import { syncSkillFiles } from './app/skills.ts'
 import type { PromptEnvironment, PromptPolicy } from './app/prompts.ts'
 import { assembleLaunchPrompt } from './app/launch-prompt.ts'
@@ -332,6 +340,23 @@ export interface BootHandle {
   refreshSourceLabels(sourceId: string): Promise<{ readonly added: number; readonly total: number }>
   /** doctor 的八项诊断（§G.2、§N.4）：与 HTTP 的 `POST doctor` 同一份接线。 */
   doctor(): Promise<DoctorResult>
+  /**
+   * Prompts 组的一次读数（§M.3）：当前版本与配置、每个分片的内置正文与占位符、
+   * default-updated 的详情、历史、技能文件，以及「已保存 / 默认」两份全文。
+   */
+  promptPanel(): PanelPromptsView
+  /**
+   * 预览一份草稿（与保存同一份校验，不写库）：合法时给拼好的全文，不合法时给 `issues[]`
+   * （填槽值还在，面板因此能说清哪一段、缺什么）。
+   */
+  previewPrompts(config: unknown): PanelPromptPreview
+  /** 保存一份配置（§L.4）：`baseRevision` 不匹配抛 `stale_revision`；成功回整个读数。 */
+  savePrompts(input: { readonly config: unknown; readonly baseRevision: number }): PanelPromptsView
+  /** 恢复某个版本或默认（§L.4）：再存一个新版本，成功回整个读数。 */
+  restorePrompts(input: {
+    readonly revision: number
+    readonly baseRevision: number
+  }): PanelPromptsView
   /** 轮换主 token（§D.6、§O）：只回 token 文件路径，绝不回 token 值。 */
   rotateToken(): { readonly rotated: boolean; readonly tokenFile: string }
   /** Settings 页的读数（§M.3）：Sources / Eval / Execution / Deployment 四个可编辑组。 */
@@ -456,6 +481,27 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
       routerStatus: () => emptyRouterSnapshot(),
       restartRouter: async () => undefined,
       notifyPromptRevision: () => undefined,
+      // follower 不读库：Prompts 组的读数与写入都属于拥有者（固定拒绝，不假装成功）。
+      promptPanel: () => {
+        throw Object.assign(new Error('another Superagent instance owns this state directory'), {
+          code: 'unavailable'
+        })
+      },
+      previewPrompts: () => {
+        throw Object.assign(new Error('another Superagent instance owns this state directory'), {
+          code: 'unavailable'
+        })
+      },
+      savePrompts: () => {
+        throw Object.assign(new Error('another Superagent instance owns this state directory'), {
+          code: 'action_failed'
+        })
+      },
+      restorePrompts: () => {
+        throw Object.assign(new Error('another Superagent instance owns this state directory'), {
+          code: 'action_failed'
+        })
+      },
       refresh: () => emptySnapshot(),
       setPaused: () => emptySnapshot(),
       // follower 不写库：重试属于拥有者，跟着它去面板里做（固定拒绝，不假装成功）。
@@ -1336,6 +1382,24 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
       routerSupervision.notifyPromptRevision(revision)
     },
     afterWrite: () => {
+      refresh()
+    }
+  })
+  /**
+   * Prompts 组的面板读/写面的接线（§M.3）：与上面三条 HTTP 路由共用同一个版本库、同一份
+   * 部署事实与同一个「保存后」钩子——面板上保存与 `prompts save` 的后果只有一套。
+   * 环境段给的是操作者的 token **文件**（面板没有角色的概念，读的是主会话的那份）；
+   * 每次调用现拼，所以设置与 Policy 改了之后一次读数就跟着变（§H.12）。
+   */
+  const operatorTokenFile = join(resolved, TOKENS_DIR, API_TOKEN_FILE)
+  const promptPanelOptions = (): PromptPanelOptions => ({
+    versions: promptVersions,
+    stateDir: resolved,
+    environment: () => promptEnvironment(operatorTokenFile),
+    policy: promptPolicy,
+    onSaved: (revision) => {
+      syncSkills()
+      routerSupervision.notifyPromptRevision(revision)
       refresh()
     }
   })
@@ -2412,6 +2476,17 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
         router: routerSupervision.snapshot()
       }),
     doctor: doctorNow,
+    // Prompts 组（§M.3）：读一份、预览草稿、保存、恢复——全部走 `app/prompt-view.ts` 的
+    // 同一份校验，面板不重算任何规则。
+    promptPanel: (): PanelPromptsView => promptPanelView(promptPanelOptions()),
+    previewPrompts: (config: unknown): PanelPromptPreview =>
+      previewPromptDraft(promptPanelOptions(), config),
+    savePrompts: (input: { readonly config: unknown; readonly baseRevision: number }): PanelPromptsView =>
+      savePromptConfig(promptPanelOptions(), input),
+    restorePrompts: (input: {
+      readonly revision: number
+      readonly baseRevision: number
+    }): PanelPromptsView => restorePromptVersion(promptPanelOptions(), input),
     rotateToken: () => {
       // §D.6、§O：只回文件路径；值不出现在任何读数里。
       const rotated = rotateApiToken(resolved)
