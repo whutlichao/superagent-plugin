@@ -1037,13 +1037,13 @@ function replyMessage(text = 'Done', address: Record<string, string> = {}): Outb
 
 test('a reply lands in the topic of its root message with the message id as the idempotency key', async () => {
   const cli = new FakeCommands()
-  cli.script(['im', '+message-reply'], () => JSON.stringify({ code: 0, data: { message_id: 'om_sent' } }))
+  cli.script(['im', '+messages-reply'], () => JSON.stringify({ code: 0, data: { message_id: 'om_sent' } }))
   const kind = createFeishuKind('lark-cli')
   assert.equal(await kind.channel?.send(cli, replyMessage()), 'sent')
   assert.deepEqual(cli.args, [
     [
       'im',
-      '+message-reply',
+      '+messages-reply',
       '--as',
       'bot',
       '--message-id',
@@ -1084,7 +1084,7 @@ test('a recalled or missing target message is gone, while every other failure re
   const kind = createFeishuKind('lark-cli')
   const send = async (error: Error): Promise<'sent' | 'gone' | undefined> => {
     const cli = new FakeCommands()
-    cli.fail('lark-cli', ['im', '+message-reply'], error)
+    cli.fail('lark-cli', ['im', '+messages-reply'], error)
     return kind.channel?.send(cli, replyMessage())
   }
   // 撤回：飞书的 230011（也认文本里的 withdrawn，不同版本的 CLI 会放进别的码里）。
@@ -1131,7 +1131,7 @@ test('the hundred-word ceiling refuses before any CLI call, counted across Chine
   )
   assert.deepEqual(cli.calls, [], 'nothing was sent')
   // 恰好一百词可以发（上限是上限，不是目标）。
-  cli.script(['im', '+message-reply'], () => '{}')
+  cli.script(['im', '+messages-reply'], () => '{}')
   assert.equal(await kind.channel?.send(cli, replyMessage('word '.repeat(100).trim())), 'sent')
 })
 

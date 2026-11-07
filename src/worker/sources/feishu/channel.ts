@@ -44,7 +44,8 @@ function targetOf(address: Record<string, string>): { messageId: string; chatId:
 }
 
 /**
- * 在目标消息的话题里回一条（`im +message-reply`）。`cli` 是配置的机器人 CLI，由组合根在
+ * 在目标消息的话题里回一条（`im +messages-reply`，lark-cli 1.0.96 的实测命令名）。`cli` 是
+ * 配置的机器人 CLI，由组合根在
  * 注册 kind 时闭包进来（`SourceChannel.send` 拿不到配置，§I.1）。
  *
  * 先做一百词校验再调 CLI：超限时一个子进程都不该起（发送前拒绝，票面验收）。
@@ -61,7 +62,7 @@ export async function sendFeishu(
   try {
     await host.run(cli, [
       'im',
-      '+message-reply',
+      '+messages-reply',
       '--as',
       'bot',
       '--message-id',
