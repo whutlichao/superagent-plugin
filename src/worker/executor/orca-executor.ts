@@ -17,6 +17,8 @@ import type { EngineForExecutor } from '../core/engine.ts'
 import { Later, type EffectHandlerOptions, type EffectKind, type EffectPayloads } from '../app/effects.ts'
 import type { OrcaRuntime, RepoSelector } from '../runtime/orca-runtime.ts'
 import { mandateInstructions } from './mandate.ts'
+import { assembleLaunchPrompt, promptLogLine, type LaunchPrompt, type LaunchPromptSource } from '../app/launch-prompt.ts'
+import { writePromptFile } from './prompt-file.ts'
 import {
   deliverPendingInputs,
   DEFAULT_CONFIRM_DELIVERY,
@@ -107,6 +109,11 @@ export interface RegisterExecutorOptions {
   readonly cliPath: string
   /** 每个 Assignment 的 token 文件路径（§D.6；本票只取路径，不签发）。 */
   readonly tokenFile: (assignmentId: string) => string
+  /**
+   * 当前 prompt 配置与版本（§L.3–§L.5）：每次 launch 现读，所以保存过的团队段、override 与
+   * revision 在下一次 launch 就生效。缺省读 revision 0 与内置默认文本（测试与早期启动路径）。
+   */
+  readonly prompts?: LaunchPromptSource
   /** 部署派生的事实（§E.11 的变量源）；缺省全空串，等 setup（#44）填。 */
   readonly deployment?: EnvironmentDeployment
   /** loopback API 基址（`SUPERAGENT_API`）；缺省空串。 */
@@ -230,6 +237,36 @@ export function resolveExecutorSettings(raw: Readonly<Record<string, unknown>>):
     ...(baseBranch === undefined ? {} : { baseBranch }),
     ...(prepare === undefined ? {} : { prepare })
   }
+}
+
+/**
+ * 一次 worker launch 的组装全文（§L.3、§L.5）：与 Router 共用 `assembleLaunchPrompt`，只是
+ * 角色是 `worker`、没有 Policy 段。配置与 revision 都**现读**，不复用旧缓存——版本变化后
+ * 下一次 launch 自动换新（§L.4）。
+ */
+function workerLaunchPrompt(
+  options: RegisterExecutorOptions,
+  input: {
+    readonly environment: Readonly<Record<string, string>>
+    readonly cliPath: string
+    readonly tokenFile: string
+    readonly stateDir: string
+  }
+): LaunchPrompt {
+  return assembleLaunchPrompt({
+    role: 'worker',
+    revision: options.prompts?.revision() ?? 0,
+    config: options.prompts?.config() ?? {},
+    environment: {
+      // 变量名就是这份 env.sh 实际写进去的那些（§E.11）：模型读到的清单不会与文件不符。
+      variables: Object.keys(input.environment),
+      cliPath: input.cliPath,
+      tokenFile: input.tokenFile,
+      stateDir: input.stateDir,
+      repository: options.deployment?.repository ?? '',
+      account: options.deployment?.githubLogin ?? ''
+    }
+  })
 }
 
 /** 一条错误的一行文本（日志与 Ticket 上的失败摘要）。 */
@@ -424,6 +461,9 @@ export function registerExecutorEffects(options: RegisterExecutorOptions): void 
       ...(trigger === undefined ? {} : { trigger }),
       ...(options.sourceEnvironments === undefined ? {} : { sources: options.sourceEnvironments })
     })
+    // 组装在环境写入之前做完（纯函数，只读当下的配置与部署）：写盘失败与 env.sh 同一处理。
+    const assembled = workerLaunchPrompt(options, { environment, cliPath, tokenFile, stateDir })
+    let promptPath: string
     try {
       const envPath = writeEnvFile({
         directory: workspace.handle.path,
@@ -440,6 +480,10 @@ export function registerExecutorEffects(options: RegisterExecutorOptions): void 
           (excluded?.added === true ? `, ignored in ${excluded.path}` : '') +
           (shims.written.length === 0 ? '' : `, shims ${shims.written.join(', ')}`)
       )
+      // 组装后的全文落盘（§L.5）：终端只拿到一行 ≤400 字符的指针（§E.2、附录 C S1）。
+      promptPath = writePromptFile({ directory: workspace.handle.path, text: assembled.text })
+      // 日志只记 revision 与长度（§L.5）：正文里是团队文本与 token 文件路径，不进日志。
+      log(`prompt for ${ticket.id}: ${promptLogLine(assembled)} at ${promptPath}`)
     } catch (error) {
       // 环境写不下去，这个 worktree 就不是一个可用的执行环境：直接记 failed，不重试（§E.3 同理）。
       markFailed(ticket.id, `execution environment failed: ${messageOf(error)}`)
@@ -482,6 +526,8 @@ export function registerExecutorEffects(options: RegisterExecutorOptions): void 
       settings: launchSettings,
       cliPath,
       tokenFile,
+      promptPath,
+      revision: assembled.revision,
       inboxPath: briefPath,
       // 钩子只给这次 launch 追加环境：变量表 + PATH 前置 shim 目录 + worker 的 git 配置（§H.11）。
       environment: launchEnvironment({

@@ -280,6 +280,8 @@ export interface PromptEnvironment {
   readonly stateDir: string
   /** `owner/name`；空串表示还没配置。 */
   readonly repository: string
+  /** agent 在 Source 上的账号（§G.5 的「仓库 + agent 账号」一行）；未知时省略或空串。 */
+  readonly account?: string
 }
 
 /** Policy 段的一条启用规则（§K.1）。`instruction` 由调用方选语言（prompt 用英文）。 */
@@ -593,12 +595,15 @@ function partText(key: PromptPartKey, config: PromptTextConfig): string {
 
 /** 环境段的填值：空串写成「还没配置」而不是留一个空路径。 */
 function environmentValues(environment: PromptEnvironment): Record<string, string> {
+  const repository = environment.repository === '' ? '(not configured yet)' : environment.repository
+  // §G.5 的部署环境段把「仓库」与「agent 账号」写在同一行；没有账号时不留空标签。
+  const account = environment.account === undefined || environment.account === '' ? '' : `   agent account: ${environment.account}`
   return {
     variables: environment.variables.length === 0 ? '(none)' : environment.variables.join(', '),
     cli: environment.cliPath,
     token_file: environment.tokenFile,
     state_dir: environment.stateDir,
-    repository: environment.repository === '' ? '(not configured yet)' : environment.repository
+    repository: `${repository}${account}`
   }
 }
 
