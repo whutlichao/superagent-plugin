@@ -5,7 +5,7 @@
 // 所有 Orca 交互都经 `FakeOrcaRuntime`（§B.4 的测试替身，`tests/support/fake-orca-runtime.ts`）：
 // 它是 seam 的外部世界，不是内部层的 mock（§P.1）。领域一侧用真 `Engine` + 内存仓储，
 // 队列用真 SQLite（临时目录），时钟与等待由测试推进，绝不 sleep。
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
+import { mkdtempSync, readFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { assert, test } from 'orca/testing'
@@ -66,7 +66,7 @@ import {
 import { openQueue } from './support/queue'
 import { isOrcaRuntimeError, OrcaRuntimeError } from '../src/worker/runtime/orca-runtime'
 import { FakeOrcaRuntime } from './support/fake-orca-runtime'
-import { AT } from './support/state'
+import { AT, removeTree } from './support/state'
 
 /** 一个最小的 Ticket；只填这一票会读的字段，其余给稳定默认值。 */
 function ticket(overrides: Partial<Ticket> = {}): Ticket {
@@ -246,10 +246,10 @@ function triggerInput(id = 'input-1', triggerId = 'trigger-1'): TicketInput {
   return { id, kind: 'trigger', triggerId, at: AT, human: true }
 }
 
-/** 一个真实临时状态目录；调用方负责删除。 */
-function stateDir(): { readonly dir: string; readonly cleanup: () => void } {
+/** 一个真实临时状态目录；调用方负责删除（有界重试、只把 ENOENT 当成功）。 */
+function stateDir(): { readonly dir: string; readonly cleanup: () => Promise<void> } {
   const dir = mkdtempSync(join(tmpdir(), 'superagent-inbox-'))
-  return { dir, cleanup: () => rmSync(dir, { recursive: true, force: true }) }
+  return { dir, cleanup: () => removeTree(dir) }
 }
 
 const DELIVERY: DeliverySettings = { inlineLimit: 1000, confirmDelivery: true }
@@ -465,7 +465,7 @@ test('a short input is written to the inbox and sent inline as one line', async 
     assert.deepEqual(delivered, ['input-1'], 'the caller learns about the delivery per input')
     assert.ok(runtime.calls.readTerminal.length >= 1, 'delivery is confirmed by reading back')
   } finally {
-    dir.cleanup()
+    await dir.cleanup()
   }
 })
 
@@ -496,7 +496,7 @@ test('a long input is sent as a one-line pointer to the file, never as the body'
     assert.ok(file.includes('truncated'), 'a clipped body points at the original')
     assert.ok(file.length < 5000 + 2000, 'the file keeps the body bounded')
   } finally {
-    dir.cleanup()
+    await dir.cleanup()
   }
 })
 
@@ -539,7 +539,7 @@ test('a delivery whose marker never shows up fails so the queue can back off and
     assert.deepEqual(delivered, [], 'an unconfirmed delivery is not reported as delivered')
     assert.ok(waits.length > 0 && waits.every((ms) => ms === 500))
   } finally {
-    dir.cleanup()
+    await dir.cleanup()
   }
 })
 
@@ -563,7 +563,7 @@ test('without confirmation a delivery is written once and never read back', asyn
     assert.equal(runtime.calls.sent.length, 1)
     assert.deepEqual(runtime.calls.readTerminal, [], 'the opt-out really turns the read off')
   } finally {
-    dir.cleanup()
+    await dir.cleanup()
   }
 })
 
@@ -594,7 +594,7 @@ test('several pending inputs are delivered in order, each with its own number an
     assert.deepEqual(runtime.calls.sent.map((sent) => sent.text.split(' ')[1]), ['#1', '#2'])
     assert.ok(readFileSync(inboxPath(dir.dir, pending.id, 2), 'utf8').includes('Also update the docs.'))
   } finally {
-    dir.cleanup()
+    await dir.cleanup()
   }
 })
 
@@ -620,7 +620,7 @@ test('a write the terminal refuses surfaces as a delivery failure, not a success
       (error: unknown) => error instanceof DeliveryError
     )
   } finally {
-    dir.cleanup()
+    await dir.cleanup()
   }
 })
 
@@ -789,7 +789,7 @@ function harness(
   const cleanup = async (): Promise<void> => {
     await queue.effects.idle().catch(() => undefined)
     queue.cleanup()
-    rmSync(worktreeRoot, { recursive: true, force: true })
+    await removeTree(worktreeRoot)
   }
   return {
     ...queue,

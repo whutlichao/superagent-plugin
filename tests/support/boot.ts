@@ -2,13 +2,14 @@
 //
 // 不发网络、不 sleep：定时器关闭，测试用 `pollOnce`/`passOnce` 手动推进；HTTP 仍是真
 // loopback 服务器（CLI 的 status/read 走真 HTTP）。
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
+import { mkdtempSync, readFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { bootPlugin, type BootHandle } from '../../src/worker/boot.ts'
 import { readRepoJson } from './repo.ts'
 import { FakeOrcaRuntime } from './fake-orca-runtime.ts'
 import { FakeCommands } from './fake-commands.ts'
+import { removeTree } from './state.ts'
 
 /** 一条通知（`gh api notifications`）。 */
 export const NOTIFICATION = {
@@ -111,9 +112,11 @@ export async function openBoot(options: {
     stateDir,
     worktrees,
     cleanup: async () => {
+      // 关停是屏障（§N.1）：它返回之后不再有写者，删除只是收尾；重试只兜住删除期间的竞态，
+      // 非 ENOENT/ENOTEMPTY 的错误照样抛出（tests/support/state.ts 的 `removeTree`）。
       await handle.shutdown()
-      rmSync(stateDir, { recursive: true, force: true })
-      rmSync(worktrees, { recursive: true, force: true })
+      await removeTree(stateDir)
+      await removeTree(worktrees)
     }
   }
 }

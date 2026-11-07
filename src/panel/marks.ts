@@ -2,6 +2,7 @@
 // 纯函数，不 import `orca`：图标与语气用字符串字面量（与组件目录的枚举同值），
 // 文案键指向 `copy.ts`，因此同一个状态在面板任何地方看起来都一样。
 import { translate, type CopyKey, type CopyValues } from './copy'
+import type { ThreadStageName } from './protocol'
 
 /** Orca 的 Tone 档位。 */
 export type MarkTone = 'neutral' | 'accent' | 'success' | 'warning' | 'danger'
@@ -39,14 +40,11 @@ export type TicketAction = 'answer' | 'review' | 'blocked' | 'failed' | 'deliver
 /** Ticket 结束的结局（§E.8：completed / merged / closed / dropped / stopped）。 */
 export type TicketOutcome = 'completed' | 'merged' | 'closed' | 'dropped' | 'stopped'
 
-/** Thread 的展示阶段。 */
-export type ThreadStage =
-  | 'subscribed'
-  | 'evaluating'
-  | 'queued'
-  | 'error'
-  | 'dormant'
-  | 'unsubscribed'
+/**
+ * Thread 的展示阶段：**就是**面板契约的 `ThreadStageName`（行与标记两处不能各写一份联合，
+ * 否则 worker 回来的行要强转）。
+ */
+export type ThreadStage = ThreadStageName
 
 /**
  * Source 实例的状态：注册表的生命周期（`sources/registry.ts` 的 `SourceState`，前四档与健康

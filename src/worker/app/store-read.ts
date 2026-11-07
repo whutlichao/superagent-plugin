@@ -112,6 +112,7 @@ export interface TimelineOptions {
 /**
  * Thread 时间线：按 `(at, trigger_id)` 升序，游标是同形的复合值。
  * 用行值比较 `(at, trigger_id) > (?, ?)`，同一时刻的多条记录既不丢也不重。
+ * 面板与 `read thread/<key>` 从最新一页往回读时走 `readTimelineTail` / `readTimelineBefore`。
  */
 export function readTimeline(
   reader: SqlReader,

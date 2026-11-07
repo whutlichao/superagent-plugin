@@ -7,7 +7,6 @@
 //   （`decisions` / `decision.detail` / `decision.dismiss`），断言发出去的请求名与入参；
 // - 读模型侧：`decisionPage` / `decisionDetail` 把真库里的 Decision 变成面板面，待人工条数
 //   与 Overview 的 System problems 用同一份 §K.7 判定（`readUnavailableProblems`）。
-import { rmSync } from 'node:fs'
 import { assert, mockHost, mount, mountWorker, test } from 'orca/testing'
 import * as main from '../src/worker/main'
 import type { Decision, Thread, Ticket } from '../src/worker/core/index'
@@ -25,7 +24,7 @@ import type {
   PanelState,
   TicketDetailView
 } from '../src/panel/protocol'
-import { AT as ISO_AT, isoAfter, openTempStore, tempStateDir } from './support/state'
+import { AT as ISO_AT, isoAfter, openTempStore, removeTree, tempStateDir } from './support/state'
 
 /** `mockHost` 的请求表类型（测试里只写用到的几个名字）。 */
 type Requests = NonNullable<NonNullable<Parameters<typeof mockHost>[0]>['requests']>
@@ -709,8 +708,9 @@ test('the worker answers the Eval requests, and dismiss feeds the Overview probl
     )
     assert.deepEqual(worker.refusals, [])
   } finally {
+    // `deactivate()` 是关停屏障（§N.1）：返回之后才删，删除有界重试且不吞非竞态错误。
     await worker.deactivate()
-    rmSync(stateDir, { recursive: true, force: true })
+    await removeTree(stateDir)
   }
 })
 

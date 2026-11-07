@@ -7,7 +7,7 @@
 // 没有网络、没有对内层模块的 mock。
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync } from 'node:fs'
+import { existsSync, mkdtempSync, readdirSync, readFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { bootPlugin, type BootHandle } from '../src/worker/boot.ts'
@@ -19,6 +19,7 @@ import { FakeCommands } from './support/fake-commands.ts'
 import { FakeOrcaRuntime } from './support/fake-orca-runtime.ts'
 import { assignmentToken, COMMENT, NOTIFICATION, settingsOf } from './support/boot.ts'
 import { readRepoJson } from './support/repo.ts'
+import { removeTree } from './support/state.ts'
 
 /** 人后来在同一条 Issue 的 Thread 上写的一句话：不点名 agent。 */
 const FOLLOWUP = {
@@ -167,9 +168,10 @@ async function openFollowup(options: { readonly maxWorkers?: number } = {}): Pro
     notifications,
     thirdComments,
     cleanup: async () => {
+      // 关停屏障之后才删（§N.1）；删除本身有界重试且只认 ENOENT，见 `tests/support/state.ts`。
       await handle.shutdown()
-      rmSync(stateDir, { recursive: true, force: true })
-      rmSync(worktrees, { recursive: true, force: true })
+      await removeTree(stateDir)
+      await removeTree(worktrees)
     }
   }
 }
