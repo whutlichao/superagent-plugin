@@ -9,7 +9,9 @@ import assert from 'node:assert/strict'
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, utimesSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { routerPrompt, ROUTER_ROLE_LINES } from '../src/worker/router/prompt'
+import { routerPrompt, ROUTER_ROLE_LINES, type RouterPromptComposer } from '../src/worker/router/prompt'
+import { assembleLaunchPrompt } from '../src/worker/app/launch-prompt'
+import type { PromptConfig, PromptEnvironment, PromptPolicy } from '../src/worker/app/prompts'
 import { ensureRouterWorkspace, launchRouter } from '../src/worker/router/router'
 import { OrcaRuntimeError } from '../src/worker/runtime/orca-runtime'
 import {
@@ -30,30 +32,58 @@ import { createClock, openQueue } from './support/queue'
 import { FakeOrcaRuntime } from './support/fake-orca-runtime'
 
 /** 一份部署环境：路径里带空格，钉住「一律双引号包裹」这条（§G.5）。 */
-const ENVIRONMENT = {
+const ENVIRONMENT: PromptEnvironment = {
+  variables: ['DSH_SUPERAGENT_DIR', 'SUPERAGENT_CLI', 'SUPERAGENT_TOKEN_FILE'],
   cliPath: '/Applications/Orca Support/plugins/superagent/src/bin/superagent.mjs',
   tokenFile: '/Users/me/.local/state/orca-superagent/tokens/router',
   stateDir: '/Users/me/.local/state/orca-superagent',
-  directory: '/w/superagent-router',
   repository: 'acme/widgets',
-  agentAccount: 'acme-agent',
-  acceptMode: 'observe' as const,
-  policyVersion: 'policy-7',
-  promptRevision: 4
+  account: 'acme-agent'
+}
+
+/** Router 自己那个专用 worktree（自检与重建现场的每条命令都在它里面跑）。 */
+const ROUTER_DIRECTORY = '/w/superagent-router'
+
+/** 当前 Policy（gen 段的填值，§K.5）。 */
+const POLICY: PromptPolicy = {
+  version: 'policy-7',
+  mode: 'observe',
+  rules: [{ id: 'copy', name: 'Copy fixes', instruction: 'Fix a typo in one place.' }]
+}
+
+/** 组装好的全文（§L.3）：与组合根喂给 Router launch 的是同一个函数。 */
+function assembledText(config: PromptConfig = {}, revision = 4): string {
+  return assembleLaunchPrompt({ role: 'orchestrator', revision, config, environment: ENVIRONMENT, policy: POLICY }).text
+}
+
+/** 一次 launch 的 Router prompt：组装后的全文（§L.3）＋ Router 自己的「先自检」尾部。 */
+function launchPrompt(prompt: { text: string } = { text: assembledText() }): string {
+  return routerPrompt({
+    text: prompt.text,
+    cliPath: ENVIRONMENT.cliPath,
+    tokenFile: ENVIRONMENT.tokenFile,
+    directory: ROUTER_DIRECTORY
+  })
 }
 
 describe('the router prompt', () => {
-  test('opens with the role and makes the status self-check its first action', () => {
-    const prompt = routerPrompt(ENVIRONMENT)
-    // 角色层在最前：launch prompt 是叠加在 agent 自身系统提示词之上的用户层（§L.5.1）。
-    assert.equal(prompt.startsWith(ROUTER_ROLE_LINES[0]!), true, 'the role text opens the prompt')
+  test('is the assembled text, with the status self-check appended as the first action', () => {
+    const assembled = assembledText()
+    const prompt = launchPrompt()
+    // 角色层不再由这里手写：§L.3 的组装（shared → 角色 → 团队段 → … → 环境 → Policy）在最前。
+    assert.equal(prompt.startsWith(assembled), true, 'the assembled prompt opens the launch prompt')
+    assert.equal(
+      prompt.indexOf(ROUTER_ROLE_LINES[0]!) > prompt.indexOf('## Roles'),
+      true,
+      'the role text still sits inside the assembled sections'
+    )
     const firstAction = prompt.slice(prompt.indexOf('First action'))
     // 「第一句先做状态自检重建现场」（§F.1、§F.5）：绝对路径 + 引号 + `status --json`。
     assert.match(firstAction.split('\n')[0]!, /First action: run node ".*" status --json/)
     assert.equal(
-      prompt.indexOf('First action') < prompt.indexOf('Deployment'),
+      prompt.indexOf('First action') > prompt.indexOf('## Policy'),
       true,
-      'the self-check is stated before the deployment detail'
+      'the self-check comes after the deployment and policy sections it rebuilds from'
     )
     // 自检先于重建现场的读取命令。
     assert.ok(prompt.indexOf('status --json') < prompt.indexOf('read decisions'))
@@ -62,23 +92,33 @@ describe('the router prompt', () => {
   })
 
   test('carries every literal of the §G.5 deployment trailer', () => {
-    const prompt = routerPrompt(ENVIRONMENT)
+    const prompt = launchPrompt()
     for (const fact of [
       ENVIRONMENT.stateDir,
       ENVIRONMENT.repository,
-      ENVIRONMENT.agentAccount,
-      ENVIRONMENT.acceptMode,
-      ENVIRONMENT.policyVersion,
-      `revision ${ENVIRONMENT.promptRevision}`
+      ENVIRONMENT.account!, // 环境段把「仓库 + agent 账号」写在同一行（§G.5）
+      `accept mode ${POLICY.mode}`,
+      POLICY.version,
+      `Prompt revision ${4}`,
+      ROUTER_DIRECTORY
     ]) {
       assert.ok(prompt.includes(fact), `the trailer names ${fact}`)
     }
-    // 工作目录就是 Router 自己那个专用 worktree。
-    assert.ok(prompt.includes(ENVIRONMENT.directory))
+  })
+
+  test('uses the saved team text and override, so a team change reaches the next launch', () => {
+    const config: PromptConfig = {
+      team: { scope: 'Only the router worktree.' },
+      overrides: { 'team/delivery': { text: 'Open no PR from the router.' } }
+    }
+    const prompt = launchPrompt({ text: assembledText(config) })
+    assert.ok(prompt.includes('Only the router worktree.'))
+    assert.ok(prompt.includes('Open no PR from the router.'))
+    assert.ok(prompt.includes(`Policy version ${POLICY.version}`), 'and the policy section of that launch')
   })
 
   test('states the boundaries the design can only ask for', () => {
-    const prompt = routerPrompt(ENVIRONMENT)
+    const prompt = launchPrompt()
     // §F.3 的无等待：逐字沿用上游那句，并写死「不 sleep / 不轮询」。
     assert.ok(prompt.includes('The main Session does not wait'))
     assert.match(prompt, /never sleep/i)
@@ -371,6 +411,8 @@ function openSupervision(
     readonly enabled?: boolean
     readonly undecidedCandidates?: () => number
     readonly promptRevision?: number
+    /** 换掉组装：只测「监督把组装结果原样交给 launch」时用它。 */
+    readonly compose?: RouterPromptComposer['compose']
   } = {}
 ) {
   const runtime = options.runtime ?? new FakeOrcaRuntime()
@@ -379,6 +421,28 @@ function openSupervision(
   const state = memoryRouterState()
   const notices: string[] = []
   const tokens: string[] = []
+  const logs: string[] = []
+  /** 默认的组装：与组合根同一个函数（§L.3），只是部署事实换成夹具的值。 */
+  const prompt: RouterPromptComposer = {
+    compose:
+      options.compose ??
+      ((input) => {
+        const assembled = assembleLaunchPrompt({
+          role: 'orchestrator',
+          revision: input.revision,
+          config: {},
+          environment: { ...ENVIRONMENT, tokenFile: input.tokenFile },
+          policy: POLICY
+        })
+        const text = routerPrompt({
+          text: assembled.text,
+          cliPath: ENVIRONMENT.cliPath,
+          tokenFile: input.tokenFile,
+          directory: input.directory
+        })
+        return { text, length: text.length }
+      })
+  }
   /** `start()` 交给调度器的周期（毫秒）：钉住「3 s 一跳」（§F.1）。 */
   const ticks: number[] = []
   const supervisor = createRouterSupervision({
@@ -395,13 +459,9 @@ function openSupervision(
       model: 'o3',
       effort: 'high',
       baseRepo: { path: '/repos/widgets' },
-      baseBranch: 'main',
-      repository: 'acme/widgets',
-      acceptMode: 'observe',
-      policyVersion: 'policy-7'
+      baseBranch: 'main'
     },
-    cliPath: '/opt/orca/superagent.mjs',
-    stateDir: '/state',
+    prompt,
     rotateToken: () => {
       const path = `/state/tokens/router-${tokens.length + 1}`
       tokens.push(path)
@@ -409,6 +469,7 @@ function openSupervision(
     },
     promptRevision: options.promptRevision ?? 1,
     enabled: options.enabled ?? true,
+    log: (line) => logs.push(line),
     ...(options.undecidedCandidates === undefined ? {} : { undecidedCandidates: options.undecidedCandidates }),
     now: () => clock.now(),
     schedule: (_run, milliseconds) => {
@@ -417,10 +478,38 @@ function openSupervision(
     },
     cancel: () => undefined
   })
-  return { runtime, board, clock, state, notices, tokens, ticks, supervisor }
+  return { runtime, board, clock, state, notices, tokens, ticks, logs, supervisor }
 }
 
 describe('router supervision', () => {
+  test('the launch prompt is what the composer returned, and the log keeps only its revision and length', async () => {
+    const composed: { readonly text: string; readonly length: number; readonly revision: number }[] = []
+    const h = openSupervision({
+      compose: (input) => {
+        const text = `# assembled for revision ${input.revision}\nwork in ${input.directory}\ntoken ${input.tokenFile}`
+        composed.push({ text, length: text.length, revision: input.revision })
+        return { text, length: text.length }
+      }
+    })
+    await h.supervisor.start()
+    const spec = h.runtime.calls.launchAgent[0]!
+    assert.equal(composed.length, 1, 'one launch, one assembly')
+    assert.equal(spec.prompt, composed[0]!.text, 'the composer result is the launch prompt, not hand-built text')
+    assert.ok(composed[0]!.text.includes(h.tokens[0]!), 'the composer got the freshly rotated token file')
+    assert.equal(composed[0]!.revision, 1, 'and the revision this session will carry')
+    // §L.5：日志只记 revision 与长度，正文一个字符都不进日志。
+    const promptLogs = h.logs.filter((line) => line.includes('prompt revision'))
+    assert.equal(promptLogs.length, 1)
+    assert.equal(
+      promptLogs[0]?.endsWith(`router launch prompt: prompt revision 1 (${composed[0]!.length} chars)`),
+      true
+    )
+    for (const line of h.logs) {
+      assert.equal(line.includes('assembled for revision'), false, 'no prompt body in the log')
+      assert.equal(line.includes(h.tokens[0]!), false, 'no path from the prompt body in the log')
+    }
+  })
+
   test('the first tick creates the dedicated worktree and launches the session in it', async () => {
     const h = openSupervision()
     await h.supervisor.start()

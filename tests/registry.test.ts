@@ -12,6 +12,9 @@ import type { SourceKind } from '../src/worker/sources/kind.ts'
 import type { OutboundMessage, Trigger } from '../src/worker/core/index.ts'
 import { FakeHealthBoard } from './support/health-board.ts'
 import { FakeCommands } from './support/fake-commands.ts'
+import { createFeishuKind } from '../src/worker/sources/feishu/kind.ts'
+import { feishuConfigSchema } from '../src/worker/sources/feishu/config.ts'
+import { validatePolicy } from '../src/worker/policy/index.ts'
 
 /** 探针 kind 的配置：interval 有默认值，scope 依赖 `meta.room` 与 `listen`。 */
 const probeSchema = object({
@@ -559,6 +562,110 @@ describe('search, replies and environment', () => {
         config: environments[0]?.config as ProbeConfig
       }),
       { PROBE_INTERVAL: '11' }
+    )
+  })
+})
+
+describe('the Feishu admission table', () => {
+  const kind = createFeishuKind('lark-cli')
+
+  test('one row per configured chat, plus other and direct, with the cells each row can use', () => {
+    const config = feishuConfigSchema.parse({
+      chats: [
+        { chatId: 'oc_all', name: 'Build alerts', listen: 'all' },
+        { chatId: 'oc_mentions', listen: 'mentions' }
+      ],
+      otherChats: 'mentions',
+      directMessages: false
+    })
+    const rows = kind.policy?.rows?.(config)
+    assert.deepEqual(rows, [
+      {
+        // 行 id 就是 scope 给的 row（§I.1）：群用 chat id，名字只作显示。
+        id: 'oc_all',
+        label: 'Build alerts',
+        note: { zh: '全部消息', en: 'All' },
+        // 收全部的群才有未点名的格子；点名的格子总是可用（该行确实在接收）。
+        cells: { listedUnaddressed: true, unlistedAddressed: true, unlistedUnaddressed: true }
+      },
+      {
+        id: 'oc_mentions',
+        label: 'oc_mentions',
+        note: { zh: '仅 @', en: '@ only' },
+        cells: { listedUnaddressed: false, unlistedAddressed: true, unlistedUnaddressed: false }
+      },
+      {
+        id: 'other',
+        label: { zh: '其他群', en: 'Other chats' },
+        note: { zh: '仅 @', en: '@ only' },
+        cells: { listedUnaddressed: false, unlistedAddressed: true, unlistedUnaddressed: false }
+      },
+      {
+        id: 'direct',
+        label: { zh: '私聊', en: 'Direct messages' },
+        note: { zh: '不接收', en: 'Not received' },
+        cells: { listedUnaddressed: false, unlistedAddressed: false, unlistedUnaddressed: false }
+      }
+    ])
+    // 默认配置只有 other 与 direct 两行（§I.3 准入行）。
+    assert.deepEqual(
+      kind.policy?.rows?.(feishuConfigSchema.parse({}))?.map((row) => row.id),
+      ['other', 'direct']
+    )
+    // 没有行被观察时，未点名的格子一律不可用（票面「由该行是否可 observe 决定」）。
+    for (const row of rows ?? []) {
+      if (row.cells.listedUnaddressed) assert.equal(row.id, 'oc_all')
+    }
+  })
+
+  test('the Policy admission keys are the configured chats, other and direct', () => {
+    const config = feishuConfigSchema.parse({
+      chats: [{ chatId: 'oc_all', listen: 'all' }]
+    })
+    const part = kind.policy
+    assert.ok(part !== undefined)
+    const kinds = (source: string) =>
+      source === 'feishu'
+        ? {
+            rows: () => part.rows?.(config) ?? [],
+            extras: (section: Record<string, unknown>) => part.schema.safeParse(section)
+          }
+        : undefined
+    const accepted = validatePolicy(
+      {
+        sources: {
+          feishu: {
+            allowed: [{ id: 'ou_alice', name: 'Alice' }],
+            syncChat: 'oc_all',
+            admission: {
+              oc_all: { unlistedAddressed: 'explicit' },
+              other: { unlistedAddressed: 'inferred' },
+              direct: { listedUnaddressed: 'inferred' }
+            }
+          }
+        }
+      },
+      { kinds }
+    )
+    assert.equal(accepted.success, true)
+    // 配置里没有的群不能出现在准入表里（§K.8：key 必须是已配置 chat、other 或 direct）。
+    const refused = validatePolicy(
+      { sources: { feishu: { admission: { oc_removed: { unlistedAddressed: 'explicit' } } } } },
+      { kinds }
+    )
+    assert.equal(refused.success, false)
+    if (!refused.success) {
+      assert.deepEqual(refused.issues[0]?.path, ['sources', 'feishu', 'admission', 'oc_removed'])
+      assert.equal(refused.issues[0]?.message, 'unknown receiving scope')
+    }
+    // 名单项是 open_id，bots 是 app id 或 open_id（kind 自己的 strict schema）。
+    assert.equal(
+      validatePolicy({ sources: { feishu: { allowed: [{ id: 'alice' }] } } }, { kinds }).success,
+      false
+    )
+    assert.equal(
+      validatePolicy({ sources: { feishu: { bots: [{ id: 'bot' }] } } }, { kinds }).success,
+      false
     )
   })
 })

@@ -41,7 +41,12 @@ import { registerAssessmentEffects } from './app/notices.ts'
 import { createRouterTools } from './app/assessment.ts'
 import { createOutbox, registerReplyEffects } from './app/outbox.ts'
 import { createPausedState } from './app/pause.ts'
-import { savedSettingsVersion } from './app/settings.ts'
+import {
+  createPolicySettingsPort,
+  createSettings,
+  savedSettingsVersion
+} from './app/settings.ts'
+import { createPolicySync, type PolicySync } from './app/policy-sync.ts'
 import {
   feishuChatsKey,
   feishuCursorKey,
@@ -96,6 +101,8 @@ import { createAssessmentHandlers, withAssessmentHandlers } from './http/assessm
 import { createDecisionHandlers, withDecisionHandlers } from './http/decisions.ts'
 import { createPromptHandlers, withPromptHandlers } from './http/prompts.ts'
 import { createPromptVersions } from './app/prompts.ts'
+import type { PromptEnvironment, PromptPolicy } from './app/prompts.ts'
+import { assembleLaunchPrompt } from './app/launch-prompt.ts'
 import { ENVIRONMENT_VARIABLES } from './executor/environment.ts'
 import type { RouteCaller } from './http/routes.ts'
 import { ROUTE_TABLE, type RouteDefinition } from './http/routes.ts'
@@ -111,6 +118,7 @@ import {
   type RouterTerminalState,
   type RouterWorkspaceState
 } from './router/supervision.ts'
+import { routerPrompt } from './router/prompt.ts'
 
 /** worker 侧一轮 pass 的周期（§N.1 的 2 s 巡检）。 */
 export const PASS_INTERVAL_MS = 2000
@@ -157,6 +165,10 @@ export interface BootHandle {
   pollOnce(): Promise<GithubPollResult>
   /** 一轮 Feishu 回填（含话题轮询与群名刷新）；没有可用实例时 `null`。 */
   feishuOnce(): Promise<FeishuRoundResult | null>
+  /** 启动时那一轮名单同步的 promise（生产不等它；测试与诊断等它）。 */
+  policySync(): Promise<void>
+  /** 手动「立即同步」：跑一次某个 Source 的名单同步（面板按钮与 `policy sync` 命令共用）。 */
+  syncPolicy(id: string): Promise<Record<string, unknown>>
   /** 一轮 pass（先到期的 effect，再到期评估与评估决定）。 */
   passOnce(): Promise<void>
   /** 实际监听的端口；follower/未监听时 `null`。 */
@@ -279,6 +291,10 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
       snapshot: () => emptySnapshot(),
       pollOnce: async () => ({ notifications: 0, triggers: 0, skipped: 0 }),
       feishuOnce: async () => null,
+      policySync: async () => undefined,
+      syncPolicy: async () => {
+        throw new Error('another instance owns the state directory; it does the list sync')
+      },
       passOnce: async () => undefined,
       port: () => null,
       resumeReport: () => null,
@@ -448,6 +464,21 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
     if (!parsed.success) return policyBlock
     return parsed.data
   }
+  /**
+   * 设置块的保存器（§K.8、§K.5）：Policy 块的内容哈希与变更投递走 `policy/*` 与引擎。
+   * 名单同步（§I.3）以 origin=`sync` 写 Policy 块，因此和面板保存共用这一条写路径。
+   */
+  const settingsWriter = createSettings({
+    store,
+    now,
+    policy: createPolicySettingsPort({
+      kinds: policyKind,
+      rows: (source) => policyKind(source)?.rows() ?? [],
+      openTickets: () => repo.tickets.list(),
+      changed: (from, to, effects) => engine.policyChanged(from, to, effects),
+      current: effectivePolicy
+    })
+  })
   const policy = createPolicy({
     block: effectivePolicy,
     sources: registry,
@@ -458,6 +489,30 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
   // ---- Router（§F.1–§F.5）：专用 worktree、terminal 面的常驻会话、relay 与保活监督
   const roles = resolveRoles(settings)
   const deploymentFacts = deployment(settings, { ...githubSetup, login: githubLogin() }, feishuSetup)
+  const cliPath = options.cliPath ?? defaultCliPath()
+  // Prompt 配置与版本的唯一读写面（§L.4、§L.5）：两个 launch 与 `prompts get --text` 都从这里读；
+  // 每次 launch 现读，所以保存过的团队段与 revision 在下一次 launch 就生效。
+  const promptVersions = createPromptVersions({ store, now })
+  /** 一次会话或一次请求的部署环境段（§G.5）：只给路径，绝不写 token 值（§D.6）。 */
+  const promptEnvironment = (tokenFile: string): PromptEnvironment => ({
+    variables: [...ENVIRONMENT_VARIABLES],
+    cliPath,
+    tokenFile,
+    stateDir: resolved,
+    repository: deploymentFacts.repository,
+    account: deploymentFacts.githubLogin
+  })
+  /** Router 的 Policy 段（§L.3 第 11 步）：跟**生效**的块走，与 Gate、复验同一个真相源。 */
+  const promptPolicy = (): PromptPolicy => {
+    const block = effectivePolicy()
+    return {
+      version: policy.version,
+      mode: block.acceptMode,
+      rules: block.rules
+        .filter((rule) => rule.enabled)
+        .map((rule) => ({ id: rule.id, name: rule.name, instruction: rule.instruction.en }))
+    }
+  }
   // setup 未完成（或没选 base repo）时 Router 保持 paused；`setup check` 之后会重新问这个函数。
   const routerEnabled = (): boolean => !setup.blocked('executor') && executorSettings.baseRepo !== undefined
   const relayDays = relayRetentionDays(settings)
@@ -474,15 +529,27 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
       ...(roles.router.model === undefined ? {} : { model: roles.router.model }),
       ...(roles.router.effort === undefined ? {} : { effort: roles.router.effort }),
       ...(executorSettings.baseRepo === undefined ? {} : { baseRepo: executorSettings.baseRepo }),
-      ...(executorSettings.baseBranch === undefined ? {} : { baseBranch: executorSettings.baseBranch }),
-      repository: deploymentFacts.repository,
-      acceptMode: acceptModeOf(settings),
-      policyVersion: policy.version
+      ...(executorSettings.baseBranch === undefined ? {} : { baseBranch: executorSettings.baseBranch })
     },
-    cliPath: options.cliPath ?? defaultCliPath(),
-    stateDir: resolved,
     rotateToken: () => issueRouterToken({ store, stateDir: resolved }).path,
     promptRevision: promptRevisionOf(store),
+    /**
+     * 组装 Router 的 launch prompt（§L.3、§L.5）：每次 launch 现读配置、当时的 Policy 与
+     * 部署事实，拼好后交出全文；监督只拿回文本与长度，不自己拼、也不缓存旧版本。
+     */
+    prompt: {
+      compose: ({ tokenFile, directory, revision }) => {
+        const assembled = assembleLaunchPrompt({
+          role: 'orchestrator',
+          revision,
+          config: promptVersions.config(),
+          environment: promptEnvironment(tokenFile),
+          policy: promptPolicy()
+        })
+        const text = routerPrompt({ text: assembled.text, cliPath, tokenFile, directory })
+        return { text, length: text.length }
+      }
+    },
     enabled: routerEnabled,
     // §F.3 的可观测事实：疑似空转时给出「N 个未决候选」（待评的 Thread）。
     undecidedCandidates: () => repo.threads.list().filter((thread) => thread.pending.length > 0).length,
@@ -593,9 +660,11 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
     records: repo,
     settings: executorSettings,
     stateDir: resolved,
-    cliPath: options.cliPath ?? defaultCliPath(),
+    cliPath,
     tokenFile: (assignmentId) => assignmentTokenFile(store, resolved, assignmentId),
     apiBase: '',
+    // Worker 的 launch 也是在启动那一刻现读配置与 revision（§L.5）。
+    prompts: promptVersions,
     wait: deliveryWait,
     log: (message) => logger.info(message)
   })
@@ -707,28 +776,12 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
   // Prompt 配置的读/写面（§L.4、§L.5）：版本库、部署事实与「保存后通知 Router」都在这里接线。
   // 部署事实给的是**路径**（CLI 的绝对路径、调用者自己的 token 文件），绝不写 token 值（§D.6）；
   // 保存产生新版本时，Router 保活器把 revision 换成一条短消息排队——不重启会话（§F.4）。
-  const promptVersions = createPromptVersions({ store, now })
   const prompts = createPromptHandlers({
     versions: promptVersions,
     deployment: {
-      environment: ({ caller }) => ({
-        variables: [...ENVIRONMENT_VARIABLES],
-        cliPath: options.cliPath ?? defaultCliPath(),
-        tokenFile: callerTokenFile(caller, resolved),
-        stateDir: resolved,
-        repository: deploymentFacts.repository
-      }),
-      // Policy 段跟着**生效**的块走（保存过的设置优先，§K.5），与 Gate、复验同一个真相源。
-      policy: () => {
-        const block = effectivePolicy()
-        return {
-          version: policy.version,
-          mode: block.acceptMode,
-          rules: block.rules
-            .filter((rule) => rule.enabled)
-            .map((rule) => ({ id: rule.id, name: rule.name, instruction: rule.instruction.en }))
-        }
-      }
+      // 一个请求自己的 token 文件：与它实际会用的那个会话一致（§G.4、§G.5）。
+      environment: ({ caller }) => promptEnvironment(callerTokenFile(caller, resolved)),
+      policy: promptPolicy
     },
     onSaved: (revision) => routerSupervision.notifyPromptRevision(revision),
     afterWrite: () => {
@@ -942,6 +995,56 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
           ticket: (id) => repo.tickets.get(id)
         })
 
+  // ---- 名单同步（§I.3「同步」行、§N.4 的 `sync:<id>` 健康条目）：启动时一次、手动
+  // 「立即同步」、失败按 1 min→1 h 退避。能同步的条件：setup 完成、实例启用、part 点名了
+  // 同步来源群。保存走 `settingsWriter`（origin=`sync`），所以策略版本与变更投递同一条路。
+  const lifetimeAbort = new AbortController()
+  const policySyncable = (): string[] => {
+    if (!feishuSetup.enabled || feishuProblem() !== undefined) return []
+    const instance = registry.instance(FEISHU_KIND)
+    const sync = registry.kind(FEISHU_KIND)?.policy?.sync
+    if (
+      instance === undefined ||
+      !instance.enabled ||
+      instance.configError !== undefined ||
+      sync === undefined
+    ) {
+      return []
+    }
+    const part = effectivePolicy().sources[FEISHU_KIND]
+    return part !== undefined && sync.ready(part) ? [FEISHU_KIND] : []
+  }
+  const policySync: PolicySync = createPolicySync({
+    current: effectivePolicy,
+    revision: () => settingsWriter.blockRevision('policy'),
+    save: (policy, expectedRevision) => {
+      settingsWriter.save({
+        block: 'policy',
+        value: policy,
+        origin: 'sync',
+        expectedRevision,
+        validate: (value) => validatePolicy(value, { kinds: policyKind })
+      })
+    },
+    syncable: policySyncable,
+    run: (id, part, signal) => {
+      const sync = registry.kind(id)?.policy?.sync
+      return sync === undefined
+        ? Promise.reject(new Error(`The ${id} Source does not sync`))
+        : sync.run(feishuHost, part, signal)
+    },
+    health: board,
+    now,
+    schedule: (run, milliseconds) => {
+      // 测试关闭定时器：失败照记健康，但不在测试进程里排真实的重试。
+      if (options.disableTimers === true) return () => undefined
+      const timer = setTimeout(run, milliseconds)
+      return () => clearTimeout(timer)
+    },
+    signal: lifetimeAbort.signal,
+    log: (message) => logger.info(message)
+  })
+
   // ---- passes：先做 effect，再评估，再把确定性评估的决定落库
   const passes = createPasses({
     effects,
@@ -1019,6 +1122,8 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
   }
   // 事件流不靠定时器：配置好了就长驻监听（§I.3 实时事件）。
   const streaming = feishuStream === null ? null : feishuStream.run()
+  // 名单同步的「启动时一次」：不等它（一次 CLI 读最多 60 s，不该挡住首屏），失败只写健康与日志。
+  const startupSync = policySync.start()
   refresh()
 
   let closed = false
@@ -1029,7 +1134,9 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
     // 监督先停：关停期间不再发现「终端没了」并去 launch 新会话。
     routerSupervision.stop()
     for (const timer of timers) clearInterval(timer)
-    // 先关事件流：看门狗与 abort 都会停子进程，再等循环真的收尾（§I.3「5 s 内停」）。
+    // 名单同步的待重试先取消；再关事件流（看门狗与 abort 都会停子进程）。
+    lifetimeAbort.abort()
+    policySync.stop()
     feishuAbort.abort()
     if (streaming !== null) await streaming
     options.statusBar?.dispose()
@@ -1050,6 +1157,8 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
     snapshot: () => stateSource.snapshot(),
     pollOnce,
     feishuOnce,
+    policySync: () => startupSync,
+    syncPolicy: (id) => policySync.sync(id),
     passOnce,
     port: () => http.port,
     resumeReport: () => resumeReport,
@@ -1135,12 +1244,6 @@ function callerTokenFile(caller: RouteCaller, stateDir: string): string {
     return join(stateDir, TOKENS_DIR, caller.assignmentId)
   }
   return join(stateDir, API_TOKEN_FILE)
-}
-
-/** `policy.acceptMode` 的三档；缺省 observe（§K.4、规格 000 的缺省）。 */
-function acceptModeOf(settings: Readonly<Record<string, unknown>>): 'off' | 'observe' | 'auto' {
-  const mode = block(settings['policy'])['acceptMode']
-  return mode === 'off' || mode === 'auto' ? mode : 'observe'
 }
 
 /** `retention.relayDays`（§F.2 缺省 7 天）：正整数才生效。 */

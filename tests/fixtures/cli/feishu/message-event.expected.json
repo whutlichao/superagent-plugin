@@ -37,13 +37,15 @@
       "program": "lark-cli",
       "args": [
         "im",
-        "+message-reply",
+        "+messages-reply",
         "--as",
         "bot",
         "--message-id",
         "om_dc13264520392913993dd051dba21dcf",
         "--text",
-        "Done"
+        "Done",
+        "--idempotency-key",
+        "<outbox message id>"
       ],
       "result": "sent"
     }

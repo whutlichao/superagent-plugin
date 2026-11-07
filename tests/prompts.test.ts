@@ -33,6 +33,7 @@ import {
   type PromptPartKey
 } from '../src/worker/app/prompts.ts'
 import { mandateInstructions } from '../src/worker/executor/mandate.ts'
+import { assembleLaunchPrompt, promptLogLine } from '../src/worker/app/launch-prompt.ts'
 
 /** 部署事实（§G.5 的字面量形状；路径里有空格，和插件安装目录一样）。 */
 const ENVIRONMENT: PromptEnvironment = {
@@ -436,6 +437,81 @@ function partTextOf(key: PromptPartKey): string {
   return PROMPT_PARTS[key].lines.join('\n')
 }
 
+describe('the launch prompt both roles are started with (§L.3, §L.5)', () => {
+  // 一个组装函数、两个消费者（Router 与 Worker）：启动时的全文就是 `composePrompt` 的结果加上
+  // 这一版 revision 的说明。别的文件不再各拼一份。
+  test('is the composed text plus the revision line, and reports its length for the log', () => {
+    const assembled = assembleLaunchPrompt({ role: 'worker', revision: 3, config: {}, environment: ENVIRONMENT })
+    assert.equal(assembled.role, 'worker')
+    assert.equal(assembled.revision, 3)
+    const composed = composePrompt({ role: 'worker', environment: ENVIRONMENT })
+    assert.ok(assembled.text.startsWith(composed), 'the launch text starts with the assembled sections')
+    assert.ok(assembled.text.includes(`Prompt revision 3`), 'the session records the revision it started with')
+    assert.equal(assembled.length, assembled.text.length, 'the length is the text it actually writes')
+    // 日志只允许 revision 与长度：这一行里没有正文的任何一句。
+    const line = promptLogLine(assembled)
+    assert.equal(line, `prompt revision 3 (${assembled.length} chars)`)
+    for (const text of [PROMPT_PARTS['runtime/worker'].lines[1]!, ENVIRONMENT.cliPath, ENVIRONMENT.tokenFile]) {
+      assert.equal(line.includes(text), false, 'the log line never carries the prompt body or a path from it')
+    }
+  })
+
+  test('each role is told how a later revision is read, not that this session hot-reloads', () => {
+    const router = assembleLaunchPrompt({
+      role: 'orchestrator',
+      revision: 2,
+      config: {},
+      environment: ENVIRONMENT,
+      policy: POLICY
+    })
+    assert.ok(router.text.includes('superagent prompts get --text'), 'the router re-reads the team and policy parts')
+    assert.match(router.text, /the role text above only changes with a new Router session/)
+    const worker = assembleLaunchPrompt({ role: 'worker', revision: 2, config: {}, environment: ENVIRONMENT })
+    assert.ok(worker.text.includes('superagent prompts get --revision'), 'the worker reads a named revision')
+    assert.match(worker.text, /the role text above stays as this session was launched with it/)
+    // 版本号随消息走、全文不热更（§L.5 / §H.2）：两段文本都不承诺自动换上新的角色层。
+    assert.equal(/hot[- ]reload/i.test(router.text + worker.text), false)
+  })
+
+  test('a team override and the current policy version are in the assembled text', () => {
+    const text = assembleLaunchPrompt({
+      role: 'orchestrator',
+      revision: 1,
+      config: { team: { scope: 'Only the router worktree.' }, overrides: { 'team/delivery': { text: 'Open no PR.' } } },
+      environment: ENVIRONMENT,
+      policy: POLICY
+    }).text
+    assert.equal(
+      text.includes(PROMPT_PARTS['team/scope'].lines[0]!),
+      false,
+      'the saved team section replaced the built-in default'
+    )
+    assert.ok(text.includes('Only the router worktree.'), 'the saved team section is used')
+    assert.ok(text.includes('Open no PR.'), 'the saved override is used')
+    assert.ok(text.includes(`Policy version ${POLICY.version}`), 'the policy version at launch is written down')
+    assert.ok(text.includes(`accept mode ${POLICY.mode}`))
+    // Worker 没有 Policy 段（§L.3 第 11 步只属于 Router）。
+    const worker = assembleLaunchPrompt({
+      role: 'worker',
+      revision: 1,
+      config: { team: { scope: 'Only the router worktree.' } },
+      environment: ENVIRONMENT,
+      policy: POLICY
+    }).text
+    assert.ok(worker.includes('Only the router worktree.'))
+    assert.equal(worker.includes('## Policy'), false)
+  })
+
+  test('the environment section names the agent account next to the repository when there is one', () => {
+    const withAccount = composePrompt({ role: 'orchestrator', environment: { ...ENVIRONMENT, account: 'acme-agent' }, policy: POLICY })
+    assert.ok(withAccount.includes(`${ENVIRONMENT.repository}   agent account: acme-agent`))
+    const without = promptSections({ role: 'orchestrator', environment: ENVIRONMENT, policy: POLICY }).find(
+      (section) => section.key === 'runtime/environment'
+    )!
+    assert.equal(without.text.includes('agent account'), false, 'no account, no empty label')
+  })
+})
+
 describe('skills', () => {
   test('the two built-in skills carry the CLI usage part and follow an override', () => {
     assert.ok(composeSkill('github').includes(PROMPT_PARTS['skill/github'].lines[0]!))
@@ -465,7 +541,6 @@ import {
   createPromptVersions,
   defaultPromptConfig,
   promptTextOf,
-  PromptVersionError,
   validatePromptConfig,
   type PromptConfig
 } from '../src/worker/app/prompts.ts'
@@ -1259,6 +1334,45 @@ describe('the prompts CLI', () => {
       const texts = (text.result as { texts: { orchestrator: string; worker: string } }).texts
       assert.ok(texts.orchestrator.includes('Report in one sentence; never open a PR for a comment.'))
       assert.ok(texts.worker.includes('Report in one sentence; never open a PR for a comment.'))
+    } finally {
+      await h.cleanup()
+    }
+  })
+
+  test('the router is launched with the assembled prompt: team override, policy version and environment', async () => {
+    const h = await openBoot()
+    try {
+      // 先存一版（团队段 + override），再重启 Router：新会话必须带上新内容与新 revision（§L.5）。
+      const saved = await runCli(
+        routerCliTarget(h.stateDir, h.handle.port()!),
+        ['prompts', 'save', '--config', '-', '--base-revision', '0'],
+        JSON.stringify({
+          team: { scope: 'Only the settings page.' },
+          overrides: { 'runtime/replies': { text: 'Reply in one sentence.' } }
+        })
+      )
+      assert.equal(saved.exit, 0, JSON.stringify(saved.error))
+      await h.handle.restartRouter()
+
+      const launched = routerLaunches(h.runtime).at(-1)!
+      const prompt = launched.prompt ?? ''
+      assert.ok(prompt.includes('Only the settings page.'), 'the saved team section is in the launch prompt')
+      assert.ok(prompt.includes('Reply in one sentence.'), 'and so is the saved override')
+      // 当次的 Policy 段（版本与 accept mode）：与 `--text` 读到的是同一份。
+      const text = await runCli(routerCliTarget(h.stateDir, h.handle.port()!), ['prompts', 'get', '--text'])
+      assert.equal(text.exit, 0, JSON.stringify(text.error))
+      const texts = (text.result as { texts: { orchestrator: string; worker: string } }).texts
+      const policyLine = /Policy version [^\n]*; accept mode [a-z]+\./.exec(texts.orchestrator)?.[0]
+      assert.ok(policyLine, 'the read surface states a policy version and mode')
+      assert.ok(prompt.includes(policyLine), 'the launch prompt carries the policy version of this launch')
+      // 当次的部署环境段。
+      assert.ok(prompt.includes(h.stateDir), 'the state directory')
+      assert.ok(prompt.includes('acme/widgets'), 'the repository')
+      assert.ok(prompt.includes('acme-agent'), 'the agent account')
+      // 版本号随消息走：全文末尾写的是这一次会话的 revision。
+      assert.ok(prompt.includes('Prompt revision 1'))
+      // §F.3：仍然有自检命令（Router 自己的尾部，不靠手写角色文本）。
+      assert.ok(/First action: run node ".*" status --json/.test(prompt))
     } finally {
       await h.cleanup()
     }
