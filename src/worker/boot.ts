@@ -17,10 +17,12 @@ import type { Store } from './app/store.ts'
 import { openStore } from './app/store.ts'
 import { acquireLock } from './infra/lock.ts'
 import { createLogger, type Logger } from './infra/log.ts'
-import { HealthBoard } from './infra/health.ts'
+import { HealthBoard, claimModelsEntry } from './infra/health.ts'
 import { defaultStateDir, resolveStateDir, writeStateDirPointer } from './infra/paths.ts'
-import { ensureApiToken, issueAssignmentToken } from './infra/tokens.ts'
+import { ensureApiToken, issueAssignmentToken, issueRouterToken } from './infra/tokens.ts'
 import { createRepositories } from './app/repositories.ts'
+import { resolveRoles } from './app/roles.ts'
+import { ROUTER_RESTARTS_KEY, ROUTER_TERMINAL_KEY, ROUTER_WORKSPACE_KEY, PROMPT_REVISION_KEY } from './app/kv.ts'
 import { createMinimalPolicy } from './app/policy.ts'
 import { createDeterministicAssessor } from './app/assessor.ts'
 import { createOutbox, registerReplyEffects } from './app/outbox.ts'
@@ -29,7 +31,7 @@ import { githubCursorKey } from './app/kv.ts'
 import { createRefreshableStateSource, type RefreshableStateSource } from './app/state-source.ts'
 import { statusBarView } from './app/status-bar.ts'
 import type { StatusBarView } from './app/status-bar.ts'
-import { Effects } from './app/effects.ts'
+import { Effects, ROUTER_EFFECT_KEY } from './app/effects.ts'
 import { createPasses } from './app/passes.ts'
 import { notePluginVersion } from './app/upgrade.ts'
 import { createSourceContext } from './app/source-context.ts'
@@ -46,6 +48,15 @@ import { ROUTE_TABLE, type RouteDefinition } from './http/routes.ts'
 import type { LoopEntry } from './http/state.ts'
 import { startHttpServer, type HttpServerHandle } from './http/server.ts'
 import type { AgentStatusEvent, OrcaRuntime } from './runtime/orca-runtime.ts'
+import { createRouterRelay } from './router/relay.ts'
+import {
+  createRouterSupervision,
+  type RouterRestartState,
+  type RouterSnapshot,
+  type RouterStateStore,
+  type RouterTerminalState,
+  type RouterWorkspaceState
+} from './router/supervision.ts'
 
 /** worker 侧一轮 pass 的周期（§N.1 的 2 s 巡检）。 */
 export const PASS_INTERVAL_MS = 2000
@@ -93,8 +104,16 @@ export interface BootHandle {
   port(): number | null
   /** 启动恢复做了什么（`resume`/`resumeAfterUpgrade` 的读数）。 */
   resumeReport(): ResumeReport | null
-  /** `agent.status.changed` 的四态映射（main 把宿主事件转进来）。 */
+  /** `agent.status.changed` 的四态映射（main 把宿主事件转进来）；Router 的终端的 done 也走它。 */
   onAgentStatus(event: AgentStatusEvent): Promise<void>
+  /** 一轮 Router 监督（3 s 定时器与测试共用）。 */
+  routerTick(): Promise<void>
+  /** Router 的读数：终端、起始时刻、重启次数、疑似空转与未决候选（§D.4、§F.3）。 */
+  routerStatus(): RouterSnapshot
+  /** 人显式要求重启 Router（命令 / 面板按钮，§F.1）。 */
+  restartRouter(): Promise<void>
+  /** prompt 版本变化 → 一条 notice（不重启、不注入，§F.4）。 */
+  notifyPromptRevision(revision: number): void
   /** 暂停写后的快照刷新（面板 `pause` 请求用）。 */
   refresh(): PanelState
   /** 写暂停状态（唯一写者是 `app/pause.ts`）并刷新快照。 */
@@ -175,6 +194,10 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
       port: () => null,
       resumeReport: () => null,
       onAgentStatus: async () => undefined,
+      routerTick: async () => undefined,
+      routerStatus: () => emptyRouterSnapshot(),
+      restartRouter: async () => undefined,
+      notifyPromptRevision: () => undefined,
       refresh: () => emptySnapshot(),
       setPaused: () => emptySnapshot(),
       shutdown: async () => undefined
@@ -187,6 +210,8 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
   const store: Store = openStore({ stateDir: resolved, log: logger.sink })
   const board = new HealthBoard()
   const runtimeHealth = board.claim('runtime', { state: 'ready', detail: 'booted' })
+  // §N.4、§H.4：`models` 条目恒 ready、明细写「handled by Orca」——模型预算重试是 Orca 的事。
+  claimModelsEntry(board)
   const paused = createPausedState(store, now)
   const repo = createRepositories(store)
 
@@ -234,6 +259,61 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
     },
     paused: () => paused.paused()
   })
+
+  // ---- Router（§F.1–§F.5）：专用 worktree、terminal 面的常驻会话、relay 与保活监督
+  const roles = resolveRoles(settings)
+  const deploymentFacts = deployment(settings, githubSetup)
+  const routerEnabled = setupProblem === undefined && executorSettings.baseRepo !== undefined
+  const relayDays = relayRetentionDays(settings)
+  const routerSupervision = createRouterSupervision({
+    runtime: options.runtime,
+    health: board,
+    state: routerStateStore(store),
+    notice: {
+      // `notice` 与 relay 共用 Router 终端与同一条 FIFO 队列（§J.2 末注）。
+      enqueue: (summary) => effects.enqueue('notice', ROUTER_EFFECT_KEY, { summary })
+    },
+    settings: {
+      agent: roles.router.agent,
+      ...(roles.router.model === undefined ? {} : { model: roles.router.model }),
+      ...(roles.router.effort === undefined ? {} : { effort: roles.router.effort }),
+      ...(executorSettings.baseRepo === undefined ? {} : { baseRepo: executorSettings.baseRepo }),
+      ...(executorSettings.baseBranch === undefined ? {} : { baseBranch: executorSettings.baseBranch }),
+      repository: deploymentFacts.repository,
+      acceptMode: acceptModeOf(settings),
+      policyVersion: policy.version
+    },
+    cliPath: options.cliPath ?? defaultCliPath(),
+    stateDir: resolved,
+    rotateToken: () => issueRouterToken({ store, stateDir: resolved }).path,
+    promptRevision: promptRevisionOf(store),
+    enabled: routerEnabled,
+    // §F.3 的可观测事实：疑似空转时给出「N 个未决候选」（待评的 Thread）。
+    undecidedCandidates: () => repo.threads.list().filter((thread) => thread.pending.length > 0).length,
+    now: nowMs,
+    ...(options.disableTimers === true
+      ? {}
+      : {
+          schedule: (run: () => void, milliseconds: number) => setTimeout(run, milliseconds),
+          cancel: (handle: unknown) => clearTimeout(handle as ReturnType<typeof setTimeout>)
+        }),
+    log: (message) => logger.info(message)
+  })
+  const routerRelay = createRouterRelay({
+    runtime: options.runtime,
+    stateDir: resolved,
+    terminal: () => routerSupervision.terminalId(),
+    // 队列行的 `seq` 是持久的单调序号：正文文件名与消息编号都用它，重启不重号（§F.2）。
+    sequence: (kind) => store.effects.get(kind, ROUTER_EFFECT_KEY)?.seq ?? null,
+    now: nowMs,
+    retentionDays: relayDays,
+    log: (message) => logger.info(message)
+  })
+  const relayHandlers = routerRelay.handlers()
+  effects.handle('relay', relayHandlers.relay)
+  effects.handle('notice', relayHandlers.notice)
+  routerRelay.prune()
+
   const assessor = createDeterministicAssessor({
     decide: (triggerId, outcome) => engine.decide(triggerId, outcome),
     onError: (error, evalId) => logger.warn(`the assessment of ${evalId} could not be decided`, { error: stringOf(error) })
@@ -257,6 +337,8 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
       if (event.type === 'assignment.started') {
         scheduleRefresh()
       }
+      // 新 Decision 落库即「不再疑似空转」（§F.3 的可观测事实，不是拦截）。
+      if (event.type === 'decision.recorded') routerSupervision.noteDecision()
     }
   })
   let refreshQueued = false
@@ -371,6 +453,13 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
     logger.error('startup resume failed', { error: stringOf(error) })
   }
 
+  // ---- Router：认回活着的会话，否则建 worktree 并 launch（不等它的一轮，§F.3）
+  try {
+    await routerSupervision.start()
+  } catch (error) {
+    logger.error('the router supervision could not start', { error: stringOf(error) })
+  }
+
   // ---- Source 轮询（§I.2）：只有 setup 完成且实例启用时才启动
   const poller: GithubPoller | null =
     setupProblem === undefined && githubSetup.enabled
@@ -462,6 +551,8 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
     if (closed) return
     closed = true
     closing = true
+    // 监督先停：关停期间不再发现「终端没了」并去 launch 新会话。
+    routerSupervision.stop()
     for (const timer of timers) clearInterval(timer)
     options.statusBar?.dispose()
     await passes.stop()
@@ -483,7 +574,15 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
     passOnce,
     port: () => http.port,
     resumeReport: () => resumeReport,
-    onAgentStatus: (event) => lifecycle.status(event),
+    // Router 的事件先过监督（空转观测），再由执行器映射到 Ticket（两者各认各的终端）。
+    onAgentStatus: async (event) => {
+      await routerSupervision.onAgentStatus(event)
+      await lifecycle.status(event)
+    },
+    routerTick: () => routerSupervision.tick(),
+    routerStatus: () => routerSupervision.snapshot(),
+    restartRouter: () => routerSupervision.restart('requested by the operator'),
+    notifyPromptRevision: (revision: number) => routerSupervision.notifyPromptRevision(revision),
     refresh,
     setPaused: (value: boolean): PanelState => {
       paused.setPaused(value, now(), 'operator')
@@ -508,6 +607,60 @@ function emptySnapshot(): PanelState {
     attention: { answer: 0, review: 0, problems: 0, items: [] },
     tickets: []
   }
+}
+
+/** follower 模式的 Router 快照：本进程不监督，也不假装有读数。 */
+function emptyRouterSnapshot(): RouterSnapshot {
+  return {
+    state: 'paused',
+    detail: 'this process follows another instance',
+    terminalId: null,
+    workspaceId: null,
+    directory: null,
+    startedAt: null,
+    promptRevision: null,
+    currentRevision: 0,
+    restarts: 0,
+    lastError: null,
+    nextAttemptAt: null,
+    idle: { suspected: false, waits: 0, since: null },
+    undecidedCandidates: 0,
+    orphaned: null,
+    agentState: null
+  }
+}
+
+/** `kv` 上的 Router 快照读写（键的命名只在 `app/kv.ts`，§D.3）。 */
+function routerStateStore(store: Store): RouterStateStore {
+  return {
+    terminal: () => store.kvGet<RouterTerminalState>(ROUTER_TERMINAL_KEY),
+    saveTerminal: (value) => {
+      if (value === null) store.kvDelete(ROUTER_TERMINAL_KEY)
+      else store.kvSet(ROUTER_TERMINAL_KEY, value)
+    },
+    workspace: () => store.kvGet<RouterWorkspaceState>(ROUTER_WORKSPACE_KEY),
+    saveWorkspace: (value) => store.kvSet(ROUTER_WORKSPACE_KEY, value),
+    restarts: () => store.kvGet<RouterRestartState>(ROUTER_RESTARTS_KEY),
+    saveRestarts: (value) => store.kvSet(ROUTER_RESTARTS_KEY, value)
+  }
+}
+
+/** `policy.acceptMode` 的三档；缺省 observe（§K.4、规格 000 的缺省）。 */
+function acceptModeOf(settings: Readonly<Record<string, unknown>>): 'off' | 'observe' | 'auto' {
+  const mode = block(settings['policy'])['acceptMode']
+  return mode === 'off' || mode === 'auto' ? mode : 'observe'
+}
+
+/** `retention.relayDays`（§F.2 缺省 7 天）：正整数才生效。 */
+function relayRetentionDays(settings: Readonly<Record<string, unknown>>): number {
+  const days = block(settings['retention'])['relayDays']
+  return typeof days === 'number' && Number.isInteger(days) && days > 0 ? days : 7
+}
+
+/** 当前的 prompt revision（`kv['prompt-revision']`；#32/#33 才写它，之前是 0）。 */
+function promptRevisionOf(store: Store): number {
+  const revision = store.kvGet<unknown>(PROMPT_REVISION_KEY)
+  return typeof revision === 'number' && Number.isInteger(revision) && revision >= 0 ? revision : 0
 }
 
 /** 一条错误的一行文本。 */
