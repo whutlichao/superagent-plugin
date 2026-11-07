@@ -36,7 +36,7 @@ import {
   type PanelContext
 } from 'orca'
 import { GLOSSARY_GROUPS, translate, type CopyKey } from './copy'
-import { openSettings, resetSettings, SettingsGroups } from './settings-groups'
+import { openSettingsGroup, resetSettings, SettingsGroups } from './settings-groups'
 import { problemDecisionId, reasonText, reasonsText } from './eval'
 import { executionMark, executionRow } from './execution'
 import {
@@ -79,6 +79,7 @@ import {
   type TicketListPage
 } from './protocol'
 import { TicketRow } from './rows'
+import { loadSources, openSources, resetSources, SourcePage } from './source-page'
 import { filterLabelKey, threadCells, threadColumns } from './trigger'
 import {
   BootingState,
@@ -269,6 +270,8 @@ export function setup(ctx: PanelContext): () => void {
   set(decisionDetail, null)
   set(decisionDetailError, '')
   set(decisionActing, false)
+  // Source 页同理：上一份读数与各卡的动作状态都不带进这一次。
+  resetSources()
   // 上一次挂载还在飞行的列表/详情请求作废（它们的答案不该画进这一次）。
   listRequest += 1
   decisionRequest += 1
@@ -291,7 +294,7 @@ export function setup(ctx: PanelContext): () => void {
       void load()
       // 部署页读的是另一份读数（限额、health、Router）：停留在这页时跟着推送刷新，但不重跑
       // doctor（那是人要的时候才跑的 `gh`/`lark-cli` 诊断）。
-      if (read(page) === 'settings') void openSettings()
+      if (read(page) === 'settings') void openSettingsGroup()
       // Execution 页读的是自己的那条请求：详情重读那一张，列表重读已经读到的那几页。
       if (read(page) === 'execution') {
         const focused = read(focus)
@@ -304,6 +307,8 @@ export function setup(ctx: PanelContext): () => void {
         if (focused?.page === 'eval') void loadDecisionDetail(focused.id)
         else void refreshDecisions()
       }
+      // Source 页读的是它自己的读数（新的 Trigger、drop 与 health 都会改变卡片）。
+      if (read(page) === 'source') void loadSources()
       // Trigger 页同理：详情重读这一条 Thread，列表重读已经读到的那几页；还没读过就先读一次
       // （面板可以在隐藏状态下启动，那一次的首屏读取只能由第一次可见的推送补上）。
       if (read(page) === 'trigger') {
@@ -318,17 +323,20 @@ export function setup(ctx: PanelContext): () => void {
   if (read(ctx.visible)) {
     void load()
     // 重开面板时停在 Deployment 组：这一页的读数也要读一次（渲染里不发请求）。
-    if (startPage === 'settings') void openSettings()
+    if (startPage === 'settings') void openSettingsGroup()
     // 停在 Execution：焦点指向一张工单就是详情，否则是列表。
     if (startPage === 'execution') enterExecution()
     // 停在 Eval：同理（焦点指向一条决定就是详情，否则是列表）。
     if (startPage === 'eval') enterEval()
+    // 停在 Source：读一次卡片（推送之后会各自重读）。
+    if (startPage === 'source') void openSources()
     // 停在 Trigger：焦点指向一条 Thread 就是详情，否则是当前筛选的列表。
     if (startPage === 'trigger') enterTriggers()
   } else set(phase, 'starting')
   return () => {
     disposed = true
     resetSettings()
+    resetSources()
     if (retryTimer !== null) {
       clearTimeout(retryTimer)
       retryTimer = null
@@ -864,10 +872,19 @@ function backToEval(): void {
   else void refreshDecisions()
 }
 
-/** 打开决定所在的 Thread（Trigger 页的详情；页面由 #39 填充，焦点是两页的共享契约）。 */
-function openDecisionThread(threadKey: string): void {
-  set(focus, { page: 'trigger', id: threadKey })
+/**
+ * 从别的页面打开一条 Thread（Eval 的链接、Source 的过滤行）：先切到 Trigger 页，再按焦点读
+ * 它的详情。Trigger 页自己的行动作直接进详情，不走这里。
+ */
+function openThreadFromElsewhere(threadKey: string): void {
   set(page, 'trigger')
+  openThread(threadKey)
+}
+
+/** 打开设置页并读一次当前分组（Source 页的空态与 setup 提示指向那里）。 */
+function openSettings(): void {
+  set(page, 'settings')
+  void openSettingsGroup()
 }
 
 /** 打开决定开的工单（Execution 详情）：与 Overview 的行同一个动作。 */
@@ -1669,7 +1686,7 @@ function DecisionDetailPage(props: {
           variant="outline"
           size="sm"
           icon="next"
-          onPress={() => openDecisionThread(shown.thread.key)}
+          onPress={() => openThreadFromElsewhere(shown.thread.key)}
         >
           {words(locale, 'eval.openThread')}
         </Button>
@@ -2335,6 +2352,17 @@ function PageBody(props: {
     // Sources/Eval/Execution 三组由 #42 填进同一张表，Prompts 是 #43，Deployment 是 #47。
     return <SettingsGroups locale={locale} />
   }
+  if (props.current === 'source') {
+    // Source 页自己管读取、错误态与动作（一张卡的失败不把整页换成错误态）。
+    return (
+      <SourcePage
+        locale={locale}
+        onOpenSettings={() => openSettings()}
+        onOpenTicket={(ticketId) => openTicket(ticketId)}
+        onOpenThread={(threadKey) => openThreadFromElsewhere(threadKey)}
+      />
+    )
+  }
   if (props.current === 'trigger') {
     // Trigger 页的三态在自己的 `Table` 上（§M.2：加载是 `Table loading`、读失败是行内错误 +
     // 重试），因此它不借用快照的首屏骨架——但 worker 完全不应答时仍是整页的错误态。
@@ -2438,9 +2466,10 @@ export default function Panel(): OrcaElement {
           if (!isNavPage(next)) return
           set(page, next)
           // Deployment 组、Execution 列表与 Eval 列表打开时才读（隐藏与未打开的页面不发请求，§M.6）。
-          if (next === 'settings') void openSettings()
+          if (next === 'settings') void openSettingsGroup()
           if (next === 'execution') enterExecution()
           if (next === 'eval') enterEval()
+          if (next === 'source') void openSources()
           if (next === 'trigger') enterTriggers()
         }}
       >

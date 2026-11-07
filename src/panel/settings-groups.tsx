@@ -4,7 +4,7 @@
 // 切过去时读一次」。已有的一组是 Deployment（#47）与 Prompts（#43）；Sources/Eval/Execution
 // 由 #42 填进同一张表——**新增一组就加一行**，别在页面里写 if。
 //
-// 页头导航与重开面板都调 `openSettings()`：它按当前分组读一次，于是「渲染里不发请求」
+// 页头导航与重开面板都调 `openSettingsGroup()`：它按当前分组读一次，于是「渲染里不发请求」
 // （§M.6）与「停在哪个分组都读得到」同时成立。
 import { atom, read, set, Tab, Tabs, type OrcaElement } from 'orca'
 import { translate } from './copy'
@@ -29,8 +29,8 @@ function currentGroup(): SettingsGroup {
   return isSettingsGroup(stored) ? stored : 'deployment'
 }
 
-/** 打开 Settings 页：读当前分组的那一份读数（渲染里不发请求，§M.6）。 */
-export async function openSettings(): Promise<void> {
+/** 读当前分组的那一份读数（渲染里不发请求，§M.6）：页面切换由 `panel.tsx` 负责。 */
+export async function openSettingsGroup(): Promise<void> {
   const shown = currentGroup()
   if (shown === 'prompts') await openPrompts()
   else await openDeployment()

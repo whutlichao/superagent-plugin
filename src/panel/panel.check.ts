@@ -2,7 +2,7 @@
 // 并把 worker 挂到同一个替身宿主上，所以面板的 `plugin.request` 真的会走到 worker 的处理器。
 //
 // 情景名单（§M.7）：booting、empty、healthy、needs-person、problems、paused、setup-missing、
-// long-lists、execution、trigger、deployment、prompts、zh、en、danger-confirm。
+// long-lists、execution、trigger、source、deployment、prompts、zh、en、danger-confirm。
 //
 // Overview（§M.2 的四块）由四个情景表达：empty（空态 + Source 概况）、needs-person（待人工行
 // 与它的直接动作）、problems（三类系统问题）、paused（暂停 + 恢复的二次确认）。
@@ -34,6 +34,8 @@ import type {
   PanelState,
   PanelThread,
   PanelTicket,
+  PanelSource,
+  SourcePageView,
   SystemProblem,
   ThreadDetailView,
   ThreadFilter,
@@ -417,6 +419,112 @@ function hostFor(state: PanelState, threadRows: readonly PanelThread[] = THREAD_
   }
 }
 
+/** 一张 Source 卡（check 只看渲染，读数按 §M.2 的形状给全）。 */
+function sourceCard(overrides: Partial<PanelSource> & Pick<PanelSource, 'id'>): PanelSource {
+  return {
+    title: { zh: overrides.id, en: overrides.id },
+    installed: true,
+    enabled: true,
+    state: 'ready',
+    fields: [],
+    facts: [],
+    health: [],
+    stats: { received: 0, filtered: 0 },
+    filtered: { total: 0, items: [] },
+    dropped: { total: 0, items: [] },
+    canSync: false,
+    canRefreshLabels: false,
+    ...overrides
+  }
+}
+
+/** Source 页的一份读数：一个健康实例、一个带 setup 问题的实例、一段有内容的 24 h 窗口。 */
+function sourceFixture(): SourcePageView {
+  const at = 1_700_000_000_000
+  return {
+    items: [
+      sourceCard({
+        id: 'github',
+        title: { zh: 'GitHub', en: 'GitHub' },
+        fields: [
+          {
+            key: 'repository',
+            label: { zh: '监听的仓库', en: 'Repository' },
+            value: { type: 'text', text: 'acme/widgets' }
+          },
+          {
+            key: 'observeComments',
+            label: { zh: '监听新评论', en: 'Observe comments' },
+            value: { type: 'flag', on: true }
+          }
+        ],
+        facts: [{ key: 'account', label: { zh: '当前账号', en: 'Account' }, value: '@agent-bot' }],
+        health: [{ name: 'github', state: 'ready', detail: 'polled 2 s ago' }],
+        stats: { received: 12, filtered: 1, lastAt: at },
+        filtered: {
+          total: 1,
+          items: [
+            {
+              id: 'trigger-1',
+              at,
+              actor: 'dependabot[bot]',
+              code: 'noMention',
+              text: 'Bump the parser to 3.2.0',
+              threadKey: 'github:owner/widgets#12'
+            }
+          ]
+        }
+      }),
+      sourceCard({
+        id: 'feishu',
+        title: { zh: '飞书', en: 'Feishu' },
+        state: 'setup',
+        enabled: false,
+        canSync: true,
+        canRefreshLabels: true,
+        problem: {
+          place: 'feishu',
+          code: 'cli_missing',
+          kind: 'missing',
+          detail: 'the Feishu Source has no CLI',
+          fix: 'set the Feishu CLI (lark-cli or its absolute path) on the Source page',
+          checkAgain: 'superagent setup check'
+        },
+        stats: { received: 3, filtered: 0 },
+        dropped: {
+          total: 1,
+          items: [
+            {
+              id: 'message-1',
+              at,
+              reason: 'channelGone',
+              kind: 'reply',
+              text: 'The parser rewrite is ready for review',
+              ticket: { id: 'ticket-1', title: 'Fix the login redirect' }
+            }
+          ]
+        }
+      })
+    ],
+    elsewhere: []
+  }
+}
+
+/** Source 页的情景：打开就停在这一页，两条动作的答案都确定。 */
+function sourceHost(state: PanelState) {
+  return {
+    ...hostFor(state),
+    requests: {
+      ...hostFor(state).requests,
+      sources: () => sourceFixture(),
+      'source.setEnabled': () => sourceFixture(),
+      'source.sync': () => ({ sourceId: 'feishu', allowed: 4 }),
+      'source.labels': () => ({ sourceId: 'feishu', added: 2, total: 5 })
+    },
+    storage: { 'panel.page': 'source' }
+  }
+}
+
 /** 部署页的一份读数：健康板是真的（三个条目由不同的写者 claim，与 #45 同一份形状）。 */
 function deploymentFixture(): DeploymentView {
   const board = new HealthBoard()
@@ -639,6 +747,13 @@ export default defineCheck({
   ),
   /** setup 缺失：指向 Settings 的提示。 */
   'setup-missing': hostFor(snapshot({ setupMissing: true })),
+  /** Source 页：一张健康卡、一张带 setup 问题的卡、被过滤的触发与被 drop 的消息各一条。 */
+  source: sourceHost(
+    snapshot({
+      sources: { enabled: 1, problems: 0 },
+      activity: { received: 12, evaluated: 9, accepted: 3, ignored: 6, ended: 1 }
+    })
+  ),
   /** Deployment 组：setup 问题、状态目录、限额、暂停、health、Router、doctor 与已知限制。 */
   deployment: deploymentHost(
     snapshot({

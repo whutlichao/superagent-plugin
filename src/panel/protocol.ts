@@ -622,6 +622,144 @@ export interface DoctorView {
   readonly note: string
 }
 
+/**
+ * 一段两面文案，或一段不需要翻译的数据文本（群 id、仓库名）：Source 页的字段与事实
+ * 由 kind 声明，其中选项/标签是两面的，文本值只是数据（§M.5）。
+ */
+export type PanelLocalizedText = string | { readonly zh: string; readonly en: string }
+
+/**
+ * Source 实例在面板上的生命周期（§I.1）：注册表的前六档（`missing`/`off`/`starting`/
+ * `paused`/`error`/`ready`）加上面板自己的 `setup`（等待部署检查）。`setup` 是展示档，
+ * 不是健康状态：setup 问题只挡住这个 Source 的轮询，不写成 health error（§I.4）。
+ */
+export type PanelSourceState = 'ready' | 'starting' | 'paused' | 'error' | 'setup' | 'off' | 'missing'
+
+/** `rows` 字段的一行：键列的值 + 其余列（下拉列用选项文案，文本列用原值）。 */
+export interface PanelSourceRow {
+  readonly key: string
+  readonly cells: readonly PanelLocalizedText[]
+}
+
+/** 卡片上一个只读字段的值（§M.2「字段」）：按 kind 的字段类型给面板可渲染的形状。 */
+export type PanelSourceValue =
+  | { readonly type: 'text'; readonly text: string }
+  | { readonly type: 'flag'; readonly on: boolean }
+  | { readonly type: 'choice'; readonly label: PanelLocalizedText }
+  | { readonly type: 'rows'; readonly rows: readonly PanelSourceRow[] }
+
+/** 一个字段：键、两面标签与已保存的值（只读展示；编辑在 Settings 的 Sources 组）。 */
+export interface PanelSourceField {
+  readonly key: string
+  readonly label: PanelLocalizedText
+  readonly value: PanelSourceValue
+}
+
+/** setup 派生的一条只读事实（账号、仓库）：键、两面标签与值（§I.1 `facts`）。 */
+export interface PanelSourceFact {
+  readonly key: string
+  readonly label: PanelLocalizedText
+  readonly value: PanelLocalizedText
+}
+
+/** 24 h 计数（§M.2「24 h 计数」）：收到的 Trigger、被过滤的 Trigger、最近一条的时刻。 */
+export interface PanelSourceStats {
+  readonly received: number
+  readonly filtered: number
+  /** 最近一条 Trigger 的时刻（epoch ms）；窗口里没有 Trigger 时省略。 */
+  readonly lastAt?: number
+}
+
+/** 一条被过滤的 Trigger（§I.1 的 `scope` 原因码 + §J.1 的 disposition 行）。 */
+export interface PanelFilteredTrigger {
+  readonly id: string
+  readonly at: number
+  /** 发送者（`<source>:<id>` 的 id 部分；CI 这类没有发送者的 Trigger 是空串）。 */
+  readonly actor: string
+  /** disposition 行记下的原因码（面板按 `reason.<code>` 翻译，未知码原样显示）。 */
+  readonly code: string
+  readonly text?: string
+  /** 它所属的 Thread（一条 Trigger 的 primary Thread）。 */
+  readonly threadKey?: string
+}
+
+/**
+ * 一条被 drop 的 outbox 消息（§J.1）：原因、时刻，以及它所属的 Ticket 或 Thread。
+ * 有 Ticket 就链接工单（更准），否则链接 Thread；两者都没有的行不给链接。
+ */
+export interface PanelDroppedMessage {
+  readonly id: string
+  /** drop 的时刻（epoch ms）。 */
+  readonly at: number
+  readonly reason: 'channelIgnored' | 'channelGone' | 'withdrawn'
+  readonly kind: 'acknowledgement' | 'reply' | 'notice'
+  readonly text?: string
+  readonly ticket?: { readonly id: string; readonly title: string }
+  readonly thread?: { readonly key: string; readonly title: string }
+}
+
+/** 一个 24 h 窗口的列表：前 N 条与窗口里的总数（总数大于 `items` 时面板说明只列了最近几条）。 */
+interface PanelListWindow<T> {
+  readonly total: number
+  readonly items: readonly T[]
+}
+
+/**
+ * 一张 Source 卡（§M.2 的 Source 页）：开关、字段、facts、health 条目、24 h 计数、
+ * 被过滤的 Trigger、被 drop 的消息，以及这个 Source 自己的 setup 问题（内联，不遮挡别的卡）。
+ */
+export interface PanelSource {
+  readonly id: string
+  readonly title: PanelLocalizedText
+  readonly description?: PanelLocalizedText
+  readonly installed: boolean
+  readonly enabled: boolean
+  readonly state: PanelSourceState
+  /** 配置校验失败的原因（§I.1：校验失败即禁用，配置回落到默认值）。 */
+  readonly configError?: string
+  /** 这个 Source 自己的 setup 问题（§I.4）；不归属任何 Source 的问题在 `SourcePageView.elsewhere`。 */
+  readonly problem?: DeploymentSetupIssue
+  readonly fields: readonly PanelSourceField[]
+  readonly facts: readonly PanelSourceFact[]
+  readonly health: readonly HealthDetail[]
+  readonly stats: PanelSourceStats
+  readonly filtered: PanelListWindow<PanelFilteredTrigger>
+  readonly dropped: PanelListWindow<PanelDroppedMessage>
+  /** 「立即同步」是否可用（§I.3：kind 声明了 `policy.sync` 且现在能同步）。 */
+  readonly canSync: boolean
+  /** 「刷新显示名」是否可用（kind 实现了 `refreshLabels`）。 */
+  readonly canRefreshLabels: boolean
+}
+
+/** Source 页的一份读数（§M.2）：每个配置过的 Source 一张卡，外加不归属任何 Source 的 setup 问题。 */
+export interface SourcePageView {
+  readonly items: readonly PanelSource[]
+  readonly elsewhere: readonly DeploymentSetupIssue[]
+}
+
+/** 一次动作的对象：一个 Source 实例。 */
+export interface SourceInput {
+  readonly sourceId: string
+}
+
+/** 打开/关闭一个 Source（§M.2 的主操作）：写 Source 的 `enabled`，其余配置不动。 */
+export interface SourceToggleInput extends SourceInput {
+  readonly enabled: boolean
+}
+
+/** 「立即同步」的结果（§I.3 的 `policy sync`）：同步后的允许名单条数。 */
+export interface SourceSyncOutcome {
+  readonly sourceId: string
+  readonly allowed: number
+}
+
+/** 「刷新显示名」的结果（§G.2 的 `source labels`）：新增多少、一共多少。 */
+export interface SourceLabelsOutcome {
+  readonly sourceId: string
+  readonly added: number
+  readonly total: number
+}
+
 /** 一份面板状态快照。本票只交付恒定骨架；真实读数由后续票填进同一形状。 */
 export interface PanelState {
   /** 单调递增的修订号：面板据此丢弃过期推送。 */
@@ -883,6 +1021,10 @@ export const PLUGIN_REQUESTS = [
   'setupCheck',
   'rotateToken',
   'restartRouter',
+  'sources',
+  'source.setEnabled',
+  'source.sync',
+  'source.labels',
   'prompts',
   'prompts.preview',
   'prompts.save',
@@ -1007,6 +1149,26 @@ declare module 'orca' {
      * 面板因此直接回到编辑页看到恢复后的文本。
      */
     'prompts.restore': { input: PromptRestoreRequest; output: PanelPromptsView }
+    /**
+     * Source 页的读数（§M.2）：每个配置过的 Source 一张卡——开关、字段、facts、health、
+     * 24 h 计数、被过滤的 Trigger 与被 drop 的消息。页面打开时读一次，推送后再读。
+     */
+    sources: { output: SourcePageView }
+    /**
+     * 打开/关闭一个 Source（§M.2 的主操作）：写 `source:<id>` 设置块的 `enabled` 并立即
+     * 作用到本进程的 Source 视图（下一个作业周期起按新状态判定监听与回复）。
+     */
+    'source.setEnabled': { input: SourceToggleInput; output: SourcePageView }
+    /**
+     * 「立即同步」一个 Source 的允许名单（§I.3 的 `policy.sync`，与 `policy sync` 命令同一个
+     * 驱动器）；不能同步时按 `invalid_params` 拒绝。
+     */
+    'source.sync': { input: SourceInput; output: SourceSyncOutcome }
+    /**
+     * 「刷新显示名」（§G.2 的 `source labels`）：重读 kind 的行键显示名（例如飞书群名），
+     * 写进 `source-labels:<kind>` 并报告新增条数；kind 没有这个能力时按 `invalid_params` 拒绝。
+     */
+    'source.labels': { input: SourceInput; output: SourceLabelsOutcome }
   }
 
   interface PluginPanelEvents {

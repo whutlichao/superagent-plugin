@@ -113,6 +113,15 @@ function ticketIdOf(input: unknown, name: string): string {
   return ticketId
 }
 
+/** 一次面板请求里的 `{ sourceId: string }`（Source 页的开关、立即同步与刷新显示名）。 */
+function sourceIdOf(input: unknown, name: string): string {
+  const sourceId = (input as { sourceId?: unknown } | null)?.sourceId
+  if (typeof sourceId !== 'string' || sourceId === '') {
+    throw invalidParams(`${name} needs { sourceId: string }`)
+  }
+  return sourceId
+}
+
 /** 一次面板请求里的 `{ decisionId: string }`（Eval 的详情与 dismiss）。 */
 function decisionIdOf(input: unknown, name: string): string {
   const decisionId = (input as { decisionId?: unknown } | null)?.decisionId
@@ -419,6 +428,41 @@ export default function activate(orca: OrcaWorkerApi): void {
       return { focused: true }
     } catch (error) {
       throw Object.assign(new Error(messageOf(error)), { code: codeOf(error, 'action_failed') })
+    }
+  })
+  // Source 页（§M.2）：卡片读数是读；开关写 `source:<id>`、立即同步名单、刷新显示名是写。
+  host.handleRequest('sources', async () => (await ready()).sources())
+  host.handleRequest('source.setEnabled', async (input) => {
+    const sourceId = sourceIdOf(input, 'source.setEnabled')
+    const enabled = (input as { enabled?: unknown } | null)?.enabled
+    if (typeof enabled !== 'boolean') {
+      throw invalidParams('source.setEnabled needs { sourceId: string, enabled: boolean }')
+    }
+    const booted = await ready()
+    try {
+      return booted.setSourceEnabled(sourceId, enabled)
+    } catch (error) {
+      throw Object.assign(new Error(messageOf(error)), { code: codeOf(error, 'invalid_params') })
+    }
+  })
+  host.handleRequest('source.sync', async (input) => {
+    const sourceId = sourceIdOf(input, 'source.sync')
+    const booted = await ready()
+    try {
+      const outcome = await booted.syncSource(sourceId)
+      return { sourceId, allowed: outcome.allowed }
+    } catch (error) {
+      throw Object.assign(new Error(messageOf(error)), { code: codeOf(error, 'invalid_params') })
+    }
+  })
+  host.handleRequest('source.labels', async (input) => {
+    const sourceId = sourceIdOf(input, 'source.labels')
+    const booted = await ready()
+    try {
+      const outcome = await booted.refreshSourceLabels(sourceId)
+      return { sourceId, added: outcome.added, total: outcome.total }
+    } catch (error) {
+      throw Object.assign(new Error(messageOf(error)), { code: codeOf(error, 'invalid_params') })
     }
   })
   // Deployment 组（§M.3）：读数一次读完；doctor、重跑探针与两个破坏性动作各一条请求。

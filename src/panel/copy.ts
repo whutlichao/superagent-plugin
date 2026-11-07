@@ -412,6 +412,74 @@ export const COPY = {
     en: 'The token value is never shown here, and never logged.'
   },
 
+  // ---- Source 页（§M.2）：每 Source 一张卡、24 h 计数、被过滤与被 drop 的列表、四个动作 ----
+  'source.intro': {
+    zh: '每个来源一张卡：开关、配置、派生事实、健康、24 小时计数，以及最近被过滤的触发与被丢弃的消息。',
+    en: 'One card per Source: its switch, configuration, derived facts, health, 24-hour counts, and the Triggers it filtered or the messages it dropped recently.'
+  },
+  'source.empty': { zh: '还没有配置任何来源。', en: 'No Source is configured yet.' },
+  'source.emptyHint': {
+    zh: '去设置页添加 GitHub 或飞书来源；每加一个，这里就多一张卡。',
+    en: 'Add a GitHub or Feishu Source on the Settings page; each one appears here as its own card.'
+  },
+  'source.checkedAgain': { zh: '已重跑部署检查。', en: 'Setup was checked again.' },
+  'source.received': { zh: '24 小时到达 {count}', en: '{count} received in 24 h' },
+  'source.filtered': { zh: '被过滤 {count}', en: '{count} filtered' },
+  'source.latest': { zh: '最近', en: 'Latest' },
+  'source.fields': { zh: '配置', en: 'Configuration' },
+  'source.facts': { zh: '派生事实', en: 'Derived facts' },
+  'source.health': { zh: '健康', en: 'Health' },
+  'source.notInstalled': {
+    zh: '这个来源的 kind 没有安装；存过的配置原样保留。',
+    en: "This Source's kind is not installed; its saved configuration is kept as it is."
+  },
+  'source.configInvalid': {
+    zh: '配置无效，已禁用：{detail}',
+    en: 'The configuration is invalid, so the Source is disabled: {detail}'
+  },
+  'source.filteredTitle': { zh: '被过滤的触发', en: 'Filtered triggers' },
+  'source.filteredHint': {
+    zh: '最近 24 小时内被来源或准入过滤的触发，每行给原因码。',
+    en: 'Triggers filtered by the Source or the admission in the last 24 hours; each row names its reason code.'
+  },
+  'source.droppedTitle': { zh: '被丢弃的消息', en: 'Dropped messages' },
+  'source.droppedHint': {
+    zh: '最近 24 小时内没能送达的消息：原因，以及它所属的工单或线程。',
+    en: 'Messages that could not be delivered in the last 24 hours: why, and the Ticket or Thread they belonged to.'
+  },
+  'source.showingLatest': {
+    zh: '只列最近 {shown} 条，窗口内共 {total} 条。',
+    en: 'Showing the latest {shown} of {total} in this window.'
+  },
+  'source.sync': { zh: '立即同步', en: 'Sync now' },
+  'source.syncing': { zh: '正在同步…', en: 'Syncing…' },
+  'source.synced': { zh: '已同步：允许名单 {count} 人。', en: 'Synced: {count} allowed.' },
+  'source.refreshLabels': { zh: '刷新显示名', en: 'Refresh labels' },
+  'source.refreshingLabels': { zh: '正在刷新…', en: 'Refreshing…' },
+  'source.labelsRefreshed': {
+    zh: '显示名已更新：新增 {added}，共 {total}。',
+    en: 'Labels refreshed: {added} added, {total} total.'
+  },
+  'source.checked': { zh: '检查完成。', en: 'The check finished.' },
+  'source.actionFailed': { zh: '动作没有成功：{reason}', en: 'The action did not succeed: {reason}' },
+  'source.enable': { zh: '运行来源：{name}', en: 'Run Source: {name}' },
+  'source.openThread': { zh: '打开线程', en: 'Open the Thread' },
+  'source.drop.channelIgnored': {
+    zh: '来源已不再监听这个对话',
+    en: 'The Source no longer listens to this conversation'
+  },
+  'source.drop.channelGone': {
+    zh: '对话已无法接收消息',
+    en: 'The conversation can no longer receive messages'
+  },
+  'source.drop.withdrawn': {
+    zh: '工单已停止，消息被撤回',
+    en: 'The Ticket was stopped, so the message was withdrawn'
+  },
+  'field.on': { zh: '开', en: 'On' },
+  'field.off': { zh: '关', en: 'Off' },
+  'field.queueJoiner': { zh: '、', en: ', ' },
+
   // ---- 已知限制（§A.3 的十一项近似；面板 Limitations 段与 README 同源同措辞）----
   'deployment.limitations': { zh: '已知限制', en: 'Limitations' },
   'limitation.intro': {
@@ -1062,7 +1130,7 @@ export const GLOSSARY_GROUPS: readonly GlossaryGroup[] = [
 export type CopyValues = Readonly<Record<string, string | number>>
 
 /** 该语言是否是中文（BCP-47 的 `zh`、`zh-CN`、`zh-Hans` 都算）。 */
-function isChinese(locale: string): boolean {
+export function isChinese(locale: string): boolean {
   return /^zh(?:[-_]|$)/i.test(locale)
 }
 
