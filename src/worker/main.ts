@@ -312,6 +312,44 @@ export default function activate(orca: OrcaWorkerApi): void {
     await booted.restartRouter()
     return booted.deployment().router
   })
+  // Settings 页（§M.3、§K.8）：读四个可编辑组、保存一个块（来源恒为 `panel`，面板不能选来源）、
+  // 读版本历史与恢复、手动同步名单。保存走 boot 里同一个 `PUT settings/:block` handler，
+  // 所以账号类字段的写前检查（#44）与 CLI 是同一条路径。
+  host.handleRequest('settings.read', async () => (await ready()).settingsView())
+  host.handleRequest('settings.save', async (input) => {
+    const request = (input ?? {}) as { block?: unknown; revision?: unknown; value?: unknown }
+    if (typeof request.block !== 'string' || request.block === '') {
+      throw invalidParams('settings.save needs { block: string }')
+    }
+    if (
+      typeof request.revision !== 'number' ||
+      !Number.isInteger(request.revision) ||
+      request.revision < 0
+    ) {
+      throw invalidParams('settings.save needs { revision: a non-negative integer }')
+    }
+    if (!Object.prototype.hasOwnProperty.call(request, 'value')) {
+      throw invalidParams('settings.save needs { value }')
+    }
+    return (await ready()).settingsSave({
+      block: request.block,
+      revision: request.revision,
+      value: request.value
+    })
+  })
+  host.handleRequest('settings.history', async () => (await ready()).settingsHistory())
+  host.handleRequest('policy.sync', async (input) => {
+    const source = (input as { source?: unknown } | null)?.source
+    if (typeof source !== 'string' || source === '') {
+      throw invalidParams('policy.sync needs { source: string }')
+    }
+    const booted = await ready()
+    try {
+      return await booted.policySyncView(source)
+    } catch (error) {
+      throw Object.assign(new Error(messageOf(error)), { code: codeOf(error, 'not_syncable') })
+    }
+  })
 
   host.register(COMMANDS.pause, () => {
     eventually((booted) => booted.setPaused(true), (message) => host.log(message))

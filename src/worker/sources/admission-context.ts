@@ -148,11 +148,11 @@ export interface AdmissionSettings {
   readonly timeoutMs: number
 }
 
-/** 缺省页数：一次评估最多读 5 页（§H.22 的 `admissionContextMaxPages`）。 */
-export const DEFAULT_ADMISSION_PAGES = 5
+/** 缺省页数：一次评估最多读 10 页（§H.22 的 `admissionContextMaxPages`，与面板显示的缺省值同一个数）。 */
+export const DEFAULT_ADMISSION_PAGES = 10
 
-/** 缺省窗口时限：30 s（§H.22 的 `admissionContextTimeoutMs`）。 */
-export const DEFAULT_ADMISSION_TIMEOUT_MS = 30_000
+/** 缺省窗口时限：15 s（§H.22 的 `admissionContextTimeoutMs`，与面板显示的缺省值同一个数）。 */
+export const DEFAULT_ADMISSION_TIMEOUT_MS = 15_000
 
 /** 页数上限：再多就不叫「有界」窗口了。 */
 export const ADMISSION_PAGE_LIMIT = 20

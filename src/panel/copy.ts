@@ -803,7 +803,183 @@ export const COPY = {
     zh: '这条人的触发还没有可用的 worker 回答。等 worker 报告，或向报告了 waiting 的 worker 要一次状态；普通进展不能被改标成回答。',
     en: "No worker answer is ready for this human trigger. Wait for the worker's report, or request one with the ticket status command, which acts only on a worker that reported waiting; ordinary progress cannot be relabelled as an answer."
   },
-  'userError.noChannel': { zh: '该工单或触发没有可回复的渠道', en: 'No reply channel for this ticket or trigger' }
+  'userError.noChannel': { zh: '该工单或触发没有可回复的渠道', en: 'No reply channel for this ticket or trigger' },
+
+  // ---- Settings 页（§M.3、§K.8）：五组框架、每组保存栏与历史 ----
+  'settings.intro': {
+    zh: '每组一个保存栏：没有改动时不占空间。保存成功的改动对 Policy 立刻生效；其余块在插件重启后生效。',
+    en: 'One save bar per group; it takes no space while the draft is empty. Policy changes take effect at once; the other blocks take effect after the plugin restarts.'
+  },
+  'settings.group.sources': { zh: '来源', en: 'Sources' },
+  'settings.group.eval': { zh: '评估', en: 'Eval' },
+  'settings.group.execution': { zh: '执行', en: 'Execution' },
+  'settings.group.prompts': { zh: '提示词', en: 'Prompts' },
+  'settings.group.deployment': { zh: '部署', en: 'Deployment' },
+  'settings.loadFailed': {
+    zh: '设置读不到：{reason}',
+    en: 'The settings could not be read: {reason}'
+  },
+  'settings.retry': { zh: '重试', en: 'Retry' },
+  'settings.saveRestart': { zh: '已保存 · 重启插件后生效', en: 'Saved · takes effect after the plugin restarts' },
+  'settings.prompts.placeholder': {
+    zh: '提示词组由 #43 提供（团队文本、override、全文 diff 与 Skills）。这里只保留组位。',
+    en: 'The Prompts group is delivered by #43 (team text, overrides, the full-prompt diff and Skills). This is only the slot.'
+  },
+  'settings.rows.add': { zh: '添加一行', en: 'Add row' },
+  'settings.rows.remove': { zh: '删除这一行', en: 'Remove this row' },
+  'settings.rows.empty': { zh: '还没有行', en: 'No rows yet' },
+  'settings.fact.empty': { zh: '（未知）', en: '(unknown)' },
+
+  // Sources 组
+  'settings.sources.intro': {
+    zh: '每个 Source 一张卡：开关、配置字段与只读的部署事实。改完保存；轮询在插件重启后按新配置跑。',
+    en: 'One card per Source: the switch, its configuration fields and the read-only deployment facts. Save when done; polling follows the new configuration after the plugin restarts.'
+  },
+  'settings.sources.enabled': { zh: '启用这个来源', en: 'Enable this Source' },
+  'settings.sources.sync': { zh: '立即同步', en: 'Sync now' },
+  'settings.sources.syncing': { zh: '正在同步…', en: 'Syncing…' },
+  'settings.sources.syncDone': {
+    zh: '已同步：新增 {added}，移除 {removed}',
+    en: 'Synced: {added} added, {removed} removed'
+  },
+  'settings.sources.syncHint': {
+    zh: '名单同步会以 origin=sync 写回 Policy 块，与面板保存同一条路径。',
+    en: 'The list sync writes the Policy block back with origin=sync, the same path as a panel save.'
+  },
+  'settings.sources.configInvalid': {
+    zh: '配置无效，已禁用：{reason}',
+    en: 'The configuration is invalid, so this Source is disabled: {reason}'
+  },
+  'settings.sources.state.ready': { zh: '就绪', en: 'Ready' },
+  'settings.sources.state.starting': { zh: '启动中', en: 'Starting' },
+  'settings.sources.state.paused': { zh: '已暂停', en: 'Paused' },
+  'settings.sources.state.error': { zh: '有错误', en: 'Error' },
+  'settings.sources.state.off': { zh: '已关闭', en: 'Off' },
+  'settings.sources.state.missing': { zh: '未安装', en: 'Not installed' },
+
+  // Eval 组
+  'settings.eval.intro': {
+    zh: 'Policy 决定谁能发起工作。版本是内容哈希：保存后立刻生效，历史里能看到受影响的工单。',
+    en: 'The Policy decides who may start work. Its version is a content hash: a save takes effect at once, and the history shows which tickets it affected.'
+  },
+  'settings.eval.policyVersion': { zh: 'Policy 版本', en: 'Policy version' },
+  'settings.eval.acceptMode': { zh: '接受模式', en: 'Accept mode' },
+  'settings.eval.acceptMode.off': { zh: '关闭（只接受显式请求）', en: 'Off (explicit requests only)' },
+  'settings.eval.acceptMode.observe': { zh: '观察（推断的只记录不接单）', en: 'Observe (inferred are recorded, not accepted)' },
+  'settings.eval.acceptMode.auto': { zh: '自动（推断的正向即接单）', en: 'Auto (a positive inferred outcome is accepted)' },
+  'settings.eval.model': { zh: '评估模型', en: 'Eval model' },
+  'settings.eval.modelHint': { zh: '留空表示用 Router 的模型。', en: 'Leave it empty to use the Router model.' },
+  'settings.eval.timeout': { zh: '评估超时（秒）', en: 'Eval timeout (seconds)' },
+  'settings.eval.rules': { zh: '规则', en: 'Rules' },
+  'settings.eval.rulesHint': {
+    zh: '每条启用的规则都会恰好判定一次；规则之间没有优先级。',
+    en: 'Every enabled rule is judged exactly once; rules carry no priority between them.'
+  },
+  'settings.eval.addRule': { zh: '添加规则', en: 'Add rule' },
+  'settings.eval.removeRule': { zh: '删除规则 {id}', en: 'Remove rule {id}' },
+  'settings.eval.ruleId': { zh: '规则 id', en: 'Rule id' },
+  'settings.eval.ruleName': { zh: '规则名称', en: 'Rule name' },
+  'settings.eval.ruleZh': { zh: '规则说明（中文）', en: 'Rule instruction (Chinese)' },
+  'settings.eval.ruleEn': { zh: '规则说明（英文）', en: 'Rule instruction (English)' },
+  'settings.eval.enabled': { zh: '启用这条规则', en: 'Enable this rule' },
+  'settings.eval.perSource': { zh: '每个 Source', en: 'On each Source' },
+  'settings.eval.admission': { zh: '准入表', en: 'Admission' },
+  'settings.eval.admissionHint': {
+    zh: '未点名的格子只在该 Source 观察全部消息时可用；不可用的格子按「不看」读。',
+    en: 'The unaddressed cells work only while that Source observes every message; an unavailable cell reads as Ignore.'
+  },
+  'settings.admission.listedUnaddressed': { zh: '名单内 · 未点名', en: 'Listed · not addressed' },
+  'settings.admission.unlistedAddressed': { zh: '名单外 · 点名', en: 'Not listed · addressed' },
+  'settings.admission.unlistedUnaddressed': { zh: '名单外 · 未点名', en: 'Not listed · not addressed' },
+  'settings.admission.explicit': { zh: '显式', en: 'Explicit' },
+  'settings.admission.inferred': { zh: '推断', en: 'Inferred' },
+  'settings.admission.ignore': { zh: '不看', en: 'Ignore' },
+
+  // Execution 组
+  'settings.execution.intro': {
+    zh: 'worker 怎么起、在哪儿工作、哪些命令不许跑。这里的值在插件重启后生效。',
+    en: 'How workers start, where they work and which commands they may not run. These values take effect after the plugin restarts.'
+  },
+  'settings.execution.agent': { zh: 'Agent', en: 'Agent' },
+  'settings.execution.model': { zh: '模型', en: 'Model' },
+  'settings.execution.modelHint': { zh: '留空表示用 Agent 的默认模型。', en: "Leave it empty to use the agent's default model." },
+  'settings.execution.effort': { zh: 'Effort', en: 'Effort' },
+  'settings.execution.effortHint': { zh: '留空表示用 Agent 的默认 effort。', en: "Leave it empty to use the agent's default effort." },
+  'settings.execution.maxWorkers': { zh: '并发上限', en: 'Max workers' },
+  'settings.execution.baseRepo': { zh: '基础仓库', en: 'Base repository' },
+  'settings.execution.baseRepoHint': {
+    zh: '必须能在 orca repo list 里找到；worktree 从这里创建。',
+    en: 'It must appear in orca repo list; ticket worktrees are created from it.'
+  },
+  'settings.execution.baseRepoManual': {
+    zh: '读不到 orca repo list，手工输入选择器（path:<路径> / name:<名字> / id:<id>）。',
+    en: 'orca repo list could not be read; type a selector (path:<path> / name:<name> / id:<id>).'
+  },
+  'settings.execution.baseBranch': { zh: '基础分支', en: 'Base branch' },
+  'settings.execution.branchPrefix': { zh: '分支前缀', en: 'Branch prefix' },
+  'settings.execution.prepare': { zh: '准备命令', en: 'Prepare command' },
+  'settings.execution.prepareHint': {
+    zh: 'checkout 之后执行；${DSH_SUPERAGENT_…} 在运行时按变量表逐值替换，插入菜单只写变量名，不拼未转义的文本。',
+    en: 'Runs after checkout; ${DSH_SUPERAGENT_…} is replaced value by value at run time. The insert menu writes the variable name only, never unescaped text.'
+  },
+  'settings.execution.variable': { zh: '变量', en: 'Variable' },
+  'settings.execution.insertVariable': { zh: '插入变量', en: 'Insert variable' },
+  'settings.execution.insert': { zh: '插入', en: 'Insert' },
+  'settings.execution.blockedCommands': { zh: '被禁命令', en: 'Blocked commands' },
+  'settings.execution.blockedHint': {
+    zh: 'shim 只挡手滑，不是安全边界（H.11）。',
+    en: 'The shim stops slips; it is not a security boundary (H.11).'
+  },
+  'settings.execution.addCommand': { zh: '添加命令', en: 'Add command' },
+  'settings.execution.inlineLimit': { zh: '内联上限（字符）', en: 'Inline limit (characters)' },
+  'settings.execution.worktreeRetention': { zh: 'worktree 保留策略', en: 'Worktree retention' },
+  'settings.execution.retentionKeep': { zh: '保留（不自动删除）', en: 'Keep (never deleted automatically)' },
+  'settings.execution.retentionOnEnd': { zh: '工单结束时删除', en: 'Delete when the ticket ends' },
+  'settings.execution.confirmDelivery': { zh: '投递前要人确认', en: 'Ask before delivering' },
+
+  // Deployment 组的机器限额（#42 起可编辑）
+  'settings.limits.title': { zh: '机器限额', en: 'Machine limits' },
+  'settings.limits.intro': {
+    zh: '四个旋钮在同一份版本历史里；保存后重启插件生效，部署页的读数显示正在生效的值。',
+    en: 'The four knobs share one version history. A save takes effect after the plugin restarts; the Deployment readout shows the value in force.'
+  },
+  'settings.limits.promptMaxChars': { zh: '提示词上限（字符）', en: 'Prompt limit (characters)' },
+  'settings.limits.pages': { zh: '一次评估的语境页数', en: 'Context pages per Eval' },
+  'settings.limits.timeoutMs': { zh: '一次语境读取的时限（毫秒）', en: 'Context timeout (ms)' },
+  'settings.limits.retentionDays': { zh: '保留天数', en: 'Retention (days)' },
+
+  // 历史（§K.5、§K.8）
+  'settings.history.title': { zh: '历史', en: 'History' },
+  'settings.history.intro': {
+    zh: '每次保存的来源、版本与受影响的工单。恢复会把那一版再保存一次，走同一条保存路径。',
+    en: "Every save's origin, version and affected tickets. Restore saves that version once more through the same path."
+  },
+  'settings.history.empty': { zh: '还没有保存过设置。', en: 'Nothing has been saved yet.' },
+  'settings.history.revision': { zh: '版本', en: 'Revision' },
+  'settings.history.block': { zh: '设置块', en: 'Block' },
+  'settings.history.origin': { zh: '来源', en: 'Origin' },
+  'settings.history.at': { zh: '时间', en: 'When' },
+  'settings.history.affected': { zh: '受影响工单', en: 'Affected tickets' },
+  'settings.history.restore': { zh: '恢复这一版', en: 'Restore this version' },
+  'settings.history.restoring': { zh: '正在恢复…', en: 'Restoring…' },
+  'settings.history.restored': { zh: '已恢复为第 {revision} 版', en: 'Restored version {revision}' },
+  'settings.history.loadFailed': { zh: '历史读不到：{reason}', en: 'The history could not be read: {reason}' },
+  'settings.origin.panel': { zh: '面板', en: 'Panel' },
+  'settings.origin.tool': { zh: 'CLI', en: 'CLI' },
+  'settings.origin.sync': { zh: '名单同步', en: 'List sync' },
+  'settings.origin.operator': { zh: '操作者', en: 'Operator' },
+  'draft.saveBarTitle': { zh: '这次保存没有完成', en: 'The save did not go through' },
+  'settings.fieldInvalid': { zh: '这个字段不合法', en: 'This field is invalid' },
+  'settings.eval.newRule': { zh: '新规则', en: 'New rule' },
+  'settings.eval.admissionUnavailable': {
+    zh: '该行没有观察全部消息，这一格按「不看」读。',
+    en: 'This row does not observe every message, so this cell reads as Ignore.'
+  },
+  'settings.history.affectedTickets': { zh: '受影响工单：{tickets}', en: 'Affected tickets: {tickets}' },
+  'settings.history.confirmRestore': {
+    zh: '把第 {revision} 版再保存一次？',
+    en: 'Save version {revision} again?'
+  }
 
 } as const satisfies Readonly<Record<string, CopyPair>>
 

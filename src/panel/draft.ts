@@ -64,6 +64,47 @@ export function changeCount(saved: unknown, value: unknown): number {
   return changed
 }
 
+/**
+ * 把一个值摊平成「路径 → 叶子」：对象递归，数组与标量算叶子。
+ * 数组按整体算一处改动（增删一行是一次改动，不按元素拆开数）。
+ */
+export function flattenLeaves(value: unknown, prefix = ''): Record<string, unknown> {
+  if (!isRecord(value)) return { [prefix]: value }
+  const leaves: Record<string, unknown> = {}
+  for (const [key, item] of Object.entries(value)) {
+    const path = prefix === '' ? key : `${prefix}.${key}`
+    Object.assign(leaves, flattenLeaves(item, path))
+  }
+  return leaves
+}
+
+/**
+ * 两个值之间的叶子改动数（保存栏的「N changes」）：设置组是一棵有嵌套的对象，
+ * 按顶层键数会把「改了三格准入表」显示成一处改动，而人要知道真正改了几个值。
+ */
+export function changedLeafCount(saved: unknown, value: unknown): number {
+  const before = flattenLeaves(saved)
+  const after = flattenLeaves(value)
+  const keys = new Set([...Object.keys(before), ...Object.keys(after)])
+  let changed = 0
+  for (const key of keys) {
+    if (!same(before[key], after[key])) changed += 1
+  }
+  return changed
+}
+
+/**
+ * 一个组里真正改了的块名（多个块的组按块保存）：顺序按草稿里的键序。
+ * 只用于「该发几次保存」，不参与「N changes」的计数。
+ */
+export function changedBlocks(
+  saved: Readonly<Record<string, unknown>>,
+  value: Readonly<Record<string, unknown>>
+): string[] {
+  const keys = new Set([...Object.keys(saved), ...Object.keys(value)])
+  return [...keys].filter((key) => !same(saved[key], value[key]))
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
 }
@@ -140,12 +181,9 @@ export function barShown(bar: SaveBar): bar is Extract<SaveBar, { visible: true 
   return bar.visible
 }
 
-/** 按状态给出保存栏的文字与按钮状态（§M.3 的五条）。 */
-export function saveBar<V>(locale: string, state: DraftState<V>, saved?: V): SaveBar {
-  if (state.phase === 'clean') return { visible: false }
-  const dirty = state.draft !== undefined && (saved === undefined || !same(state.draft.value, saved))
-  const notice = state.notice
-  if (notice?.kind === 'failed') {
+/** 一条 notice 的保存栏（失败 / 字段级 invalid / 冲突四种措辞只在这里写一次）。 */
+function noticeBar(locale: string, notice: DraftNotice, dirty: boolean): SaveBar {
+  if (notice.kind === 'failed') {
     return {
       visible: true,
       error: translate(locale, 'draft.failed', { error: notice.error }),
@@ -154,7 +192,7 @@ export function saveBar<V>(locale: string, state: DraftState<V>, saved?: V): Sav
       canSave: dirty
     }
   }
-  if (notice?.kind === 'invalid') {
+  if (notice.kind === 'invalid') {
     const fields = notice.issues.map((issue) => issue.path).join(translate(locale, 'draft.listSeparator'))
     return {
       visible: true,
@@ -164,23 +202,77 @@ export function saveBar<V>(locale: string, state: DraftState<V>, saved?: V): Sav
       canSave: dirty
     }
   }
-  if (notice?.kind === 'conflict') {
-    return {
-      visible: true,
-      error: translate(locale, 'draft.conflict', { revision: notice.revision }),
-      dirty,
-      busy: false,
-      canSave: false,
-      reload: true
-    }
+  return {
+    visible: true,
+    error: translate(locale, 'draft.conflict', { revision: notice.revision }),
+    dirty,
+    busy: false,
+    canSave: false,
+    reload: true
   }
+}
+
+/** 按状态给出保存栏的文字与按钮状态（§M.3 的五条）。 */
+export function saveBar<V>(locale: string, state: DraftState<V>, saved?: V): SaveBar {
+  if (state.phase === 'clean') return { visible: false }
+  const dirty = state.draft !== undefined && (saved === undefined || !same(state.draft.value, saved))
+  const notice = state.notice
+  if (notice !== undefined) return noticeBar(locale, notice, dirty)
   if (state.phase === 'saving') {
     return { visible: true, status: translate(locale, 'draft.saving'), dirty, busy: true, canSave: false }
   }
   if (state.phase === 'awaitingRevision') {
     return { visible: true, status: translate(locale, 'draft.saved'), dirty: false, busy: true, canSave: false }
   }
-  const count = state.draft ? changeCount(state.draft.base, state.draft.value) : 0
+  const count = state.draft ? changedLeafCount(state.draft.base, state.draft.value) : 0
+  const key: CopyKey = count === 1 ? 'draft.changeOne' : 'draft.changes'
+  return { visible: true, status: translate(locale, key, { count }), dirty, busy: false, canSave: dirty }
+}
+
+/** 一个组里的一块的草稿与它当前的已保存值。 */
+export interface GroupDraftEntry<V> {
+  readonly state: DraftState<V>
+  readonly saved: V
+}
+
+/**
+ * 一个组的保存栏：Sources 这类组一次覆盖多个块（每个实例一个块），但设计要求「每组一个
+ * 保存栏」。合成规则：保存中/等修订优先显示进度；其次第一条 notice（失败/字段级/冲突）；
+ * 否则数所有块的叶子改动。没有草稿与 notice 时不占空间。
+ */
+export function groupSaveBar<V>(locale: string, entries: readonly GroupDraftEntry<V>[]): SaveBar {
+  if (entries.length === 0) return { visible: false }
+  const saving = entries.find((entry) => entry.state.phase === 'saving')
+  if (saving !== undefined) {
+    return {
+      visible: true,
+      status: translate(locale, 'draft.saving'),
+      dirty: true,
+      busy: true,
+      canSave: false
+    }
+  }
+  const waiting = entries.find((entry) => entry.state.phase === 'awaitingRevision')
+  if (waiting !== undefined) {
+    return {
+      visible: true,
+      status: translate(locale, 'draft.saved'),
+      dirty: false,
+      busy: true,
+      canSave: false
+    }
+  }
+  const dirty = entries.some(
+    (entry) => entry.state.draft !== undefined && !same(entry.state.draft.value, entry.saved)
+  )
+  const notice = entries.map((entry) => entry.state.notice).find((entry) => entry !== undefined)
+  if (notice !== undefined) return noticeBar(locale, notice, dirty)
+  const count = entries.reduce(
+    (sum, entry) =>
+      sum + (entry.state.draft === undefined ? 0 : changedLeafCount(entry.state.draft.base, entry.state.draft.value)),
+    0
+  )
+  if (count === 0 && !dirty) return { visible: false }
   const key: CopyKey = count === 1 ? 'draft.changeOne' : 'draft.changes'
   return { visible: true, status: translate(locale, key, { count }), dirty, busy: false, canSave: dirty }
 }

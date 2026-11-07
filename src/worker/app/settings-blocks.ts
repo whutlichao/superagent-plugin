@@ -10,24 +10,52 @@
 // 本模块不读存储、不跑子进程、不认识 HTTP。
 import { array, boolean, enumOf, number, object, string } from '../infra/schema.ts'
 import type { SafeParse, SchemaIssue } from '../infra/schema.ts'
+import {
+  ADMISSION_PAGE_LIMIT,
+  ADMISSION_TIMEOUT_MAX_MS,
+  ADMISSION_TIMEOUT_MIN_MS
+} from '../sources/admission-context.ts'
 
 /** 三个固定块的名字（`--block` 的候选，`source:<id>` 另算）。 */
-export const BASE_SETTINGS_BLOCKS = ['policy', 'eval', 'executor'] as const
+export const BASE_SETTINGS_BLOCKS = ['policy', 'eval', 'executor', 'limits'] as const
 
 /** 一个基块名。 */
 export type SettingsBaseBlock = (typeof BASE_SETTINGS_BLOCKS)[number]
+
+/** 机器限额块的名字（§M.3 Deployment 组）：唯一一处字面量，部署视图与写入器都读它。 */
+export const MACHINE_LIMITS_BLOCK = 'limits' as const
 
 /** 一个块名：策略块名，或 `source:<id>`。 */
 export type SettingsBlockName = string
 
 /**
- * `eval` 块（§K.7 的评估窗口与超时）：页数/超时是部署设置（§H.22），`timeoutSeconds` 是
- * §K.7 的 Eval 截止时间。全部可选——面板只提交改动的字段时其余保留。
+ * `eval` 块（§K.7 的评估超时）：`timeoutSeconds` 是 §K.7 的 Eval 截止时间。全部可选——
+ * 面板只提交改动的字段时其余保留。机器限额（语境页数与时限）不在这里：它们在 `limits` 块
+ * （§M.3 Deployment 组），一个旋钮只有一个写者。
  */
 export const EVAL_BLOCK_SCHEMA = object({
-  admissionContextMaxPages: number().int().min(1).max(20).optional(),
-  admissionContextTimeoutMs: number().int().min(1_000).max(600_000).optional(),
   timeoutSeconds: number().int().min(30).max(3_600).optional()
+}).strict()
+
+/**
+ * 机器限额块（§M.3 Deployment 组、§H.12、§H.22、§L.6、§D.2 要点 5）：
+ *
+ * - `promptMaxChars`：保存的提示词配置总量上限（§L.6）；
+ * - `admissionContextMaxPages` / `admissionContextTimeoutMs`：一次评估语境读取的页数与时限；
+ * - `retention.days`：Trigger/Decision 等旧记录的保留天数。
+ *
+ * 四个都可选：面板只提交改动过的值，其余沿用缺省（200 000 / 10 / 15 000 / 90）。上下界就是
+ * 运行时的上下界（`sources/admission-context.ts` 的常量），越界的值不能存进来。
+ */
+export const LIMITS_BLOCK_SCHEMA = object({
+  promptMaxChars: number().int().min(1).max(2_000_000).optional(),
+  admissionContextMaxPages: number().int().min(1).max(ADMISSION_PAGE_LIMIT).optional(),
+  admissionContextTimeoutMs: number()
+    .int()
+    .min(ADMISSION_TIMEOUT_MIN_MS)
+    .max(ADMISSION_TIMEOUT_MAX_MS)
+    .optional(),
+  retention: object({ days: number().int().min(1).max(3_650).optional() }).strict().optional()
 }).strict()
 
 /**
@@ -131,7 +159,11 @@ export function validateSettingsBlock(
       // （它仍然 strict，未知键照样拒绝）。
       return options.policy === undefined ? { success: true, data: value } : options.policy(value)
     }
-    return block.name === 'eval' ? EVAL_BLOCK_SCHEMA.safeParse(value) : EXECUTOR_BLOCK_SCHEMA.safeParse(value)
+    return block.name === 'eval'
+      ? EVAL_BLOCK_SCHEMA.safeParse(value)
+      : block.name === MACHINE_LIMITS_BLOCK
+        ? LIMITS_BLOCK_SCHEMA.safeParse(value)
+        : EXECUTOR_BLOCK_SCHEMA.safeParse(value)
   }
   const base = validateSourceBlock(value, options.sourceConfig?.(block.id))
   if (!base.success) return base

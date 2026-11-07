@@ -582,8 +582,15 @@ function LimitationsSection(props: { readonly locale: string }): OrcaElement {
   )
 }
 
-/** Deployment 组：读不到时是错误态，读到之前是加载态；读到之后按块渲染。 */
-export function Deployment(props: { readonly locale: string }): OrcaElement {
+/**
+ * Deployment 组：读不到时是错误态，读到之前是加载态；读到之后按块渲染。
+ * `limitsEditor` 由 Settings 页传入（#42 起机器限额可编辑，走同一套保存栏）；
+ * 不传时保留 #47 的只读事实表（直接挂载这一组的测试仍读同一份读数）。
+ */
+export function Deployment(props: {
+  readonly locale: string
+  readonly limitsEditor?: OrcaNode
+}): OrcaElement {
   const locale = props.locale
   const view = read(deployment)
   const stage = read(phase)
@@ -611,7 +618,7 @@ export function Deployment(props: { readonly locale: string }): OrcaElement {
       </Section>
       <SetupSection locale={locale} view={view} />
       <StateDirectory locale={locale} view={view} />
-      <Limits locale={locale} view={view} />
+      {props.limitsEditor ?? <Limits locale={locale} view={view} />}
       <PausedSwitch locale={locale} view={view} />
       <HealthSection locale={locale} view={view} />
       <RouterSection locale={locale} view={view} />

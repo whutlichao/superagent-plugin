@@ -38,7 +38,12 @@ test('the panel declares the state snapshot, the Overview actions, the Execution
     'doctor',
     'setupCheck',
     'rotateToken',
-    'restartRouter'
+    'restartRouter',
+    // Settings 页（#42）：四个可编辑组的读数、块保存、版本历史与手动名单同步。
+    'settings.read',
+    'settings.save',
+    'settings.history',
+    'policy.sync'
   ])
 })
 
