@@ -169,7 +169,7 @@ stateDir 解析顺序 `--state-dir` ＞ `$ORCA_SUPERAGENT_STATE_DIR` ＞ 默认�
 | `superagent admin rotate-token` | 轮换主 token（破坏性，要 `--yes`；面板里要二次确认） |
 | `superagent source labels <id>` | 刷新来源的显示名 |
 
-Router 与 worker 用的命令（`route`、`eval`、`eval-read`、`eval-decide`、`report`、`reply`、`ack`、`ticket …`、`trigger …`、`thread …`、`settings …`、`prompts …`、`read …`）在命令表里占住最终名字与参数，逐条见设计 §G.2；尚未接线的命令返回固定 `unavailable`（exit 3），不会静默成功。它们的角色由 token 决定，越权是固定拒绝 `not_permitted_role`（exit 2）。
+Router 与 worker 用的命令（`route`、`eval`、`eval-read`、`eval-decide`、`report`、`reply`、`ack`、`ticket …`、`trigger …`、`thread …`、`settings …`、`prompts …`、`read …`）在命令表里占住最终名字与参数，逐条见设计 §G.2；任何还没有 handler 的命令都返回固定 `unavailable`（exit 3），不会静默成功。它们的角色由 token 决定，越权是固定拒绝 `not_permitted_role`（exit 2）。
 
 ## 门禁
 
@@ -213,9 +213,9 @@ orca plugin types . --json && ls .orca/types
 | 退出码 | 含义 | 重启能修吗 |
 | --- | --- | --- |
 | `0` | 正常运行 | — |
-| `1` | 没跑 / 跑了两份 / 不响应 / `runtime` 报错 | 通常可以 |
+| `1` | `runtime` 不是 ready/paused（`starting` 也算没跑起来）或它报错；「跑了两份」归这一档 | 通常可以 |
 | `2` | 某个**非 runtime** 部件报错（例如 `github`、`relay`、`router`） | 不能，要人看 |
-| `3` | 等 setup / 已暂停 / 未启动（都不是故障） | 不能，要人补配置或恢复 |
+| `3` | 等 setup / 已暂停 / **连不上 worker**（未启动、端口没人听） | 不能，要人补配置或恢复 |
 
 常见几件：
 
@@ -245,9 +245,11 @@ Limitations 段与本节读同一份文案（同源同措辞）。
 
 这一节是**近似**的清单，不是已实现功能的清单：没有 DSH 的机制就是没有，替换物如上所述。
 
-**§H 里还有标「是」但不在上面十一条里的行**，它们的影响写在 §H 对应行：H.14（relay 不保证「下一步」送达）、H.15（宿主工具面不同，例如没有 `job_kill`）、H.16（没有权威模型清单，model id 填错要到 launch 才报）、H.17（Router 的 agent 读不了图时，图片评估退化为文本）；H.20（不做进程隔离）已经并入第 11 项。
-
-计数口径有三处不同，这里不动用户可见的十一项：§A.3 列 11 项、§H 差异表有 15 行标「是」、附录 B 的摘要枚举 12 条（它按 H.14/H.16/H.17 重排，并把 H.5/H.6 移出、H.20 并入第 8 条）。这三处设计文本的对齐是 #50 的事，本票只保证「面板与 README 同源同措辞」。
+计数口径只有一处：这十一项就是用户可见的完整列表，单一来源是 `src/panel/limitations.ts`（面板
+Deployment 页的 Limitations 段与本节读同一份文案，中英各一份，顺序也由它给）。设计文档 §A.3 列的
+同样是这十一项；§H 差异表标「是」的 15 行里，H.19 并入第 1 项、H.20 并入第 11 项，剩下 4 行
+（H.14 relay 的送达时机、H.15 宿主工具面、H.16 没有权威模型清单、H.17 Feishu 图片）是精度与能力面
+的附加近似，列在设计附录 B 的第二张表并注明披露位置，**不**扩成第 12–15 项。
 
 ## 目录
 
@@ -256,6 +258,7 @@ orca-plugin.json        清单（trusted-worker）
 tsconfig.json           自包含；绝不 extends .orca/types
 types/                  手写的最小 Orca 声明（pinned to Orca 1.4.251）
 docs/design/            技术设计（唯一的设计文档）
+docs/adding-a-source.md  新增一个 Source 的十一步指南（§I.1 的工程说明）
 docs/spikes/            实测记录（附录 C 的 spike 台账）
 docs/hourly-check.md    可选的小时级巡检（Orca Automation）
 src/worker/main.ts      activate(orca)：登记贡献点 + boot

@@ -43,7 +43,7 @@ Orca 能力的可核验来源在本仓库外，逐条标注为：`[skill]`＝`or
 
 ### A.3 只能近似的能力（预告）
 
-以下 11 项无法 100% 等价，全部进 §H 差异表并标注影响与「已知限制」：
+以下 11 项无法 100% 等价。它们是**用户可见的完整清单**，每条都能在 §H 差异表找到对应行与影响：
 
 1. Session preset（`dsh-superagent-router` / `-worker`）约束的工具集与 5 秒 shell 预算；
 2. 系统提示词注入（DSH 是运行时注入，Orca 是 launch prompt + 会话内后续 relay）；
@@ -56,6 +56,18 @@ Orca 能力的可核验来源在本仓库外，逐条标注为：`[skill]`＝`or
 9. `dsh` CLI；
 10. `ask_user_question` / `present` / plan mode 等「向人提问」的工具移除；
 11. DSH 的 `danger-full-access` 之外的进程隔离与 `worker-bin` / `worker-gitconfig` 环境注入。
+
+**计数口径（只有这里一处）**：这十一项是用户可见的完整列表，单一来源是
+`src/panel/limitations.ts`——面板 Deployment 页的 Limitations 段与 README 的已知限制段读同一份
+`limitation.<id>.*` 文案（中英各一份），顺序与编号也由它给出。§H 差异表按「上游行为」逐行标注，
+标「是」的有 15 行，它**不是**第二张清单：
+
+- H.19（Router 不读代码）并入第 1 项，H.20（进程隔离）并入第 11 项；
+- 第 5、6 项（Plugin Manager、Web 面板）对应的 H.5/H.6 标「否」——替换物视为改进，但「没有」
+  这个事实仍写进用户可见清单；
+- 剩下 4 行是**精度与能力面**的附加近似：H.14（relay 不保证「下一步」送达）、H.15（宿主工具面
+  不同）、H.16（没有权威模型清单）、H.17（Router 的 agent 读不了图时图片评估退化）。它们列在
+  附录 B 的第二张表并注明披露位置，不扩成第 12–15 项。
 
 ---
 
@@ -74,7 +86,7 @@ Orca 能力的可核验来源在本仓库外，逐条标注为：`[skill]`＝`or
 ```ts
 // src/worker/runtime/orca-runtime.ts
 export type RuntimeErrorCode =
-  // Host API 的 12 个错误码，原样透出（references/host-api.md §Errors）
+  // Host API 的 13 个错误码，原样透出（references/host-api.md §Errors）
   | 'invalid_request' | 'invalid_params' | 'unknown_method' | 'capability_denied'
   | 'consent_required' | 'not_permitted' | 'rate_limited' | 'unavailable'
   | 'action_failed' | 'cancelled' | 'timeout' | 'conflict' | 'too_large'
@@ -89,7 +101,27 @@ export class OrcaRuntimeError extends Error {
   readonly values?: Readonly<Record<string, string>>;   // 固定拒绝用的填槽值
 }
 
+// 宿主 13 + seam 7 = 20 个（`runtime/orca-runtime.ts` 的 `RuntimeErrorCode`）。设计早期写的「12 个
+// 宿主错误码」是笔误：它自己枚举的就是 13 个，与 references/host-api.md §Errors 逐条一致。
+
 export interface RepoSelector { readonly path?: string; readonly name?: string; readonly id?: string }
+
+// `orca repo list --json` 的一行：setup 探针只读这三项（§E.1 base repo 行）。
+export interface RepoRow { readonly id: string; readonly path: string; readonly name: string }
+
+// prepare（§E.3）：`command` 已经是替换完变量、单引号转义过的最终文本。
+export interface CommandSpec {
+  readonly workspace: WorkspaceHandle;
+  readonly command: string;
+  readonly timeoutMs: number;             // prepare 是 10 分钟，超时视为失败
+  readonly title?: string;
+}
+
+export interface CommandHandle {
+  readonly terminalId: string;
+  readonly exitCode: number | null;       // 拿不到时为 null
+  readonly output: readonly string[];
+}
 
 export interface WorkspaceSpec {
   readonly name: string;                  // ticket 短名（只含 [a-z0-9-]）或 'superagent-router'
@@ -164,6 +196,10 @@ export interface OrcaRuntime {
   readonly api: { readonly major: number; readonly minor: number; readonly locale: string };
   supports(method: RuntimeMethod): boolean;
 
+  // 0.5 仓库（base repo 的 setup 校验与 base ref 存在性）
+  listRepos(): Promise<readonly RepoRow[]>;                       // orca repo list --json
+  searchRefs(selector: RepoSelector, query: string): Promise<readonly string[]>;  // orca repo search-refs
+
   // 1. 工作区
   ensureWorkspace(spec: WorkspaceSpec, signal?: AbortSignal): Promise<WorkspaceHandle>;
   listWorkspaces(): Promise<readonly WorkspaceInfo[]>;
@@ -174,6 +210,8 @@ export interface OrcaRuntime {
   // 2. Agent
   launchAgent(spec: AgentSpec, signal?: AbortSignal): Promise<AgentHandle>;
   listAgents(): Promise<readonly AgentRow[]>;          // 只见"当前聚焦 workspace"，只作提示
+  // 回执缺句柄时的反查：宿主行不带 workspaceId，所以不能靠 listAgents() 做到（附录 C S2）。
+  findAgent(workspaceId: string): Promise<AgentHandle | null>;
   listTerminals(): Promise<readonly TerminalRow[]>;    // 全机真源（orca terminal list）
   onAgentStatus(handler: (event: AgentStatusEvent) => void): () => void;
 
@@ -181,6 +219,8 @@ export interface OrcaRuntime {
   sendText(terminalId: string, text: string, options?: { enter?: boolean }): Promise<{ accepted: boolean }>;
   readTerminal(terminalId: string, options?: { maxLines?: number }): Promise<{ lines: readonly string[]; truncated: boolean }>;
   closeTerminal(terminalId: string): Promise<void>;
+  focusTerminal(terminalId: string): Promise<void>;    // orca terminal focus（面板的「Open terminal」）
+  runCommand(spec: CommandSpec, signal?: AbortSignal): Promise<CommandHandle>;  // prepare（§E.3）
 
   // 4. Orca 侧副作用
   notify(input: { title: string; body?: string }): Promise<{ delivered: boolean }>;
@@ -210,17 +250,21 @@ export interface OrcaRuntime {
 
 | 方法 | 落地 | 失败语义 |
 | --- | --- | --- |
+| `listRepos` | `spawn orca repo list --json`；setup 检查用它校验 `executor.baseRepo` 存在（§E.1） | `cli_missing`；CLI 缺失**不返回空表**（空表会被误读成「一个仓库都没有」） |
+| `searchRefs` | `spawn orca repo search-refs --repo <sel> --query <ref> --json`；配了 base ref 时校验存在性 | `cli_failed`；查不到只是空数组 |
 | `ensureWorkspace` | 先 `listWorkspaces()` 按 `path`/`name` 复用；否则 `spawn orca worktree create --name <name> --repo <sel> --base-branch <ref> --branch <branch> --setup <p> --no-parent --json`，读 `result` 里的 worktree `id`/`path`/`branch` `[probe]`(`orca worktree create --help`) | `cli_failed`（带 CLI 的 `error.code`）、`cli_timeout`（120 s）、`locked`（同名 worktree 被占用） |
 | `listWorkspaces` | `host.call('workspace.list')` `[skill]` | `capability_denied` / `not_permitted` |
 | `openWorkspace` | `host.call('workspace.open')`；面板不直接调（面板无此方法） | `not_permitted`（浏览器客户端） |
 | `removeWorkspace` | §E.1「清理」的「Remove worktree」：`spawn orca worktree rm --worktree path:<p> --force --delete-branch`（Host API 无删除方法；附录 C S3 实测过同一条命令）。面板与 CLI 都要人先确认 | `cli_failed`（worktree 被占用等）、`cli_missing` |
-| `launchAgent` | 首选 `spawn orca agent launch --agent <id> --worktree path:<p> --model <m> --effort <e> --surface terminal --prompt <t> --json`，句柄取 `result.launch.outcome.handle`（旧宿主 `result.agentTerminalHandle`）；`model`/`effort` 缺省且 CLI 不可用时回落 `host.call('agent.launch', { workspaceId, agent, prompt })`（返回 `{ terminalId }`） `[probe]`(`orca agent launch --help`)/`[skill]` | `agent_gone`（回执无 terminalId）、`cli_failed`；字段名见附录 C S2 实测 |
+| `launchAgent` | 首选 `spawn orca agent launch --agent <id> --worktree path:<p> --model <m> --effort <e> --surface terminal --prompt <t> --json`，句柄依次取 `result.outcome.handle`（`outcome.kind==='terminal'`，#16 实测）→ `result.launch.outcome.handle`（S2 的旧记录）→ `result.agentTerminalHandle` → `result.terminalId`；`model`/`effort` 缺省且 CLI 不可用时回落 `host.call('agent.launch', { workspaceId, agent, prompt })`（返回 `{ terminalId }`） `[probe]`(`orca agent launch --help`)/`[skill]` | `agent_gone`（回执无 terminalId）、`cli_failed`；字段名见附录 C S2 与 Router 记录 |
 | `listAgents` | `host.call('agents.list')`；**只返回当前聚焦 workspace 的 agent** `[skill]`，所以只作提示，不作枚举真源 | `unavailable`（Orca 未就绪） |
-| `listTerminals` | `spawn orca terminal list --json`：`terminals[].handle/worktreeId/worktreePath/title/connected/orphaned` `[probe]`；这是「哪些 worker 终端还活着」的**唯一权威枚举** | `cli_failed`；解析失败按空集处理并记 warning |
+| `findAgent` | seam 自己的反查（不是 `agents.list`）：宿主行里**没有** `workspaceId`，`agents.list` 只投影当前聚焦工作区（附录 C S2），所以按 workspace 反查必须是 `listTerminals()` 里 `worktreeId` 命中且 `connected` 的**唯一**一行；找到包成 `AgentHandle`，否则 `null` | 不抛：找不到就是 `null`（调用方走 `agent_gone`） |
+| `listTerminals` | `spawn orca terminal list --json`：`terminals[].handle/worktreeId/worktreePath/title/connected/orphaned` `[probe]`；这是「哪些 worker 终端还活着」的**唯一权威枚举**。判活只看「枚举里没有」或 `connected===false`：`orphaned:true` 只表示这个 pty 没有挂载到可见 pane（后台会话常态，附录 C Router 记录），**不是死亡** | `cli_failed`；解析失败按空集处理并记 warning |
 | `onAgentStatus` | `orca.events.on('agent.status.changed', …)`；事件须在 manifest `contributes.events` 列表 `[skill]` | 无（订阅失败即启动失败，`invalid_request`） |
 | `sendText` | `host.call('terminal.sendText', { terminalId, text, enter })`；宿主实现要求终端属于**当前聚焦**工作区（附录 C S1），Ticket worktree 通常不在，故实现需回落 `orca terminal send --terminal <h> --text <t> --enter --json` | `rate_limited`（`retryAfterMs`）、`not_permitted`（面板调用）、`too_large` |
 | `readTerminal` | `host.call('terminal.read', { terminalId, maxLines })`（上限 2000 行） | `unknown_method`（旧宿主，`supports` 已挡） |
-| `closeTerminal` | `spawn orca terminal close --terminal <h> --json`（Host API 无终端关闭） `[probe]` | `cli_failed`；终端已消失视为成功（幂等） |
+| `closeTerminal` | `spawn orca terminal close --terminal <h> --json`（Host API 无终端关闭） `[probe]`；对一个 `orphaned`（无 tab）的终端会回 `tab_not_found`，交给 `worktree rm` 收尾 | `cli_failed`；终端已消失视为成功（幂等）；关不掉 `orphaned` 终端不是重试理由 |
+| `focusTerminal` | `spawn orca terminal focus --terminal <h>`（§M.2：面板没有切前台的能力，必须走 worker） | `agent_gone`（枚举里没有这台终端） |
 | `runCommand` | prepare 用（§E.3）：`spawn orca terminal create --worktree id:<ws> --command <cmd> --json` 起终端，再 `orca terminal read` 收尾；10 分钟预算 `[probe]`(`orca terminal create/read --help`) | `cli_failed`、`cli_timeout`；超时视为 prepare 失败 |
 | `notify` | `host.call('notifications.show')` | `capability_denied`，只记日志不抛 |
 | `setStatusBar` | `host.call('statusBar.update', { id, … })` | 同上 |
@@ -375,6 +419,16 @@ bin     → http client only
 | Input | `ticket.inputs[]`，渲染后投递到 worker 的 terminal | 无差异（投递方式变了） |
 | Execution environment | 变量表（同名 `DSH_SUPERAGENT_*`）+ `<ticketDir>/.superagent/env.sh` | 从 PATH shim 改为 env 文件 + launch hook（§H.11） |
 
+**context-only Thread 的语义（#27 的裁决）**：一个 Ticket 可以 `thread follow` 一条它不拥有的 Thread，
+那条 Thread 上后续的每条消息**以语境到达它**——交付的是**一条** `context: true` 的 Input，不产生候选、
+不产生 Decision、也不给它所有权（`candidate` 对它为 `undefined`；拿它去 `route` / `eval-decide` 是
+固定拒绝 `refused`，`values.tickets` 列出真正拥有它的 Ticket）。**已结束**的 Ticket 在只当语境的 Thread 上
+既拿不到 Input、也不会被恢复：那条消息按常规走它 primary Thread 的 Eval（如果没有别的 Ticket 拥有它）。
+上游 docs/001–002 的句子：*“Every later message on a subscribed thread, from any participant or bot,
+reaches the subscribed tickets as context; it carries no authority and needs no mention or allowed-sender
+check.”*（`runtime/subscriptions` 分片逐字保留这句，见 §L.2；断言在 `core-engine.test.ts` 的两条
+「only for context」用例里。）
+
 ### D.2 SQLite 表
 
 只有一个库：`<stateDir>/superagent.sqlite`（`node:sqlite` 的 `DatabaseSync`，`journal_mode=WAL`、`synchronous=NORMAL`、`foreign_keys=ON`、`busy_timeout=5000`）。只有 `app/store.ts` 打开它。
@@ -492,14 +546,17 @@ CREATE TABLE kv (
 
 | 族 | 键 / 内容 |
 | --- | --- |
-| schema | `schema-version` |
+| schema | `schema-version`、`plugin-version`（上一次运行的插件版本，§N.6 第 5 条） |
 | 设置版本 | `settings-revision`、`settings-version:<n>`、`settings-block-revision:<block>` |
 | Prompt 版本 | `prompt-revision`、`prompt-version:<n>`、`prompt-builtin-base`（团队覆盖所基于的内置文本） |
 | Router | `router-terminal`、`router-workspace`、`router-token`、`router-restarts` |
-| Source 状态 | `github-cursor:<notification id>`、`github-ci:<pr>#<head sha>`、`feishu-cursor:<chat>`、`thread-seen:<key>`、`source-labels:<kind>` |
+| token 与幂等 | `token-hash:<sha256(token)>`（库里只存哈希）、`request-id:<tokenHash>:<requestId>`（同 id 一小时内重试返回首次结果） |
+| Source 状态 | GitHub：`github-cursor:<notification id>`（通知游标）、`github-body:<number>`（Issue/PR 正文指纹；#36 的 receive-all 复用同键）、`github-ci:<pr>#<head sha>`（某 PR 某个 head 的 CI 指纹）、`github-stream:<stream>`（仓库级事件流的读位置，`issues`/`comments`/`review-comments`）、`github-branch-ci`（默认分支 CI 的失败集合指纹）；Feishu：`feishu-cursor:<chat>`、`feishu-chats`（见过的会话与是否私聊）、`feishu-topics:<chat>`（见过的话题与最后时刻）；共用：`thread-seen:<key>`、`source-labels:<kind>`（`refreshLabels` 写回的显示名） |
 | 维护 | `lock-pid`、`last-prune`、`api-port`、`backup-index` |
+| 暂停 | `pause-state`（§K.6：独立设置，唯一读写处 `app/pause.ts`） |
 
-上线约束（`store.test.ts` 断言）：键字面量只允许出现在 `app/kv.ts` 与 `migration.ts`。
+上线约束（`store.test.ts` 断言）：键字面量只允许出现在 `app/kv.ts` 与 `migration.ts`；
+`app/kv.ts` 的 `KV_KEY_LITERALS` 是唯一清单，常量与构造函数全部由它派生，新增键只改一处。
 
 ### D.4 写者表（每个状态一个写者）
 
@@ -573,7 +630,7 @@ CREATE TABLE kv (
 | agent id | 设置 `executor.agent`（缺省 `pi`，可覆盖为 `claude`、`codex` 等任一已装的 Orca agent id），setup 检查校验非空；不猜测 |
 | model / effort | 设置 `executor.model` / `executor.effort`，透传给 CLI；两个角色各自独立的模型设置在 `eval.model` 与 `executor.model` |
 | 开播语 | 短（≤ 400 字符）：角色声明 + Ticket id/短名 + 目录 + **CLI 绝对路径与 token 文件路径** + 「先读 `inbox/0.md`」。长正文一律写文件，不让终端吞长文本（§附录 C S1） |
-| 回执 | CLI 的 `result.launch.outcome.handle`（`outcome.kind === 'terminal'`；旧宿主是 `result.agentTerminalHandle`）取 terminal 句柄；取不到就用 `workspaceId` 在 `agents.list()` 里按 workspace 反查（最多 10 s，200 ms 间隔）。仍取不到 → `agent_gone` → 重试一次 → `failed`（附录 C S2：宿主行不含 workspaceId，反查走 `OrcaRuntime.findAgent`） |
+| 回执 | 句柄依次取 `result.outcome.handle`（`outcome.kind === 'terminal'`，#16 实测的形报）→ `result.launch.outcome.handle`（S2 的旧记录）→ `result.agentTerminalHandle` → `result.terminalId`（`host.call('agent.launch')` 的形报）。取不到就用 `workspaceId` 在 `listTerminals()` 里反查（`OrcaRuntime.findAgent`，最多 10 s，200 ms 间隔——**不能**用 `agents.list`：宿主行不含 workspaceId，且只投影当前聚焦工作区，附录 C S2）。仍取不到 → `agent_gone` → 重试一次 → `failed` |
 | 会话形态 | 一个 Ticket 一个 agent 终端；重试与恢复**复用同一 worktree 与同一分支**，新建终端 |
 
 ### E.3 Assignment 生命周期
@@ -607,7 +664,7 @@ pending ──launch 成功──▶ running ──report(ready|dropped) / stop 
 | --- | --- |
 | stop（人） | 撤回 Mandate、`outbox` 发收尾消息、`closeTerminal`（`orca terminal close`）→ Assignment `ended(reason: stopped)`；worktree 保留。Ticket 之后不再接收任何 Input |
 | retry | 结束当前 Assignment（同 stop 的终端关闭），`launch` 一条新 Assignment，同 worktree/分支/PR；带 recovery note（「检查目录、git 历史与 GitHub，别重复已做的外部动作」） |
-| 恢复（进程重启） | 启动时列出 `running` Assignment，用 `listTerminals()`（全机权威）判断终端是否还在，用 `listWorkspaces()` 判断 worktree 是否还在。终端已不在（或 `orphaned:true`）→ `interrupted`，新建 Assignment 并带 recovery note；终端还在且 `worktreeId` 命中本 Ticket → 认领（`adopt`），投递一条「已恢复，继续」。**不用 `agents.list()` 做枚举**：它只见聚焦 workspace |
+| 恢复（进程重启） | 启动时列出 `running` Assignment，用 `listTerminals()`（全机权威）判断终端是否还在，用 `listWorkspaces()` 判断 worktree 是否还在。终端不在枚举里或 `connected===false` → `interrupted`，新建 Assignment 并带 recovery note；终端还在且 `worktreeId` 命中本 Ticket → 认领（`adopt`），投递一条「已恢复，继续」。**不用 `agents.list()` 做枚举**：它只见聚焦 workspace。`orphaned:true` 只表示「没有挂载到可见 pane」（附录 C Router 记录），不是死亡——但**认领**比判活严一格：`resume.ts` 要求 `connected && !orphaned`，于是「后台跑着、UI 里没开」的 worker 终端会被重建而不是认领（宁可重建，也不把看不见的会话当自己的） |
 | 停止整插件 | `deactivate()` 顺序：停 passes → 排空 effects（保留 pending 行）→ 不杀 worker 终端（它们继续跑，重启后被 adopt）→ 关 HTTP → 关库 → 释放锁 |
 
 上游「shutdown 等 10 s worker 后台工作、进程重启直接丢掉」在 Orca 上不适用：**worker 终端是 Orca 的，不随插件停止而结束**。这是改进而非损失，写进 §H.3。
@@ -629,10 +686,16 @@ pending ──launch 成功──▶ running ──report(ready|dropped) / stop 
 | `working` | agent 在跑 | Assignment 保持 `running`；清 `waiting` 标记；若此时有未投递 Input，不催 |
 | `blocked` | agent 停在一个需要人回答的提示上（权限/提问） | **额外产生 Attention**：`terminal.read` 抓最后 20 行摘要 → 写 `ticket.attention`（上游要求「必须结构化提问」，这里是近似：来源标 `via: 'terminal'`）。面板显示「Awaiting answer (terminal)」并给出终端预览 |
 | `waiting` | agent 空闲、等待输入 | 若最近 Report 是 `waiting` 或没有 Report → Ticket 进 `idle`/`working·queued` 的判定见 §E.8；若无未投递 Input 且无 pending Assignment → Assignment `ended(waiting)` |
-| `done` | agent 进程结束 | Assignment `ended(done)`；有 `ready`/`dropped` 的 report 按 §E.9 结束 Ticket；无 report → `failed`（`report_missing`），可 retry |
+| `done` | **一轮结束**（provider 的 Stop/`agent_end`，以及 `SessionStart`）——**不是进程结束** | Assignment `ended(done)`；有 `ready`/`dropped` 的 report 按 §E.9 结束 Ticket；无**最终** report（无 report 或只有 `progress`）→ `failed`（`report_missing`），可 retry。每一轮结束都会来一条，所以「无最终 report」的判定不能算作「进程退了」 |
 
 事件是**唯一**的 worker 生命周期真源；`terminal.read` 只用于取证与 `blocked` 摘要，绝不阻塞等待（无 `terminal wait` 依赖）。
-实测（附录 C S7/S9，Orca 1.4.251）：`done` 不只表示进程结束，**每一轮结束与会话启动**都会到达；`terminal close` 不产生事件，而是静默清掉该 pane 的状态行。因此「报告缺失」只对**没有最终 Report**（无 report 或只有 `progress`）判定，有 `waiting`/`blocked`/`failed` 报告的一轮按 §E.8 处理。
+实测（附录 C S7/S9，Orca 1.4.251）：`done` 不只表示进程结束，**每一轮结束与会话启动**都会到达；`terminal close` 不产生事件（`{ptyKilled:true}` 之后 3 s 内该 pane 一条 `agent.status.changed` 都没有），而是静默清掉该 pane 的状态行。因此：
+
+1. 「报告缺失」只对**没有最终 Report**（无 report 或只有 `progress`）判定，有 `waiting`/`blocked`/`failed`
+   报告的一轮按 §E.8 处理；
+2. 停止/重试/关闭终端的收尾**不等事件**——领域先把 Assignment 置 `ended`，迟到的 `done`
+   因 Assignment 已结束而被忽略；
+3. §E.9 的 30 分钟计时把 `done` 当作「这一轮结束」：它与人写的消息一样清掉后台标记。
 
 **持久化**：每次事件都把观测值写进 Ticket（`ticket.agentState` + `agentStateAt`，随 `ticket.body` 落库，§D.2），写者仍是 Engine（§D.4：执行器经 `Engine.agentStateChanged` 进来）。读模型与重启恢复用的就是这一次观测；Assignment 结束、被替换与 Ticket 结束/终端关闭由领域**直接收尾成 `done`**（不等事件，附录 C S7 的回落），陈旧的 `blocked` 因此不会钉住工单；`ended(waiting)` 例外——`waiting` 本身就是「空闲等待」的观测，原值保留。认领（`adopt`，§E.10）不改写这个值：会话还在，下一个事件才改。
 
@@ -669,17 +732,19 @@ Report 状态映射：
 2. 30 分钟到点：不杀进程（做不到），改为
    a. `sendText` 一条作业指令：「后台工作已超 30 分钟，收尾：报告还在跑什么、停掉可停的、用 `report waiting` 结束本轮」；
    b. 标记 `backgroundExpired = true`，面板显示「Background work ran past 30 min」。
-3. 人写的消息或 `sendText` 之后 `agentState` 变 `waiting` → 清标记。
+3. 人写的消息、或 `agentState` 变 `waiting`/`done` → 清标记。`done` 也算「这一轮结束了」：
+   附录 C S7 实测它每一轮结束都会到，不把 `done` 当作清标记的条件，标记就会跟到下一轮。
 4. 上游「handoff 后 subagent 停止、shell job 继续」在 Orca 上不可分；统一按「agent 会话本身继续，插件不再催」。
 
-影响：判定精度下降（少杀、不少报），写进 §H.3 与已知限制。
+影响：判定精度下降（少杀、不少报）；而且「每一轮结束」就会清掉计时（第 3 步），所以只有
+真正跨轮跑着的后台工作才会被计时到 30 分钟。写进 §H.3 与已知限制。
 
 ### E.10 崩溃 / 重启恢复
 
 | 场景 | 处理 |
 | --- | --- |
 | 插件 worker 被 Orca 重启（保存文件、插件重载） | 库与 worktree 都在；`resume()` 认领仍存活的终端，其余标记 `interrupted` 并重建 Assignment（oldest first） |
-| Orca 应用重启 | 终端不保活。`resume()` 时 `listAgents()` 为空，全部 `interrupted`；重建 Assignment，recovery note 说明「先看 git 历史与 GitHub」 |
+| Orca 应用重启 | 终端不保活。`resume()` 时 `listTerminals()` 为空，全部 `interrupted`；重建 Assignment，recovery note 说明「先看 git 历史与 GitHub」 |
 | 投递到一半崩溃 | Input 仍在 `ticket.inputs[]` 且未标 `delivered`；新 Assignment 的 `launch` 后重投（上游同：未取走的输入保留） |
 | 终止时 effect 未跑完 | `effect` 行保留（`drain` 不删），下次 `start` 继续；`seq` 不变，顺序不乱 |
 | 人在 Orca 里删了 worktree | 订阅的 `workspace.removed` → 该 Ticket 的 Assignment `ended(worktree_removed)`，Ticket 进 `person/blocked` 并给「重建 worktree」（确认后走 `ensureWorkspace` + 新 Assignment）。`workspace.created` 只用于让面板的工作区快照失效并推 `state.changed` |
@@ -698,7 +763,9 @@ Report 状态映射：
 | `DSH_SUPERAGENT_FEISHU_BOT` / `_CHAT` | bot open_id 与起始 chat |
 | `SUPERAGENT_CLI` / `SUPERAGENT_TOKEN_FILE` / `SUPERAGENT_API` | 本插件的 CLI 路径、token 文件、API 基址 |
 
-同时写 `<ticketDir>/.superagent/env.sh`（`export K='v'`，全部单引号转义），并把它列入 `.git/info/exclude`（在 worktree 内写，不影响 base repo 的 index）。worker prompt 里既有变量的值也有「不要把这些写进提交」的说明。
+同时写 `<ticketDir>/.superagent/env.sh`（`export K='v'`，全部单引号转义），并把 `.superagent/` 列入该
+仓库共用的 `info/exclude`（不是 per-worktree 的那份，见下方实测补充）。worker prompt 里既有变量的
+值也有「不要把这些写进提交」的说明。
 
 **实测补充（#13，2026-11-07）**：Orca 建的是 **linked worktree**，`.git` 是一个文本文件
 （`gitdir: <repo>/.git/worktrees/<name>`），而 git 只读 **common dir** 的 `info/exclude`；
@@ -734,8 +801,8 @@ Trigger 的 `meta`），不由 agent 发现；`${DSH_SUPERAGENT_*}` 的替换只
 | 启动 | 与 worker 同一条 `launchAgent` 路径，`agent = settings.router.agent`、`model = settings.router.model`、`surface = terminal` |
 | prompt | 内置 router 角色文本（§L.2 的 `runtime/orchestrator` 等价物）+ 尾部追加「部署环境段」：CLI 绝对路径、token 文件、`stateDir`、仓库、accept mode、policy version；再要求首句执行 `superagent status --json` 自检 |
 | 保活 | 插件带 `contributes.statusBarItems` + `main`，Orca 会**在插件启用期间保持 worker 常驻**（`statusBar.update` 文档明确：带 `main` 与状态栏项的插件，worker 在启用时启动并保持运行）`[skill]`。监督循环因此有落脚点 |
-| 监督 | 3 s tick：`agents.list()` 找 router terminalId。缺失/`done` → 重启（退避 5 s→300 s；10 分钟内 5 次 → health `router` 报 `error`，面板给「Restart router」） |
-| 状态栏 | `superagent` 项显示待人工数：`⏳3`；tone 随健康：`success`（0 待人工）/`warning`（有待人工）/`danger`（health error）；tooltip 列前 3 条 |
+| 监督 | 3 s tick：`listTerminals()`（全机权威枚举）里该 terminal「不在枚举里」或 `connected===false` → 重启（退避 5 s→300 s；10 分钟内 5 次 → health `router` 报 `error`，面板给「Restart router」）。**`orphaned:true` 不算死**（附录 C Router 记录：后台会话的 pty 本来就没有可见 pane），也不看 `agents.list()`（它只投影当前聚焦工作区） |
+| 状态栏 | `superagent` 项显示待人工数：`Superagent 3`；tone 随健康：`success`（0 待人工）/`warning`（有待人工）/`danger`（health error）/`neutral`（暂停）；tooltip 列前 3 条。**清单里的这一项没有 `command`（§N.7）**：点一下不会暂停处理 |
 
 ### F.2 候选与报告的 relay
 
@@ -764,9 +831,10 @@ Router 不需要「被唤醒」的通道：它有终端。relay = 往它的终�
 
 ### F.5 Router 死亡与重启
 
-触发条件（任一）：`agents.list()` 无该 terminalId；收到该 terminalId 的 `done`；`workspace.list()` 里 Router worktree 消失（则先重建 worktree 再启动）。
+触发条件（任一）：`listTerminals()` 里该 terminal 不在枚举中，或 `connected===false`；`workspace.list()` 里 Router worktree 消失（则先重建 worktree 再启动）。
+**`agent.status.changed` 的 `done` 不是触发条件**：附录 C S7 与 Router 记录都实测到 `done` 在**每一轮结束与会话启动**时就到，按它重启会把 Router 每轮换一次。`done` 只用作观测（`working → waiting` 的「疑似空转」），不参与生死判定（`router/supervision.ts`）。
 
-重启流程：`closeTerminal`（幂等）→ `ensureWorkspace` → `launchAgent`（带 `resume` 说明与「先 `superagent status --json`，再处理 `pending_relays`」）→ 成功则把 `router-restarts` 计数清零（连续成功 10 分钟后）。
+重启流程：`closeTerminal`（幂等；`orphaned` 终端会回 `tab_not_found`，不算失败）→ `ensureWorkspace` → `launchAgent`（带 `resume` 说明与「先 `superagent status --json`，再处理 `pending_relays`」）→ 成功则把 `router-restarts` 计数清零（连续成功 10 分钟后）。
 
 重启不清空 relay 队列；队列里未发的消息随新会话继续发。Router 上下文丢失（会话是新的），所以 launch prompt 末尾要求它先读 `superagent status --json` 与 `superagent read decisions --window 1h` 重建现场。
 
@@ -777,7 +845,7 @@ Router 只用这些命令（其余对 Router 返回 `not_permitted_role`）：
 | 命令 | 用途 |
 | --- | --- |
 | `status --json`、`health` | 自检与重建现场 |
-| `read <resource>` | `tickets/triggers/threads/decisions/ticket/<id>/thread/<key>/trigger/<id>/settings/models` |
+| `read <resource>` | `tickets` / `threads` / `thread/<key>` / `decisions` / `ticket/<id>` / `settings` / `models` / `overview` / `sources`，以及 Source 资源 `github/…`、`feishu/…`（§G.2、§G.3）。**`read triggers` 与 `read trigger/<id>` 不可用**：没有对应 GET 路由，服务端是 `missing`/404（§G.3 表末） |
 | `route --decisions <file>` | 批量路由（1–20 条，逐条独立） |
 | `eval` / `eval-read` / `eval-decide` | 主动候选评估 |
 | `reply` | `answer` / `result` / `attention` 三种 purpose |
@@ -804,7 +872,7 @@ Router 只用这些命令（其余对 Router 返回 `not_permitted_role`）：
 | 项 | 决定 |
 | --- | --- |
 | 输出 | 默认 JSON：成功 `{ok:true, result:…}`；失败 `{ok:false, error:{code, message, values?}}`。`--text` 打人读文本。 |
-| 退出码 | `0` 成功；`1` 内部错误；`2` 固定拒绝（`error.code` 有值）；`3` 未就绪（setup 未完成/暂停/未启动）。与上游 `scripts/dsh-superagent status` 的 0/1/2/3 语义对齐。 |
+| 退出码 | `0` 成功；`1` 内部错误；`2` 固定拒绝（`error.code` 有值）；`3` 未就绪（setup 未完成/暂停/未启动/连不上 worker）。与上游 `scripts/dsh-superagent status` 的 0/1/2/3 语义对齐。**注意**：`status` 与 `health` 把同一组数字用在自己的读数上，`1`/`2` 的含义与这张表不同（§N.4 的四码矩阵：`1` = runtime 不 ready 或两实例，`2` = 非 runtime 部件报错）；其余命令照本表。 |
 | 角色 | token 决定角色：`operator`（`api-token`，全权）、`router`（Router token）、`assignment`（ticket token，只能动自己的 Ticket 与自己能做到的事）。越权 → `not_permitted_role`（退出 2）。 |
 | 幂等 | 所有写命令带一个可选的 `--request-id <id>`；同 id 重试返回首次结果（存在 `kv`，1 小时）。对应上游「transport retries reuse the same trigger_id」。 |
 | 限额 | 单次 HTTP body ≤ 1 MiB（`route`/`prompts save` 的 JSON 也在此内）；`--decisions` 最多 20 项；单 token 60 req/min、burst 20。 |
@@ -817,7 +885,7 @@ Router/Worker 用的命令（等价上游 `orchestrator_*` 工具）：
 | 命令 | 参数 | 返回 | 主要错误码 |
 | --- | --- | --- | --- |
 | `superagent route` | `--decisions <file\|-> `（JSON 数组，1–20）或重复 `--item '<json>'` | `{results:[{kind, decision?, reason, ticket?, triggerIds?, refused?}]}`，顺序与入参一致 | `refused_item`（单条，内嵌在 results）、`too_many_items`、`invalid_params` |
-| `superagent read <resource>` | `--offset N`、`--limit N`（默认 20，上限 50；文本页默认 4000 字符，上限 8000） | `{items, next_offset}` 或单对象 | `unknown_resource`、`refused`（角色不可读）、`missing` |
+| `superagent read <resource>` | 资源名：`overview`、`sources`、`search`、`threads`、`thread/<key>`、`decisions`、`tickets`、`ticket/<id>`、`settings`、`prompts`、`models`（视图，走 §G.3 各自的路由），以及 `github/…` / `feishu/…`（Source 资源，#57，走 `GET read/:resource`）；`--offset N`、`--limit N`（默认 20，上限 50；文本页默认 4000 字符，上限 8000） | `{items, next_offset}` 或单对象 | `unknown_resource`、`refused`（角色不可读）、`missing`（含 `triggers`/`trigger/<id>`：名字合法但没有这条路由，§G.3） |
 | `superagent eval <trigger_id>` | — | 候选窗口：`{trigger, batch, threadWindow, relatedTickets, ticketsTotal, policyVersion, stubs}` | `not_a_candidate`、`missing`、`rate_limited` |
 | `superagent eval-read <trigger_id>` | 必含其一：`--message-id`、`--image-id`、`--part root\|parent\|thread`（可加 `--cursor`）、`--path <repo 内路径>` | `{messages?, message?, image?, next?, path?}` | `not_a_candidate`、`missing`、`too_large`（`--path` 越界是 `refused`，§O） |
 | `superagent eval-decide <trigger_id>` | `--assessment <file\|->`（direction/rule_assessments/intent_evidence/acknowledgement/worktree_name/scope/reason） | `{decision, reason, ticket?}` | `invalid_assessment`、`incomplete_rules`、`policy_changed`、`too_late` |
@@ -846,7 +914,7 @@ Router/Worker 用的命令（等价上游 `orchestrator_*` 工具）：
 
 | 命令 | 说明 |
 | --- | --- |
-| `superagent status [--json]` | 上游 `scripts/dsh-superagent status` 的等价物：进程/库/HTTP/loop，`health` 每项、`setup` 问题、`paused`、`load`（running/queued/maxWorkers）。退出码同上 |
+| `superagent status [--json]` | 上游 `scripts/dsh-superagent status` 的等价物：进程/库/HTTP/loop，`health` 每项、`setup` 问题、`paused`、`load`（running/queued/maxWorkers）。退出码见 §N.4 的四码矩阵（与普通命令的 §G.1 全集不完全同义） |
 | `superagent health` | 仅 health 数组 |
 | `superagent pause` / `resume` | 处理暂停（`paused=true/false`），写 `settings` 的 `paused`，origin=`operator` |
 | `superagent setup check` | 重跑 setup（会重启 worker 内的 loops，不重启 Orca）；`setup` 已无问题时拒绝 |
@@ -862,7 +930,7 @@ Router/Worker 用的命令（等价上游 `orchestrator_*` 工具）：
 | 方法与路径 | 命令 | 备注 |
 | --- | --- | --- |
 | `GET state` | `status` | 面板首屏 |
-| `GET overview`、`GET sources`、`GET search?q=` | `read` 的视图版 | |
+| `GET overview`、`GET sources`、`GET search?q=` | `read overview` / `read sources` / `read search` | router 可读前两个；`search` 是 operator（面板 Search 页） |
 | `GET threads?filter=&offset=&limit=`、`GET threads/:key?before=&around=&limit=` | `read threads`、`read thread/<key>` | |
 | `GET decisions?kind=&window=24h&offset=` | `read decisions` | |
 | `GET tickets?state=&offset=`、`GET tickets/:id` | `read tickets`、`read ticket/<id>` | |
@@ -870,20 +938,30 @@ Router/Worker 用的命令（等价上游 `orchestrator_*` 工具）：
 | `GET prompts?revision=&offset=`、`PUT prompts`、`POST prompts/preview` | `prompts …` | |
 | `GET policy/history` | 设置历史 | |
 | `POST policy-sync/:id` | `policy sync` | |
-| `POST sources/:id/labels` | `source labels` | |
+| `POST route` | `route` | Router 的批量路由（1–20 条），REST 与 CLI 同一个 handler |
+| `POST sources/:id/labels` | `source labels` | kind 没实现 `refreshLabels` → `not_syncable`（不返回空表假装刷新成功）；未知 Source 是 `missing` |
 | `POST triggers/:id/requeue`、`POST decisions/:id/dismiss` | 同名 | |
-| `POST triggers/:id/handback` | `trigger handback` | worker 的命令：Ticket 来自 assignment token，错误码 `not_owned`/`already_handed_back` |
+| `POST triggers/:id/handback` | `trigger handback` | worker 的命令：Ticket 来自 assignment token；错误码 `not_owned`/`already_handed_back` |
 | `POST threads/:key/unsubscribe` | `thread unsubscribe` | |
+| `POST threads/:key/follow`、`POST threads/:key/unrelated` | `thread follow` / `thread unrelated` | 同样是 worker 的命令（Ticket 来自 token）；`own_thread`/`not_followed`/`unrelated_required` |
 | `POST tickets/:id/retry`、`POST tickets/:id/stop`、`POST tickets/:id/note` | 同名 | stop 是破坏性动作：body `{confirm:true}`（CLI `--yes`）；错误码 `already_ended`/`not_retryable`/`missing` |
 | `POST tickets/:id/request-status` | 同名 | |
+| `POST report`、`POST reply`、`POST ack` | `report` / `reply` / `ack` | §G.2 的三条 worker 命令；Ticket 来自 assignment token，不是 body |
+| `POST eval-decide/:id` | `eval-decide` | body 是 `{assessment}`；角色 ≥ router |
 | `POST executor/pause` | `pause/resume` | body `{paused}` |
 | `POST setup/check` | `setup check` | |
 | `POST router/restart` | Router 重启（面板动作） | |
 | `POST workspaces/:id/open` | `host.call('workspace.open')` | 面板无此 Host 方法，必须走 worker |
 | `GET models` | 可用模型清单（来自 Orca 启动时的模型参数与设置） | 见 §H.17 |
-| `GET read/:resource` | `read <resource>` | 资源名整段（百分号编码，`/` 不改变分段）：`github/…`/`feishu/…` 由 `app/read.ts` 路由到 kind 的读模块；角色在 handler 里细化（assignment 只读自己 Ticket 相关的资源，§O） |
+| `GET read/:resource` | `read <resource>` | 资源名整段（百分号编码，`/` 不改变分段）：`github/…`/`feishu/…`（#57）由 `app/read.ts` 路由到 kind 的读模块。**`read` 的视图名走各自的路由**（`overview`/`sources`/`search`/`threads`/`thread/<key>`/`decisions`/`tickets`/`ticket/<id>`/`settings`/`prompts`/`models`，`cli/commands.ts` 的 `readPath`，§G.2），不经过这条；资源名在 `READ_SOURCE_RESOURCES` 之外时拒绝并列出可用写法（`unknown_resource`）。角色在 handler 里细化（assignment 只读自己 Ticket 相关的资源，§O） |
 | `GET eval/:id`、`GET eval-read/:id` | `eval`、`eval-read` | `eval-read` 的四种读法是查询串：`message-id`、`image-id`、`part`（+`cursor`）、`path`；角色 ≥ router |
 | `POST doctor` | `doctor` | |
+| `POST admin/backup`、`POST admin/rotate-token` | `admin backup` / `admin rotate-token` | 运维动作，operator only；`rotate-token` 破坏性，handler 要求确认 |
+
+**没有 GET 的两个 `read` 名字**：`read triggers` 与 `read trigger/<id>` 是合法资源名（`READ_RESOURCES`
+里有），但 §G.3 没有对应的 `GET triggers`/`GET triggers/:id` 路由，于是服务端回 `missing`、
+HTTP 404（CLI 退出 2）。Trigger 的正文改从 `read threads` / `read thread/<key>` 的时间线拿，
+worker 也可以 `read eval <id>` 或 Source 资源取得同一条消息。
 
 鉴权与边界（逐条都要在 `http.test.ts` 里测）：
 
@@ -934,13 +1012,13 @@ stateDir：/Users/me/.local/state/orca-superagent
 
 ## H. DSH → Orca 差异表
 
-读法：**「等价实现」是设计承诺；「影响」是用户能感知的差异；「已知限制」为「是」的条目会写进 `README`/面板的 Limitations 与本文 §附录 B。**
+读法：**「等价实现」是设计承诺；「影响」是用户能感知的差异；「已知限制」为「是」的条目会归入本文 §A.3 / 附录 B、README 与面板 Limitations 的十一项**（对应关系：H.19 并入第 1 项、H.20 并入第 11 项；H.14–H.17 是附加近似，只在这里与附录 B 第二张表披露；H.5/H.6 标「否」因为替换物视为改进，但「没有」这个事实仍在用户可见清单里）。
 
 | # | 上游行为 | Orca 上的等价实现 | 无法完全等价时的影响 | 已知限制 |
 | --- | --- | --- | --- | --- |
 | H.1 | **Session preset**：`dsh-superagent-router` / `-worker` / subagent 用 `standard`，决定可用工具集与 5 s shell 预算 | worker/Router 都是普通 Orca agent 会话，用该 agent 的默认工具集。工具裁剪靠 prompt 明说「不要阅读代码/不要直接修」；等待约束靠 prompt + 结构性不等待（§F.3） | 工具集不可裁剪：Router 理论上能改代码；worker 可用的工具比上游 `WORK_TOOLS` 多或少（取决于 Orca 的 agent） | 是 |
 | H.2 | **系统提示词**由宿主在每次 model request 注入（含角色 + 团队段 + Policy 段） | launch prompt 一次性注入；后续变更用 relay/Input 通知「revision 变更 + 读法」（§L.5） | 运行中的会话不会自动看到新 Policy 段；Policy 变更只对新 launch 完整生效，对活会话是「告知」 | 是 |
-| H.3 | **shell job / subagent 与 30 分钟预算**：turn 结束仍有后台工作时保持 slot；30 分钟杀 job | 无法观测 agent 内部 job。用 `report` + `agent.status.changed` 推断后台工作，30 分钟时**发收尾指令**并标记过期（§E.9） | 不杀进程、精度下降：可能长时间占用 slot，也可能把长任务误判为过期 | 是 |
+| H.3 | **shell job / subagent 与 30 分钟预算**：turn 结束仍有后台工作时保持 slot；30 分钟杀 job | 无法观测 agent 内部 job。用 `report` + `agent.status.changed` 推断后台工作，30 分钟时**发收尾指令**并标记过期（§E.9） | 不杀进程、精度下降：可能长时间占用 slot，也可能把长任务误判为过期；`done` 每轮结束都到，所以它一清掉计时，只有真正跨轮的后台工作才会被计时 | 是 |
 | H.4 | **模型预算重试**（provider/网络 3 次、`models` 健康项、`model_retry`） | 重试交给 Orca agent 自己与其 CLI；插件只做**三次 launch 重试**（5 s→300 s）与 `models` 健康项的空实现（始终 `ready`，detail 写「handled by Orca」） | 看不到预算重试状态；provider 抖动时 Ticket 可能直接 `failed` 而不是先重试 | 是 |
 | H.5 | **DSH Plugin Manager 页面**（同一份 Deployment 设置） | Orca 的 `contributes.settings`（少量、可声明的项）+ 面板的 Settings → Deployment 页（全部项） | 少量项需在 Orca Settings 里改，其余在面板改；两处不重复 | 否 |
 | H.6 | **DSH Web 面板**（`127.0.0.1:3082`，浏览器打开） | Orca 的 components 侧边栏面板（原生 UI，无端口、无浏览器） | 无独立 URL：无法在浏览器里看，也不能跨设备开（Orca 客户端支持的地方可以） | 否（视为改进） |
@@ -1016,6 +1094,11 @@ export interface SourceKind<C = unknown> {
 
 `SourceContext`（由 `app/source-context.ts` 构造）给 kind 的只有：`ready`、`configured()`、`problem`、`config<C>(kind)`、`receive(trigger)`、`atomic(fn)`、`state`（typed kv）、`threads.describe/patch`、`tickets.bindThread/threadClosed`、`triggers.read`、`notify`、`report(entry, health)`、`commands.withSignal`。
 
+**新增一个 SourceKind 的十一步**已经成文在 [`docs/adding-a-source.md`](../adding-a-source.md)：kind 协议与
+配置 schema、fields、facts、health 条目、scope、Channel、Thread 上下文、搜索、Policy 部分（准入行 /
+bots / sync）、环境变量、夹具与测试；以及它在 `sources/registry.ts` 与 `boot.ts` 里怎么注册、
+`SourceContext` 里哪些东西可以用、必须守的接口缝纪律。
+
 图片的 id 是 `threadContext.image` 与 `eval-read --image-id` 之间的唯一契约：**`<message-id>/<image-key>`**。`eval` 窗口在每条消息上列出这样组合出来的 `images[]`（key 由 `threadContext.images(text)` 从正文认出），`eval-read --image-id` 原样把它交回 `threadContext.image`；kind 只接受自己正文里出现过的 key（与上游 `image` 的校验同），绝不下载任意远端 id。
 
 ### I.2 GitHub
@@ -1051,7 +1134,7 @@ export interface SourceKind<C = unknown> {
 | Trigger | 一条消息；`addressed='mention'\|'direct'`；bot 自身消息丢弃；编辑/删除按 `update_time` 生成新 id | — |
 | Thread | `<chat>:<root message id>`；私聊为 `<chat>:direct` | — |
 | 准入行 | 每个 chat 一行、`other`、`direct` | — |
-| Channel | `im +messages-reply --as bot --message-id <root> --reply-in-thread --markdown <text> --idempotency-key <key>`（幂等：`uuid` 或正文隐藏标记；`--idempotency-key` 上限 50 字符，超长确定性截短）；Markdown→富文本由 CLI 负责 | 撤回/找不到 → `gone`；其余抛错重试；100 词上限在发送前强制（中英混排按上游分词规则） |
+| Channel | `im +messages-reply --as bot --message-id <root> --reply-in-thread --markdown <text> --idempotency-key <key>`（幂等：`--idempotency-key` 就是消息 id，**上限 50 字符**，超长时确定性截短——保留前缀 + 由完整 id 派生的 32 位 hex；不靠正文隐藏标记，也不需要 `uuid`）；Markdown→富文本由 CLI 负责 | 撤回/找不到 → `gone`（`230011`、文本含 withdrawn、或 `2300xx` + not found）；其余抛错重试；100 词上限在发送前强制（中英混排按上游分词规则） |
 | 线程上下文 | `feishu/<trigger>/message`、`/root`、`/parent`、`/thread`、`/around`（前后各 5 条，按时间分页） | 无权限/已删 → 明确 `status` 而不是空 | 
 | 图片 | `--image-id` → `lark-cli` 下载到 `inbox/images/<id>`，返回路径（§H.17） | 下载失败 → 「无法读取图片」，不猜内容 |
 | find | 消息 id（`om_…`）、群 id（`oc_…`）、消息链接 | — |
@@ -1139,7 +1222,7 @@ kind 清单：
 
 > 与上游的一处合并：上游 `relay` 与 `notice` 是两个 kind；这里保留两个 kind，但**共用同一串行队列**（都是 Router 终端），实现上用一个 `routerQueue` 互斥即可，语义上仍是「失败挡住后来的同种」。
 
-> `return` 的入队点与语义（#31）：`trigger handback`、`thread unrelated` 与 Ticket 结束时的释放（`letGo`）在**同一个事务里只写 disposition 与一行 `return`**（key 是该 Trigger 的 id），handler 经 `Engine.returnToEval` 幂等重排，提交之后才执行。上游在这三处是同步入队；这里改成持久意图，崩溃后「它该回到 Eval」这件事不会丢。因此 `{queued:true}` 的含义是「**会**进入 Eval」，候选出现在 `return` 跑过之后，而不是命令的事务里（实现上它在提交后的微任务里就跑了，所以调用方几乎立刻能看到候选）。
+> `return` 的入队点与语义（#31）：三个入口都**在 Engine 的同一个事务里**只写 disposition 与一行 `return`——`trigger handback`（`handBack`）、`thread unrelated`（`markUnrelated` → `handBack`），以及 Ticket 结束/无法恢复时的释放（`letGo` → `enqueueReturn`）。`key` 是该 Trigger 的 id，handler 提交后经 `Engine.returnToEval` 幂等重排（`boot.ts` 的 `return` handler）。上游在这三处是**同步**入队；这里改成持久意图，崩溃后「它该回到 Eval」这件事不会丢。因此 `{queued:true}` 的含义是「**会**进入 Eval」：候选出现在 `return` 跑过之后，而不是命令的事务里（实现上它在提交后的微任务里就跑了，所以调用方几乎立刻能看到候选）。
 
 ### J.3 与健康看板的关系
 
@@ -1283,7 +1366,7 @@ interface AdmissionCells {
 | `runtime/shared` | `prompts/shared.md` | 角色分工与「不越界」 |
 | `runtime/orchestrator` | `prompts/orchestrator.md` | Router 角色 |
 | `runtime/worker` | `prompts/worker.md` | Worker 角色 |
-| `runtime/subscriptions` | `prompts/subscriptions.md` | 订阅语义 |
+| `runtime/subscriptions` | `prompts/subscriptions.md` | 订阅语义（上游 docs/001–002）。逐字保留那句「语境不携带授权」：*Every later message on a subscribed thread, from any participant or bot, reaches the subscribed tickets as context; it carries no authority and needs no mention or allowed-sender check.* —— 它就是 §D.1 的 context-only 语义：一条 `context: true` 的 Input、无候选、无 Decision、无所有权；已结束的 Ticket 不接也不被恢复 |
 | `runtime/replies` | `prompts/replies.md` | 回复与 ack 规则（含 100 词） |
 | `runtime/dispatch` | `prompts/dispatch.md` | Router 的路由细则 |
 | `runtime/work` | `prompts/work.md` | Worker 的工作细则 |
@@ -1368,7 +1451,7 @@ interface AdmissionCells {
 
 ### L.6 skills 作为文件
 
-- 启动时把内置 skills 写到 `<stateDir>/skills/<name>/SKILL.md`（内容来自 `app/skill-files.ts` 常量）；已存在且用户改过（有 `<!-- team-edited -->` 标记）则不覆盖。
+- 启动时把内置 skills 写到 `<stateDir>/skills/<name>/SKILL.md`（名字与正文来自 `app/prompts.ts` 的 `BUILT_IN_SKILLS`：`superagent-github` / `superagent-feishu`；落盘与不覆盖的判断在 `app/skills.ts`）。正文没变就不重写，已存在且用户改过（有 `<!-- team-edited -->` 标记）则不覆盖。
 - prompt 里写路径并要求：`开始 GitHub 相关工作前，读 <stateDir>/skills/superagent-github/SKILL.md`。
 - 团队 skills：面板 Prompts 页「Skills」组可新建/编辑；名字不能与内置重名（`reserved_skill_name`）；校验 1–64 字符、`[a-z0-9-]`。
 - 总大小上限 `promptMaxChars`（缺省 200 000 字符，含 override 与团队 skills）；超限保存被拒，**绝不静默截断**。
@@ -1461,7 +1544,8 @@ interface AdmissionCells {
 ### M.7 测试与 `plugin check`
 
 - 每个页面一个 `*.test.tsx`：`mount(module, { host: mockHost({ results: { 'state': fixture, … } }), persisted })` → 断言列表行数、`summary()` 关键行、危险操作需要二次确认、`panel.refusals` 为空。
-- `src/panel/panel.check.ts` 的情景（`defineCheck`）：`booting`、`empty`、`healthy`、`needs-person`、`problems`、`paused`、`setup-missing`、`long-lists`（>50 行分页）、`zh`/`en`（用 `theme`/`locale` 组合）、`danger-confirm`。`orca plugin check` 逐情景渲染并给出 `summary` 与 `tree`，CI 逻辑（`scripts/check.sh`）断言没有 issue。
+- `src/panel/panel.check.ts` 的情景（`defineCheck`）共 **17 个**：`booting`、`empty`、`healthy`、`needs-person`、`problems`、`paused`、`setup-missing`、`source`、`deployment`、`prompts`、`long-lists`（>50 行分页）、`execution`、`trigger`、`search`、`zh`、`en`、`danger-confirm`。`orca plugin check` 逐情景渲染并给出 `summary` 与 `tree`，CI 逻辑（`scripts/check.sh`）断言没有 issue。
+- **语言不是 check 的维度（实测偏差）**：宿主 1.4.251 的 `CheckScenario` 只有 `mockHost` 选项 + `persisted`/`theme`/`events`，**没有 `locale`**，check 的挂载固定用 `'en'`。所以 `zh`/`en` 两个情景实际区分的是**主题**（`light`/`dark`），不是语言；中英双语由 `mount(module, { locale })` 的单测覆盖（`locales.test.ts` 断言 key 集合与非空、`panel-navigation.test.tsx` 按 `locale` 断文案）。17 个情景覆盖的是状态与主题，语言改由单测盖。
 - 视觉验收：`orca plugin shot <key> --panel superagent --theme light|dark --width 360` 与 `--scenario` 各情景，读 PNG 检查窄宽度与两套主题。
 
 ---
@@ -1512,7 +1596,7 @@ manifest 声明（对齐 `[skill] manifest.md`）：
       { "key": "routerAgent", "title": "Router agent", "type": "string", "default": "pi", "description": "Orca agent id used for the long-lived router session." },
       { "key": "baseRepo", "title": "Base repository", "type": "string", "description": "Repo selector (path:<p>, name:<n> or id:<id>) that ticket worktrees are created from." }
     ],
-    "statusBarItems": [{ "id": "superagent", "text": "Superagent", "icon": "bot", "tone": "neutral", "tooltip": "Superagent", "command": "superagent.pause" }]
+    "statusBarItems": [{ "id": "superagent", "text": "Superagent", "icon": "bot", "tone": "neutral", "tooltip": "Superagent" }]
   },
   "capabilities": [
     { "kind": "workspace:read" }, { "kind": "workspace:write" }, { "kind": "agent:read" }, { "kind": "agent:launch" },
@@ -1590,7 +1674,20 @@ $ orca plugin types <dir> --json
 | `sync:<source id>` | settings | 名单同步 |
 | `sources` | registry | Source 实例总览（`starting/ready/paused/error`） |
 
-`superagent status` 的退出码（与上游 `scripts/dsh-superagent` 对齐）：`0` 正常运行；`1` 没跑/跑了两份/不响应/runtime 报错；`2` 某个非 runtime 部件报错（重启不修）；`3` 等 setup（重启不修）。面板 Overview 用同一份数据渲染。
+`superagent status` 的退出码（与上游 `scripts/dsh-superagent` 对齐；判定在 `http/state.ts` 的 `statusCode()`，`status` 与面板 Overview 读同一份 `StateView`，不各判一次）：
+
+| 码 | 含义 | 重启能修吗 |
+| --- | --- | --- |
+| `0` | `runtime` 为 `ready`/`paused`，setup 无问题、未暂停，且没有非 runtime 条目报 `error` | — |
+| `1` | `runtime` 不是 `ready`/`paused`（`starting` 也算没跑起来）或它报 `error`；「跑了两份」归这一档 | 通常可以 |
+| `2` | 某个**非 runtime** 部件报 `error`（`github`、`relay`、`router`…） | 不能，要人看 |
+| `3` | 等 setup、已暂停，或**连不上 worker**（未启动 / 端口没人听 / follower 不服务 HTTP → CLI 本地 `not_ready`） | 不能，要人补配置或恢复 |
+
+「跑了两份」在本实现里的形态：第二个实例取锁时发现活实例，进入 follower（不启 loops、不发 HTTP、
+面板写入一律固定拒绝，§N.1）；所以 `superagent status` 读到的是 leader 的读数——leader 健康就是 `0`，
+只有 leader 的 `runtime` 自报不可用才是 `1`；一个能应答的实例都找不到时（例如 leader 正在重启）是 `3`。
+判定顺序即优先级：runtime 先、setup 次、暂停再次、部件错误最后（先告诉你「为什么现在什么都没发生」）。
+面板 Overview 用同一份数据渲染。
 
 ### N.5 日志
 
@@ -1615,7 +1712,9 @@ $ orca plugin types <dir> --json
 - 状态栏文本：`Superagent` / `Superagent 3`（待人工数）/ `Superagent paused` / `Superagent error`。
 - tone：无待人工且无 error → `success`；有待人工 → `warning`；有 error → `danger`；暂停 → `neutral`。
 - tooltip：`2 awaiting answer · 1 awaiting review · 1 problem`（分项计数）。
-- 点击 → 运行 `superagent.pause`（可换成贡献命令里的任意一个；本设计选 pause，因为它是最高频的「随时可用」动作）。
+- **无点击动作（已批准的偏差）**：清单里的这一项**没有 `command`**。§N.2 早期草稿给它挂了
+  `superagent.pause`，但那样一点就会暂停处理，而暂停是破坏性操作（面板里要二次确认，§M.2）。
+  所以点击什么都不发生；暂停/恢复走命令面板里的四个贡献命令或 `superagent pause` / `resume`。
 - 更新节流：最多每 2 s 一次 `statusBar.update`，且值未变不发。
 
 ---
@@ -1653,76 +1752,96 @@ $ orca plugin types <dir> --json
 
 ### P.2 测试套件（`orca plugin test .` 会跑所有 `*.test.ts(x)`）
 
+快照（本机 Orca 1.4.251、Node 25）：**88 个文件、1560 条测试、169 个 suite、fail 0**。下表按模块
+分组，每行都是 `tests/` 下的真实文件；「对应上游」写上游同名测试面，合并与改名的地方直接写出
+去向（§R.2 是同一件事的反向对照）。**没有落地的一项**单独列在表末。
+
+#### 领域与 Source
+
 | 文件 | 覆盖 | 对应上游 |
 | --- | --- | --- |
-| `core-engine.test.ts` | 收 Trigger、Eval、扇出、resume/stop、被中断的 Assignment、暂停、Policy 变更、Report 与结局、attach、reply、投递失败、dismiss | `core-engine.spec.ts` |
-| `stage.test.ts` | Ticket stage 逐行（含 `agentState` 新维度） | `stage.spec.ts` |
-| `policy.test.ts` | Source scope、gate、准入表、Mandate 复验、Policy version、设置迁移、assessment outcome | `policy.spec.ts` |
-| `registry.test.ts` | SourceRegistry：实例、校验、Policy 部分、Channel、线程上下文 | `registry.spec.ts` |
-| `sources-github.test.ts` / `sources-feishu.test.ts` | 翻译、轮询与读位置、PR 规则、health | `sources.spec.ts` |
-| `commands.test.ts` | CLI 调用经端口、Channel 的 `sent/gone`、仓库范围校验、错误脱敏 | `commands.spec.ts` |
-| `feishu-read.test.ts` / `github-read.test.ts` | Source 读面 | 同名 |
-| `admission-context.test.ts` / `feishu-image.test.ts` | 评估窗口、图片下载 | 同名 |
-| `assessment.test.ts` | 每个 Eval 缓存什么、何时释放 | `assessment.spec.ts` |
-| `background.test.ts` | 30 分钟近似：计时、收尾指令、清除标记 | `background.spec.ts` |
-| `effects.test.ts` | 队列：合并、并发上限、退避、health、关停 | `effects.spec.ts` |
-| `passes.test.ts` | 单线程 pass、期间请求合并成一次、失败上报 runtime health | `passes.spec.ts` |
-| `outbox.test.ts` | 暂停时等待、Source 关闭时等待、顺序、drop | `outbox.spec.ts` |
-| `queue.test.ts` | 通过 effect 队列的运行、旧版本存储的兼容 | `queue.spec.ts` |
-| `followups.test.ts` | 人 follow-up：通知、工具、退避成本、handback/context、note | `followups.spec.ts` |
-| `health.test.ts` | 每部件一条、各自下一次成功清除 | `health.spec.ts` |
-| `delivery.test.ts` | 投递去重（request id） | `delivery.spec.ts` |
-| `roles.test.ts` | 两个角色的模型解析（+ `models` health 空实现） | `retry-health.spec.ts`, `role-models.spec.ts` |
-| `runtime.test.ts` | 整个应用跑在 `FakeOrcaRuntime` 上，经 CLI 与 HTTP 驱动 | `runtime.spec.ts` |
-| `runtime-concurrency.test.ts` | 交叠：pass 期间的 Trigger、投递/启动中变化的 Ticket | 同名 |
-| `tools.test.ts` | 每个 CLI 命令的入参/出参/错误码（等价上游工具 schema 面） | `tools.spec.ts` |
-| `http.test.ts` | loopback/Host/Origin 校验、每类失败的状态码、body 上限、路径参数、查询 | `http.spec.ts` |
-| `settings.test.ts` | 保存与模型/账号检查竞态、被保存甩下的 Policy sync、pause/sync/block 的拒绝 | `settings.spec.ts` |
-| `views.test.ts` | 视图从 Store 推导（如被 drop 消息所属的 Thread） | `views.spec.ts` |
-| `timeline.test.ts` | Thread 分页、Trigger 按时间再 id 的邻居、时间格式化 | `timeline.spec.ts` |
-| `migration.test.ts` | 迁移把每条记录写成当前形状；拒绝更新的库 | `migration.spec.ts` |
-| `store.test.ts` | 仓储与工作集、kv、键字面量只在 `kv.ts`、设置历史、查询 | `store.spec.ts` |
-| `prompts.test.ts` | 校验、组装、版本、default-changed | `prompts.spec.ts` |
-| `cards.test.ts` | 内置文本必须声明的规则，逐分片 | `cards.spec.ts` |
-| `model-surface.test.ts` | 模型能读到的一切（CLI 帮助、prompt、skills、Input）与命令表/环境变量/术语表一致，且有大小预算 | `model-surface.spec.ts` |
-| `deployment.test.ts` / `environment.test.ts` / `main.test.ts` | 部署解析与 setup、执行环境、插件入口（`activate` 的注册与幂等） | 同名 |
-| `cli-status.test.ts` | `status` 的 0/1/2/3 退出码与字段 | `service-script.spec.ts` |
-| `panel-*.test.tsx` | 各页面 + Settings 组 + Prompts + Deployment + 搜索/术语表/路由记忆 | `panel-*.spec.tsx` |
-| `draft.test.ts` / `prompt-config.test.ts` / `markdown.test.ts` / `marks.test.ts` | 草稿状态机与保存栏文案、prompt 配置分区与行 diff、Markdown 子集、状态标记 | 同名 |
-| `locales.test.ts` / `styles.test.ts` | 双语 key 集合与非空、CSS 变量使用 | `locales.spec.ts`, `styles.spec.ts` |
-| `class-docs.test.ts` | 每个类前有 JSDoc 块（保持上游一条纪律） | `class-docs.spec.ts` |
-| `docs.test.ts` | 编号文档只链接更早的、本地链接可解析、无冲突标记、模块表与测试表完整 | `docs.spec.ts` |
+| `core-engine.test.ts` | 收 Trigger、同 Trigger 只接一次、扇出（含 context-only）、Eval、Decision、accept 建 Ticket + Mandate、resume/stop、被中断的 Assignment、暂停、Policy 变更、Report 与结局、attach/handback、reply、投递失败、dismiss | `core-engine.spec.ts` |
+| `stage.test.ts` | Ticket stage 逐行（含 `agentState` 新维度），第一行命中即止 | `stage.spec.ts` |
+| `policy.test.ts` | Policy 块、Gate、准入表、Mandate 复验、Policy version、设置迁移、assessment outcome | `policy.spec.ts` |
+| `assessment.test.ts` | `assessmentOutcome()`：每条规则恰好一次、方向与目标、结论与 `wouldAccept`；**Eval 语境缓存**（每个 `evalId` 只加载一次、何时释放）也在这里 | `assessment.spec.ts`、`cache.spec.ts`（合并） |
+| `route.test.ts` | `eval-decide` 与 `route`（1–20 条、逐条独立） | `tools.spec.ts` 的路由段 |
+| `registry.test.ts` | SourceRegistry：实例、配置校验失败即禁用、Policy 部分、Channel、Thread 上下文、health 归属 | `registry.spec.ts` |
+| `kind.test.ts` | `SourceKind` 协议的契约（每个成员可实现、可调用；`SourceContext` 只做加法） | `sources.spec.ts` 的协议段 |
+| `sources-github.test.ts` / `sources-feishu.test.ts` | 翻译、轮询、事件流与回填、读位置、PR 规则、health | `sources.spec.ts` |
+| `github-read.test.ts` / `feishu-read.test.ts` | Source 读面（资源、线程上下文、搜索） | 同名 |
+| `read-surface.test.ts` | `read <resource>` 的资源路由、分页、角色与固定拒绝（CLI 与 HTTP 共用一份） | `tools.spec.ts` 的读段 |
+| `admission-context.test.ts` | 评估窗口：页数/超时、四种结局、去重、游标 | 同名 |
+| `feishu-image.test.ts` | 图片按 `<message-id>/<image-key>` 下载并返回路径 | 同名 |
+| `commands.test.ts` | 命令端口：白名单、argv 数组、错误脱敏、`gone` 判定 | `commands.spec.ts` |
+| `fixtures.test.ts` | `tests/fixtures/cli/**` 的形态与 `.expected.json`（真实输出、脱敏、id 可复算） | `sources.spec.ts` 的夹具段 |
 
-新增（上游没有，Orca 专有）：
+#### 执行器、Router 与队列
 
-| 文件 | 覆盖 |
-| --- | --- |
-| `runtime-seam.test.ts` | 只有 `src/worker/runtime/` 出现 `host.call(`/`spawn('orca'`/`from 'orca`；`dependency.test.ts` 的规则 1–6 |
-| `host-methods.test.ts` | 源码里的 `host.call('<m>')` 字面量 ⊆ `HOST_METHODS`；清单里每项有 since 注释 |
-| `types-surface.test.ts` | `types/*.d.ts` 声明的方法与 `HOST_METHODS` 对齐（少一个就报） |
-| `executor-orca.test.ts` | 在 `FakeOrcaRuntime` 上：建 worktree（复用/新建）、launch 回执缺失时的反查、slots（含人类槽）、投递指针、stop/retry/resume、`agent.status.changed` 的四态映射、30 分钟近似 |
-| `router-orca.test.ts` | Router 启动/保活/重启退避、relay FIFO 与失败阻塞、prompt revision 通知 |
-| `cli-contract.test.ts` | 表驱动：每个命令至少一条成功 + 一条固定拒绝，断言 `error.code` 而非文案 |
-| `panel.check.ts` | `plugin check` 的情景（§M.7） |
+| 文件 | 覆盖 | 对应上游 |
+| --- | --- | --- |
+| `executor-orca.test.ts` | worktree 建/复用、launch 回执兜底（含 `findAgent`）、Input 投递（直发/指针/回车/回读）、slots（含人类槽）、stop/retry/resume、`agent.status.changed` 四态映射、**30 分钟后台工作的计时/收尾/清标记**，以及 `launch`/`delivery` 两个 effect handler | `runtime.spec.ts` 的执行器段、`background.spec.ts`（合并） |
+| `router-orca.test.ts` | Router 专用 worktree、terminal 面启动、relay FIFO 与失败阻塞、保活/重启退避、prompt revision 通知 | `runtime.spec.ts` 的 Router 段 |
+| `environment.test.ts` / `execution-environment.test.ts` | 变量表的值与替换；`env.sh` 与 git 排除（真 `sh` source、真 git 查索引） | `environment.spec.ts` |
+| `host-runtime.test.ts` | launch 回执的字段链与 `terminal list` 的 `orphaned` 语义（附录 C 的原样回执） | 无（Orca 专有） |
+| `runtime-errors.test.ts` | 宿主 13 + seam 7 个错误码、可重试集合、填槽值 | `runtime.spec.ts` 的错误段 |
+| `runtime.test.ts` | 端到端 tracer bullet（§Q.1）：真 loopback HTTP，侧效只经 `FakeOrcaRuntime`/`FakeCommands` 观察 | `runtime.spec.ts` |
+| `passes.test.ts` | 单线程 pass、期间请求合并成一次、失败上报 runtime health；**交叠**（pass 期间到达的请求）在这里 | `passes.spec.ts`、`runtime-concurrency.spec.ts`（合并） |
+| `queue.test.ts` / `effects.test.ts` | 关停保留 pending 行、重启接续；effect 的合并/并发/退避/`Later`/health | `queue.spec.ts`、`effects.spec.ts` |
+| `outbox.test.ts` | 先存后发、幂等、顺序、暂停等待、drop 与撤回 | `outbox.spec.ts` |
+| `followups.test.ts` | 人 follow-up 的归属、note/request-status、handback/context/unrelated、退避成本 | `followups.spec.ts` |
+| `roles.test.ts` | 两个角色的模型解析（`eval.model` / `executor.model`、`routerAgent` / `agent`），`models` 健康项恒 `ready` 并写「handled by Orca」 | `roles.spec.ts`、`retry-health.spec.ts` 与 `role-models.spec.ts`（合并） |
+
+#### 存储、HTTP/CLI 与门禁
+
+| 文件 | 覆盖 | 对应上游 |
+| --- | --- | --- |
+| `store.test.ts` / `repositories.test.ts` / `memory.test.ts` | 真库与四条 PRAGMA、kv 键只在 `kv.ts`、仓储映射与生成列、确定性读序；内存仓储的克隆/回滚 | `store.spec.ts` |
+| `migration.test.ts` / `retention.test.ts` / `lock.test.ts` | 迁移与备份、保留阈值、单实例锁与陈旧锁回收 | `migration.spec.ts` |
+| `health.test.ts` / `health-states.test.ts` | 每条目一个写者、release 语义；四档状态集合（`starting/ready/paused/error`） | `health.spec.ts` |
+| `http.test.ts` | §G.3 的 1–9 条边界、错误码 → 状态码、三角色拒绝面、`GET state` 形状、端口选择 | `http.spec.ts` |
+| `read-views.test.ts` | 视图读面（overview/sources/search/threads/thread/decisions/models）、筛选、`(at, triggerId)` 游标、assignment 边界；**上游 `views`/`timeline` 的断言在这里** | `views.spec.ts`、`timeline.spec.ts`（合并） |
+| `eval-tools.test.ts` | `eval` / `eval-read` 的窗口与四种读法 | `tools.spec.ts` |
+| `cli-contract.test.ts` / `tools.test.ts` | 表驱动：每条命令一条成功 + 一条固定拒绝（断言 `error.code`）；入参/出参、请求幂等 | `tools.spec.ts` |
+| `cli-status.test.ts` / `cli-doctor.test.ts` / `cli-entry.test.ts` | `status` 的 0/1/2/3、`doctor` 的三档结论、可执行入口的端到端（真子进程） | `service-script.spec.ts` |
+| `settings.test.ts` / `settings-view.test.ts` / `settings-limits.test.ts` | 保存与 origin、写前校验、版本记账；Settings 页的 worker 面；四个机器限额 | `settings.spec.ts` |
+| `prompts.test.ts` / `cards.test.ts` / `panel-prompts.test.tsx` / `diff.test.ts` | 分片清单、占位符、组装顺序、版本与 default-changed；每个分片必须声明的规则；prompt 配置分区与行 diff（上游 `prompt-config`） | `prompts.spec.ts`、`cards.spec.ts`、`prompt-config.spec.ts`（合并） |
+| `model-surface.test.ts` | 模型能读到的一切（帮助、prompt、skills、Input）与命令表/变量表/术语表一致，且有体量预算 | `model-surface.spec.ts` |
+| `deployment.test.ts` / `agent-defaults.test.ts` / `gitconfig.test.ts` / `main.test.ts` | setup 探针；两个 agent 默认值同源；`worker-gitconfig` 的内容与注入姿态；`activate` 的登记与越权 | `deployment.spec.ts`、`index.spec.ts` |
+| `panel-overview.test.tsx` / `panel-source.test.tsx` / `panel-trigger.test.tsx` / `panel-eval.test.tsx` / `panel-execution.test.tsx` / `panel-settings.test.tsx` / `panel-prompts.test.tsx` / `panel-deployment.test.tsx` / `panel-search.test.tsx` / `panel-navigation.test.tsx` | 每页的行数、三态、危险操作确认、路由记忆、`panel.refusals` 为空 | `panel-*.spec.tsx`、`client.spec.ts`、`navigation.spec.ts` |
+| `widgets.test.tsx` / `draft.test.ts` / `markdown.test.ts` / `marks.test.ts` / `terms.test.ts` / `protocol.test.ts` | 组件契约、草稿状态机与保存栏、Markdown 子集、状态标记、码表与文案键一一对应、面板↔worker 协议形状 | `client.spec.ts`、`controls.spec.ts`（删除：Orca 提供控件） |
+| `locales.test.ts` / `styles.test.ts` | 双语 key 集合与非空；只用主题变量（无 `style`/`className`） | `locales.spec.ts`、`styles.spec.ts` |
+| `runtime-seam.test.ts` / `dependency.test.ts` / `host-methods.test.ts` / `types-surface.test.ts` / `type-surface-config.test.ts` | 运行缝唯一性（`host.call(`/`spawn('orca'`/`from 'orca` 只在 `runtime/`）；§C.2 规则 1–6；`host.call` 字面量 ⊆ 清单；`types/*.d.ts` 与清单对齐；两份 tsconfig 的 `paths` 一致 | 无（Orca 专有） |
+| `manifest-budget.test.ts` / `license.test.ts` / `check-script.test.ts` / `shutdown.test.ts` | 清单形态与每类上限；MIT 与署名句；`scripts/check.sh` 的四道门禁与 `types` 缺陷探针；关停屏障 | `bundle-patch.spec.ts`（删除：改由 `plugin validate` 承担） |
+| `source-state.test.ts` / `log.test.ts` / `schema.test.ts` / `status-bar.test.ts` | Source 只经端口写自己的状态；日志滚动、脱敏、`orca.log`；零依赖校验器的 `strict`/`safeParse`/错误路径；状态栏文本、语气与 2 s 节流 | 无（Orca 专有） |
+| `docs.test.ts` | 本地链接、无冲突标记、编号文档、§C.1 模块表覆盖 `src/` 每个目录、§P.2 ↔ §R.2 互相对得上、README 的十一项限制与 attribution | `docs.spec.ts` |
+| `src/panel/panel.check.ts`（不在 `tests/`） | `plugin check` 的 17 个情景（§M.7） | 无（Orca 专有） |
+
+#### 没有落地的上游测试面（记为差异，不是笔误）
+
+| 上游测试面 | 现在的状态 | 归属 |
+| --- | --- | --- |
+| `class-docs.spec.ts` | **没有** `class-docs.test.ts`：仓库里没有「每个类前必须有 JSDoc」的自动断言，这条纪律今天靠审阅 | 无票。§H 之外的一处实现差异，#50 在此记明；要补需要一张新票 |
+| `runtime-concurrency` 的独立文件 | 断言并入 `passes.test.ts`（pass 期间到达的请求）与 `core-engine.test.ts`（Thread 串行 Eval + 合并待评估的 Trigger） | #15 T1 |
+| `delivery.spec.ts` | 投递去重（request id）的断言在 `effects.test.ts` 与 `tools.test.ts`（幂等），没有单独文件 | #11 F6A |
 
 ### P.3 灯红→灯绿清单（先失败后通过的回归）
 
 | # | 红灯现象 | 会红的测试 | 说明 |
 | --- | --- | --- | --- |
 | R1 | 有人在 GitHub 评论里 @ agent，等一分钟仍然没有 Ticket | `sources-github.test.ts` 的收信链路 + `core-engine.test.ts` 的 accept | tracer bullet 的第一盏灯 |
-| R2 | Ticket 建了但 worktree 没建/建在错误的 repo | `executor-orca.test.ts#creates a worktree from the configured base repo` | 断言 CLI argv |
-| R3 | worker 起了但收不到 assignment | `executor-orca.test.ts#delivers the assignment as a pointer` | 断言 `sendText` 文本含文件路径 |
+| R2 | Ticket 建了但 worktree 没建/建在错误的 repo | `executor-orca.test.ts#a missing worktree is created with the documented create arguments` | 断言 CLI argv |
+| R3 | worker 起了但收不到 assignment | `executor-orca.test.ts#a long input is sent as a one-line pointer to the file, never as the body` | 断言 `sendText` 文本含文件路径 |
 | R4 | `report ready` 之后消息没回到原会话 | `outbox.test.ts` + `sources-github.test.ts` 的 Channel | 断言 `gh api` 的 argv 与幂等标记 |
-| R5 | 重复通知导致重复 Ticket | `core-engine.test.ts#accepts the same trigger once` | 幂等由 key 保证 |
-| R6 | Policy 改成 observe 后仍然自动接单 | `policy.test.ts#observe records would-accept without a ticket` | — |
-| R7 | 暂停后仍在投递/回复 | `outbox.test.ts#waits while paused`、`effects.test.ts#Later does not count as a failure` | — |
-| R8 | 插件重启后 running Assignment 变成僵尸 | `executor-orca.test.ts#adopts a live terminal and restarts the rest` | — |
-| R9 | Router 死掉后候选堆着没人处理 | `router-orca.test.ts#restarts the router with backoff` | — |
+| R5 | 重复通知导致重复 Ticket | `core-engine.test.ts#accepts the same trigger once: a replay returns the first Decision and starts no second ticket` | 幂等由 key 保证 |
+| R6 | Policy 改成 observe 后仍然自动接单 | `policy.test.ts#observe records would-accept without a ticket (R6)` | — |
+| R7 | 暂停后仍在投递/回复 | `outbox.test.ts#a paused plugin keeps the message pending without counting a failure, and sends on resume`、`effects.test.ts#Later means "cannot now": not a failure, retried after five seconds` | — |
+| R8 | 插件重启后 running Assignment 变成僵尸 | `executor-orca.test.ts#resume adopts a live terminal whose worktree is this ticket and says restored` | — |
+| R9 | Router 死掉后候选堆着没人处理 | `router-orca.test.ts#a gone terminal is restarted on the next tick` | — |
 | R10 | 面板列出 60 个 Ticket 时被渲染上限截断/报错 | `panel-execution.test.tsx` 分页 + `plugin check` 的 `long-lists` 情景 | — |
 | R11 | 有人在 `stateDir` 写了第二个实例 | `lock.test.ts` | — |
 | R12 | 升级后旧库打不开 / 静默丢字段 | `migration.test.ts` | 备份 + 版本拒绝 |
-| R13 | 命令注入：消息正文里带 `; rm -rf` 被拼进 shell | `commands.test.ts#never interpolates message text`、`execution-environment.test.ts` | argv 数组 + 单引号转义 |
-| R14 | token 泄漏到日志 | `log.test.ts#redacts tokens and message bodies` | — |
+| R13 | 命令注入：消息正文里带 `; rm -rf` 被拼进 shell | `commands.test.ts#never interpolates message text into a shell`、`execution-environment.test.ts` | argv 数组 + 单引号转义 |
+| R14 | token 泄漏到日志 | `log.test.ts#redacts tokens, secrets, message bodies and CLI argv; keeps ids, lengths and codes` | — |
 | R15 | 面板调用了面板无权的方法（如 `workspace.open`） | `panel-*.test.tsx` 的 `panel.refusals` 非空 | 说明必须走 worker |
 
 ### P.4 测试档宽建议
@@ -1921,30 +2040,38 @@ manifest + types + tsconfig + boot + lock + sqlite(trigger/thread/ticket/decisio
 | 007 | 配置热重载 | §H.12、§N.2 | T9 |
 | 007 | 用真实数据审阅变更 | §P.4 验收 + `doctor` | T9 |
 | 007 | 开放问题（信任边界、部署隔离） | §O、§H.20 | T9、T10 |
-| 008 | 新增 Source 的 11 步 | §I.1（协议）+ `docs/design` 的补充说明（实现票里写成 `docs/adding-a-source.md`） | T10 |
+| 008 | 新增 Source 的 11 步 | §I.1（协议）+ [`docs/adding-a-source.md`](../adding-a-source.md)（十一步指南） | T10 |
 
 ### R.2 上游测试面 → Orca 对应
 
 | 上游测试 | Orca 对应（§P.2） | 状态 |
 | --- | --- | --- |
-| `core-engine` / `stage` / `policy` / `registry` / `sources` | `core-engine` / `stage` / `policy` / `registry` / `sources-*` | 一对一 |
-| `commands` / `feishu-read` / `github-read` / `admission-context` / `feishu-image` | `commands` / `feishu-read` / `github-read` / `admission-context` / `feishu-image` | 一对一 |
-| `assessment` / `background` / `effects` / `passes` / `outbox` / `cache` | `assessment` / `background` / `effects` / `passes` / `outbox` / `cache` | 一对一（`background` 语义改为近似，测试也随之改为「计时 + 收尾指令」） |
-| `queue` / `followups` / `health` / `delivery` / `retry-health` / `role-models` | `queue` / `followups` / `health` / `delivery` / `roles` | `retry-health` 合并进 `roles`（§H.4 空实现） |
-| `runtime` / `runtime-concurrency` / `tools` / `http` / `settings` | `runtime` / `runtime-concurrency` / `tools` / `http` / `settings` | 一对一 |
-| `views` / `timeline` / `migration` / `store` / `prompts` / `cards` | 同名 | 一对一 |
-| `model-surface` / `deployment` / `environment` / `index` | `model-surface` / `deployment` / `environment` / `main` | 一对一 |
+| `core-engine` / `stage` / `policy` / `registry` / `sources` | `core-engine` / `stage` / `policy` / `registry` / `sources-github` + `sources-feishu` | 一对一 |
+| `commands` / `feishu-read` / `github-read` / `admission-context` / `feishu-image` | 同名 | 一对一 |
+| `assessment` / `cache` | `assessment` | 合并：Eval 语境缓存（什么时候加载一次、什么时候释放）在 `assessment.test.ts` 里 |
+| `background` | `executor-orca` | 合并：语义改为近似，断言改成「计时 + 收尾指令 + `done` 清标记」 |
+| `effects` / `passes` / `outbox` / `queue` | 同名 | 一对一 |
+| `followups` / `health` | 同名 | 一对一 |
+| `delivery` | `effects` / `tools` | 合并：投递去重（request id）的断言并入 effect 与幂等测试 |
+| `retry-health` / `role-models` | `roles` | 合并（§H.4 的空实现） |
+| `runtime` | `runtime` | 一对一 |
+| `runtime-concurrency` | `passes` / `core-engine` | 合并：交叠场景并入 pass 与 Thread 串行 Eval |
+| `tools` | `tools` / `cli-contract` | 一对一（另加每条命令的固定拒绝对照） |
+| `http` / `settings` | 同名 | 一对一 |
+| `views` / `timeline` | `read-views` | 合并 |
+| `migration` / `store` / `prompts` / `cards` / `model-surface` / `deployment` / `environment` | 同名 | 一对一 |
+| `index` | `main` | 改名（`activate` 的登记面） |
 | `service-script` | `cli-status` | 语义等价（0/1/2/3 + 字段） |
 | `bundle-patch` | 删除 | DSH bundle 概念在 Orca 上不存在（§H.9）；清单校验由 `orca plugin validate` 承担 |
-| `client` / `navigation` / `controls` | `panel-*` + `draft`/`marks` | `controls` 删除（Orca 提供控件，我们只组合）；`navigation` 改为「路由记忆」测试 |
-| `panel-overview` / `panel-source` / `panel-trigger` / `panel-eval` / `panel-execution` / `panel-settings` / `panel-prompts` / `panel-deployment` / `panel-panel` | `panel-*.test.tsx` | 一对一 |
-| `draft` / `prompt-config` / `markdown` / `marks` / `locales` / `styles` | 同名（`prompt-config` → `prompt-config`） | 一对一 |
-| `class-docs` / `docs` | 同名 | 一对一（`docs.test.ts` 的「模块表/测试表完整」改为针对本文 §C 与 §P） |
-| （无） | `runtime-seam` / `host-methods` / `types-surface` / `executor-orca` / `router-orca` / `cli-contract` | 新增（Orca 专有） |
+| `client` / `navigation` / `controls` | `panel-*` + `draft` / `marks` | `controls` 删除（Orca 提供控件）；`navigation` 改为「路由记忆」测试 |
+| `panel-overview` / `panel-source` / `panel-trigger` / `panel-eval` / `panel-execution` / `panel-settings` / `panel-prompts` / `panel-deployment` | `panel-overview` … `panel-deployment`（10 个文件） | 一对一 |
+| `draft` / `prompt-config` / `markdown` / `marks` / `locales` / `styles` | 同名（`prompt-config` → `prompts` + `panel-prompts` + `diff`） | 一对一 / 合并 |
+| `docs` | `docs` | 一对一（「模块表/测试表完整」改为针对本文 §C 与 §P） |
+| `class-docs` | 未落地 | 没有 `class-docs.test.ts`；§P.2 表末记为差异（要补需要一张新票） |
+| （无） | `runtime-seam` / `host-methods` / `types-surface` / `executor-orca` / `router-orca` / `cli-contract` / `host-runtime` / `kind` / `read-surface` / `read-views` / `route` | 新增（Orca 专有） |
 
-**没有遗漏的核对方式**：本表每一行的「Orca 对应」都必须在 §P.2 出现，`docs.test.ts` 断言这一点；上游新增能力时，本表是唯一的对照处。
-
----
+**没有遗漏的核对方式**：本表每一行的「Orca 对应」都必须在 §P.2 出现，`docs.test.ts` 断言这一点；
+上游新增能力时，本表是唯一的对照处。
 
 ## 附录 A：许可证与归属
 
@@ -1953,34 +2080,62 @@ manifest + types + tsconfig + boot + lock + sqlite(trigger/thread/ticket/decisio
 
   > Ported from `deepseek-ai/dsh-superagent-prototype` (MIT, Copyright DeepSeek), commit `8c32a9dc5d72c033816c6a8110b37f40cf94fba4`. The Orca adaptation changes the host integration; the domain rules, prompts and documents are derived from that prototype.
 
-- 上游 `prompts/*.md` 与 `skills/**/SKILL.md` 的文本在 `src/worker/app/prompt-text/` 与 `app/skill-files.ts` 中以等价形式保留（可编辑、可 diff），文件头注释写明来源与许可。
+- 上游 `prompts/*.md` 与 `skills/**/SKILL.md` 的文本在 `src/worker/app/prompt-text/`（内置分片与两个 skill 的正文，`BUILT_IN_SKILLS` 在 `app/prompts.ts`）与 `app/skills.ts`（落盘、team-edited 与不覆盖）中以等价形式保留（可编辑、可 diff），文件头注释写明来源与许可。
 - 不复制上游 `src/**` 代码；领域规则以「同一规则、Orca 原生实现」重写（§A.1 的验收口径）。若个别函数（如 `ticketStage`、`policyEffects`）逻辑与上游逐条一致，注释里注明对应上游文件与文档小节，便于审阅。
 
 ## 附录 B：已知限制（用户可见摘要）
 
-与 §H 标「是」的条目一致，面板 Deployment 页与 README 各有一份：
+**十一项，与 §A.3、`src/panel/limitations.ts` 同一份清单**：面板 Deployment 页的 Limitations 段与
+README 的已知限制段读 `limitation.<id>.*` 文案（中英各一份），顺序即 §A.3 的编号。本节是设计文档里
+的那一份，措辞与面板略有不同（这里是写给读设计的人看的），但**编号、内容与 §A.3 一一对应**：
 
-1. Worker/Router 是普通 Orca agent，工具集不可裁剪；「Router 不读代码」「不等待」只由 prompt 与结构保证（H.1/H.19/F.3）。
-2. 运行中的会话不会自动看到新版 prompt / Policy；版本随消息告知，全文需新会话（H.2/L.5）。
-3. 看不到 agent 内部的后台 job：30 分钟规则退化为「提醒 + 标记」，不杀进程（H.3）。
-4. 模型预算重试由 Orca agent 负责，插件只做 launch 重试，`models` 健康项恒 ready（H.4）。
-5. 生命周期属 Orca：没有 `start/stop` 命令，没有 tmux 会话；「停」用 `paused`（H.7）。
-6. Skills 不是宿主注册表：写盘 + prompt 给路径，agent 可能不读（H.8）。
-7. Worker 可能在自己的终端里提问：由 `blocked` 状态兜底，但问题文本是终端摘要而非结构化（H.10）。
-8. blocked commands 与账号 shim 依赖 `agent.launch.before` hook（2 s、fail-open），不是安全边界（H.11）。worker 的 git 配置是一份最小副本（凭据 helper、SSH→HTTPS、提交身份），其余全局项（`http.*`、LFS 的 `filter.lfs.*`）只剩系统级配置——LFS 依赖系统配置，仍是近似（H.11）。
-9. Relay 不保证「下一步」送达，只保证顺序与重试（H.14）。
-10. 没有权威模型清单，model id 填错要到 launch 才报（H.16）。
-11. 若 Router 的 agent 不能读图，图片评估退化为文本 + 明确说明（H.17）。
-12. 不提供进程隔离，建议专用 OS 账号（H.20）。
+1. **Session preset 的工具裁剪** —— Worker/Router 是普通 Orca agent，工具集不可裁剪；「Router 不读代码」「不等待」只由 prompt 与结构保证（H.1/H.19/F.3）。
+2. **系统提示词在 launch 时一次性注入** —— 运行中的会话不会自动看到新版 prompt / Policy；版本随消息告知，全文需新会话（H.2/L.5）。
+3. **看不到 agent 内部的后台工作与 30 分钟预算** —— 30 分钟规则退化为「提醒 + 标记」，不杀进程；`done` 每轮结束都会到，所以它一清掉计时，只有真正跨轮的后台工作才会被计时（H.3）。
+4. **模型预算重试由 Orca 负责** —— 插件只做 launch 重试，`models` 健康项恒 ready（H.4）。
+5. **没有 DSH Plugin Manager 页面** —— 少量项在 Orca 设置里改，其余在面板 Settings → Deployment 组，两处不重复（H.5）。
+6. **没有 DSH 的 Web 面板与端口** —— 面板只在 Orca 客户端里打开，没有可跨设备访问的 URL（H.6，视为改进）。
+7. **生命周期归 Orca，没有服务脚本与 tmux** —— 没有 `start/stop` 命令，没有 tmux 会话；「停」用 `paused`（H.7）。
+8. **Skills 不是宿主注册表** —— 写盘 + prompt 给路径，agent 可能不读（H.8）。
+9. **没有 `dsh` CLI 与 profile** —— 用 `superagent` CLI 与 `orca` CLI 顶上（H.9）。
+10. **无法移除 worker 的提问工具** —— 由 `blocked` 状态兜底，但问题文本是终端摘要而非结构化（H.10）。
+11. **进程隔离与执行环境注入只是近似** —— blocked commands 与账号 shim 依赖 `agent.launch.before` hook（2 s、fail-open），不是安全边界；worker 的 git 配置是一份最小副本（凭据 helper、SSH→HTTPS、提交身份），其余全局项（`http.*`、LFS 的 `filter.lfs.*`）只剩系统级配置——LFS 依赖系统配置，仍是近似；不提供进程隔离，建议专用 OS 账号（H.11/H.20）。
+
+每条的**加粗部分就是面板与 README 的标题**（`copy.ts` 的 `limitation.<id>.title`），编号与顺序与
+`src/panel/limitations.ts` 一致；破折号后的句子是设计文档的详细版（面板的 `impact` 是同一件事的
+用户向措辞）。
+
+### B.1 附加近似：标「是」但不在十一项里的四行
+
+§H 差异表按「上游行为」逐行标注，所以它的「是」比用户可见清单多四行。这四行是**精度与能力面**的
+差异，不是「能力缺失」，披露位置都写在 §H 对应行与本节；它们**不**进 README 与面板的十一项：
+
+| §H | 近似 | 为什么不在十一项里 | 披露位置 |
+| --- | --- | --- | --- |
+| H.14 | Relay 不保证 Router 在「下一步」看到，只保证顺序、重试与「失败挡住后来的」 | 时序精度，不是缺能力；失败可见（relay effect 的 health 与面板 System problems） | §F.2、§J.2、§H.14 |
+| H.15 | 宿主工具面不同（上游 `job_output`/`job_list`/`job_kill`/`read_image` 由 worker agent 自己的等价工具顶上） | 取决于装的 agent；`job_kill` 的缺席已并入第 3 项（30 分钟只能劝停） | §H.15、§H.3 |
+| H.16 | 没有权威模型清单：`GET models` 给的是「设置里配过的 + 最近一次 launch 用的 + 空目录提示」，填错要到 launch 才报 | 读数的完整性，不是功能差异 | §H.16、§G.2 `status` 的 `models` 行 |
+| H.17 | Router 的 agent 读不了图时，图片评估退化为文本 + 明确说明 | 评估质量，且只有在 Router 的 agent 不支持读图时出现 | §H.17、§I.3「图片」行 |
+
+### B.2 十一项之外的一处实现差异（不属 §H）
+
+`class-docs.test.ts`（上游 `class-docs.spec.ts`，断言「每个类前有 JSDoc」）**没有落地**：仓库里没有
+这条自动断言，纪律靠审阅。它不是行为差异（§H 记的是行为），所以只写在这里与 §P.2 的表末；要补需要
+一张新票。
 
 ## 附录 C：spike 台账（不是「待定」，是「已定方向 + 需实测的参数」）
 
 每一项都已经有设计决定；spike 只是把**参数或字段名**钉死。全部落在 F1/F6/F7 票里，且失败时都有回落方案。
 
+实测也钉死了 seam 的四处增补（§B.2/§B.3 已写入）：`OrcaRuntime.findAgent(workspaceId)`（宿主 `agents.list`
+的行不带 workspaceId，只靠它做不到反查）、`removeWorkspace`（Host API 没有删工作区，走
+`orca worktree rm`）、launch 回执的**权威字段是 `result.outcome.handle`**、以及
+**`orphaned:true` ≠ 死亡**（它只表示 pty 没挂到可见 pane）。
+
 | ID | 待实测 | 影响 | 回落 |
 | --- | --- | --- | --- |
 | S1 | `terminal.sendText` 的单次可用长度与多行行为（换行是否会被当作多次提交） | §E.2 开播语、§E.4 的 `inlineLimit` 缺省值 | 一律文件指针 + 单行提示（保守值 1000 字符） |
-| S2 | `orca agent launch --json` 回执里 terminal 句柄的字段名与稳定性，及该 terminal 是否出现在 `agents.list` | §E.2 回执解析、§E.7 映射 | 用 `workspaceId` 在 `agents.list()` 反查；再不行用 `terminal.read` 探活 |
+| S2 | `orca agent launch --json` 回执里 terminal 句柄的字段名与稳定性，及该 terminal 是否出现在 `agents.list` | §E.2 回执解析、§E.7 映射 | 用 `workspaceId` 在 `listTerminals()` 里反查（`OrcaRuntime.findAgent`）；再不行用 `terminal.read` 探活 |
 | S3 | `orca worktree create` 的耗时与 `--setup` 行为，以及 `--base-branch` 对非 main 默认分支的处理 | §E.1 超时（120 s）与 setup 语义 | 超时调到 300 s；base ref 由设置在首次 setup 时固化 |
 | S4 | `agent.launch.before` hook 的 env 是否真的进入 agent 进程，以及 hook 在 2 s 内的稳定率 | §H.11 的 shim 有效性 | 若不稳定：改为「prompt 强制绝对路径 + setup 检查 git config」并把 H.11 升级为更强限制 |
 | S5 | 状态栏项能否在 Orca 窗口关闭/重开后仍保持 worker 常驻 | §N.7 常驻与 Router 监督 | 若否则用 `contributes.events` + 定时 `agent.status.changed` 兜底，并在 Limitations 写明 |
@@ -2265,7 +2420,10 @@ superagent-router-spike16 --repo path:<base> --base-branch HEAD --setup skip --n
    保留在解析链里，旧宿主不受影响。
 2. **`orphaned` 只说明「没有 pane」，`connected` 才说明「还连着」**。保活判据因此是
    「不在枚举里 ∨ `connected=false`」；`orphaned` 只作为快照里的一条事实（面板可显示「后台
-   终端」）。派发说明里「gone or orphaned」的措辞按这条实测收窄。
+   终端」）。`findAgent` 的反查同步放宽（只看 `connected`）。一份例外：**Ticket 的认领更严**
+   —— `executor/resume.ts` 要求 `connected && !orphaned` 才 `adopt`，否则重建 Assignment（§E.5）。
+   这是「宁可重建，也不把看不见的会话当自己的」的姿态，不是判活规则的第二套真源；用户能感知
+   的结果是：一个后台跑着、UI 里没开的 worker 终端，在插件重启后会被重建而不是认领。
 3. **`done` 是回合结束，不是会话结束**（与 S7 的记录一致）。§F.5 的 `done` 触发留给 DOC2
    对齐；实现不再按 `done` 重启，避免每一轮都换 Router。
 4. **未证实（不写成事实）**：Router 终端的事件到达。它用的是与 #12 相同的一条
