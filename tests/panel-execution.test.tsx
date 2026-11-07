@@ -6,7 +6,7 @@
 //   `ticket.detail`），动作断言发出去的请求名与入参，并断言面板没有直接调宿主方法；
 // - 读模型侧：`panelTicketPage` / `ticketDetail` 把真 Ticket 变成 `PanelTicket` 与详情
 //   （不是手写夹具），包括「没有 agentState 时按严格表落 Working」这一行。
-import { mkdtempSync, rmSync } from 'node:fs'
+import { mkdtempSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { assert, mockHost, mount, mountWorker, test } from 'orca/testing'
@@ -23,6 +23,7 @@ import {
 import { COPY, translate } from '../src/panel/copy'
 import * as panelModule from '../src/panel/panel'
 import check from '../src/panel/panel.check.ts'
+import { removeTree } from './support/state'
 
 /** `mockHost` 的请求表类型（测试里只写用到的几个名字）。 */
 type Requests = NonNullable<NonNullable<Parameters<typeof mockHost>[0]>['requests']>
@@ -1000,7 +1001,8 @@ test('the worker answers the Execution requests the panel sends', async () => {
     await unknown('workspace.remove', { ticketId: 'nope' })
     assert.deepEqual(worker.refusals, [])
   } finally {
+    // `deactivate()` 是关停屏障（§N.1）：返回之后才删，删除有界重试且不吞非竞态错误。
     await worker.deactivate()
-    rmSync(stateDir, { recursive: true, force: true })
+    await removeTree(stateDir)
   }
 })

@@ -168,7 +168,11 @@ export interface RouterSupervision {
   /** 当前终端句柄；没有可用会话时 `null`（relay 据此失败并重试）。 */
   terminalId(): string | null
   snapshot(): RouterSnapshot
-  stop(): void
+  /**
+   * 关停：停掉 tick，并**等还在跑的 tick/restart 收尾**再返回（§N.1 的关停屏障）。
+   * 返回之后本保活器不再建 worktree、不再轮换 token、不再 launch，也不写库。
+   */
+  stop(): Promise<void>
 }
 
 /** 一行可读的错误（健康 detail 用；截断到 200 字符）。 */
@@ -218,6 +222,16 @@ export function createRouterSupervision(options: RouterSupervisionOptions): Rout
   let stopped = false
   let timer: unknown = null
   let detail = enabledNow() ? 'not started yet' : 'setup not ready'
+  /** 还在跑的 tick/restart（含它们内部的 launch）：`stop()` 要等它们，否则写会落在关停之后。 */
+  const inflight = new Set<Promise<void>>()
+  const track = (work: Promise<void>): Promise<void> => {
+    inflight.add(work)
+    void work.then(
+      () => inflight.delete(work),
+      () => inflight.delete(work)
+    )
+    return work
+  }
 
   /** 写一次健康条目：error 只在「连续 3 次失败」或「十分钟内五次重启」时（§N.4、§F.1）。 */
   const report = (): void => {
@@ -270,8 +284,11 @@ export function createRouterSupervision(options: RouterSupervisionOptions): Rout
   /** 建 worktree（如需）→ 轮换 token → launch；成功即 ready，失败按 5 s→300 s 退避。 */
   const launch = async (at: number, countsAsRestart: boolean): Promise<void> => {
     try {
+      // 关停之后不再建 workspace、不轮换 token、不 launch：条件不在时一次也不写（§N.1）。
+      if (stopped) return
       if (workspaceHandle === null) {
         const ensured = await ensureRouterWorkspace(options.runtime, options.settings)
+        if (stopped) return
         workspaceHandle = ensured.handle
       }
       const handle = workspaceHandle
@@ -284,6 +301,8 @@ export function createRouterSupervision(options: RouterSupervisionOptions): Rout
         directory: handle.path,
         revision: currentRevision
       })
+      // token 已经轮换（同步写盘）：这一步之后关停判定仍然有效，不再 launch 新会话。
+      if (stopped) return
       const launched: AgentHandle = await launchRouter(options.runtime, {
         workspace: handle,
         settings: options.settings,
@@ -321,7 +340,7 @@ export function createRouterSupervision(options: RouterSupervisionOptions): Rout
     }
   }
 
-  const tick = async (): Promise<void> => {
+  const runTick = async (): Promise<void> => {
     if (!enabledNow() || stopped || running) return
     running = true
     try {
@@ -351,6 +370,36 @@ export function createRouterSupervision(options: RouterSupervisionOptions): Rout
     } finally {
       running = false
     }
+  }
+
+  /** 定时器与测试共用的一次 tick：登记下来，`stop()` 才等得到它。 */
+  const tick = (): Promise<void> => track(runTick())
+
+  /** 人显式要求重启：关掉旧会话、清空重启窗口、立即换新会话（登记成在跑的一次）。 */
+  const restartNow = async (reason: string): Promise<void> => {
+    if (!enabledNow() || stopped) return
+    const current = terminal ?? options.state.terminal()
+    if (current !== null) {
+      try {
+        await options.runtime.closeTerminal(current.terminalId)
+      } catch (error) {
+        log(`the old router terminal could not be closed: ${messageOf(error)}`)
+      }
+    }
+    terminal = null
+    workspaceHandle = null
+    agentState = null
+    orphaned = null
+    waits.length = 0
+    options.state.saveTerminal(null)
+    // 显式动作：清掉崩溃循环的证据与退避，立刻换新会话。
+    restartTimes = []
+    failures = 0
+    lastError = null
+    nextAttemptAt = 0
+    saveRestarts()
+    log(`restarting the router on purpose: ${reason}`)
+    await launch(now(), false)
   }
 
   return {
@@ -399,29 +448,7 @@ export function createRouterSupervision(options: RouterSupervisionOptions): Rout
       waits.length = 0
     },
     async restart(reason: string): Promise<void> {
-      if (!enabledNow() || stopped) return
-      const current = terminal ?? options.state.terminal()
-      if (current !== null) {
-        try {
-          await options.runtime.closeTerminal(current.terminalId)
-        } catch (error) {
-          log(`the old router terminal could not be closed: ${messageOf(error)}`)
-        }
-      }
-      terminal = null
-      workspaceHandle = null
-      agentState = null
-      orphaned = null
-      waits.length = 0
-      options.state.saveTerminal(null)
-      // 显式动作：清掉崩溃循环的证据与退避，立刻换新会话。
-      restartTimes = []
-      failures = 0
-      lastError = null
-      nextAttemptAt = 0
-      saveRestarts()
-      log(`restarting the router on purpose: ${reason}`)
-      await launch(now(), false)
+      return track(restartNow(reason))
     },
     terminalId(): string | null {
       return terminal?.terminalId ?? null
@@ -451,12 +478,15 @@ export function createRouterSupervision(options: RouterSupervisionOptions): Rout
         agentState
       }
     },
-    stop(): void {
+    async stop(): Promise<void> {
       stopped = true
       if (timer !== null && options.cancel !== undefined) {
         options.cancel(timer)
         timer = null
       }
+      // 关停屏障（#60）：还在跑的 tick/restart 会写 workspace 快照、轮换 token、launch 新会话。
+      // 等它们结束，`stop()` 返回之后这些写者就不存在了（不再轮询新的 to-do）。
+      while (inflight.size > 0) await Promise.allSettled([...inflight])
     }
   }
 }

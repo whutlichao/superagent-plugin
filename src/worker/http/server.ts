@@ -104,8 +104,12 @@ export interface HttpServerHandle {
   readonly basePath: string
   /** 已服务的请求数（`GET state` 的 `http.requests`）。 */
   readonly requests: number
-  /** 关闭：释放监听并删掉自己写的端口文件；重复调用无副作用。 */
-  close(): void
+  /**
+   * 关闭：先删端口文件、停止接受新连接，**等已经进到 handler 的请求跑完**，再拆掉剩余连接。
+   * 关停屏障（#60）落在这一点上：handler 会写状态目录（设置、技能文件、token），`close()`
+   * 返回之后它们就不存在了。重复调用无副作用。
+   */
+  close(): Promise<void>
 }
 
 /** 一次请求的日志上下文。 */
@@ -167,6 +171,8 @@ export async function startHttpServer(options: HttpServerOptions): Promise<HttpS
   let requests = 0
   const bound: { port: number } = { port: 0 }
 
+  /** 已经进到 handler 的请求：`close()` 要等它们（关停屏障，见句柄的注释）。 */
+  const inFlight = new Set<Promise<void>>()
   const listener = (request: IncomingMessage, response: ServerResponse): void => {
     requests += 1
     const context: RequestContext = {
@@ -178,7 +184,7 @@ export async function startHttpServer(options: HttpServerOptions): Promise<HttpS
       tokenRole: null,
       retryAfterMs: null
     }
-    void dispatch(request, response, context).finally(() => {
+    const work: Promise<void> = dispatch(request, response, context).finally(() => {
       log({
         method: context.method,
         path: context.path,
@@ -188,6 +194,11 @@ export async function startHttpServer(options: HttpServerOptions): Promise<HttpS
         tokenRole: context.tokenRole
       })
     })
+    inFlight.add(work)
+    void work.then(
+      () => inFlight.delete(work),
+      () => inFlight.delete(work)
+    )
   }
 
   /** 一个请求的完整流程（九道边界 + 分派）。 */
@@ -272,12 +283,15 @@ export async function startHttpServer(options: HttpServerOptions): Promise<HttpS
     get requests(): number {
       return requests
     },
-    close(): void {
+    async close(): Promise<void> {
       if (closed) return
       closed = true
       removePortRecord(options.stateDir, record)
+      // 停止接受新连接（仍活着的连接留给在跑的 handler 回包），等它们跑完再拆连接。
+      const listening = new Promise<void>((resolve) => server.close(() => resolve()))
+      while (inFlight.size > 0) await Promise.allSettled([...inFlight])
       server.closeAllConnections()
-      server.close()
+      await listening
     }
   }
 

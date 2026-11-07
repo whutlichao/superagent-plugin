@@ -1,11 +1,12 @@
 // 插件入口的启动面：`activate(orca)` 只登记贡献点（§N.1），把等待留给 boot。
 // 这里用 `mountWorker` 断言「清单声明的命令/事件/钩子都注册了、没有越权宿主调用」。
 import { assert, mockHost, mountWorker, test } from 'orca/testing'
-import { mkdtempSync, rmSync } from 'node:fs'
+import { mkdtempSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import * as main from '../src/worker/main'
 import { readRepoFile } from './support/repo'
+import { removeTree } from './support/state'
 
 /**
  * 挂载一次 worker，并给它一个独立的状态目录（真实组合根：boot 会取锁、开库、起 HTTP）。
@@ -20,8 +21,9 @@ async function mounted(): Promise<{
   return {
     worker,
     cleanup: async () => {
+      // `deactivate()` 走的是 boot 的同一个关停屏障（§N.1）：返回之后状态目录不再被写。
       await worker.deactivate()
-      rmSync(stateDir, { recursive: true, force: true })
+      await removeTree(stateDir)
     }
   }
 }
