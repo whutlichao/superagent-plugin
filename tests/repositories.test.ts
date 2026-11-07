@@ -203,6 +203,15 @@ test('a ticket round-trips, lists newest first and reports open/active with doma
       )
     )
     assert.deepEqual(repo.tickets.active().map((item) => item.id).sort(), ['ticket-1', 'ticket-2'])
+    // §E.7 的 agent 观测值存在 ticket 的 body 里（§D.2）：读到的是同一次观测与它的时刻。
+    const observed = ticket({
+      id: 'ticket-3',
+      agentState: 'blocked',
+      agentStateAt: AT,
+      assignments: [{ id: 'asg-3', state: 'running', createdAt: AT }]
+    })
+    repo.atomic(() => repo.tickets.save(observed))
+    assert.deepEqual(repo.tickets.get('ticket-3'), observed)
   } finally {
     cleanup()
   }

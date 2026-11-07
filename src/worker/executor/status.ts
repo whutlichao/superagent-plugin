@@ -123,6 +123,9 @@ export function createStatusHandler(options: StatusOptions): AgentStatusHandler 
     event: AgentStatusEvent
   ): Promise<void> => {
     const { ticket, assignment } = found
+    // 四态先落到 Ticket 上（§E.7）：`agentState`/`agentStateAt` 是 §E.8 的 stage 输入，观测者
+    // 是执行器，Ticket 的写者仍是 Engine（§D.4）。后面的分支只处理事件带来的副作用。
+    options.engine.agentStateChanged(ticket.id, event.state)
     options.background?.observed(ticket.id, event.state)
     switch (event.state) {
       case 'working':

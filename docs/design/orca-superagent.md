@@ -429,7 +429,7 @@ CREATE INDEX thread_subscribed ON thread(subscribed) WHERE subscribed = 1;
 CREATE TABLE ticket (
   id       TEXT PRIMARY KEY,
   at       TEXT NOT NULL,
-  body     TEXT NOT NULL,              -- mandate/origin/execution/follows/inputs/assignments/report/attention
+  body     TEXT NOT NULL,              -- mandate/origin/execution/follows/inputs/assignments/report/attention/agentState
   open     INTEGER GENERATED ALWAYS AS (json_extract(body,'$.ended') IS NULL) VIRTUAL,
   active   INTEGER GENERATED ALWAYS AS
            (json_array_length(body,'$.inputs') > 0
@@ -634,9 +634,11 @@ pending ──launch 成功──▶ running ──report(ready|dropped) / stop 
 事件是**唯一**的 worker 生命周期真源；`terminal.read` 只用于取证与 `blocked` 摘要，绝不阻塞等待（无 `terminal wait` 依赖）。
 实测（附录 C S7/S9，Orca 1.4.251）：`done` 不只表示进程结束，**每一轮结束与会话启动**都会到达；`terminal close` 不产生事件，而是静默清掉该 pane 的状态行。因此「报告缺失」只对**没有最终 Report**（无 report 或只有 `progress`）判定，有 `waiting`/`blocked`/`failed` 报告的一轮按 §E.8 处理。
 
+**持久化**：每次事件都把观测值写进 Ticket（`ticket.agentState` + `agentStateAt`，随 `ticket.body` 落库，§D.2），写者仍是 Engine（§D.4：执行器经 `Engine.agentStateChanged` 进来）。读模型与重启恢复用的就是这一次观测；Assignment 结束、被替换与 Ticket 结束/终端关闭由领域**直接收尾成 `done`**（不等事件，附录 C S7 的回落），陈旧的 `blocked` 因此不会钉住工单；`ended(waiting)` 例外——`waiting` 本身就是「空闲等待」的观测，原值保留。认领（`adopt`，§E.10）不改写这个值：会话还在，下一个事件才改。
+
 ### E.8 与上游 Report / Ticket stage 的对应表
 
-上游 Ticket stage 由 Report 与 Assignment 共同决定（`ticketStage`）。Orca 上 `ticketStage` 的输入多一个 `agentState`。
+上游 Ticket stage 由 Report 与 Assignment 共同决定（`ticketStage`）。Orca 上 `ticketStage` 的输入多一个 `agentState`——它是 Ticket 上持久化的那次观测（§E.7）；没有观测过的旧数据不满足任何集合成员条件，按表继续往下落。
 
 | 上游 stage | 条件 | Orca 条件 | 面板标签 |
 | --- | --- | --- | --- |

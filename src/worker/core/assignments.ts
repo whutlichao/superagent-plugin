@@ -139,15 +139,21 @@ export class Assignments extends EnginePart {
   /**
    * 执行器报告：运行中的 Assignment 结束了（agent 的 `waiting`/`done`），Ticket 仍然开着。
    * 只认当前正在跑的那个，重复的事件是幂等的；`reason` 是 `waiting` / `done` 这类结局码。
+   *
+   * agent 状态随 Assignment 一起收尾（§E.7 的 `done`，§E.8 的收尾）：陈旧的 `blocked` 不会
+   * 把 Ticket 永远钉在「阻塞」。`waiting` 例外：它是 agent 空闲等待观测值本身，保留它，
+   * 让 §E.8 第 7 行拿到的就是那次 `waiting`。
    */
   ended(ticketId: string, assignmentId: string, reason: string): void {
     const ticket = this.running(ticketId, assignmentId)
     if (!ticket) return
     const assignment = runningAssignment(ticket)!
+    const at = this.now()
     assignment.state = 'ended'
-    assignment.endedAt = this.now()
+    assignment.endedAt = at
     assignment.endedReason = reason
-    ticket.updatedAt = this.now()
+    if (reason !== 'waiting') this.tickets.agentSettled(ticket, at)
+    ticket.updatedAt = at
     this.repo.tickets.save(ticket)
     this.emit('assignment.ended', { ticketId, assignmentId, reason })
   }

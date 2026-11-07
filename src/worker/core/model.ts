@@ -375,6 +375,14 @@ export interface Ticket {
   ended?: { at: string; by: TicketEndBy; outcome: TicketOutcome; reason?: string }
   /** 等人回答的问题；执行器清除或 Ticket 结束时清除。 */
   attention?: Attention
+  /**
+   * 执行器最近一次观测到的 agent 状态（§E.7 的四态，§E.8 的 stage 输入）。写者只有 Engine
+   * （§D.4）：执行器经 `Engine.agentStateChanged` 写，Assignment 结束时由领域收尾成 `done`；
+   * 没观察过就没有这个字段——它不满足 §E.8 任何集合成员条件。
+   */
+  agentState?: AgentState
+  /** 上面那次观测的时刻（ISO-8601）：状态随 Ticket 持久化，重启后一起读回（§E.10）。 */
+  agentStateAt?: string
   assignments: Assignment[]
   inputs: TicketInput[]
   /** 尚未交给运行中 Assignment 的 Input。 */

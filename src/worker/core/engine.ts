@@ -1,7 +1,7 @@
 // 领域 Engine：core 的唯一入口，也是调用方拿到的按角色裁剪的接口（§C.1、§D.4）。
 import { UserError } from './errors.ts'
 import { isoTime, liveTicket } from './model.ts'
-import type { Decision, PolicyEffect, ThreadRef, Ticket, Trigger } from './model.ts'
+import type { AgentState, Decision, PolicyEffect, ThreadRef, Ticket, Trigger } from './model.ts'
 import type { Candidate, Repositories } from './ports.ts'
 import type { EngineOptions } from './part.ts'
 import { Assignments, type AssignmentLaunch, type WorkerReport } from './assignments.ts'
@@ -263,6 +263,17 @@ export class Engine {
     })
   }
 
+  /**
+   * 执行器报告它观测到该 Ticket 的 agent 状态（§E.7 的四态），带观测时刻。这是 `agentState`
+   * 的唯一写入口（§D.4：Ticket 的写者只有 Engine）；已结束的 Ticket 不再改。
+   * @throws UserError Ticket 未知。
+   */
+  agentStateChanged(ticketId: string, state: AgentState, at?: string): void {
+    this.repo.atomic(() => {
+      this.tickets.observed(ticketId, state, at)
+    })
+  }
+
   /** 执行器报告运行该 Ticket 的 worker 一轮结束了（报告之后也算）。 */
   turnEnded(ticketId: string, assignmentId: string): void {
     this.repo.atomic(() => {
@@ -374,6 +385,7 @@ export type EngineForSettings = Pick<Engine, 'policyChanged'>
 export type EngineForExecutor = Pick<
   Engine,
   | 'assignmentStarted'
+  | 'agentStateChanged'
   | 'inputsDelivered'
   | 'inputsRead'
   | 'turnEnded'

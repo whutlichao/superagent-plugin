@@ -13,7 +13,7 @@ import { assert, mockHost, mount, mountWorker, test } from 'orca/testing'
 import * as main from '../src/worker/main'
 import type { Thread, Ticket, Trigger } from '../src/worker/core/index'
 import { createRefreshableStateSource, panelTicketPage } from '../src/worker/app/state-source'
-import { ticketDetail } from '../src/worker/app/views'
+import { ticketDetail, ticketsPage } from '../src/worker/app/views'
 import {
   EXECUTION_FILTERS,
   type PanelState,
@@ -671,14 +671,80 @@ test('the list read model maps the five design filters onto the domain filters',
 })
 
 test('a report of waiting still reads Working when no agent state was observed', () => {
-  // §E.8 第 7 行要求 `agentState ∈ {waiting, done}`；没有观察到状态（null）时不满足集合成员，
-  // 落到第 8 行的 Working。列表读模型不带 agentState，因此这一行必须是严格的表结果。
+  // §E.8 第 7 行要求 `agentState ∈ {waiting, done}`；没有观察到状态时不满足集合成员，落到第 8
+  // 行的 Working。读模型现在带的是 Ticket 上持久化的那次观测——没有它（旧数据）就是这一行。
   const waiting = ticketOf({
     assignments: [
       { id: 'a', state: 'running', createdAt: AT, report: { state: 'waiting', summary: '', at: AT } }
     ]
   })
   assert.equal(panelTicketPage([waiting]).items[0]?.stage, 'working')
+})
+
+test('the Waiting filter lists a ticket whose agent is waiting', () => {
+  // #58：`agentState` 落库之后，§E.8 第 7 行在生产路径上才真的成立（之前 Waiting 恒空）。
+  const waiting = ticketOf({
+    agentState: 'waiting',
+    agentStateAt: AT,
+    assignments: [
+      { id: 'a', state: 'running', createdAt: AT, report: { state: 'waiting', summary: '', at: AT } }
+    ]
+  })
+  const other = ticketOf({ id: 'ticket-2', title: 'Still working', agentState: 'working', agentStateAt: AT })
+
+  assert.equal(panelTicketPage([waiting]).items[0]?.stage, 'idle')
+  assert.deepEqual(
+    panelTicketPage([waiting, other], { filter: 'waiting' }).items.map((ticket) => ticket.id),
+    ['ticket-1'],
+    'the Waiting filter lists it'
+  )
+  assert.deepEqual(
+    panelTicketPage([waiting, other], { filter: 'working' }).items.map((ticket) => ticket.id),
+    ['ticket-2'],
+    'and an idle ticket is not a working one'
+  )
+})
+
+test('Blocked and Failed read the persisted agent state, strictly by the §E.8 set membership', () => {
+  const reported = (state: 'blocked' | 'failed') =>
+    ticketOf({
+      assignments: [
+        { id: 'a', state: 'running', createdAt: AT, report: { state, summary: '', at: AT } }
+      ]
+    })
+  const stage = (ticket: Ticket, agentState: Ticket['agentState']): string | undefined =>
+    panelTicketPage([{ ...ticket, ...(agentState === undefined ? {} : { agentState }) }]).items[0]?.stage
+
+  // 集合 {blocked, done} 的成员：阻塞/失败行成立，面板的「待办」档列它。
+  assert.equal(stage(reported('blocked'), 'blocked'), 'blockedFailed')
+  assert.equal(stage(reported('failed'), 'blocked'), 'blockedFailed')
+  assert.equal(stage(reported('failed'), 'done'), 'blockedFailed', 'a closed turn is still a failure')
+  // 集合外的取值与未观测：不命中第 5 行，严格落到第 8 行的 Working。
+  for (const outside of ['working', 'waiting', undefined] as const) {
+    assert.equal(stage(reported('blocked'), outside), 'working', `blocked report with ${outside}`)
+    assert.equal(stage(reported('failed'), outside), 'working', `failed report with ${outside}`)
+  }
+  const person = panelTicketPage(
+    [{ ...reported('blocked'), agentState: 'blocked' as const, agentStateAt: AT }],
+    { filter: 'pending' }
+  )
+  assert.equal(person.items.length, 1, 'the pending filter is the person group')
+})
+
+test('the ticket read model carries the observed agent state and judges the stage by it', () => {
+  // `read tickets` / `GET tickets` 的读模型（Cli/HTTP 与面板共用的那一份）：带 agentState，
+  // 且 `idle` 筛选（CLI 的 `--state idle`）用的就是这份判定。
+  const waiting = ticketOf({
+    agentState: 'waiting',
+    agentStateAt: AT,
+    assignments: [
+      { id: 'a', state: 'running', createdAt: AT, report: { state: 'waiting', summary: '', at: AT } }
+    ]
+  })
+  const page = ticketsPage([waiting], { filter: 'idle' })
+  assert.equal(page.items[0]?.agentState, 'waiting')
+  assert.equal(page.items[0]?.stage, 'idle')
+  assert.deepEqual(ticketsPage([ticketOf()]).items[0]?.agentState, undefined, 'no observation, no field')
 })
 
 // ---------------------------------------------------------------------------
