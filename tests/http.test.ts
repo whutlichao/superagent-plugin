@@ -5,7 +5,7 @@
 // 时钟一律注入，不 sleep（§P.1 第 3、4 条）。
 import { assert, test } from 'orca/testing'
 import { existsSync, readFileSync, statSync, writeFileSync } from 'node:fs'
-import { request as httpRequest, createServer } from 'node:http'
+import { request as httpRequest } from 'node:http'
 import { join } from 'node:path'
 import type { Store } from '../src/worker/app/store'
 import {
@@ -56,6 +56,7 @@ import { openStore } from '../src/worker/app/store'
 import { SCHEMA_VERSION } from '../src/worker/app/schema'
 import { runIdempotent } from '../src/worker/http/idempotency'
 import { tempStateDir } from './support/state'
+import { holdPortBlock } from './support/ports'
 
 // ---------------------------------------------------------------- 错误码映射
 
@@ -1142,62 +1143,10 @@ test('the api token file is created once, 0600, and stays readable', () => {
 })
 
 // ---------------------------------------------------------------- 端口选择（§N.1）
-
-/** 占住一个端口；返回关闭函数。 */
-function occupy(port: number): Promise<() => void> {
-  const server = createServer((_request, response) => response.end('blocked'))
-  return new Promise((resolve, reject) => {
-    server.on('error', reject)
-    server.listen(port, '127.0.0.1', () => {
-      resolve(() => {
-        server.closeAllConnections()
-        server.close()
-      })
-    })
-  })
-}
-
-/** 找一个空闲端口 p，且 p+1 也空闲（用于断言「+1」规则）。 */
-async function twoFreePorts(): Promise<number> {
-  for (let attempt = 0; attempt < 20; attempt += 1) {
-    const probe = createServer(() => undefined)
-    const base = await new Promise<number>((resolve, reject) => {
-      probe.on('error', reject)
-      probe.listen(0, '127.0.0.1', () => {
-        const address = probe.address()
-        resolve(typeof address === 'object' && address !== null ? address.port : 0)
-      })
-    })
-    probe.closeAllConnections()
-    await new Promise<void>((resolve) => probe.close(() => resolve()))
-    try {
-      const release = await occupy(base + 1)
-      release()
-      if (base < 65_535 - PORT_ATTEMPTS - 1) return base
-    } catch {
-      // base+1 被占：换一个 base。
-    }
-  }
-  throw new Error('could not find two free ports')
-}
-
-/** 在 `[base, base+PORT_ATTEMPTS]` 内找一个**可用**的端口：用完即放，下一轮不再撞车。 */
-async function pickPreferredPort(): Promise<number> {
-  for (let attempt = 0; attempt < 20; attempt += 1) {
-    const probe = createServer(() => undefined)
-    const candidate = await new Promise<number>((resolve, reject) => {
-      probe.once('error', reject)
-      probe.listen(0, '127.0.0.1', () => {
-        const address = probe.address()
-        resolve(typeof address === 'object' && address !== null ? address.port : 0)
-      })
-    })
-    probe.closeAllConnections()
-    await new Promise<void>((resolve) => probe.close(() => resolve()))
-    if (candidate > 1024 && candidate < 65_535 - PORT_ATTEMPTS - 1) return candidate
-  }
-  throw new Error('could not find a usable port')
-}
+//
+// 端口一律由 `tests/support/ports.ts` 提供：**当场绑定并持有**，不做「先探测空闲、之后再绑」。
+// 探测与绑定之间的窗口正是 #28 的 `EADDRINUSE`（并行跑的另一个测试文件拿走同一端口），
+// 也是 #24 只手缩小过、没有消掉的那条竞态（详谈见该文件的头部注释）。
 
 test('the actual port is written to the state directory, and close removes it', async () => {
   const harness = await startHarness()
@@ -1217,10 +1166,10 @@ test('the actual port is written to the state directory, and close removes it', 
 })
 
 test('an occupied port makes the server try the next one and record the port it got', async () => {
-  // base 与 base+1 都空闲才断言「+1」：pickPreferredPort 只保证 base，另一个并发测试文件
-  // 的系统分配端口可能正好拿走 base+1（这个 helper 本来就是为这条断言准备的）。
-  const base = await twoFreePorts()
-  const release = await occupy(base)
+  // base 由本进程**真实占住**（blocker 一直监听着），所以「base 被占」不是探测结论而是事实；
+  // 端口取自内核临时区间之外的窄带，并行的测试文件（`listen(0)`）也不可能拿走 base+1。
+  const blocked = await holdPortBlock(1)
+  const base = blocked.ports[0] as number
   const harness = await startHarness({ preferredPort: base })
   try {
     assert.equal(harness.server.port, base + 1)
@@ -1228,28 +1177,28 @@ test('an occupied port makes the server try the next one and record the port it 
     assert.equal((await harness.call('/superagent/api/state')).status, 200)
   } finally {
     harness.close()
-    release()
+    blocked.release()
   }
 })
 
 test('twenty occupied increments fall back to an ephemeral port', async () => {
-  const base = await pickPreferredPort()
-  const blockers: (() => void)[] = []
+  // `[base, base+PORT_ATTEMPTS]` 的 21 个端口由本进程**同时持有**（不是「探测完就放」），
+  // 所以扫描区间里的每一个候选在 startHttpServer 尝试时都确实被占着，回落到临时端口是必定的。
+  const blocked = await holdPortBlock(PORT_ATTEMPTS + 1)
+  const base = blocked.ports[0] as number
+  const last = blocked.ports[blocked.ports.length - 1] as number
+  const harness = await startHarness({ preferredPort: base })
   try {
-    // 逐个占住；万一某个端口刚被系统分出去，换一个起点重来（端口竞争不可避免）。
-    for (let offset = 0; offset <= PORT_ATTEMPTS; offset += 1) blockers.push(await occupy(base + offset))
-    const harness = await startHarness({ preferredPort: base })
-    try {
-      assert.ok(
-        harness.server.port < base || harness.server.port > base + PORT_ATTEMPTS,
-        `port ${harness.server.port} is outside the scanned range`
-      )
-      assert.equal(readPortRecord(harness.stateDir)?.port, harness.server.port)
-      assert.equal((await harness.call('/superagent/api/state')).status, 200)
-    } finally {
-      harness.close()
-    }
+    assert.equal(blocked.ports.length, PORT_ATTEMPTS + 1)
+    assert.equal(last, base + PORT_ATTEMPTS)
+    assert.ok(
+      harness.server.port < base || harness.server.port > last,
+      `port ${harness.server.port} is outside the scanned range`
+    )
+    assert.equal(readPortRecord(harness.stateDir)?.port, harness.server.port)
+    assert.equal((await harness.call('/superagent/api/state')).status, 200)
   } finally {
-    for (const release of blockers) release()
+    harness.close()
+    blocked.release()
   }
 })
