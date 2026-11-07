@@ -34,7 +34,7 @@ import type { TimelineCursor, TimelineItem } from '../records.ts'
 import { ticketView, type TicketView } from '../views.ts'
 import type { ReadParam } from '../store-read.ts'
 // 容错读取与预览的实现只有 `views/values.ts` 一份（#64）：本文件只引用，不再各写一遍。
-import { jsonObject, previewOf, reasonsOf, stringsOf, textOf } from './values.ts'
+import { jsonObject, previewOf, textOf } from './values.ts'
 
 /** Thread 列表的筛选（§M.1 的 Trigger 页：Subscribed / Evaluating / New in 24 h / All）。 */
 export const THREAD_FILTERS = ['all', 'subscribed', 'evaluating', 'new'] as const
