@@ -463,9 +463,9 @@ test('write methods require x-superagent-request: 1', async () => {
       assert.equal(failureOf(missing).code, 'origin_forbidden')
 
       const present = await harness.call(path, { method, body })
-      // 请求头通过之后落到尚未落地的 handler：503（不是 403）。
-      assert.equal(present.status, 503)
-      assert.equal(failureOf(present).code, 'unavailable')
+      // 请求头是写方法的唯一额外要求：#8 接线了 `executor/pause`（200），`settings` 仍是
+      // stub（503）。两者都不是 403——边界已过。
+      assert.notEqual(present.status, 403, `${method} ${path} passes the header boundary`)
     }
 
     // GET 不要求该请求头（浏览器地址栏/CLI 的读命令）。
@@ -744,6 +744,8 @@ test('the route table carries every row §G.3 names', () => {
     'GET threads/:key',
     'GET tickets',
     'GET tickets/:id',
+    'POST admin/backup',
+    'POST admin/rotate-token',
     'POST decisions/:id/dismiss',
     'POST doctor',
     'POST executor/pause',
@@ -1005,8 +1007,8 @@ test('every route refuses a role below its minimum with not_permitted_role', asy
         checked += 1
       }
     }
-    // 30 条路由：28 条高于 assignment，11 条是 operator → 39 次拒绝。
-    assert.equal(checked, 39, 'every route above assignment refuses it, and every operator route refuses router')
+    // 32 条路由：30 条高于 assignment，13 条是 operator → 43 次拒绝。
+    assert.equal(checked, 43, 'every route above assignment refuses it, and every operator route refuses router')
   } finally {
     harness.close()
   }

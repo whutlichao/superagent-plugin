@@ -2,7 +2,7 @@
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { openStore, type Store } from '../../src/worker/app/store'
+import { openStore, type Store } from '../../src/worker/app/store.ts'
 
 /** 新建一个空的状态目录（`mkdtemp`，调用方负责删除）。 */
 export function tempStateDir(): string {

@@ -21,7 +21,7 @@
 // 写命令的幂等（§G.1 幂等行）：CLI 的 `--request-id` 走 HTTP 的 `x-superagent-request-id`
 // 头；handler 用 `idempotency.ts` 的 `runIdempotent()` 包住真正的工作，同 id 一小时内
 // 重试返回首次结果。**失败不缓存**（重试有机会成功）。
-import { ApiError, ERROR_CODES } from './errors'
+import { ApiError, ERROR_CODES } from './errors.ts'
 
 /** 三种 token 角色（与 `infra/tokens.ts` 的同名类型一致；这里只声明，不 import 实现）。 */
 export type RouteRole = 'operator' | 'router' | 'assignment'
@@ -52,6 +52,16 @@ export interface RouteInput {
   readonly caller: RouteCaller
   /** 请求时间（ISO-8601；幂等记录用）。 */
   readonly at: string
+  /**
+   * 调用者的 Bearer token 原文：只给**幂等键的哈希**用（`callerKey()`），handler 不得回显、
+   * 不得写进结果或日志（§O）。缺失表示调用没经过鉴权（只可能在测试的注入路由上发生）。
+   */
+  readonly token?: string
+  /**
+   * `x-superagent-request-id`（§G.1 幂等行）：CLI 的 `--request-id` 走这个头。
+   * 没有头时为 `null`；body 里也允许带一份（面板/测试），由 handler 决定优先级。
+   */
+  readonly requestId?: string | null
 }
 
 /** handler 的返回值：直接进 `{ok:true, result}`。 */
@@ -173,7 +183,11 @@ export const ROUTE_TABLE: readonly RouteDefinition[] = [
   { method: 'POST', path: 'setup/check', command: 'setup check', minimumRole: 'operator', handler: stub },
   { method: 'POST', path: 'router/restart', command: 'router restart', minimumRole: 'operator', handler: stub },
   { method: 'POST', path: 'workspaces/:id/open', command: 'workspace open', minimumRole: 'operator', handler: stub },
-  { method: 'POST', path: 'doctor', command: 'doctor', minimumRole: 'operator', handler: stub }
+  { method: 'POST', path: 'doctor', command: 'doctor', minimumRole: 'operator', handler: stub },
+
+  // ---- 运维：立即备份与轮换主 token（§G.2 的 admin 行；破坏性动作由 handler 要求确认）
+  { method: 'POST', path: 'admin/backup', command: 'admin backup', minimumRole: 'operator', handler: stub },
+  { method: 'POST', path: 'admin/rotate-token', command: 'admin rotate-token', minimumRole: 'operator', handler: stub }
 ]
 
 /** 从 `{value, revision}` 的请求体里取 `value`（形状不对交给 handler 报 invalid_params）。 */

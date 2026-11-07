@@ -7,7 +7,7 @@
 // - 释放：只删自己持有的锁（pid 对得上），不误删别人的。
 import { closeSync, openSync, readFileSync, statSync, unlinkSync, utimesSync, writeSync } from 'node:fs'
 import { join } from 'node:path'
-import { SILENT_LOG, type LogSink } from './log-line'
+import { SILENT_LOG, type LogSink } from './log-line.ts'
 
 /** 锁文件名（§D.5 的 stateDir 布局）。 */
 export const LOCK_FILE = 'lock'

@@ -11,8 +11,8 @@
 import { createHash, randomBytes, timingSafeEqual } from 'node:crypto'
 import { closeSync, mkdirSync, openSync, readFileSync, unlinkSync, writeSync } from 'node:fs'
 import { join } from 'node:path'
-import { tokenHashKey } from '../app/kv'
-import type { Store } from '../app/store'
+import { tokenHashKey } from '../app/kv.ts'
+import type { Store } from '../app/store.ts'
 
 /** 主 token 文件（§D.5、§D.6）。 */
 export const API_TOKEN_FILE = 'api-token'
@@ -51,8 +51,8 @@ export interface IssuedToken {
   readonly record: TokenRecord
 }
 
-/** token 文件的权限（§D.6：0600）。 */
-const TOKEN_MODE = 0o600
+/** token 文件的权限（§D.6：0600）；doctor 用它判定「有没有被别人读的权限」。 */
+export const TOKEN_MODE = 0o600
 
 /** 签发所需的输入。 */
 interface IssueOptions {
@@ -123,6 +123,21 @@ export function ensureApiToken(stateDir: string): { readonly token: string; read
 /** 读主 token；不存在时 `null`（doctor 只报有没有，不报是什么，§O）。 */
 export function readApiToken(stateDir: string): string | null {
   return readSecretFile(join(stateDir, API_TOKEN_FILE))
+}
+
+/**
+ * 轮换主 token（§D.6、§G.2 的 `admin rotate-token`）：生成新的 32 字节随机串并**重写**
+ * `<stateDir>/api-token`（0600）。旧值随文件被覆盖而立即失效——operator 的判据就是
+ * 「等于文件内容」，所以不需要额外的吊销记录。
+ *
+ * 返回**新 token 的哈希**而不是原文：调用方（CLI/面板）只需确认「轮换发生了」，
+ * 原文留在文件里给下一次请求读（§O：token 不进程间明文传递、不进日志）。
+ */
+export function rotateApiToken(stateDir: string): { readonly path: string; readonly hash: string } {
+  const path = join(stateDir, API_TOKEN_FILE)
+  const token = randomToken()
+  writeSecretFile(path, token)
+  return { path, hash: hashToken(token) }
 }
 
 /**

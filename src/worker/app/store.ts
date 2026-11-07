@@ -7,11 +7,12 @@
 // 谁能调哪一组由写者表与后续票的引擎决定。Source 的读位置与 Thread meta 走
 // `state` / `threads` 两个端口（§D.4 第二行），不直接写表。
 import { DatabaseSync, type SQLInputValue } from 'node:sqlite'
+import { statSync } from 'node:fs'
 import { join } from 'node:path'
-import type { LogLine, LogSink } from '../infra/log-line'
-import { SILENT_LOG } from '../infra/log-line'
-import { migrate, readSchemaVersion } from './migration'
-import { SCHEMA_VERSION } from './schema'
+import type { LogLine, LogSink } from '../infra/log-line.ts'
+import { SILENT_LOG } from '../infra/log-line.ts'
+import { migrate, readSchemaVersion } from './migration.ts'
+import { SCHEMA_VERSION } from './schema.ts'
 import {
   readAssignmentCounts,
   readTimeline,
@@ -20,7 +21,7 @@ import {
   type AssignmentCounts,
   type TimelineOptions,
   type WorkingSetName
-} from './store-read'
+} from './store-read.ts'
 import type {
   DecisionRecord,
   DispositionRecord,
@@ -38,7 +39,7 @@ import type {
   TriggerRecord,
   TriggerThreadRecord,
   WorkingSet
-} from './records'
+} from './records.ts'
 
 /** 数据库文件名（§D.2：只有一个库）。 */
 export const DATABASE_FILE = 'superagent.sqlite'
@@ -180,6 +181,11 @@ export interface Store {
   pragmas(): PragmaState
   /** 用户表名，按字母序（§D.2 的表族清单）。 */
   tables(): readonly string[]
+  /**
+   * 只读自检视图（`doctor` 用）：版本、表数、文件大小。**不迁移、不写库**——doctor 在
+   * 「库比插件新」时也要能读，否则它会因为一次检查而把库升级或拒绝打开。
+   */
+  inspect(): DatabaseInspection
   /** 读一个 KV 值（JSON 反序列化）；缺失时为 `null`。 */
   kvGet<T>(key: string): T | null
   /** 写一个 KV 值（JSON 序列化）。 */
@@ -266,6 +272,9 @@ export function openStore(options: StoreOptions): Store {
       return sql
         .all("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name")
         .map((row) => String(field(row, 'name')))
+    },
+    inspect(): DatabaseInspection {
+      return inspectOpenDatabase(db, path)
     },
     kvGet<T>(key: string): T | null {
       const row = sql.one('SELECT value FROM kv WHERE key = ?', [key])
@@ -844,3 +853,43 @@ function parseJson(value: unknown): unknown {
   return typeof value === 'string' ? (JSON.parse(value) as unknown) : null
 }
 
+
+/**
+ * 只读自检视图（`doctor` 用）。它**不打开第二个连接**：拿已经打开的那个句柄读版本与表数，
+ * 于是「插件只有一个写驱动」这条纪律不变，doctor 也不会因为并发打开而卡在 busy 上。
+ */
+export interface DatabaseInspection {
+  /** `<stateDir>/superagent.sqlite` 的绝对路径。 */
+  readonly path: string
+  /** 库里的 schema 版本（`kv['schema-version']`，退到 `PRAGMA user_version`）。 */
+  readonly schemaVersion: number
+  /** 插件支持的版本（`SCHEMA_VERSION`）。 */
+  readonly pluginVersion: number
+  /** 用户表数量（不含 `sqlite_*`）。 */
+  readonly tables: number
+  /** 文件大小（字节）。 */
+  readonly bytes: number
+}
+
+/** 在已打开的库上取自检读数；任何一条读不到都退到保守值（doctor 只报「有没有」）。 */
+export function inspectOpenDatabase(db: DatabaseSync, path: string): DatabaseInspection {
+  const tables = Number(
+    field(
+      db.prepare("SELECT count(*) AS n FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'").get(),
+      'n'
+    )
+  )
+  let bytes = 0
+  try {
+    bytes = statSync(path).size
+  } catch {
+    bytes = 0
+  }
+  return {
+    path,
+    schemaVersion: readSchemaVersion(db),
+    pluginVersion: SCHEMA_VERSION,
+    tables: Number.isFinite(tables) ? tables : 0,
+    bytes
+  }
+}

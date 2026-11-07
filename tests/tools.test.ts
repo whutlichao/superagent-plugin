@@ -3,6 +3,8 @@
 // 本票只覆盖 HTTP 这一层能测的部分：**请求幂等**（§G.1 幂等行：同 id 一小时内重试返回首次
 // 结果）。命令本身的成功/固定拒绝面由 #8 的 `cli-contract.test.ts` 接管。
 import { assert, test } from 'orca/testing'
+import { chmodSync, mkdirSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { join } from 'node:path'
 import { openStore } from '../src/worker/app/store'
 import {
   IDEMPOTENCY_WINDOW_MS,
@@ -12,7 +14,37 @@ import {
 } from '../src/worker/http/idempotency'
 import { ApiError, ERROR_CODES } from '../src/worker/http/errors'
 import { REQUEST_ID_PREFIX } from '../src/worker/app/kv'
+import {
+  defaultStateDir,
+  readStateDirPointer,
+  removeStateDirPointer,
+  resolveStateDir,
+  writeStateDirPointer,
+  STATE_DIR_ENV,
+  STATE_DIR_NAME,
+  STATE_DIR_POINTER
+} from '../src/worker/infra/paths'
+import {
+  DEFAULT_PORT,
+  PORT_FILE,
+  TOKEN_ENV,
+  encodePathSegment,
+  resolvePort,
+  resolveTarget,
+  resolveToken
+} from '../src/worker/cli/target'
+import { RETRY_DELAY_MS, parseResponse, requestJson } from '../src/worker/cli/transport'
+import { dispatch } from '../src/worker/cli/commands'
+import {
+  envelopeForError,
+  failureEnvelope,
+  parseArgs,
+  render,
+  successEnvelope
+} from '../src/worker/cli/io'
+import { API_TOKEN_FILE, TOKENS_DIR, ROUTER_TOKEN_FILE } from '../src/worker/infra/tokens'
 import { tempStateDir } from './support/state'
+import { startTestServer } from './support/cli-server'
 
 /** 一个固定的测试时刻。 */
 const AT = '2026-11-07T03:26:00.000Z'
@@ -205,4 +237,415 @@ test('expired records are pruned on the next write, so the kv does not grow fore
       'only the fresh record stays'
     )
   })
+})
+
+// ---------------------------------------------------------------- #8 的 CLI 工具面
+//
+// 状态目录 / 端口 / token 的三重解析、连不上时的一次重试、参数解析与信封（§G.1、§G.4）。
+// 一次警告：输出与错误绝不回显 argv 与 token——本文件的断言逐条覆盖。
+
+test('the default state directory is $HOME/.local/state/orca-superagent', () => {
+  const home = tempStateDir()
+  try {
+    assert.equal(defaultStateDir({ home, env: {} }), join(home, '.local', 'state', STATE_DIR_NAME))
+    assert.equal(STATE_DIR_NAME, 'orca-superagent')
+    assert.equal(STATE_DIR_ENV, 'ORCA_SUPERAGENT_STATE_DIR')
+    assert.equal(STATE_DIR_POINTER, 'state-dir-pointer')
+    // `XDG_STATE_HOME` 只替换基目录；空值视同未设置（§D.5 的 `${XDG_STATE_HOME:-…}`）。
+    const xdg = join(home, 'xdg')
+    assert.equal(defaultStateDir({ home, env: { XDG_STATE_HOME: xdg } }), join(xdg, STATE_DIR_NAME))
+    assert.equal(
+      defaultStateDir({ home, env: { XDG_STATE_HOME: '' } }),
+      join(home, '.local', 'state', STATE_DIR_NAME)
+    )
+  } finally {
+    rmSync(home, { recursive: true, force: true })
+  }
+})
+
+test('the flag beats the environment variable, which beats the default', () => {
+  const home = tempStateDir()
+  try {
+    const env = { [STATE_DIR_ENV]: '/tmp/from-env' }
+    assert.deepEqual(resolveStateDir({ argument: '/tmp/from-flag', env, home }), {
+      stateDir: '/tmp/from-flag',
+      source: 'argument'
+    })
+    assert.deepEqual(resolveStateDir({ env, home }), { stateDir: '/tmp/from-env', source: 'environment' })
+    assert.deepEqual(resolveStateDir({ env: {}, home }), {
+      stateDir: defaultStateDir({ home, env: {} }),
+      source: 'default'
+    })
+    // 空串与缺失等价：不会把空路径当成一个显式选择。
+    assert.deepEqual(resolveStateDir({ argument: '', env: { [STATE_DIR_ENV]: '' }, home }), {
+      stateDir: defaultStateDir({ home, env: {} }),
+      source: 'default'
+    })
+  } finally {
+    rmSync(home, { recursive: true, force: true })
+  }
+})
+
+test('a pointer in the default directory redirects the default to the configured stateDir', () => {
+  const home = tempStateDir()
+  try {
+    const fallback = defaultStateDir({ home, env: {} })
+    const configured = join(home, 'elsewhere', 'state')
+    mkdirSync(fallback, { recursive: true })
+    writeFileSync(join(fallback, STATE_DIR_POINTER), `${configured}\n`, 'utf8')
+
+    assert.equal(readStateDirPointer(fallback), configured)
+    assert.deepEqual(resolveStateDir({ env: {}, home }), { stateDir: configured, source: 'pointer' })
+
+    // 显式参数与环境变量一律不读指针：一次误写不能让显式路径失效。
+    assert.equal(resolveStateDir({ argument: '/tmp/explicit', env: {}, home }).stateDir, '/tmp/explicit')
+    assert.equal(
+      resolveStateDir({ env: { [STATE_DIR_ENV]: '/tmp/from-env' }, home }).stateDir,
+      '/tmp/from-env'
+    )
+  } finally {
+    rmSync(home, { recursive: true, force: true })
+  }
+})
+
+test('the worker writes the pointer, and what it writes is what the CLI reads', () => {
+  const home = tempStateDir()
+  try {
+    const fallback = defaultStateDir({ home, env: {} })
+    const configured = join(home, 'configured')
+    // worker 侧：设置里的 stateDir 与默认不同 → 写指针（0600）。
+    const path = writeStateDirPointer(fallback, configured)
+    assert.equal(path, join(fallback, STATE_DIR_POINTER))
+    assert.equal(statSync(path).mode & 0o777, 0o600, 'the pointer is private')
+    // CLI 侧：默认路径上命中指针 → 改用配置目录。两侧读写同一处字面量。
+    assert.deepEqual(resolveStateDir({ env: {}, home }), { stateDir: configured, source: 'pointer' })
+    // 相对路径写不进去（写一个读不出来的值等于没写）。
+    assert.throws(() => writeStateDirPointer(fallback, 'relative/state'))
+    // 改回默认目录时删掉指针；再解析就回到默认。
+    assert.equal(removeStateDirPointer(fallback), true)
+    assert.equal(removeStateDirPointer(fallback), false, 'removing twice is harmless')
+    assert.deepEqual(resolveStateDir({ env: {}, home }), { stateDir: fallback, source: 'default' })
+  } finally {
+    rmSync(home, { recursive: true, force: true })
+  }
+})
+
+test('a missing, empty, relative or unreadable pointer leaves the default in place', () => {
+  const home = tempStateDir()
+  try {
+    const fallback = defaultStateDir({ home, env: {} })
+    assert.equal(resolveStateDir({ env: {}, home }).stateDir, fallback, 'no pointer file')
+    mkdirSync(fallback, { recursive: true })
+    for (const content of ['', '   ', 'relative/path', '~/state']) {
+      writeFileSync(join(fallback, STATE_DIR_POINTER), content, 'utf8')
+      assert.equal(readStateDirPointer(fallback), null, JSON.stringify(content))
+      assert.deepEqual(resolveStateDir({ env: {}, home }), { stateDir: fallback, source: 'default' })
+    }
+    // 指针本身是个目录（读不出文本）：同样退回默认。
+    rmSync(join(fallback, STATE_DIR_POINTER), { force: true })
+    mkdirSync(join(fallback, STATE_DIR_POINTER), { recursive: true })
+    assert.equal(readStateDirPointer(fallback), null)
+  } finally {
+    rmSync(home, { recursive: true, force: true })
+  }
+})
+
+test('the port comes from <stateDir>/api-port, falling back to 3847', () => {
+  const stateDir = tempStateDir()
+  try {
+    assert.equal(resolvePort(stateDir), DEFAULT_PORT)
+    assert.equal(DEFAULT_PORT, 3847)
+    writeFileSync(join(stateDir, PORT_FILE), '4123', 'utf8')
+    assert.equal(resolvePort(stateDir), 4123)
+    // 带 pid 的 JSON 形态（#7 的端口文件）同样可读。
+    writeFileSync(join(stateDir, PORT_FILE), JSON.stringify({ port: 4321, pid: process.pid }), 'utf8')
+    assert.equal(resolvePort(stateDir), 4321)
+    // 坏内容、越界端口、已死进程一律退回默认端口（S6 的回落）。
+    for (const content of ['nope', '70000', JSON.stringify({ port: 4444, pid: 999_999 })]) {
+      writeFileSync(join(stateDir, PORT_FILE), content, 'utf8')
+      assert.equal(resolvePort(stateDir), DEFAULT_PORT, content)
+    }
+  } finally {
+    rmSync(stateDir, { recursive: true, force: true })
+  }
+})
+
+/** 在临时状态目录里写一个 token 文件（0600）。 */
+function writeToken(path: string, value: string): string {
+  writeFileSync(path, value, { encoding: 'utf8', mode: 0o600 })
+  chmodSync(path, 0o600)
+  return path
+}
+
+test('the token is --token, then $ORCA_SUPERAGENT_TOKEN_FILE, then <stateDir>/api-token', () => {
+  const stateDir = tempStateDir()
+  try {
+    const apiToken = writeToken(join(stateDir, API_TOKEN_FILE), 'operator-token\n')
+    const envToken = writeToken(join(stateDir, 'env-token'), 'router-token\n')
+    const flagFile = writeToken(join(stateDir, 'flag-token'), 'flag-file-token')
+
+    // `--token-file` 是公开形态（§G.5 的 prompt 只给文件路径）；`--token` 只用于调试。
+    assert.deepEqual(resolveToken({ stateDir, file: flagFile, env: { [TOKEN_ENV]: envToken } }), {
+      token: 'flag-file-token',
+      source: 'argument',
+      tokenFile: flagFile
+    })
+    assert.deepEqual(resolveToken({ stateDir, argument: 'flag-token', env: { [TOKEN_ENV]: envToken } }), {
+      token: 'flag-token',
+      source: 'argument',
+      tokenFile: null
+    })
+    assert.deepEqual(resolveToken({ stateDir, env: { [TOKEN_ENV]: envToken } }), {
+      token: 'router-token',
+      source: 'environment',
+      tokenFile: envToken
+    })
+    assert.deepEqual(resolveToken({ stateDir, env: {} }), {
+      token: 'operator-token',
+      source: 'default',
+      tokenFile: apiToken
+    })
+    assert.equal(TOKEN_ENV, 'ORCA_SUPERAGENT_TOKEN_FILE')
+
+    // 空值视同未给；环境变量指向不存在的文件时也退到默认 token。
+    assert.equal(resolveToken({ stateDir, argument: '  ', env: { [TOKEN_ENV]: '' } }).token, 'operator-token')
+    assert.equal(resolveToken({ stateDir, env: { [TOKEN_ENV]: join(stateDir, 'missing') } }).source, 'default')
+
+    // 一个 token 也没有：`token` 为 null（由调用点报 not_ready，而不是编一个空字符串去鉴权）。
+    rmSync(apiToken)
+    assert.deepEqual(resolveToken({ stateDir, env: {} }), { token: null, source: 'default', tokenFile: null })
+
+    // 轮换后无需重启：每次解析都现读文件。
+    writeToken(apiToken, 'rotated')
+    assert.equal(resolveToken({ stateDir, env: {} }).token, 'rotated')
+  } finally {
+    rmSync(stateDir, { recursive: true, force: true })
+  }
+})
+
+test('the target combines the three resolutions and never carries the token into the base url', () => {
+  const home = tempStateDir()
+  try {
+    const stateDir = join(home, 'state')
+    mkdirSync(join(stateDir, TOKENS_DIR), { recursive: true })
+    const routerToken = writeToken(join(stateDir, TOKENS_DIR, ROUTER_TOKEN_FILE), 'router-secret')
+    const apiToken = writeToken(join(stateDir, API_TOKEN_FILE), 'operator-secret')
+    writeFileSync(join(stateDir, PORT_FILE), '3999', 'utf8')
+
+    const target = resolveTarget({ env: { ORCA_SUPERAGENT_STATE_DIR: stateDir }, home })
+    assert.equal(target.stateDir, stateDir)
+    assert.equal(target.stateDirSource, 'environment')
+    assert.equal(target.port, 3999)
+    assert.equal(target.baseUrl, 'http://127.0.0.1:3999/superagent/api')
+    assert.equal(target.baseUrl.includes('router-secret'), false, 'the token never enters the url')
+    assert.equal(target.baseUrl.includes('operator-secret'), false)
+    // 默认 token 文件是主 token；router token 另有文件（doctor 用路径判断）。
+    assert.equal(target.tokenFile, apiToken)
+    assert.equal(target.token, 'operator-secret')
+    assert.equal(routerToken.endsWith(join(TOKENS_DIR, ROUTER_TOKEN_FILE)), true)
+  } finally {
+    rmSync(home, { recursive: true, force: true })
+  }
+})
+
+test('a path segment is percent-encoded once for thread keys with slashes and spaces', () => {
+  assert.equal(encodePathSegment('a/b c'), 'a%2Fb%20c')
+  assert.equal(encodePathSegment('gh:o/r#1'), 'gh%3Ao%2Fr%231')
+})
+
+test('an unreachable worker is retried exactly once, after the fixed 200 ms', async () => {
+  // 用一个真实但立刻关闭的服务器拿一个「确定没人听」的端口。
+  const probe = await startTestServer()
+  const port = probe.port
+  probe.close()
+  const waits: number[] = []
+  const result = await requestJson({
+    target: {
+      stateDir: '/tmp/unused',
+      stateDirSource: 'argument',
+      port,
+      baseUrl: `http://127.0.0.1:${port}/superagent/api`,
+      token: 'operator-token',
+      tokenSource: 'argument',
+      tokenFile: null
+    },
+    method: 'GET',
+    path: 'state',
+    sleep: async (milliseconds: number) => {
+      waits.push(milliseconds)
+    }
+  })
+  assert.equal(RETRY_DELAY_MS, 200)
+  assert.deepEqual(waits, [200], 'exactly one retry, after 200 ms')
+  assert.equal(result.ok, false)
+  if (!result.ok) {
+    assert.equal(result.notReady, true, 'an unreachable worker is not_ready, never a fake success')
+    assert.equal(result.error.code, 'not_ready')
+    assert.ok(result.error.message.includes('superagent doctor'), 'the hint names the doctor command')
+  }
+})
+
+test('a server that answers is used on the first attempt, without waiting', async () => {
+  const server = await startTestServer()
+  try {
+    const waits: number[] = []
+    const result = await requestJson({
+      target: server.target(),
+      method: 'GET',
+      path: 'state',
+      sleep: async (milliseconds: number) => {
+        waits.push(milliseconds)
+      }
+    })
+    assert.deepEqual(waits, [])
+    assert.equal(result.ok, true)
+    assert.equal(server.requests.length, 1)
+  } finally {
+    server.close()
+  }
+})
+
+test('a response that is not an envelope maps to internal, not to a refusal', () => {
+  assert.deepEqual(parseResponse(200, JSON.stringify({ ok: true, result: { a: 1 } })), {
+    ok: true,
+    status: 200,
+    result: { a: 1 }
+  })
+  const noEnvelope = parseResponse(502, '<html>bad gateway</html>')
+  assert.equal(noEnvelope.ok, false)
+  if (!noEnvelope.ok) {
+    assert.equal(noEnvelope.error.code, 'internal')
+    assert.equal(noEnvelope.notReady, false)
+  }
+  // 信封里的 values 原样带回，且不含任何提示文本改写。
+  const refused = parseResponse(
+    400,
+    JSON.stringify({ ok: false, error: { code: 'refused', message: 'no', values: { ticket: 't1' } } })
+  )
+  assert.equal(refused.ok, false)
+  if (!refused.ok) {
+    assert.deepEqual(refused.error, { code: 'refused', message: 'no', values: { ticket: 't1' } })
+    assert.equal(refused.notReady, false)
+  }
+})
+
+// ---------------------------------------------------------------- 参数解析与信封（§G.1 输出）
+
+test('argv is split into words and flags without deciding the command', () => {
+  const parsed = parseArgs([
+    'ticket',
+    'stop',
+    't-1',
+    '--reason',
+    'done',
+    '--request-id=r-1',
+    '--json',
+    '--token-file',
+    '/tmp/token'
+  ])
+  // 命令名也是词：由命令表判定哪几个词是命令路径。
+  assert.deepEqual(parsed.words, ['ticket', 'stop', 't-1'])
+  assert.deepEqual(parsed.flags, {
+    reason: 'done',
+    'request-id': 'r-1',
+    json: true,
+    'token-file': '/tmp/token'
+  })
+  assert.equal(parsed.text, false, '--json is the default output; --text is opt-in')
+})
+
+test('--text is a bare switch and never eats the next word', () => {
+  const parsed = parseArgs(['status', '--text'])
+  assert.equal(parsed.text, true)
+  assert.deepEqual(parsed.flags, { text: true })
+  assert.deepEqual(parsed.words, ['status'])
+  // 开关后面的词仍是词，不会被当成它的值。
+  assert.deepEqual(parseArgs(['status', '--text', 'extra']).words, ['status', 'extra'])
+})
+
+test('everything after -- is a word, so a path that starts with dashes survives', () => {
+  const parsed = parseArgs(['eval-read', 't-1', '--', '--weird-name'])
+  assert.deepEqual(parsed.words, ['eval-read', 't-1', '--weird-name'])
+  assert.deepEqual(parsed.flags, {})
+  assert.equal(parseArgs(['eval-read', 't-1', '--path=--weird-name']).flags['path'], '--weird-name')
+  // 值以 `--` 开头、又不是等号形式：拒绝，而不是悄悄吞掉下一个 flag。
+  assert.throws(
+    () => parseArgs(['eval-read', 't-1', '--path', '--weird-name']),
+    (error: unknown) => error instanceof ApiError && error.code === 'invalid_params'
+  )
+})
+
+test('a missing value for a flag is invalid_params, never a guessed default', () => {
+  assert.throws(
+    () => parseArgs(['pause', '--reason']),
+    (error: unknown) =>
+      error instanceof ApiError && error.code === 'invalid_params' && error.message.includes('--reason')
+  )
+})
+
+test('an unknown flag is invalid_params and the message never echoes the whole argv', async () => {
+  const argv = ['status', '--not-a-flag', 'super-secret-token-value']
+  const result = await dispatch({
+    parsed: parseArgs(argv),
+    target: {
+      stateDir: '/tmp/unused',
+      stateDirSource: 'argument',
+      port: 1,
+      baseUrl: 'http://127.0.0.1:1/superagent/api',
+      token: 'x',
+      tokenSource: 'argument',
+      tokenFile: null
+    },
+    sleep: async () => undefined
+  })
+  assert.equal(result.exit, 2, 'unknown flags are refused before the wire')
+  assert.equal(result.envelope.ok, false)
+  if (result.envelope.ok) return
+  assert.equal(result.envelope.error.code, 'invalid_params')
+  const text = JSON.stringify(result.envelope)
+  assert.equal(text.includes('super-secret-token-value'), false, 'the value is not echoed')
+  assert.equal(text.includes(argv.join(' ')), false, 'argv is never echoed')
+})
+
+test('--token is accepted for debugging, and the parser never puts it into messages', () => {
+  const parsed = parseArgs(['status', '--token', 'debug-secret'])
+  assert.equal(parsed.flags['token'], 'debug-secret')
+  let caught: unknown = null
+  try {
+    parseArgs(['status', '--token'])
+  } catch (error) {
+    caught = error
+  }
+  assert.ok(caught instanceof ApiError)
+  if (caught instanceof ApiError) {
+    assert.equal(caught.code, 'invalid_params')
+    assert.equal(caught.message.includes('debug-secret'), false)
+  }
+  assert.equal(parseArgs(['status', '--token-file', '/tmp/api-token']).flags['token-file'], '/tmp/api-token')
+})
+
+test('a repeated flag is invalid_params instead of the last one silently winning', () => {
+  assert.throws(
+    () => parseArgs(['status', '--state-dir', '/a', '--state-dir', '/b']),
+    (error: unknown) => error instanceof ApiError && error.code === 'invalid_params'
+  )
+})
+
+test('the envelopes and exit codes are the §G.1 ones', () => {
+  assert.deepEqual(successEnvelope({ a: 1 }), { ok: true, result: { a: 1 } })
+  assert.deepEqual(failureEnvelope({ code: 'refused', message: 'no' }), {
+    ok: false,
+    error: { code: 'refused', message: 'no' }
+  })
+  // `ApiError` → 固定码；其余 → internal（不回显原文）。
+  const refused = envelopeForError(new ApiError(ERROR_CODES.refused, 'no'))
+  assert.equal(refused.exit, 2)
+  const internal = envelopeForError(new Error('postgres://secret'))
+  assert.equal(internal.exit, 1)
+  assert.equal(JSON.stringify(internal.envelope).includes('secret'), false)
+  // 渲染：JSON 是信封，`--text` 是人读文本但错误仍带 code。
+  assert.equal(render(successEnvelope({ a: 1 }), { text: false }), JSON.stringify({ ok: true, result: { a: 1 } }, null, 2))
+  assert.equal(render(failureEnvelope({ code: 'missing', message: 'gone' }), { text: true }), 'error: missing: gone')
+  assert.equal(render(successEnvelope('hi'), { text: true }), 'hi')
+  assert.equal(render(successEnvelope([1, 2]), { text: true }), '- 1\n- 2')
 })

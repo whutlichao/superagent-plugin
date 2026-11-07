@@ -6,9 +6,9 @@
 // 不带着半迁移库启动。
 import { mkdirSync, readdirSync, unlinkSync } from 'node:fs'
 import { join } from 'node:path'
-import { SILENT_LOG, type LogSink, type LogLine } from '../infra/log-line'
-import { KV_KEY_LITERALS, SCHEMA_VERSION_KEY } from './kv'
-import { MIGRATIONS, SCHEMA_VERSION, type MigrationStep, type SchemaDatabase } from './schema'
+import { SILENT_LOG, type LogSink, type LogLine } from '../infra/log-line.ts'
+import { KV_KEY_LITERALS, SCHEMA_VERSION_KEY } from './kv.ts'
+import { MIGRATIONS, SCHEMA_VERSION, type MigrationStep, type SchemaDatabase } from './schema.ts'
 
 /** 迁移在 `exec` 之外还要一次 `get` 去读版本（`DatabaseSync` 满足这个形状）。 */
 export interface MigrationDatabase extends SchemaDatabase {
