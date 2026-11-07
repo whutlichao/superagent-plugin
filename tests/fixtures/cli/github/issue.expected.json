@@ -1,0 +1,30 @@
+{
+  "source": {
+    "command": "gh api repos/cli/cli/issues/14980",
+    "note": "真实输出（关闭的 Issue，34 个字段，含 repository_url/labels/issue_dependencies_summary 等宽字段）；仓库、账号、标题、正文与 Issue 号替换成中性值，字段集合与类型原样保留。"
+  },
+  "read": {
+    "program": "gh",
+    "args": [
+      "api",
+      "repos/acme/widgets/issues/42"
+    ],
+    "why": "通知或订阅 Thread 的 subject 展开成 Issue 读取；返回里没有 pull_request 即 Issue"
+  },
+  "thread": {
+    "source": "github",
+    "id": "42",
+    "key": "github:42"
+  },
+  "shape": {
+    "number": 42,
+    "isPull": false,
+    "title": "Fix the login redirect",
+    "url": "https://github.com/acme/widgets/issues/42",
+    "state": "closed"
+  },
+  "tally": {
+    "skipped": 0
+  },
+  "fixture": "tests/fixtures/cli/github/issue.json"
+}

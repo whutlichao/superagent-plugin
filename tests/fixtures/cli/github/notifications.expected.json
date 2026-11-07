@@ -1,0 +1,27 @@
+{
+  "fixture": "tests/fixtures/cli/github/notifications.json",
+  "source": {
+    "command": "gh api 'notifications?all=true&per_page=2'",
+    "note": "真实输出的第二条通知（PullRequest / state_change），只把仓库、账号与标题替换成中性值；字段集合、层级与类型保持原样（含 repository 的 60 余个 URL 字段，用来证明解析器不能假设窄形状）。"
+  },
+  "notification": {
+    "id": "26977600684",
+    "reason": "state_change",
+    "unread": true,
+    "updatedAt": "2026-11-06T12:40:45Z",
+    "repository": "acme/widgets",
+    "subjectType": "PullRequest",
+    "subjectUrl": "https://api.github.com/repos/acme/widgets/pulls/45"
+  },
+  "expandsTo": {
+    "read": {
+      "program": "gh",
+      "args": ["api", "repos/acme/widgets/pulls/45"],
+      "why": "PullRequest 通知的 subject 展开成 PR 读取；Issue 通知读 issues/<n>"
+    },
+    "thread": { "source": "github", "id": "45", "key": "github:45" },
+    "cursor": { "key": "github-cursor:26977600684", "value": "2026-11-06T12:40:45Z" }
+  },
+  "skipped": [],
+  "tally": { "skipped": 0 }
+}

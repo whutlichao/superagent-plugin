@@ -1,0 +1,44 @@
+[
+  {
+    "id": 1714394287,
+    "node_id": "PRR_kwDODKw3uc5mL5Sv",
+    "user": {
+      "login": "carol",
+      "id": 7969779,
+      "node_id": "MDQ6VXNlcjc5Njk3Nzk=",
+      "avatar_url": "https://avatars.githubusercontent.com/u/7969779?u=7159877c47ae1dd304936c3cc530a65408aeb379&v=4",
+      "gravatar_id": "",
+      "url": "https://api.github.com/users/carol",
+      "html_url": "https://github.com/carol",
+      "followers_url": "https://api.github.com/users/carol/followers",
+      "following_url": "https://api.github.com/users/carol/following{/other_user}",
+      "gists_url": "https://api.github.com/users/carol/gists{/gist_id}",
+      "starred_url": "https://api.github.com/users/carol/starred{/owner}{/repo}",
+      "subscriptions_url": "https://api.github.com/users/carol/subscriptions",
+      "organizations_url": "https://api.github.com/users/carol/orgs",
+      "repos_url": "https://api.github.com/users/carol/repos",
+      "events_url": "https://api.github.com/users/carol/events{/privacy}",
+      "received_events_url": "https://api.github.com/users/carol/received_events",
+      "type": "User",
+      "user_view_type": "public",
+      "site_admin": false
+    },
+    "body": "",
+    "state": "COMMENTED",
+    "html_url": "https://github.com/acme/widgets/pull/45#pullrequestreview-1714394287",
+    "pull_request_url": "https://api.github.com/repos/acme/widgets/pulls/45",
+    "author_association": "CONTRIBUTOR",
+    "is_copilot_code_review": false,
+    "copilot_code_review_effort": null,
+    "_links": {
+      "html": {
+        "href": "https://github.com/acme/widgets/pull/45#pullrequestreview-1714394287"
+      },
+      "pull_request": {
+        "href": "https://api.github.com/repos/acme/widgets/pulls/45"
+      }
+    },
+    "submitted_at": "2023-11-06T07:14:48Z",
+    "commit_id": "48ab24d08ec56a03ee76d0ddad470517cdb900bd"
+  }
+]

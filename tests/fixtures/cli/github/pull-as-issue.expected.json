@@ -1,0 +1,30 @@
+{
+  "source": {
+    "command": "gh api repos/cli/cli/issues/8294",
+    "note": "真实输出（同一个 PR 的 issues/<n> 视图，33 个字段）；仓库、账号、标题、正文与编号替换成中性值。pull_request 字段原样保留，它是「这是 PR」的唯一判据。"
+  },
+  "read": {
+    "program": "gh",
+    "args": [
+      "api",
+      "repos/acme/widgets/issues/45"
+    ],
+    "why": "订阅 Thread 先读 issues/<n>；带 pull_request 说明它是 PR，接着读 pulls/<n>、评审与评审评论"
+  },
+  "thread": {
+    "source": "github",
+    "id": "45",
+    "key": "github:45"
+  },
+  "shape": {
+    "number": 45,
+    "isPull": true,
+    "title": "docs: describe the identity of the agent account",
+    "url": "https://github.com/acme/widgets/pull/45",
+    "state": "closed"
+  },
+  "tally": {
+    "skipped": 0
+  },
+  "fixture": "tests/fixtures/cli/github/pull-as-issue.json"
+}
