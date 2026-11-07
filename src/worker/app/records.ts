@@ -145,12 +145,21 @@ export interface OutboxRecord {
   /** 分组键：`ticket:<id>` 或 channel 地址。 */
   readonly channel: string
   readonly status: OutboxStatus
-  /** purpose/text/address/attempts/lastError。 */
+  /** 消息本体（`OutboundMessage`：id/channel/text/kind/ticketId）。 */
   readonly body: unknown
   /** 进入终态（sent/dropped）的时刻；保留策略按它算 30 天。 */
   readonly settledAt: IsoTime | null
   readonly droppedAt: IsoTime | null
   readonly droppedReason: string | null
+}
+
+/** 一条待发 Outbox 行与它 `reply` effect 的进度（§J.1 顺序与 §J.3 失败计数用）。 */
+export interface OutboxWaitingRow {
+  readonly record: OutboxRecord
+  /** `reply` effect 的入队序；没有 effect 行时为 `null`（不参与排序）。 */
+  readonly seq: number | null
+  /** `reply` effect 的连续失败次数（`Later` 不计）。 */
+  readonly attempts: number
 }
 
 /** 设置版本快照（`settings_version` 表，§D.2 要点 3、§K.5）。 */

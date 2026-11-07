@@ -43,7 +43,7 @@ export interface LaunchPromptInput {
 
 /**
  * 启动时读「当前保存的提示词配置与版本」的口子（§L.4）：每次 launch 现读，不复用旧缓存。
- * `app/prompts.ts` 的 `PromptVersions` 结构上满足它；Execuor 只拿这两个读数，不碰版本表。
+ * `app/prompts.ts` 的 `PromptVersions` 结构上满足它；Executor 只拿这两个读数，不碰版本表。
  */
 export interface LaunchPromptSource {
   /** 当前版本号；还没存过是 0（= 内置默认）。 */

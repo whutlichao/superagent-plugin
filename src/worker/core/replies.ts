@@ -62,14 +62,17 @@ export class Replies extends EnginePart {
   }
 
   /**
-   * 人停掉一个未结束的 Ticket 时的收尾消息（§E.5）：排到它开始时的 Channel。id 固定，
-   * 重复停止不会再发一条；没有 Channel（例如面板里直接建的工作）就什么都不发。
+   * 人停掉一个未结束的 Ticket 时的收尾消息（§E.5）：先撤回它还没发出的非收尾消息
+   * （§J.1 撤回行），再把收尾消息排到它开始时的 Channel。id 固定，重复停止不会再发一条；
+   * 没有 Channel（例如面板里直接建的工作）就只撤回、不发。
    */
   stopped(ticket: Ticket): void {
+    const closing = key('stopped', ticket.id)
+    this.options.outbox.withdrawTicket(ticket.id, [closing])
     const channel = this.sourceChannel(ticket)
     if (!channel) return
     this.options.outbox.send({
-      id: key('stopped', ticket.id),
+      id: closing,
       channel,
       text: `Stopped by a person: ${ticket.title} (${ticket.id}).`,
       kind: 'notice',

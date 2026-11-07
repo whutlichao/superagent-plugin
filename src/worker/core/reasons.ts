@@ -5,7 +5,9 @@
 // 键、且键集合与状态码/强度码/结局码一起构成完整的术语键集合。
 export const REASONS = {
   said: '{text}',
-  timeout: 'Assessment timed out',
+  // 超时的结论记下尝试次数（§K.7：连续 2 次重试后第 3 次到期）；`{attempts}` 由 Decision 的
+  // `reason.values` 提供，面板与 agent 读到的同一份记录。
+  timeout: 'Assessment timed out after {attempts} attempts',
   policyChanged: 'Policy changed during assessment',
   noAdmissible: 'No admissible trigger',
   startedTicket: 'Already started ticket {ticket}',

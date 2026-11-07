@@ -51,6 +51,7 @@ import {
 } from './app/kv.ts'
 import { createRefreshableStateSource, type RefreshableStateSource } from './app/state-source.ts'
 import { deliveredFollowups } from './app/views.ts'
+import { readEvalsHealth, readUnavailableProblems } from './app/views/attention.ts'
 import { statusBarView } from './app/status-bar.ts'
 import type { StatusBarView } from './app/status-bar.ts'
 import { Effects, ROUTER_EFFECT_KEY } from './app/effects.ts'
@@ -91,6 +92,7 @@ import { resumeAfterUpgrade, type ResumeReport } from './executor/resume.ts'
 import { DEFAULT_MAX_WORKERS } from './http/state.ts'
 import { createDomainHandlers, withDomainHandlers } from './http/domain.ts'
 import { createAssessmentHandlers, withAssessmentHandlers } from './http/assessment.ts'
+import { createDecisionHandlers, withDecisionHandlers } from './http/decisions.ts'
 import { createPromptHandlers, withPromptHandlers } from './http/prompts.ts'
 import { createPromptVersions } from './app/prompts.ts'
 import type { PromptEnvironment, PromptPolicy } from './app/prompts.ts'
@@ -413,7 +415,9 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
     paused: () => paused.paused(),
     // §E.6：`launch` 的取行上限 = 普通槽空位 + 「有人的唤醒在等」时那一个人人类槽。
     // 人/自动的精确判定仍在执行器里（拿不到槽抛 `Later`，不算失败）。
-    slots: () => launchCapacity(repo.tickets.list(), executorSettings.maxWorkers)
+    slots: () => launchCapacity(repo.tickets.list(), executorSettings.maxWorkers),
+    // §J.3：单条 dropped 不算错误、只计数；撤回是人的动作，不计入 drop 计数。
+    dropped: (kind) => (kind === 'reply' ? store.outbox.countDropped() : 0)
   })
   const outbox = createOutbox({ store, effects, now })
   // ---- Policy（§K.1、§K.2）：块从宿主设置里解析；Source 的 Policy 部分与准入行由 kind 认领。
@@ -610,6 +614,9 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
     effects,
     outbox,
     channel: {
+      // Source 关闭（或未安装）时等待（§J.1 暂停行）；不再监听该地址时 drop（§J.1 原因 a）。
+      enabled: (source) => registry.instance(source)?.enabled ?? false,
+      allowed: (message) => registry.channelAllowed(message.channel),
       send: (message) => registry.send(message, (options.commands ?? new Commands()).withSignal())
     },
     now,
@@ -617,6 +624,9 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
   })
 
   // ---- 读模型 / 状态栏 / 面板
+  /** health 里报 error 的条目数（面板的 `health.error` 与 §J.3 的系统问题共用这一条读法）。 */
+  const healthErrors = (): number =>
+    Object.values(board.all()).filter((entry) => entry.state === 'error').length
   const stateSource: RefreshableStateSource = createRefreshableStateSource({
     tickets: () => repo.tickets.list(),
     activity: () => activityCounts(store, nowMs()),
@@ -624,9 +634,13 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
       const counts = store.assignmentCounts()
       return { running: counts.running, maxWorkers: executorSettings.maxWorkers }
     },
-    hasError: () => Object.values(board.all()).some((entry) => entry.state === 'error'),
+    hasError: () => healthErrors() > 0,
     setupMissing: () => setup.missing(),
-    paused: () => paused.paused()
+    paused: () => paused.paused(),
+    // §J.3 的系统问题 = health error 条目 + §K.7 判过四条件的 unavailable（窗口、最新决定、
+    // dismiss 与 Thread 是否在忙都在读模型里判）。回复连续失败那一项由 outbox 的计数补。
+    problems: () =>
+      healthErrors() + readUnavailableProblems({ sql: store.sql }, { now: now() }).length
   })
 
   function refresh(): PanelState {
@@ -716,17 +730,26 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
       refresh()
     }
   })
-  const routes: readonly RouteDefinition[] = withPromptHandlers(
-    withAssessmentHandlers(
-      withDomainHandlers(ROUTE_TABLE, domain),
-      createAssessmentHandlers({
-        tools: routerTools,
-        afterWrite: () => {
-          refresh()
-        }
-      })
+  const routes: readonly RouteDefinition[] = withDecisionHandlers(
+    withPromptHandlers(
+      withAssessmentHandlers(
+        withDomainHandlers(ROUTE_TABLE, domain),
+        createAssessmentHandlers({
+          tools: routerTools,
+          afterWrite: () => {
+            refresh()
+          }
+        })
+      ),
+      prompts
     ),
-    prompts
+    createDecisionHandlers({
+      // 面板的 dismiss（§K.7）：领域只接受 unavailable 的 Decision，其余给固定拒绝。
+      dismiss: (decisionId) => engine.dismiss(decisionId),
+      afterWrite: () => {
+        refresh()
+      }
+    })
   )
 
   ensureApiToken(resolved)
@@ -924,6 +947,8 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
       }
     },
     health: board,
+    // `evals` 条目（§N.4）：1 h 内未解决的 unavailable 数量，写者就是 pass（与设计写者表一致）。
+    evals: () => readEvalsHealth({ sql: store.sql }, now()),
     schedule: (run, milliseconds) => setTimeout(run, milliseconds),
     cancel: (handle) => clearTimeout(handle as ReturnType<typeof setTimeout>),
     closing: () => closing,

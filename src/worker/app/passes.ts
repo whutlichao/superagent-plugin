@@ -6,6 +6,7 @@
 // 因此本模块不读环境时钟，也没有自己的 I/O（§P.1）。
 import type { HealthBoardLike, HealthEntryHandle } from '../infra/health'
 import { FAILURES_BEFORE_ERROR } from '../infra/health'
+import type { HealthEntry } from '../core/index.ts'
 
 /** 周期 pass 的间隔（§N.1 的 2 s 巡检；设计 §C.1 的「单线程 pass」由它驱动）。 */
 export const PASS_INTERVAL_MS = 2000
@@ -34,6 +35,11 @@ export interface PassesOptions extends PassPorts {
   readonly closing?: () => boolean
   /** 周期（缺省 2 s；测试可调小）。 */
   readonly intervalMs?: number
+  /**
+   * `evals` 条目的读数（§N.4：1 h 内未解决的 unavailable 数量）。由组合根接读模型；
+   * 缺省时不 claim 这一条（本调度器不是它的写者时，不假装有读数）。
+   */
+  readonly evals?: () => HealthEntry
 }
 
 /** 一次 pass 的输入：调度器只关心「做完了没有」。 */
@@ -61,6 +67,8 @@ function messageOf(error: unknown): string {
 export class Passes implements PassesPort {
   readonly #options: PassesOptions
   readonly #entry: HealthEntryHandle
+  /** `evals` 条目的写句柄；没接读模型时为空（本调度器不当它的写者）。 */
+  readonly #evals: HealthEntryHandle | null
   #timer: unknown = null
   #stopped = false
   #pumping: Promise<void> | null = null
@@ -72,6 +80,11 @@ export class Passes implements PassesPort {
     // `passes` 条目由本调度器独占写入（§N.4 写者表）。刚 claim、还没有跑过一轮时是
     // `starting`（§J.3 四档之一），第一轮成功后才说 ready。
     this.#entry = options.health.claim('passes', { state: 'starting', detail: 'not run yet' })
+    // `evals` 的写者也是 pass（§N.4 的写者列）：每轮成功之后重算一次，与 `passes` 同一拍。
+    this.#evals =
+      options.evals === undefined
+        ? null
+        : options.health.claim('evals', { state: 'starting', detail: 'not counted yet' })
   }
 
   start(): void {
@@ -145,6 +158,9 @@ export class Passes implements PassesPort {
         return
       }
       this.#options.engine.evaluateDue()
+      // 评估走过的这一轮里可能新增或了结了 unavailable 决定：读数在同一个 pass 里刷新。
+      const evals = this.#options.evals
+      if (evals !== undefined && this.#evals !== null) this.#evals.set(evals())
       this.succeeded()
     } catch (error) {
       this.failed(error)

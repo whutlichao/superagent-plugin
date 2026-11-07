@@ -88,14 +88,14 @@ export class Evals extends EnginePart {
 
   /**
    * 过期的 Eval 把它的 Trigger 重新排队给新的 Eval，连续 `REQUEUES` 次，免得忙碌的 assessor
-   * 丢掉请求；之后记为 unavailable。
+   * 丢掉请求；之后记为 unavailable，并在原因里记下尝试次数（§K.7 的「第 3 次到期」）。
    */
   private expire(thread: Thread): void {
     const expired = (thread.expired ?? 0) + 1
     if (expired > REQUEUES) {
       this.finish(thread, thread.evaluating!, {
         kind: 'unavailable',
-        reason: [{ code: 'timeout' }]
+        reason: [{ code: 'timeout', values: { attempts: String(expired) } }]
       })
       return
     }
