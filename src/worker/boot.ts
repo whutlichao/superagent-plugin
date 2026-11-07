@@ -52,6 +52,7 @@ import {
   feishuCursorKey,
   feishuTopicsKey,
   githubBodyKey,
+  githubCiKey,
   githubCursorKey,
   sourceLabelsKey,
   threadSeenKey
@@ -950,6 +951,8 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
           cursorKey: githubCursorKey,
           // Issue/PR 正文指纹也在这里命名（#18；#36 的 receive-all 复用同一个键）。
           bodyKey: githubBodyKey,
+          // 一个 PR head 提交的 CI 指纹键也在这里命名（#19）。
+          ciKey: githubCiKey,
           host: createSourceContext({
             engine,
             store,

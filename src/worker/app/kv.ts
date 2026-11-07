@@ -81,7 +81,11 @@ export const githubCursorKey = (notificationId: string): string =>
  */
 export const githubBodyKey = (issue: number | string): string =>
   `${KV_KEY_LITERALS.githubBodyPrefix}${issue}`
-export const githubCiKey = (pull: string, headSha: string): string =>
+/**
+ * 一个 PR 的某个 head 提交的 CI 指纹（§I.2 CI 行、票 #19）：键按「PR + head sha」，值只有指纹。
+ * 换了 head 就是新的基线（新提交的检查从第一次读到开始比）。
+ */
+export const githubCiKey = (pull: number | string, headSha: string): string =>
   `${KV_KEY_LITERALS.githubCiPrefix}${pull}#${headSha}`
 export const feishuCursorKey = (chat: string): string => `${KV_KEY_LITERALS.feishuCursorPrefix}${chat}`
 /**

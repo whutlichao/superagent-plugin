@@ -12,11 +12,13 @@
 import { liveTicket } from '../../core/index.ts'
 import type { HealthEntry, Thread, Ticket, Trigger } from '../../core/index.ts'
 import type { SourceContext } from '../kind.ts'
-import type { GithubNotification } from './api.ts'
-import { issueNumberOf, type GithubApi } from './api.ts'
+import type { GithubChecks, GithubNotification, GithubRead } from './api.ts'
+import { issueNumberOf, rateLimited, type GithubApi } from './api.ts'
 import type { GithubBodySource } from './translate.ts'
 import {
   bodyFingerprint,
+  ciFingerprint,
+  ciTrigger,
   commentTrigger,
   isSelf,
   issueBodyTrigger,
@@ -47,6 +49,23 @@ export interface GithubSubscribedThread {
   readonly lastAt: string
 }
 
+/**
+ * 这一轮读到的 PR 头部（#19 起带回）：CI 要读它的 head 提交，已关闭/已合并的不再读
+ * （§I.5：Ticket 随之结束）。
+ */
+export interface GithubPullHead {
+  readonly number: number
+  readonly headSha: string
+  readonly url: string
+  readonly closed: boolean
+}
+
+/** 读一个 Thread 的读数：收到的 Trigger 数，以及（PR 时）CI 轮询要的 head。 */
+interface ThreadRead {
+  readonly received: number
+  readonly pull?: GithubPullHead
+}
+
 /** 轮询器的依赖。 */
 export interface GithubPollerOptions {
   readonly api: GithubApi
@@ -66,6 +85,11 @@ export interface GithubPollerOptions {
    * 由组合根注入。缺省时不翻译正文版本（#36 的 receive-all 复用同一个键）。
    */
   readonly bodyKey?: (issue: number) => string
+  /**
+   * 一个 PR 某个 head 提交的 CI 指纹键（`githubCiKey(pull, headSha)`）：键名只活在
+   * `app/kv.ts`，由组合根注入。缺省时不轮询 CI（与 `bodyKey` 同一条约定）。
+   */
+  readonly ciKey?: (pull: number, headSha: string) => string
   /** 时钟（毫秒，水位线判定用）；缺省 `Date.now`。 */
   readonly now?: () => number
   readonly log?: (message: string) => void
@@ -206,6 +230,51 @@ export function createGithubPoller(options: GithubPollerOptions): GithubPoller {
   }
 
   /**
+   * 一个 PR head 提交的 CI 读数（§I.2 CI 行）：指纹（`github-ci:<pr>#<sha>`）变化才交一条
+   * Trigger——第一次读只当基线，同一结果重复读不出 Trigger（Trigger id 也按指纹幂等）。
+   *
+   * 限流不是失败（票 #19 的验收）：记一次日志、指纹不动，于是下一轮重读同一个提交；它不进
+   * `failures`，因此连续限流也不会把 `github` 报成 error。只有 `observeCi` 打开时才读
+   * （scope 层同样只在它打开时收 CI，§I.2 准入行）。
+   */
+  const readChecks = async (
+    pull: GithubPullHead,
+    hooks: { readonly skip: (count: number) => void; readonly defer: () => void }
+  ): Promise<number> => {
+    if (options.ciKey === undefined || !options.config.observeCi) return 0
+    if (pull.closed || pull.headSha.length === 0) return 0
+    let read: GithubRead<GithubChecks>
+    try {
+      read = await options.api.checks(options.config.repository, pull.headSha)
+    } catch (error) {
+      if (!rateLimited(error)) throw error
+      const detail = error instanceof Error ? error.message : String(error)
+      log(`CI checks for #${pull.number} are rate limited; retrying next round: ${detail.slice(0, 200)}`)
+      hooks.defer()
+      return 0
+    }
+    hooks.skip(read.skipped)
+    const found = read.items[0]
+    if (found === undefined) return 0
+    const stateKey = options.ciKey(pull.number, pull.headSha)
+    const seen = options.host.state.get(stateKey)
+    const fingerprint = ciFingerprint(found)
+    let received = 0
+    if (typeof seen === 'string' && seen !== fingerprint) {
+      const trigger = ciTrigger({
+        repository: options.config.repository,
+        pull: pull.number,
+        checks: found,
+        at: new Date(nowMs()).toISOString(),
+        ...(pull.url.length === 0 ? {} : { url: pull.url })
+      })
+      if (options.host.receive(trigger) !== 'duplicate') received += 1
+    }
+    options.host.state.set(stateKey, fingerprint)
+    return received
+  }
+
+  /**
    * 读一个 Thread 的会话：Issue/PR 本体、会话评论，PR 再读评审与评审评论（#18 只读不翻）。
    * `pull` 已知时（通知的 subject.type 就是 PullRequest）跳过 issues/<n> 的探测读取。
    */
@@ -215,11 +284,12 @@ export function createGithubPoller(options: GithubPollerOptions): GithubPoller {
     readonly since: string | null
     readonly knownPull: boolean | undefined
     readonly skip: (count: number) => void
-  }): Promise<number> => {
+  }): Promise<ThreadRead> => {
     const { repository, issue, since, skip } = input
     let isPull = input.knownPull === true
     let url: string | undefined
     let body: GithubBodySource | undefined
+    let pull: GithubPullHead | undefined
     if (input.knownPull === undefined) {
       const read = await options.api.issue(repository, issue)
       skip(read.skipped)
@@ -229,11 +299,20 @@ export function createGithubPoller(options: GithubPollerOptions): GithubPoller {
       if (found) body = found
     }
     if (isPull) {
-      const pull = await options.api.pull(repository, issue)
-      skip(pull.skipped)
-      const found = pull.items[0]
+      const read = await options.api.pull(repository, issue)
+      skip(read.skipped)
+      const found = read.items[0]
       url = found?.url ?? url
-      if (found) body = found
+      if (found) {
+        body = found
+        // CI 读 head 提交的检查与状态；已关闭/已合并的 PR 不再读（§I.5、§I.2 CI 行）。
+        pull = {
+          number: issue,
+          headSha: found.headSha,
+          url: found.url,
+          closed: found.state === 'closed' || found.merged
+        }
+      }
     }
     let received = 0
     // 正文版本（§I.2「issue-body 编辑」）：第一次读只当基线；之后只在正文指纹变化时
@@ -297,17 +376,20 @@ export function createGithubPoller(options: GithubPollerOptions): GithubPoller {
       }
     }
     recordSuccess(issue, url)
-    return received
+    return { received, ...(pull === undefined ? {} : { pull }) }
   }
 
   return {
     async poll(): Promise<GithubPollResult> {
       pending = new Map<string, Cursor>()
       let skipped = 0
+      let deferred = 0
       let notifications = 0
       let triggers = 0
       /** 这一轮已经读过的 Issue/PR（通知与订阅两路只读一次）。 */
       const read = new Set<number>()
+      /** 这一轮读到的 PR 头部：CI 段按订阅过滤后读它们的 head 提交（§I.2 CI 行）。 */
+      const heads = new Map<number, GithubPullHead>()
       let failed = false
       let firstError: unknown
       const noteFailure = (error: unknown): void => {
@@ -317,6 +399,9 @@ export function createGithubPoller(options: GithubPollerOptions): GithubPoller {
       const addSkipped = (count: number): void => {
         skipped += count
       }
+      const addDeferred = (): void => {
+        deferred += 1
+      }
 
       // 1) 通知：逐条 subject 展开成 Issue/PR 读取。
       try {
@@ -325,7 +410,9 @@ export function createGithubPoller(options: GithubPollerOptions): GithubPoller {
         notifications = listing.items.length
         for (const notification of listing.items) {
           try {
-            triggers += await readNotification(notification, read, addSkipped)
+            const outcome = await readNotification(notification, read, addSkipped)
+            triggers += outcome.received
+            if (outcome.pull !== undefined) heads.set(outcome.pull.number, outcome.pull)
           } catch (error) {
             noteFailure(error)
             const issue = issueNumberOf(notification.apiUrl)
@@ -337,14 +424,15 @@ export function createGithubPoller(options: GithubPollerOptions): GithubPoller {
       }
 
       // 2) 订阅 Thread：凡有活 Ticket 订阅的都每轮读一次；超出水位线的标为过期、不再读。
-      for (const thread of options.subscribed?.() ?? []) {
+      const subscribed = options.subscribed?.() ?? []
+      for (const thread of subscribed) {
         if (!withinHorizon(thread, nowMs())) {
           markExpired(thread.issue)
           continue
         }
         if (read.has(thread.issue)) continue
         try {
-          triggers += await readThread({
+          const outcome = await readThread({
             repository: options.config.repository,
             issue: thread.issue,
             // 订阅 Thread 每轮全量读会话评论：幂等由 Trigger id 保证（§I.2 Trigger id 行）。
@@ -352,21 +440,39 @@ export function createGithubPoller(options: GithubPollerOptions): GithubPoller {
             knownPull: undefined,
             skip: addSkipped
           })
+          triggers += outcome.received
+          if (outcome.pull !== undefined) heads.set(outcome.pull.number, outcome.pull)
         } catch (error) {
           noteFailure(error)
           recordPollError(thread.issue, error)
         }
       }
 
-      // 3) 整轮成功才推进游标：被中断的一轮重读，而不是漏读（§I.2 / §I.6）。
+      // 3) CI：订阅的 PR 读一次 head 提交的检查与状态，只在指纹变化时出 Trigger（§I.2 CI 行）。
+      //    只有还活着的 Ticket 需要 CI 反馈（上游只轮询 open ticket 的 PR）：结束的 Ticket 不再读。
+      for (const thread of subscribed) {
+        if (!thread.live) continue
+        const pull = heads.get(thread.issue)
+        if (pull === undefined) continue
+        try {
+          triggers += await readChecks(pull, { skip: addSkipped, defer: addDeferred })
+        } catch (error) {
+          noteFailure(error)
+          recordPollError(pull.number, error)
+        }
+      }
+
+      // 4) 整轮成功才推进游标：被中断的一轮重读，而不是漏读（§I.2 / §I.6）。
       if (failed) {
         failRound(firstError)
       } else {
         for (const [key, value] of pending) options.host.state.set(key, value)
         failures = 0
+        const deferredText =
+          deferred === 0 ? '' : `; ${deferred} CI ${deferred === 1 ? 'read' : 'reads'} deferred by rate limit`
         report({
           state: 'ready',
-          detail: `${notifications} notifications${skipped > 0 ? `; ${skipped} unreadable items skipped` : ''}`
+          detail: `${notifications} notifications${skipped > 0 ? `; ${skipped} unreadable items skipped` : ''}${deferredText}`
         })
       }
       return { notifications, triggers, skipped }
@@ -378,10 +484,10 @@ export function createGithubPoller(options: GithubPollerOptions): GithubPoller {
     notification: GithubNotification,
     read: Set<number>,
     skip: (count: number) => void
-  ): Promise<number> {
+  ): Promise<ThreadRead> {
     const key = options.cursorKey(notification.id)
     const cursor = cursorOf(options.host.state.get(key))
-    if (cursor !== null && cursor.updatedAt === notification.updatedAt) return 0
+    if (cursor !== null && cursor.updatedAt === notification.updatedAt) return { received: 0 }
     const issue = issueNumberOf(notification.apiUrl)
     const repository = notification.repository || options.config.repository
     if (issue === undefined || (notification.type !== 'Issue' && notification.type !== 'PullRequest')) {
@@ -391,10 +497,10 @@ export function createGithubPoller(options: GithubPollerOptions): GithubPoller {
         lastReadAt: notification.lastReadAt,
         ...(notification.type === '' ? {} : { skipped: notification.type })
       })
-      return 0
+      return { received: 0 }
     }
     read.add(issue)
-    const received = await readThread({
+    const outcome = await readThread({
       repository,
       issue,
       since: cursor?.lastReadAt ?? notification.lastReadAt,
@@ -405,6 +511,6 @@ export function createGithubPoller(options: GithubPollerOptions): GithubPoller {
       updatedAt: notification.updatedAt,
       lastReadAt: notification.lastReadAt
     })
-    return received
+    return outcome
   }
 }

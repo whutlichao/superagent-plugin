@@ -12,7 +12,7 @@
 //   路由仍看 primary（Issue/PR 会话）。`root` 取 `in_reply_to_id`，根评论自己就是根。
 import { key } from '../../core/index.ts'
 import type { ChannelRef, Trigger } from '../../core/index.ts'
-import type { GithubComment, GithubIssue, GithubPull, GithubReview } from './api.ts'
+import type { GithubChecks, GithubComment, GithubIssue, GithubPull, GithubReview } from './api.ts'
 
 /** GitHub 的 Thread 键：Issue/PR 号（§I.2 Thread 行）。 */
 export const githubThread = (issue: number): { source: 'github'; id: string } => ({
@@ -245,4 +245,121 @@ export function issueBodyTrigger(input: {
  */
 export function bodyFingerprint(body: string): string {
   return key('github-content', body)
+}
+
+/** CI 结论的三档（§I.2 CI 行）：成功、失败、进行中。 */
+export type CiState = 'success' | 'failure' | 'running'
+
+/** 算作失败的检查结论与状态（`success`/`neutral`/`skipped`/`stale` 不算，上游同）。 */
+const FAILING = new Set([
+  'failure',
+  'timed_out',
+  'cancelled',
+  'action_required',
+  'startup_failure',
+  'error'
+])
+
+/**
+ * 一个提交的 CI 读数 → 三档结论：有失败就是失败（即使还有在跑的，上游同）；否则还在跑
+ * 就是进行中；全部完成且没有失败就是成功。
+ */
+export function ciState(checks: GithubChecks): CiState {
+  const failed =
+    checks.checks.some((check) => check.conclusion !== null && FAILING.has(check.conclusion)) ||
+    checks.statuses.some((status) => FAILING.has(status.state))
+  if (failed) return 'failure'
+  const running =
+    checks.checks.some((check) => check.status !== 'completed') ||
+    checks.statuses.some((status) => status.state === 'pending')
+  return running ? 'running' : 'success'
+}
+
+/** 摘要里列名字的数量上限（其余写成「and N more」，上游同）。 */
+const SUMMARY_NAMES = 5
+
+/** 结果的名字列表：失败时只列失败的名字，进行中时只列还在跑的名字。 */
+function names(list: readonly string[]): string {
+  const shown = list.slice(0, SUMMARY_NAMES).join(', ')
+  return list.length > SUMMARY_NAMES ? `${shown}, and ${list.length - SUMMARY_NAMES} more` : shown
+}
+
+/**
+ * CI 读数的一句话摘要（Trigger 的正文）：失败/进行中/通过 + 计数 + PR 与 head + 「去读哪个
+ * 资源」。模型据此决定要不要看细节；资源名与 §I.2「资源读取」同一写法。
+ */
+export function ciSummary(checks: GithubChecks, pull: number): string {
+  const head = checks.headSha.slice(0, 7) || 'unknown'
+  const at = `on PR #${pull} at ${head}`
+  const total = checks.checks.length + checks.statuses.length
+  const failed = [
+    ...checks.checks
+      .filter((check) => check.conclusion !== null && FAILING.has(check.conclusion))
+      .map((check) => check.name),
+    ...checks.statuses.filter((status) => FAILING.has(status.state)).map((status) => status.context)
+  ]
+  const running = [
+    ...checks.checks.filter((check) => check.status !== 'completed').map((check) => check.name),
+    ...checks.statuses.filter((status) => status.state === 'pending').map((status) => status.context)
+  ]
+  const line =
+    failed.length > 0
+      ? `CI failed ${failed.length}/${total} ${at}: ${names(failed)}`
+      : running.length > 0
+        ? `CI running ${running.length}/${total} ${at}: ${names(running)}`
+        : `CI passed ${total}/${total} ${at}`
+  return `${line}\nRead github/pulls/${pull}/checks for every check.`
+}
+
+/**
+ * 一个提交的 CI 指纹（§I.2 CI 行）：只由检查与状态的**结果**派生，与摘要文本和时刻无关。
+ * 同一结果永远同一指纹；轮询据此判断「只在变化时出 Trigger」。
+ */
+export function ciFingerprint(checks: GithubChecks): string {
+  return key(
+    'github',
+    'ci',
+    checks.headSha,
+    JSON.stringify({
+      checks: checks.checks.map((check) => [check.name, check.status, check.conclusion]),
+      statuses: checks.statuses.map((status) => [status.context, status.state])
+    })
+  )
+}
+
+/**
+ * 一个提交的 CI 读数 → Trigger（§I.2 CI 行、§K.2 第 6 条）。
+ *
+ * CI 没有发送者：`actor` 是 Source 自己、`id` 为空，`human=false`，永不带 `addressed`——
+ * Gate 因此只读该接收行的最后一格。Thread 是它所属的 PR，回复地址是 PR 会话。
+ * id 由指纹派生：同一结果永远同一 id（重复读到只是 `duplicate`），结果变化才是新事件。
+ */
+export function ciTrigger(input: {
+  readonly repository: string
+  readonly pull: number
+  readonly checks: GithubChecks
+  /** 这一轮读到的时刻（CI 自己没有 `updated_at`）。 */
+  readonly at: string
+  /** PR 页面地址；读不到时省略。 */
+  readonly url?: string
+}): Trigger {
+  const { repository, pull, checks, at, url } = input
+  return {
+    id: key('github', 'ci', String(pull), ciFingerprint(checks)),
+    source: 'github',
+    threads: [githubThread(pull)],
+    actor: { source: 'github', id: '' },
+    human: false,
+    at,
+    text: ciSummary(checks, pull),
+    ...(url === undefined || url.length === 0 ? {} : { url }),
+    channel: githubCommentChannel(repository, pull),
+    meta: {
+      kind: 'ci',
+      repository,
+      issue: pull,
+      headSha: checks.headSha,
+      state: ciState(checks)
+    }
+  }
 }
