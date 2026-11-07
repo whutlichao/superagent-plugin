@@ -58,8 +58,10 @@ import {
   feishuCursorKey,
   feishuTopicsKey,
   githubBodyKey,
+  githubBranchCiKey,
   githubCiKey,
   githubCursorKey,
+  githubStreamKey,
   sourceLabelsKey,
   threadSeenKey
 } from './app/kv.ts'
@@ -1090,6 +1092,9 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
           bodyKey: githubBodyKey,
           // 一个 PR head 提交的 CI 指纹键也在这里命名（#19）。
           ciKey: githubCiKey,
+          // receive-all 的仓库流与默认分支 CI 基线也在这里命名（#36）。
+          streamKey: githubStreamKey,
+          branchCiKey: githubBranchCiKey,
           host: createSourceContext({
             engine,
             store,

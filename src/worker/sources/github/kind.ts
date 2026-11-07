@@ -21,6 +21,7 @@ import { array, object, string } from '../../infra/schema.ts'
 import type { GithubConfig } from './config.ts'
 import { githubConfigSchema } from './config.ts'
 import { rateLimited } from './api.ts'
+import { githubFind, githubThreadContext } from './read.ts'
 import { mentionsAgent } from './translate.ts'
 
 /** 这个 kind 的稳定 id。 */
@@ -132,6 +133,11 @@ export function createGithubKind(cli: string): SourceKind<GithubConfig> {
       'Polls GitHub notifications, reads Issues and pull requests with their comments and reviews, and replies in the same conversation.'
     ),
     schema: githubConfigSchema,
+    /**
+     * 评估窗口的语境（§I.2「线程上下文」行）：Issue/PR 描述 + 评论页、评审页、评审线程页，
+     * 每页 20 条、带下一页游标；默认分支的 CI 以它自己的 Trigger 作语境。
+     */
+    threadContext: githubThreadContext(cli),
     fields: [
       {
         key: 'repository',
@@ -152,24 +158,40 @@ export function createGithubKind(cli: string): SourceKind<GithubConfig> {
         key: 'observeIssues',
         type: 'switch',
         label: both('接收仓库里的新 Issue', 'Observe new Issues'),
+        hint: both(
+          '打开后，没点名 agent 的新 Issue 也接收；从打开的那一刻开始，不读以前的。',
+          'New Issues that do not mention the agent are received too, from the moment this is switched on; earlier ones are not read.'
+        ),
         advanced: true
       },
       {
         key: 'observePulls',
         type: 'switch',
         label: both('接收仓库里的新 PR', 'Observe new pull requests'),
+        hint: both(
+          '打开后，没点名 agent 的新 PR 也接收；从打开的那一刻开始，不读以前的。',
+          'New pull requests that do not mention the agent are received too, from the moment this is switched on; earlier ones are not read.'
+        ),
         advanced: true
       },
       {
         key: 'observeComments',
         type: 'switch',
         label: both('接收未点名的评论', 'Observe unaddressed comments'),
+        hint: both(
+          '打开后，Issue 与 PR 上没点名 agent 的评论（含行内评审评论）也接收；从打开的那一刻开始。',
+          'Comments on any Issue or pull request, review comments included, are received without a mention, from the moment this is switched on.'
+        ),
         advanced: true
       },
       {
         key: 'observeCi',
         type: 'switch',
         label: both('接收 CI 变化', 'Observe CI changes'),
+        hint: both(
+          'PR 的 CI 变化与默认分支的 CI 失败/恢复都接收；默认分支只在失败集合变化时出事件，且从打开的那一刻建基线。',
+          "A pull request's CI changes and the default branch's failures and recovery are received; the default branch reports only a change in its failing checks, baselined when this is switched on."
+        ),
         advanced: true
       }
     ],
@@ -254,12 +276,8 @@ export function createGithubKind(cli: string): SourceKind<GithubConfig> {
       }
     },
     find(query: string) {
-      // 最小切片只认评论/Issue 的 URL 与 `#12` 形式的短引用（完整搜索归 #36）。
-      const url = /github\.com\/([\w.-]+\/[\w.-]+)\/(?:issues|pull)\/(\d+)/.exec(query)
-      const short = /^#(\d+)$/.exec(query.trim())
-      if (url !== null) return { threads: [`github:${url[2]}`], terms: [url[0]] }
-      if (short !== null) return { threads: [`github:${short[1]}`], terms: [query.trim()] }
-      return { threads: [], terms: [query.trim()] }
+      // `#12`、Issue/PR 链接、评论链接 → Thread key + 搜索词（§I.2「find」行、读面的纯函数）。
+      return githubFind(query)
     },
     policy: {
       schema: policySchema,

@@ -113,8 +113,10 @@ export function commentTrigger(input: {
 /**
  * 评审的正文：非 `COMMENTED` 的评审是「决定」，即使没有正文也要让 worker 看见（上游同）；
  * `COMMENTED` 且没正文的评审不产生可读内容。
+ *
+ * 导出给读面：资源读取与线程上下文里的评审消息与 Trigger 用同一份正文（一处定义）。
  */
-function reviewText(review: GithubReview): string {
+export function reviewText(review: GithubReview): string {
   const decision =
     review.state.length > 0 && review.state !== 'COMMENTED'
       ? `${review.state} review of commit ${review.commitId || 'unknown'}`
@@ -261,14 +263,24 @@ const FAILING = new Set([
 ])
 
 /**
+ * 失败的检查与状态名（按名字排序）：`ciState`、指纹与两种 CI 摘要共用这一份判定。
+ * 排序让「同一组失败」永远同一个指纹：GitHub 的返回顺序不参与比较。
+ */
+export function ciFailures(checks: GithubChecks): string[] {
+  return [
+    ...checks.checks
+      .filter((check) => check.conclusion !== null && FAILING.has(check.conclusion))
+      .map((check) => check.name),
+    ...checks.statuses.filter((status) => FAILING.has(status.state)).map((status) => status.context)
+  ].sort()
+}
+
+/**
  * 一个提交的 CI 读数 → 三档结论：有失败就是失败（即使还有在跑的，上游同）；否则还在跑
  * 就是进行中；全部完成且没有失败就是成功。
  */
 export function ciState(checks: GithubChecks): CiState {
-  const failed =
-    checks.checks.some((check) => check.conclusion !== null && FAILING.has(check.conclusion)) ||
-    checks.statuses.some((status) => FAILING.has(status.state))
-  if (failed) return 'failure'
+  if (ciFailures(checks).length > 0) return 'failure'
   const running =
     checks.checks.some((check) => check.status !== 'completed') ||
     checks.statuses.some((status) => status.state === 'pending')
@@ -285,30 +297,36 @@ function names(list: readonly string[]): string {
 }
 
 /**
- * CI 读数的一句话摘要（Trigger 的正文）：失败/进行中/通过 + 计数 + PR 与 head + 「去读哪个
+ * CI 读数的一句话摘要（Trigger 的正文）：失败/进行中/通过 + 计数 + 在哪里 + 「去读哪个
  * 资源」。模型据此决定要不要看细节；资源名与 §I.2「资源读取」同一写法。
  */
-export function ciSummary(checks: GithubChecks, pull: number): string {
+function ciLine(checks: GithubChecks, where: string): string {
   const head = checks.headSha.slice(0, 7) || 'unknown'
-  const at = `on PR #${pull} at ${head}`
+  const at = `on ${where} at ${head}`
   const total = checks.checks.length + checks.statuses.length
-  const failed = [
-    ...checks.checks
-      .filter((check) => check.conclusion !== null && FAILING.has(check.conclusion))
-      .map((check) => check.name),
-    ...checks.statuses.filter((status) => FAILING.has(status.state)).map((status) => status.context)
-  ]
+  const failed = ciFailures(checks)
   const running = [
     ...checks.checks.filter((check) => check.status !== 'completed').map((check) => check.name),
     ...checks.statuses.filter((status) => status.state === 'pending').map((status) => status.context)
   ]
-  const line =
-    failed.length > 0
-      ? `CI failed ${failed.length}/${total} ${at}: ${names(failed)}`
-      : running.length > 0
-        ? `CI running ${running.length}/${total} ${at}: ${names(running)}`
-        : `CI passed ${total}/${total} ${at}`
-  return `${line}\nRead github/pulls/${pull}/checks for every check.`
+  return failed.length > 0
+    ? `CI failed ${failed.length}/${total} ${at}: ${names(failed)}`
+    : running.length > 0
+      ? `CI running ${running.length}/${total} ${at}: ${names(running)}`
+      : `CI passed ${total}/${total} ${at}`
+}
+
+/** 一个 PR 的 CI 摘要（§I.2 CI 行）：下面那一行是模型该去读的资源名。 */
+export function ciSummary(checks: GithubChecks, pull: number): string {
+  return `${ciLine(checks, `PR #${pull}`)}\nRead github/pulls/${pull}/checks for every check.`
+}
+
+/**
+ * 默认分支 CI 的摘要（§I.2 receive-all 行）：默认分支没有 PR 编号，读法是那个提交的检查。
+ * 只有失败集合变化时才出 Trigger（`branchCiFingerprint`），所以措辞照抄 `ciSummary`。
+ */
+export function branchCiSummary(checks: GithubChecks, branch: string): string {
+  return `${ciLine(checks, branch)}\nRead github/commits/${checks.headSha}/checks for every check.`
 }
 
 /**
@@ -358,6 +376,61 @@ export function ciTrigger(input: {
       kind: 'ci',
       repository,
       issue: pull,
+      headSha: checks.headSha,
+      state: ciState(checks)
+    }
+  }
+}
+
+/**
+ * 默认分支 CI 的 Thread 键：`github:ci:<branch>`（§I.2 receive-all 行）。它没有 Issue/PR 编号
+ * 可挂，所以用分支名做 id；`subscribedThreads` 只认数字 id，因此永远不会把它当成 Issue 去轮询。
+ */
+export const githubBranchThread = (branch: string): { source: 'github'; id: string } => ({
+  source: 'github',
+  id: `ci:${branch}`
+})
+
+/**
+ * 默认分支 CI 的指纹（§I.2 receive-all 行）：只由**失败的名字**派生。
+ *
+ * 通过、进行中都不算变化：默认分支每推一个新提交就跑一遍 CI，若按整份读数比指纹，每个绿提交
+ * 都会产一条「CI 通过」的 Trigger，那是噪音而不是反馈。失败集合变了才是新闻（坏了、或修好了）。
+ */
+export function branchCiFingerprint(checks: GithubChecks): string {
+  return key('github', 'ci', 'branch', JSON.stringify(ciFailures(checks)))
+}
+
+/**
+ * 默认分支 CI 的变化 → Trigger（§I.2 receive-all 行、§K.2 第 6 条）。
+ *
+ * 与 PR 的 CI 同：没有发送者（`actor.id` 为空、`human=false`、永不带 `addressed`），准入行只看
+ * 最后一格。区别是它没有可回复的会话——默认分支的 CI 不属于任何 Issue/PR，所以没有 `channel`；
+ * Thread 是 `github:ci:<branch>`，语境是这条 Trigger 自己（见 `githubThreadContext`）。
+ */
+export function branchCiTrigger(input: {
+  readonly repository: string
+  readonly branch: string
+  readonly checks: GithubChecks
+  /** 这一轮读到的时刻（CI 自己没有 `updated_at`）。 */
+  readonly at: string
+  /** 提交页面的地址；读不到时省略。 */
+  readonly url?: string
+}): Trigger {
+  const { repository, branch, checks, at, url } = input
+  return {
+    id: key('github', 'ci', `branch:${branch}`, branchCiFingerprint(checks)),
+    source: 'github',
+    threads: [githubBranchThread(branch)],
+    actor: { source: 'github', id: '' },
+    human: false,
+    at,
+    text: branchCiSummary(checks, branch),
+    ...(url === undefined || url.length === 0 ? {} : { url }),
+    meta: {
+      kind: 'ci',
+      repository,
+      branch,
       headSha: checks.headSha,
       state: ciState(checks)
     }

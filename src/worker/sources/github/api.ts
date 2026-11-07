@@ -46,8 +46,14 @@ export interface GithubPull {
   readonly url: string
   readonly state: string
   readonly merged: boolean
+  /** 草稿 PR：描述读把 `draft: true` 交给模型，免得它把草稿当可合并的改动。 */
+  readonly draft: boolean
   /** PR 的 head 提交：CI 读这个提交的检查与状态（§I.2 CI 行）。 */
   readonly headSha: string
+  /** head 分支名；描述读用它说明这条 PR 从哪来。 */
+  readonly headRef: string
+  /** base（目标）分支名。 */
+  readonly baseRef: string
   readonly updatedAt: string
   readonly body: string
   readonly login: string
@@ -111,6 +117,21 @@ export interface GithubChecks {
   readonly statuses: readonly GithubCommitStatus[]
 }
 
+/** 一个仓库的底线事实：默认分支的名字（默认分支 CI 用，§I.2 receive-all 行）。 */
+export interface GithubRepository {
+  readonly defaultBranch: string
+}
+
+/** 一个分支的 head 提交（默认分支没有工作流运行时退回它）。 */
+export interface GithubBranchHead {
+  readonly headSha: string
+}
+
+/** 仓库级评论流的一条：评论本身 + 它所在的 Issue/PR 编号。 */
+export interface GithubStreamComment extends GithubComment {
+  readonly issue: number
+}
+
 /** GitHub 的读取面（测试用 FakeCommands 实现同一个契约）。 */
 export interface GithubApi {
   /** 未读通知；`gh api notifications --paginate`（§I.2）。 */
@@ -130,10 +151,49 @@ export interface GithubApi {
   /** 一个 PR 的评审评论页（`/pulls/:n/comments`，行内讨论）。 */
   pullComments(repository: string, issue: number): Promise<GithubRead<GithubComment>>
   /**
+   * 一页 Issue/PR 会话评论（`/issues/:n/comments`，每页 `pageSize` 条）：资源读取与线程上下文
+   * 用服务端分页，而不是把整条会话读进内存（§I.2「资源读取」行的 20 条一页）。
+   */
+  issueCommentsPage(
+    repository: string,
+    issue: number,
+    page: number,
+    pageSize: number
+  ): Promise<GithubRead<GithubComment>>
+  /** 一页评审评论（`/pulls/:n/comments`，行内讨论）。 */
+  pullCommentsPage(
+    repository: string,
+    issue: number,
+    page: number,
+    pageSize: number
+  ): Promise<GithubRead<GithubComment>>
+  /** 一页评审（`/pulls/:n/reviews`）。 */
+  pullReviewsPage(
+    repository: string,
+    issue: number,
+    page: number,
+    pageSize: number
+  ): Promise<GithubRead<GithubReview>>
+  /**
    * 一个提交的 CI 读数（§I.2 CI 行）：检查运行 + 提交状态。畸形页/条目进 `skipped`，
    * 与其它读一致。
    */
   checks(repository: string, sha: string): Promise<GithubRead<GithubChecks>>
+  /** 仓库本体的底线事实（`repos/:o/:r`）：默认分支名。 */
+  repositoryInfo(repository: string): Promise<GithubRead<GithubRepository>>
+  /** 默认分支上最新的工作流运行（`repos/:o/:r/actions/runs?branch=<default>`）：它的 head 提交。 */
+  workflowRuns(repository: string, branch: string): Promise<GithubRead<GithubBranchHead>>
+  /** 一个分支的 head 提交（`repos/:o/:r/commits/<branch>`）：没有工作流运行时的退路。 */
+  branchHead(repository: string, branch: string): Promise<GithubRead<GithubBranchHead>>
+  /**
+   * 仓库级新 Issue/PR（`repos/:o/:r/issues?state=all&sort=updated&direction=asc&since=…`）。
+   * GitHub 的 `/issues` 同时返回 PR（带 `pull_request`），所以这一个读服务两个开关。
+   */
+  repoIssues(repository: string, since: string): Promise<GithubRead<GithubIssue>>
+  /** 仓库级会话评论（`repos/:o/:r/issues/comments`，含 PR 会话，不含行内评审评论）。 */
+  repoComments(repository: string, since: string): Promise<GithubRead<GithubStreamComment>>
+  /** 仓库级行内评审评论（`repos/:o/:r/pulls/comments`）。 */
+  repoReviewComments(repository: string, since: string): Promise<GithubRead<GithubStreamComment>>
 }
 
 /** 从任意值里取字符串字段（缺失 → 空串）。 */
@@ -244,7 +304,10 @@ export function pullOf(value: unknown): GithubPull | undefined {
     url: text(value, 'html_url'),
     state: text(value, 'state'),
     merged: flag(value, 'merged'),
+    draft: flag(value, 'draft'),
     headSha: text(isRecord(value['head']) ? value['head'] : {}, 'sha'),
+    headRef: text(isRecord(value['head']) ? value['head'] : {}, 'ref'),
+    baseRef: text(isRecord(value['base']) ? value['base'] : {}, 'ref'),
     updatedAt: text(value, 'updated_at'),
     body: text(value, 'body'),
     login: author.login,
@@ -352,9 +415,55 @@ export function issueNumberOf(apiUrl: string): number | undefined {
   return match === null ? undefined : Number(match[1])
 }
 
+/** 仓库本体 → 端口形状；默认分支缺失时跳过（不猜 `main`）。 */
+export function repositoryOf(value: unknown): GithubRepository | undefined {
+  if (!isRecord(value)) return undefined
+  const branch = text(value, 'default_branch')
+  return branch.length === 0 ? undefined : { defaultBranch: branch }
+}
+
+/** 一个分支/运行 → 它的 head 提交；字段名按端点给（`actions/runs` 是 `head_sha`，`commits/:ref` 是 `sha`）。 */
+export function branchHeadOf(value: unknown, field = 'sha'): GithubBranchHead | undefined {
+  if (!isRecord(value)) return undefined
+  const sha = text(value, field)
+  return sha.length === 0 ? undefined : { headSha: sha }
+}
+
+/** 一条仓库级评论 → 端口形状：评论本身 + 它所在的 Issue/PR 编号（`issue_url` / `pull_request_url`）。 */
+export function streamCommentOf(value: unknown, field = 'issue_url'): GithubStreamComment | undefined {
+  const comment = commentOf(value)
+  if (comment === undefined) return undefined
+  const issue = issueNumberOf(isRecord(value) ? text(value, field) : '')
+  return issue === undefined ? undefined : { ...comment, issue }
+}
+
+/** 行内评审评论的仓库级读：编号在 `pull_request_url` 上。 */
+export const streamReviewCommentOf = (value: unknown): GithubStreamComment | undefined =>
+  streamCommentOf(value, 'pull_request_url')
+
 /** 打开分页的读参数（`--method GET` 是关键：`gh api -f` 默认把请求改成 POST）。 */
 function pageArgs(path: string): string[] {
   return ['api', path, '--paginate', '--method', 'GET', '-f', 'per_page=100']
+}
+
+/** 读**一页**的参数（不 `--paginate`：游标由调用方给）。 */
+function onePageArgs(path: string, page: number, pageSize: number): string[] {
+  return ['api', path, '--method', 'GET', '-f', `per_page=${pageSize}`, '-f', `page=${page}`]
+}
+
+/**
+ * 仓库级事件流的读参数（§I.2 receive-all 行）：按更新时间升序，从 `since` 开始，最多一页 100 条。
+ * 升序很重要：满了就取到最老的那些，游标向前走得慢但不跳；漏读由 Trigger id 幂等兜住。
+ */
+function streamArgs(
+  path: string,
+  since: string,
+  extra: readonly string[],
+  sort: readonly string[]
+): string[] {
+  const args = ['api', path, '--paginate', '--method', 'GET', '-f', 'per_page=100']
+  for (const value of [...extra, ...sort, 'direction=asc', `since=${since}`]) args.push('-f', value)
+  return args
 }
 
 /** 限流的文案（与 `commands.test.ts` 的错误脱敏形状一致：只认标准错误里的这几句）。 */
@@ -429,6 +538,39 @@ export function createGithubApi(commands: CommandsHost, cli: string): GithubApi 
     pullComments(repository: string, issue: number): Promise<GithubRead<GithubComment>> {
       return readList(pageArgs(`repos/${repository}/pulls/${issue}/comments`), commentOf)
     },
+    issueCommentsPage(
+      repository: string,
+      issue: number,
+      page: number,
+      pageSize: number
+    ): Promise<GithubRead<GithubComment>> {
+      return readList(
+        onePageArgs(`repos/${repository}/issues/${issue}/comments`, page, pageSize),
+        commentOf
+      )
+    },
+    pullCommentsPage(
+      repository: string,
+      issue: number,
+      page: number,
+      pageSize: number
+    ): Promise<GithubRead<GithubComment>> {
+      return readList(
+        onePageArgs(`repos/${repository}/pulls/${issue}/comments`, page, pageSize),
+        commentOf
+      )
+    },
+    pullReviewsPage(
+      repository: string,
+      issue: number,
+      page: number,
+      pageSize: number
+    ): Promise<GithubRead<GithubReview>> {
+      return readList(
+        onePageArgs(`repos/${repository}/pulls/${issue}/reviews`, page, pageSize),
+        reviewOf
+      )
+    },
     async checks(repository: string, sha: string): Promise<GithubRead<GithubChecks>> {
       // check-runs 是对象响应：`--slurp` 把分页包成数组，再逐页展平（§I.2 CI 行）。
       const pages = parseJson(
@@ -460,6 +602,52 @@ export function createGithubApi(commands: CommandsHost, cli: string): GithubApi 
         ],
         skipped: runs.skipped + statuses.skipped
       }
+    },
+    repositoryInfo(repository: string): Promise<GithubRead<GithubRepository>> {
+      return readOne(['api', `repos/${repository}`], repositoryOf)
+    },
+    async workflowRuns(
+      repository: string,
+      branch: string
+    ): Promise<GithubRead<GithubBranchHead>> {
+      // 工作流运行是对象响应（`workflow_runs: [...]`），与 check-runs 同一条读法（不 `--slurp`：只要最新一页）。
+      const value = parseJson(
+        await commands.run(cli, [
+          'api',
+          `repos/${repository}/actions/runs`,
+          '--method',
+          'GET',
+          '-f',
+          `branch=${branch}`,
+          '-f',
+          'per_page=1'
+        ])
+      )
+      const runs = isRecord(value) ? value['workflow_runs'] : undefined
+      if (!Array.isArray(runs)) return { items: [], skipped: 1 }
+      const items = runs.flatMap((run) => {
+        const parsed = branchHeadOf(run, 'head_sha')
+        return parsed === undefined ? [] : [parsed]
+      })
+      return { items, skipped: runs.length - items.length }
+    },
+    branchHead(repository: string, branch: string): Promise<GithubRead<GithubBranchHead>> {
+      return readOne(['api', `repos/${repository}/commits/${encodeURIComponent(branch)}`], branchHeadOf)
+    },
+    repoIssues(repository: string, since: string): Promise<GithubRead<GithubIssue>> {
+      return readList(streamArgs(`repos/${repository}/issues`, since, ['state=all'], ['sort=updated']), issueOf)
+    },
+    repoComments(repository: string, since: string): Promise<GithubRead<GithubStreamComment>> {
+      return readList(
+        streamArgs(`repos/${repository}/issues/comments`, since, [], ['sort=updated']),
+        streamCommentOf
+      )
+    },
+    repoReviewComments(repository: string, since: string): Promise<GithubRead<GithubStreamComment>> {
+      return readList(
+        streamArgs(`repos/${repository}/pulls/comments`, since, [], ['sort=updated']),
+        streamReviewCommentOf
+      )
     }
   }
 }
