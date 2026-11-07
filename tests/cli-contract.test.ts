@@ -24,6 +24,7 @@ import type { Store } from '../src/worker/app/store'
 import { createRouterTools } from '../src/worker/app/assessment'
 import type { Candidate, Decision, Ticket } from '../src/worker/core/index'
 import { ROUTE_TABLE, type RouteDefinition } from '../src/worker/http/routes'
+import { UserError } from '../src/worker/core/index'
 import { AT, tempStateDir } from './support/state'
 import { startTestServer, type TestServer } from './support/cli-server'
 
@@ -182,6 +183,45 @@ const WIRED: readonly (readonly [string, Case, Case])[] = [
       exit: 2,
       code: 'not_permitted_role'
     }
+  ],
+  // #28 的 `ticket note`：100 词上限由 handler 固定拒绝；成功面是一条 `note` Input。
+  [
+    'ticket note',
+    { argv: ['ticket', 'note', 'ticket-own', '--text=a fact'], exit: 0, resultKeys: ['sent'] },
+    { argv: ['ticket', 'note', 'ticket-own', '--text=' + 'word '.repeat(101)], exit: 2, code: 'too_long' }
+  ],
+  [
+    'ticket request-status',
+    { argv: ['ticket', 'request-status', 'ticket-own'], exit: 0, resultKeys: ['asked', 'ticket'] },
+    { argv: ['ticket', 'request-status', 'nope'], exit: 2, code: 'missing' }
+  ],
+  // #29 的两条：重试新建一个 Assignment，停止要确认且只对未结束的 Ticket 成立（§G.2、§O）。
+  [
+    'ticket retry',
+    { argv: ['ticket', 'retry', 'ticket-own'], exit: 0, resultKeys: ['retried', 'assignment'] },
+    { argv: ['ticket', 'retry', 'ticket-ended'], exit: 2, code: 'not_retryable' }
+  ],
+  [
+    'ticket stop',
+    { argv: ['ticket', 'stop', 'ticket-own', '--yes', '--reason=Not needed'], exit: 0, resultKeys: ['stopped'] },
+    // 已经结束的 Ticket 不再改变状态：固定的 `already_ended`，不是 `refused`。
+    { argv: ['ticket', 'stop', 'ticket-ended', '--yes'], exit: 2, code: 'already_ended' }
+  ],
+  // `trigger handback` 是 worker 的命令：Ticket 来自 assignment token（§G.2）。
+  [
+    'trigger handback',
+    {
+      argv: ['trigger', 'handback', 'trigger-1', '--reason=It is a different request.'],
+      exit: 0,
+      resultKeys: ['queued'],
+      token: 'assignment'
+    },
+    {
+      argv: ['trigger', 'handback', 'never-reached', '--reason=Not mine.'],
+      exit: 2,
+      code: 'not_owned',
+      token: 'assignment'
+    }
   ]
 ]
 
@@ -189,13 +229,8 @@ const WIRED: readonly (readonly [string, Case, Case])[] = [
 const PENDING: readonly string[][] = [
   ['eval', 't-1'],
   ['eval-read', 't-1'],
-  ['ticket', 'retry', 't-1'],
-  ['ticket', 'stop', 't-1'],
-  ['ticket', 'note', 't-1', '--text=a note'],
-  ['ticket', 'request-status', 't-1'],
   ['ticket', 'list'],
   ['trigger', 'requeue', 't-1'],
-  ['trigger', 'handback', 't-1'],
   ['thread', 'unsubscribe', 'k'],
   ['thread', 'follow', 'k'],
   ['thread', 'unrelated', 'k'],
@@ -295,7 +330,26 @@ function commandRoutes(store: Store): readonly RouteDefinition[] {
         createDomainHandlers({
           report: () => ticket,
           reply: () => ({ id: 'reply-1', status: 'pending', reused: false }),
-          ticketOf: (id) => (id === ticket.id ? ticket : undefined),
+          note: () => ticket,
+          requestStatus: () => true,
+          handback: (ticketId, triggerId) => {
+            // 到达过这张 Ticket 的消息可以交回；其余的给核心的固定拒绝（`not_owned`）。
+            if (triggerId !== 'trigger-1') throw new UserError('notReached')
+            return ticketId === ticket.id
+          },
+          // 停止与重试的可用性由领域判定：这里只替身「能不能」与「是否已结束」两个事实。
+          stop: () => ticket,
+          retry: (ticketId) => {
+            if (ticketId === ticket.id) return ticket
+            if (ticketId === 'ticket-ended') throw new UserError('notRetryable')
+            throw new UserError('unknownTicket')
+          },
+          ticketOf: (id) =>
+            id === ticket.id
+              ? ticket
+              : id === 'ticket-ended'
+                ? { ...ticket, ended: { at: AT, by: 'human', outcome: 'stopped' } }
+                : undefined,
           tickets: () => [ticket]
         })
       ),

@@ -50,6 +50,28 @@ export function countSlots(tickets: readonly Ticket[]): SlotCounts {
   return { running, pending, occupied: running + pending }
 }
 
+/**
+ * 一张 Ticket 是否有一条「人的唤醒」在等：人写的 Trigger、或恢复标记。只有它能用人类槽
+ * （§E.6）；自动的 Trigger、note、状态请求都不会把新的 launch 带进人类槽。
+ */
+export function humanWake(ticket: Ticket): boolean {
+  return ticket.undelivered.some((id) => {
+    const input = ticket.inputs.find((item) => item.id === id)
+    return input?.kind === 'resumed' || (input?.kind === 'trigger' && input.human === true)
+  })
+}
+
+/**
+ * `launch` effect 的取行上限（§E.6）：普通槽的空位（`maxWorkers - running`），加上「有人的
+ * 唤醒在等」时的那一个人人类槽。取行只是粗筛：人/自动的精确判定在 handler 的 `mayLaunch`，
+ * 拿不到槽就抛 `Later`（不算失败，到期再看）。
+ */
+export function launchCapacity(tickets: readonly Ticket[], maxWorkers: number): number {
+  const { running } = countSlots(tickets)
+  const reserve = tickets.some((ticket) => !ticket.ended && humanWake(ticket)) ? HUMAN_SLOTS : 0
+  return Math.max(0, maxWorkers - running) + reserve
+}
+
 /** 槽读数：人类槽在 `occupied > maxWorkers` 时算已占用（那多出来的一个就是它）。 */
 export function slotState(tickets: readonly Ticket[], maxWorkers: number): SlotState {
   const counts = countSlots(tickets)

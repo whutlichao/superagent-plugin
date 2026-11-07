@@ -263,19 +263,23 @@ export const CLI_COMMANDS: readonly CommandDefinition[] = [
   // ---- Ticket / Trigger / Thread（#28/#29/#27）
   {
     name: ['ticket', 'retry'],
-    summary: 'retry a failed or blocked ticket',
+    summary: 'retry a ticket whose worker reported failed or blocked, on the same worktree',
     flags: [REQUEST_ID_FLAG],
     positionals: [{ name: 'ticket_id', required: true }],
     write: true,
-    available: false
+    available: true
   },
   {
     name: ['ticket', 'stop'],
-    summary: 'stop a ticket (a person can still resume it)',
-    flags: [{ name: 'reason', kind: 'value', hint: 'one sentence for the record' }, REQUEST_ID_FLAG],
+    summary: 'stop a ticket for good (destructive; needs --yes): a person can never resume it',
+    flags: [
+      { name: 'reason', kind: 'value', hint: 'one sentence for the record' },
+      { name: 'yes', kind: 'switch', hint: 'confirm that this ticket stays ended' },
+      REQUEST_ID_FLAG
+    ],
     positionals: [{ name: 'ticket_id', required: true }],
     write: true,
-    available: false
+    available: true
   },
   {
     name: ['ticket', 'note'],
@@ -283,7 +287,7 @@ export const CLI_COMMANDS: readonly CommandDefinition[] = [
     flags: [{ name: 'text', kind: 'value', hint: 'the note (at most 100 words)', required: true }, REQUEST_ID_FLAG],
     positionals: [{ name: 'ticket_id', required: true }],
     write: true,
-    available: false
+    available: true
   },
   {
     name: ['ticket', 'request-status'],
@@ -291,7 +295,7 @@ export const CLI_COMMANDS: readonly CommandDefinition[] = [
     flags: [REQUEST_ID_FLAG],
     positionals: [{ name: 'ticket_id', required: true }],
     write: true,
-    available: false
+    available: true
   },
   {
     name: ['ticket', 'list'],
@@ -315,10 +319,10 @@ export const CLI_COMMANDS: readonly CommandDefinition[] = [
   {
     name: ['trigger', 'handback'],
     summary: 'hand a trigger back as beyond this ticket',
-    flags: [{ name: 'reason', kind: 'value', hint: 'one sentence' }, REQUEST_ID_FLAG],
+    flags: [{ name: 'reason', kind: 'value', hint: 'one sentence', required: true }, REQUEST_ID_FLAG],
     positionals: [{ name: 'trigger_id', required: true }],
     write: true,
-    available: false
+    available: true
   },
   {
     name: ['thread', 'unsubscribe'],
@@ -800,6 +804,34 @@ async function run(
           trigger: valueArgs(args.flags, 'trigger'),
           text: valueArgs(args.flags, 'text')
         })
+      })
+    case 'ticket note':
+      return call(`tickets/${encodePathSegment(args.positionals[0] ?? '')}/note`, {
+        method: 'POST',
+        body: { text: valueArgs(args.flags, 'text') ?? '' }
+      })
+    case 'ticket stop': {
+      // `--yes` 就是 body 里的 `confirm`：同一个含义只有一个名字（与 `admin rotate-token` 同）。
+      const reason = valueArgs(args.flags, 'reason')
+      return call(`tickets/${encodePathSegment(args.positionals[0] ?? '')}/stop`, {
+        method: 'POST',
+        body: { confirm: switched(args, 'yes'), ...(reason === undefined ? {} : { reason }) }
+      })
+    }
+    case 'ticket retry':
+      return call(`tickets/${encodePathSegment(args.positionals[0] ?? '')}/retry`, {
+        method: 'POST',
+        body: {}
+      })
+    case 'ticket request-status':
+      return call(`tickets/${encodePathSegment(args.positionals[0] ?? '')}/request-status`, {
+        method: 'POST',
+        body: {}
+      })
+    case 'trigger handback':
+      return call(`triggers/${encodePathSegment(args.positionals[0] ?? '')}/handback`, {
+        method: 'POST',
+        body: { reason: valueArgs(args.flags, 'reason') ?? '' }
       })
     case 'report':
       return call('report', {

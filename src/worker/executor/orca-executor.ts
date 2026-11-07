@@ -11,7 +11,7 @@
 // 依赖纪律（§C.2）：本文件只 import core 的领域类型、`OrcaRuntime` 接口与 `app/effects` 的
 // 队列形状；不 spawn、不 `host.call`（§B.1）。
 import { join } from 'node:path'
-import type { Assignment, Ticket, TicketInput, Trigger } from '../core/model.ts'
+import type { Assignment, Ticket, Trigger } from '../core/model.ts'
 import type { Executor } from '../core/ports.ts'
 import type { EngineForExecutor } from '../core/engine.ts'
 import { Later, type EffectHandlerOptions, type EffectKind, type EffectPayloads } from '../app/effects.ts'
@@ -39,7 +39,7 @@ import { launchEnvironment, launchHook as defaultLaunchHook, type LaunchHook } f
 import { runPrepare } from './prepare.ts'
 import { resumeAssignments, type ResumeReport } from './resume.ts'
 import { writeCommandShims } from './shims.ts'
-import { countSlots, DEFAULT_MAX_WORKERS, mayLaunch, mayWake, type SlotCounts } from './slots.ts'
+import { countSlots, DEFAULT_MAX_WORKERS, humanWake, mayLaunch, mayWake, type SlotCounts } from './slots.ts'
 import { createStatusHandler, type AgentStatusHandler } from './status.ts'
 import { closeAssignmentTerminal } from './stop.ts'
 import { ensureTicketWorkspace, type WorkspaceSettings } from './workspace.ts'
@@ -238,17 +238,6 @@ function messageOf(error: unknown): string {
   return text.length > 300 ? `${text.slice(0, 300)}…` : text
 }
 
-/**
- * 这次 launch 是不是人的唤醒：待投 Input 里有 `resumed`（人的消息恢复已结束 Ticket，§E.3）
- * 或人的 Trigger。它决定能不能用那一个人类槽（§E.6）。
- */
-function isHumanWake(ticket: Ticket): boolean {
-  return ticket.undelivered.some((id) => {
-    const input = ticket.inputs.find((item: TicketInput) => item.id === id)
-    return input?.kind === 'resumed' || (input?.kind === 'trigger' && input.human === true)
-  })
-}
-
 /** 作业文本里正文的裁剪：超出上限就留一行说明，原文在 URL / Trigger 里。 */
 function briefBody(text: string, original: string): string {
   if (text.length <= BRIEF_TEXT_LIMIT) return text
@@ -414,7 +403,8 @@ export function registerExecutorEffects(options: RegisterExecutorOptions): void 
     }
     // 自己这张 Ticket 的 pending 不算「占着槽」：要判的是它能不能占用下一个槽。
     const others = records.tickets.list().filter((item) => item.id !== ticket.id)
-    if (!mayLaunch(others, settings.maxWorkers, isHumanWake(ticket))) {
+    // 人的唤醒（人的消息或恢复）可以用那一个人人类槽；自动的 launch 不能（§E.6）。
+    if (!mayLaunch(others, settings.maxWorkers, humanWake(ticket))) {
       // 没有槽不是失败：到期再看（§E.6 末行、§J.2 `Later`）。
       throw new Later(`all ${settings.maxWorkers} worker slots are taken`)
     }

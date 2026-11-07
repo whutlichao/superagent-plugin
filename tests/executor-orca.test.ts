@@ -864,6 +864,30 @@ test('every later input to a proactive ticket repeats the local-only limit', () 
   assert.equal(explicit.includes('only the local small change'), false)
 })
 
+test('a policy-change input carries what changed: the rule text and the lowered authority', () => {
+  const markdown = renderInputMarkdown(
+    proactiveTicket(),
+    {
+      id: 'input-3',
+      kind: 'policy-changed',
+      from: 'aaaaaaaaaaaa',
+      to: 'bbbbbbbbbbbb',
+      at: AT,
+      effect: {
+        rules: [
+          { id: 'copy', name: 'Copy fixes', change: 'changed', instruction: 'Fix spelling only' }
+        ],
+        proactive: false
+      }
+    },
+    3,
+    undefined
+  )
+  assert.ok(markdown.includes('aaaaaaaaaaaa → bbbbbbbbbbbb'), markdown)
+  assert.ok(markdown.includes('Fix spelling only'), markdown)
+  assert.ok(markdown.includes('no longer accepted'), markdown)
+})
+
 test('three failed launches mark the ticket failed and put the launch health entry in error', async () => {
   const h = harness()
   h.runtime.script.ensureWorkspace = () => {

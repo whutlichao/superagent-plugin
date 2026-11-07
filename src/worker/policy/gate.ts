@@ -28,13 +28,10 @@ import type {
 import type { AcceptMode } from '../core/index.ts'
 import { admissionCell, admissionOf } from './admission.ts'
 import type { AdmissionRow } from './admission.ts'
-import type { AllowedIdentity, PolicyBlock, SourcePolicySection } from './schema.ts'
-
-/**
- * 没有内容哈希时 `Policy.version` 的占位值。#25 用 §K.5 的 sha256 前 12 位替换它；
- * 在替换之前，每个 Mandate 仍然记着一个稳定的、可读的版本串。
- */
-export const UNVERSIONED_POLICY = 'policy-unversioned'
+import { admitsInferred, allowedSender, listedBot, sectionOf, senderName } from './lists.ts'
+import { revalidateMandate } from './revalidate.ts'
+import { policyVersion } from './version.ts'
+import type { PolicyBlock, SourcePolicySection } from './schema.ts'
 
 /** 构造 Policy 的输入。读设置用 getter，所以设置变了不必重建对象（§K.5）。 */
 export interface PolicyInputs {
@@ -44,36 +41,11 @@ export interface PolicyInputs {
   readonly sources: SourceScope
   /** 一个 Source 的准入行（kind 的 `policy.rows()`，§I.1）；没装时为空。 */
   readonly rows: (source: string) => readonly AdmissionRow[]
-  /** Policy 版本；#25 之前是 `UNVERSIONED_POLICY`。 */
-  readonly version: () => string
   /** 处理是否暂停（§K.6；与 Policy 版本无关）。 */
   readonly paused?: () => boolean
   /** 评估超时（毫秒）；缺省取块里的 `eval.timeoutSeconds`。 */
   readonly evalTimeoutMs?: () => number
 }
-
-/** 一个 Source 的 Policy 部分；没配时是空名单、空 bot 名单、空表。 */
-function sectionOf(block: PolicyBlock, source: string): SourcePolicySection {
-  return block.sources[source] ?? { allowed: [], bots: [], admission: {} }
-}
-
-/** 在 Source 自己的身份空间里找名单项（大小写不敏感，与 GitHub login 一致）。 */
-function allowedSender(section: SourcePolicySection, id: string): AllowedIdentity | undefined {
-  const wanted = id.trim().toLowerCase()
-  if (wanted.length === 0) return undefined
-  return section.allowed.find((entry) => entry.id.trim().toLowerCase() === wanted)
-}
-
-/** 在 `bots` 名单里找一行。 */
-function listedBot(section: SourcePolicySection, id: string): { id: string } | undefined {
-  const wanted = id.trim().toLowerCase()
-  if (wanted.length === 0) return undefined
-  return section.bots.find((entry) => entry.id.trim().toLowerCase() === wanted)
-}
-
-/** 名单项的显示名：没有 `name` 时用 id。 */
-const senderName = (entry: AllowedIdentity | { id: string }): string =>
-  'name' in entry && typeof entry.name === 'string' && entry.name.length > 0 ? entry.name : entry.id
 
 /** Thread 上有「自己的」Ticket（排除只当语境的订阅，排除被人停掉的，§K.2 第 3 条）。 */
 function participating(thread: Thread, tickets: readonly Ticket[]): boolean {
@@ -85,12 +57,6 @@ function participating(thread: Thread, tickets: readonly Ticket[]): boolean {
     return true
   }
   return false
-}
-
-/** 一条候选在推断强度上是否可用：auto 模式，且至少一条匹配规则、全部仍启用（§K.4）。 */
-function admitsInferred(block: PolicyBlock, rules: readonly string[]): boolean {
-  if (block.acceptMode !== 'auto' || rules.length === 0) return false
-  return rules.every((id) => block.rules.some((rule) => rule.enabled && rule.id === id))
 }
 
 /** Gate 一次判定（见文件头的七条）。 */
@@ -227,12 +193,13 @@ function machineGate(
 
 /**
  * 造一个 Policy（领域端口，§C.1）：Gate 按块判定，`admitsInferred` 按模式与规则，
- * `revalidate` 只复核 gate 层的依据（完整的复验表是 #25）。
+ * `revalidate` 是 §K.3 的逐来源复验表（`revalidate.ts`）。
  */
 export function createPolicy(inputs: PolicyInputs): Policy {
   return {
     get version(): string {
-      return inputs.version()
+      // 版本是块的内容哈希（§K.5）：没有第二个来源，也没有「忘了传版本」的入口。
+      return policyVersion(inputs.block())
     },
     get paused(): boolean {
       return inputs.paused?.() ?? false
@@ -244,17 +211,10 @@ export function createPolicy(inputs: PolicyInputs): Policy {
       return gate(inputs.block(), inputs, trigger, thread, tickets)
     },
     revalidate(mandate: Mandate): boolean {
-      const block = inputs.block()
-      const section = sectionOf(block, mandate.actor.source)
-      if (mandate.basis.via === 'addressed' || mandate.basis.via === 'followup') {
-        if (allowedSender(section, mandate.actor.id) === undefined) return false
-      }
-      if (mandate.basis.via === 'bot' && listedBot(section, mandate.actor.id) === undefined) {
-        return false
-      }
-      return (
-        mandate.strength === 'explicit' || admitsInferred(block, mandate.basis.rules ?? [])
-      )
+      return revalidateMandate(mandate, {
+        block: inputs.block(),
+        rows: inputs.rows(mandate.actor.source)
+      })
     },
     admitsInferred(rules: readonly string[]): boolean {
       return admitsInferred(inputs.block(), rules)

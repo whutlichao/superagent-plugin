@@ -25,7 +25,11 @@ test('a fresh database is created at the current schema version in one transacti
     const result = migrate(db, { databasePath: join(stateDir, 'superagent.sqlite'), backupDir: join(stateDir, 'backups'), keepBackups: 5 })
     assert.equal(result.from, 0)
     assert.equal(result.to, SCHEMA_VERSION)
-    assert.deepEqual(result.applied.map((step) => step.to), [SCHEMA_VERSION])
+    assert.deepEqual(
+      result.applied.map((step) => step.to),
+      MIGRATIONS.map((step) => step.to),
+      'a fresh database runs every step in order'
+    )
     assert.equal(readSchemaVersion(db), SCHEMA_VERSION, 'kv schema-version is the version source')
     assert.equal(Number((db.prepare('PRAGMA user_version').get() as { user_version: number }).user_version), 0, 'user_version is not written by the step itself')
   } finally {
@@ -42,6 +46,68 @@ test('the step array is monotonic: each step goes up by exactly one level', () =
     expected = step.to
   }
   assert.equal(expected, SCHEMA_VERSION, 'the chain ends at the plugin schema version')
+})
+
+test('the v2 migration widens the settings origin to operator without losing a history row', () => {
+  const stateDir = tempStateDir()
+  const path = join(stateDir, 'superagent.sqlite')
+  const db = new DatabaseSync(path)
+  try {
+    // 一个 v1 库：`settings_version` 的 CHECK 只有 panel/tool/sync（§K.8 的第四种来源无处可写，
+    // #20 只好把 operator 记成 panel；这次修正让审计说真话）。
+    db.exec(`
+      CREATE TABLE kv (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+      CREATE TABLE settings_version (
+        revision     INTEGER PRIMARY KEY CHECK (revision > 0),
+        predecessor  INTEGER,
+        at           TEXT NOT NULL CHECK (at IS strftime('%Y-%m-%dT%H:%M:%fZ', at)),
+        origin       TEXT NOT NULL CHECK (origin IN ('panel', 'tool', 'sync')),
+        block        TEXT NOT NULL,
+        config       TEXT NOT NULL CHECK (json_valid(config)),
+        policy_version TEXT
+      );
+    `)
+    db.prepare('INSERT INTO kv (key, value) VALUES (?, ?)').run('schema-version', JSON.stringify(1))
+    db.prepare(
+      'INSERT INTO settings_version (revision, predecessor, at, origin, block, config, policy_version) VALUES (?, ?, ?, ?, ?, ?, ?)'
+    ).run(1, null, AT, 'panel', 'executor', '{"baseRepo":"acme/widgets"}', null)
+
+    const result = migrate(db, {
+      databasePath: path,
+      backupDir: join(stateDir, 'backups'),
+      keepBackups: 5
+    })
+    assert.equal(result.from, 1)
+    assert.equal(result.to, SCHEMA_VERSION)
+
+    // 不丢数据：旧行逐列原样还在。
+    const kept = db.prepare('SELECT * FROM settings_version WHERE revision = 1').get() as Record<string, unknown>
+    assert.equal(kept['predecessor'], null)
+    assert.equal(kept['at'], AT)
+    assert.equal(kept['origin'], 'panel')
+    assert.equal(kept['block'], 'executor')
+    assert.equal(kept['config'], '{"baseRepo":"acme/widgets"}')
+    assert.equal(kept['policy_version'], null)
+
+    // operator 现在能落库；设计里没有的第五种来源仍被 CHECK 拒绝。
+    db.prepare(
+      'INSERT INTO settings_version (revision, predecessor, at, origin, block, config) VALUES (?, ?, ?, ?, ?, ?)'
+    ).run(2, 1, AT, 'operator', 'policy', '{}')
+    const widened = db.prepare('SELECT origin FROM settings_version WHERE revision = 2').get() as Record<string, unknown>
+    assert.equal(widened['origin'], 'operator')
+    assert.throws(
+      () =>
+        db
+          .prepare(
+            'INSERT INTO settings_version (revision, at, origin, block, config) VALUES (?, ?, ?, ?, ?)'
+          )
+          .run(3, AT, 'internal', 'policy', '{}'),
+      /CHECK constraint failed/
+    )
+  } finally {
+    db.close()
+    rmSync(stateDir, { recursive: true, force: true })
+  }
 })
 
 test('a database from a newer plugin is refused with a readable log line', () => {
@@ -408,7 +474,8 @@ function legacyMigrate(stateDir: string, backupDir: string, days: number): void 
 /** 备份文件名里的时刻：`backupNow` 与迁移前备份用的是同一个命名规则（`:` → `-`）。 */
 function backupName(days: number): string {
   const stamp = isoDaysAfter(AT, days).replaceAll(':', '-')
-  return days % 2 === 0 ? `superagent-0-${stamp}.sqlite` : `superagent-1-${stamp}.sqlite`
+  // 手工备份的版本前缀是本插件当前的 schema 版本，迁移前备份是那个库当时的版本（v0）。
+  return days % 2 === 0 ? `superagent-0-${stamp}.sqlite` : `superagent-${SCHEMA_VERSION}-${stamp}.sqlite`
 }
 
 test('a plugin-version upgrade treats running assignments as interrupted and hands them to resume', async () => {

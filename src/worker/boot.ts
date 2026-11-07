@@ -31,16 +31,16 @@ import { createRepositories } from './app/repositories.ts'
 import {
   createPolicy,
   DEFAULT_POLICY,
-  UNVERSIONED_POLICY,
   validatePolicy
 } from './policy/index.ts'
-import type { PolicyKindView } from './policy/index.ts'
+import type { PolicyBlock, PolicyKindView } from './policy/index.ts'
 import { resolveRoles } from './app/roles.ts'
 import { ROUTER_RESTARTS_KEY, ROUTER_TERMINAL_KEY, ROUTER_WORKSPACE_KEY, PROMPT_REVISION_KEY } from './app/kv.ts'
 import { createDeterministicAssessor } from './app/assessor.ts'
 import { createRouterTools } from './app/assessment.ts'
 import { createOutbox, registerReplyEffects } from './app/outbox.ts'
 import { createPausedState } from './app/pause.ts'
+import { savedSettingsVersion } from './app/settings.ts'
 import {
   feishuChatsKey,
   feishuCursorKey,
@@ -50,6 +50,7 @@ import {
   threadSeenKey
 } from './app/kv.ts'
 import { createRefreshableStateSource, type RefreshableStateSource } from './app/state-source.ts'
+import { deliveredFollowups } from './app/views.ts'
 import { statusBarView } from './app/status-bar.ts'
 import type { StatusBarView } from './app/status-bar.ts'
 import { Effects, ROUTER_EFFECT_KEY } from './app/effects.ts'
@@ -84,6 +85,8 @@ import {
 } from './sources/feishu/index.ts'
 import type { Deployment } from './sources/kind.ts'
 import { OrcaExecutor, registerExecutorEffects, registerExecutorLifecycle, resolveExecutorSettings } from './executor/orca-executor.ts'
+import { launchCapacity } from './executor/slots.ts'
+import { retryTicket } from './executor/retry.ts'
 import { resumeAfterUpgrade, type ResumeReport } from './executor/resume.ts'
 import { DEFAULT_MAX_WORKERS } from './http/state.ts'
 import { createDomainHandlers, withDomainHandlers } from './http/domain.ts'
@@ -405,10 +408,9 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
     health,
     now: nowMs,
     paused: () => paused.paused(),
-    slots: () => {
-      const counts = store.assignmentCounts()
-      return Math.max(0, executorSettings.maxWorkers - counts.running)
-    }
+    // §E.6：`launch` 的取行上限 = 普通槽空位 + 「有人的唤醒在等」时那一个人人类槽。
+    // 人/自动的精确判定仍在执行器里（拿不到槽抛 `Later`，不算失败）。
+    slots: () => launchCapacity(repo.tickets.list(), executorSettings.maxWorkers)
   })
   const outbox = createOutbox({ store, effects, now })
   // ---- Policy（§K.1、§K.2）：块从宿主设置里解析；Source 的 Policy 部分与准入行由 kind 认领。
@@ -430,11 +432,21 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
     })
   }
   const policyBlock = parsedPolicy.success ? parsedPolicy.data : DEFAULT_POLICY
+  /**
+   * 生效的 Policy 块：保存过就以存下来的那份为准，否则是启动时读到的那份。Policy 的保存
+   * （§K.5）因此立刻改变 Gate、复验与版本——不必等重启，也不需要第二个真相源。
+   */
+  const effectivePolicy = (): PolicyBlock => {
+    const stored = savedSettingsVersion(store, 'policy')?.config
+    if (stored === undefined) return policyBlock
+    const parsed = validatePolicy(stored, { kinds: policyKind })
+    if (!parsed.success) return policyBlock
+    return parsed.data
+  }
   const policy = createPolicy({
-    block: () => policyBlock,
+    block: effectivePolicy,
     sources: registry,
     rows: (source) => policyKind(source)?.rows() ?? [],
-    version: () => UNVERSIONED_POLICY,
     paused: () => paused.paused()
   })
 
@@ -619,17 +631,29 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
   const domain = createDomainHandlers({
     report: (ticketId, report) => engine.report(ticketId, report),
     reply: (request) => engine.reply(request),
+    note: (ticketId, text) => engine.note(ticketId, text),
+    requestStatus: (ticketId) => engine.requestStatus(ticketId),
+    handback: (ticketId, triggerId, reason) => engine.handback(ticketId, triggerId, reason),
+    // 停止与重试是三条改变 Mandate 的操作里的两条（§E.5、§K.3）。重试的恢复说明由执行器
+    // 拼一次（`executor/retry.ts`），这里只把 Ticket 交给它——避免第二个说法。
+    stop: (ticketId, reason) => engine.stopTicket(ticketId, reason),
+    retry: (ticketId) => retryTicket(engine, ticketId),
     ticketOf: (id) => repo.tickets.get(id),
     tickets: () => repo.tickets.list(),
+    // 读模型里的「已投递到该 Ticket」：归属判定与扇出/交回同一份记录（`followupOwners`）。
+    followups: (ticket) => deliveredFollowups(ticket, repo),
     afterWrite: () => {
       refresh()
     }
   })
   // Router 的两条命令（§G.2 的 `route` / `eval-decide`）：策略判断在 `policy/assessment.ts`，
-  // 领域写入经 Engine；版本与块取组合根持有的那一份（#25 把版本换成内容哈希）。
+  // 领域写入经 Engine；版本是块的内容哈希（§K.5），块从设置里读（保存立刻生效）。
   const routerTools = createRouterTools({
     candidate: (triggerId) => engine.candidate(triggerId),
-    policy: () => ({ acceptMode: policyBlock.acceptMode, rules: policyBlock.rules }),
+    policy: () => {
+      const block = effectivePolicy()
+      return { acceptMode: block.acceptMode, rules: block.rules }
+    },
     policyVersion: () => policy.version,
     decide: (triggerId, outcome) => engine.decide(triggerId, outcome),
     attach: (ticketId, triggerId, note) => engine.attach(ticketId, triggerId, note),
@@ -650,13 +674,17 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
         stateDir: resolved,
         repository: deploymentFacts.repository
       }),
-      policy: () => ({
-        version: policy.version,
-        mode: acceptModeOf(settings),
-        rules: policyBlock.rules
-          .filter((rule) => rule.enabled)
-          .map((rule) => ({ id: rule.id, name: rule.name, instruction: rule.instruction.en }))
-      })
+      // Policy 段跟着**生效**的块走（保存过的设置优先，§K.5），与 Gate、复验同一个真相源。
+      policy: () => {
+        const block = effectivePolicy()
+        return {
+          version: policy.version,
+          mode: block.acceptMode,
+          rules: block.rules
+            .filter((rule) => rule.enabled)
+            .map((rule) => ({ id: rule.id, name: rule.name, instruction: rule.instruction.en }))
+        }
+      }
     },
     onSaved: (revision) => routerSupervision.notifyPromptRevision(revision),
     afterWrite: () => {

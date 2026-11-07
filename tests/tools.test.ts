@@ -45,6 +45,7 @@ import {
 } from '../src/worker/cli/io'
 import { API_TOKEN_FILE, TOKENS_DIR, ROUTER_TOKEN_FILE } from '../src/worker/infra/tokens'
 import { tempStateDir } from './support/state'
+import { closedPort } from './support/ports'
 import { startTestServer } from './support/cli-server'
 
 /** 一个固定的测试时刻。 */
@@ -455,10 +456,9 @@ test('a path segment is percent-encoded once for thread keys with slashes and sp
 })
 
 test('an unreachable worker is retried exactly once, after the fixed 200 ms', async () => {
-  // 用一个真实但立刻关闭的服务器拿一个「确定没人听」的端口。
-  const probe = await startTestServer()
-  const port = probe.port
-  probe.close()
+  // 一个真实但已经没人监听的端口：`not_ready` 必须来自一次真实连接失败，不是假成功。
+  // 端口取自内核临时区间之外的窄带（#53），不会被别的测试或另一轮测试半途绑定。
+  const port = await closedPort()
   const waits: number[] = []
   const result = await requestJson({
     target: {
