@@ -202,6 +202,6 @@ function firstSettings(stateDir: string): Record<string, unknown> {
     baseRepo: '/repos/widgets',
     executor: { agent: 'pi', maxWorkers: 2, confirmDelivery: false },
     sources: { github: { enabled: true, config: { repository: 'acme/widgets', cli: 'gh', pollSeconds: 60 } } },
-    policy: { sources: { github: { allowed: ['alice'] } } }
+    policy: { sources: { github: { allowed: [{ id: 'alice' }] } } }
   }
 }

@@ -21,13 +21,26 @@ import { HealthBoard, claimModelsEntry } from './infra/health.ts'
 import { defaultStateDir, resolveStateDir, writeStateDirPointer } from './infra/paths.ts'
 import { ensureApiToken, issueAssignmentToken, issueRouterToken } from './infra/tokens.ts'
 import { createRepositories } from './app/repositories.ts'
+import {
+  createPolicy,
+  DEFAULT_POLICY,
+  UNVERSIONED_POLICY,
+  validatePolicy
+} from './policy/index.ts'
+import type { PolicyKindView } from './policy/index.ts'
 import { resolveRoles } from './app/roles.ts'
 import { ROUTER_RESTARTS_KEY, ROUTER_TERMINAL_KEY, ROUTER_WORKSPACE_KEY, PROMPT_REVISION_KEY } from './app/kv.ts'
-import { createMinimalPolicy } from './app/policy.ts'
 import { createDeterministicAssessor } from './app/assessor.ts'
 import { createOutbox, registerReplyEffects } from './app/outbox.ts'
 import { createPausedState } from './app/pause.ts'
-import { githubCursorKey } from './app/kv.ts'
+import {
+  feishuChatsKey,
+  feishuCursorKey,
+  feishuTopicsKey,
+  githubCursorKey,
+  sourceLabelsKey,
+  threadSeenKey
+} from './app/kv.ts'
 import { createRefreshableStateSource, type RefreshableStateSource } from './app/state-source.ts'
 import { statusBarView } from './app/status-bar.ts'
 import type { StatusBarView } from './app/status-bar.ts'
@@ -47,6 +60,20 @@ import {
   GITHUB_KIND
 } from './sources/github/index.ts'
 import type { GithubPollResult, GithubPoller } from './sources/github/index.ts'
+import {
+  FEISHU_KIND,
+  createFeishuApi,
+  createFeishuBackfill,
+  createFeishuKind,
+  createFeishuStream,
+  feishuConfigSchema,
+  refreshChatNames,
+  type FeishuBackfill,
+  type FeishuConfig,
+  type FeishuKeys,
+  type FeishuRoundResult,
+  type FeishuStream
+} from './sources/feishu/index.ts'
 import type { Deployment } from './sources/kind.ts'
 import { OrcaExecutor, registerExecutorEffects, registerExecutorLifecycle, resolveExecutorSettings } from './executor/orca-executor.ts'
 import { resumeAfterUpgrade, type ResumeReport } from './executor/resume.ts'
@@ -68,6 +95,9 @@ import {
 
 /** worker 侧一轮 pass 的周期（§N.1 的 2 s 巡检）。 */
 export const PASS_INTERVAL_MS = 2000
+
+/** 历史回填、话题轮询与群名刷新的周期（§I.3：群名一分钟内刷新）。 */
+export const FEISHU_ROUND_MS = 60_000
 
 /** 组合根的输入：宿主、设置与三件输出端口全部注入（测试不碰 Orca、不 sleep）。 */
 export interface BootOptions {
@@ -106,6 +136,8 @@ export interface BootHandle {
   snapshot(): PanelState
   /** 一轮通知轮询（定时器与测试共用）。 */
   pollOnce(): Promise<GithubPollResult>
+  /** 一轮 Feishu 回填（含话题轮询与群名刷新）；没有可用实例时 `null`。 */
+  feishuOnce(): Promise<FeishuRoundResult | null>
   /** 一轮 pass（先到期的 effect，再到期评估与评估决定）。 */
   passOnce(): Promise<void>
   /** 实际监听的端口；follower/未监听时 `null`。 */
@@ -168,11 +200,24 @@ function block(value: unknown): Record<string, unknown> {
 }
 
 /** 把设置解析成注册表要的视图（`sources.<id>` 与 `policy.sources.<id>`）。 */
-function settingsView(raw: Readonly<Record<string, unknown>>, enabled: boolean, config: Record<string, unknown>): SourceSettingsView {
+function settingsView(
+  raw: Readonly<Record<string, unknown>>,
+  github: { enabled: boolean; config: Record<string, unknown> },
+  feishu: { enabled: boolean; config: Record<string, unknown> }
+): SourceSettingsView {
   const policy = block(raw['policy'])
+  const sources = block(policy['sources'])
   return {
-    sources: { [GITHUB_KIND]: { enabled, config } },
-    policy: { sources: { [GITHUB_KIND]: block(block(policy['sources'])[GITHUB_KIND]) } }
+    sources: {
+      [GITHUB_KIND]: { enabled: github.enabled, config: github.config },
+      [FEISHU_KIND]: { enabled: feishu.enabled, config: feishu.config }
+    },
+    policy: {
+      sources: {
+        [GITHUB_KIND]: block(sources[GITHUB_KIND]),
+        [FEISHU_KIND]: block(sources[FEISHU_KIND])
+      }
+    }
   }
 }
 
@@ -214,6 +259,7 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
       ready: Promise.resolve(),
       snapshot: () => emptySnapshot(),
       pollOnce: async () => ({ notifications: 0, triggers: 0, skipped: 0 }),
+      feishuOnce: async () => null,
       passOnce: async () => undefined,
       port: () => null,
       resumeReport: () => null,
@@ -272,13 +318,24 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
     config: githubInstance.config,
     login: fallbackLogin
   }
+  const feishuStored = block(rawSources[FEISHU_KIND])
+  const feishuSetup = await setupFeishu({
+    raw: settings,
+    stored: feishuStored,
+    commands:
+      options.commands ??
+      new Commands({ configuredPrograms: () => [text(settings['feishuCli'])] }),
+    log: (message) => logger.info(message)
+  })
   const setup = createSetupState(await runSetupChecks(setupInput()))
-  const sourceSettings: SourceSettingsView = settingsView(settings, githubSetup.enabled, githubSetup.config)
+  const sourceSettings: SourceSettingsView = settingsView(settings, githubSetup, feishuSetup)
 
   // ---- 注册表与 kind
   const registry = new SourceRegistry({ health: board, settings: () => sourceSettings })
   registry.register(createGithubKind(String(githubSetup.config['cli'] ?? 'gh')))
+  registry.register(createFeishuKind())
   const githubHealth = registry.healthEntries(['github']).get('github')
+  const feishuHealth = registry.healthEntries(['feishu', 'history'])
   /**
    * 把 setup 结论落到各部分：Source 的 setup 问题写 `starting`（**不是** error，§N.4），
    * `orca` CLI 缺失才是 runtime error（§I.4：其余 setup 问题都不该让插件看起来「坏了」）。
@@ -290,6 +347,14 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
       githubHealth?.set({ state: 'starting', detail: githubIssues[0]?.code ?? 'setup' })
     } else if (!githubSetup.enabled) {
       githubHealth?.set({ state: 'paused', detail: 'disabled' })
+    }
+    const feishuIssues = issuesOf(report.issues, 'feishu')
+    if (feishuIssues.length > 0) {
+      for (const entry of feishuHealth.values()) {
+        entry.set({ state: 'starting', detail: feishuIssues[0]?.code ?? 'setup' })
+      }
+    } else if (!feishuSetup.enabled) {
+      for (const entry of feishuHealth.values()) entry.set({ state: 'paused', detail: 'disabled' })
     }
     if (issuesOf(report.issues, 'orca').length > 0) {
       runtimeHealth.set({ state: 'error', detail: 'cli_missing' })
@@ -305,6 +370,15 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
     if (found === undefined) return undefined
     return { place: found.place, code: found.code, detail: found.detail }
   }
+  /**
+   * Feishu 的 setup 问题：setup 报告是「缺什么」的唯一权威（含 bot-only 规则），
+   * `setupFeishu` 读机器人的那次调用若失败（`bot_unreadable`）也一并算进来。
+   */
+  const feishuProblem = (): FeishuSetup['problem'] => {
+    const found = issuesOf(setup.issues(), 'feishu')[0]
+    if (found !== undefined) return { place: found.place, code: found.code, detail: found.detail }
+    return feishuSetup.problem
+  }
 
   // ---- 领域与执行器
   const health = board
@@ -319,18 +393,36 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
     }
   })
   const outbox = createOutbox({ store, effects, now })
-  const policy = createMinimalPolicy({
-    part: (source) => {
-      const part = registry.policyPart(source, sourceSettings)
-      const allowed = part?.['allowed']
-      return { allowed: Array.isArray(allowed) ? allowed.filter((item): item is string => typeof item === 'string') : [] }
-    },
+  // ---- Policy（§K.1、§K.2）：块从宿主设置里解析；Source 的 Policy 部分与准入行由 kind 认领。
+  // 校验失败时回落缺省块并记日志——授权面 fail closed（谁都不准入），错误由面板的设置页显示。
+  const policyKind = (source: string): PolicyKindView | undefined => {
+    const part = registry.kind(source)?.policy
+    if (part === undefined) return undefined
+    const config = registry.instance(source, sourceSettings)?.config ?? {}
+    return {
+      rows: () => part.rows?.(config) ?? [],
+      extras: (section) => part.schema.safeParse(section)
+    }
+  }
+  const policyRaw = block(settings['policy'])
+  const parsedPolicy = validatePolicy(policyRaw, { kinds: policyKind })
+  if (!parsedPolicy.success) {
+    logger.warn('the stored policy block is invalid; refusing every candidate until it is fixed', {
+      issues: parsedPolicy.issues.map((issue) => `${issue.path.join('.') || '(root)'}: ${issue.message}`)
+    })
+  }
+  const policyBlock = parsedPolicy.success ? parsedPolicy.data : DEFAULT_POLICY
+  const policy = createPolicy({
+    block: () => policyBlock,
+    sources: registry,
+    rows: (source) => policyKind(source)?.rows() ?? [],
+    version: () => UNVERSIONED_POLICY,
     paused: () => paused.paused()
   })
 
   // ---- Router（§F.1–§F.5）：专用 worktree、terminal 面的常驻会话、relay 与保活监督
   const roles = resolveRoles(settings)
-  const deploymentFacts = deployment(settings, { ...githubSetup, login: githubLogin() })
+  const deploymentFacts = deployment(settings, { ...githubSetup, login: githubLogin() }, feishuSetup)
   // setup 未完成（或没选 base repo）时 Router 保持 paused；`setup check` 之后会重新问这个函数。
   const routerEnabled = (): boolean => !setup.blocked('executor') && executorSettings.baseRepo !== undefined
   const relayDays = relayRetentionDays(settings)
@@ -532,7 +624,12 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
         ),
       setup: () => ({ problem: setup.problem() }),
       paused: () => paused.paused(),
-      loops: () => loopEntries(board, githubSetup.enabled && !githubBlocked()),
+      loops: () =>
+        loopEntries(
+          board,
+          (githubSetup.enabled && !githubBlocked()) ||
+            (feishuSetup.enabled && feishuProblem() === undefined)
+        ),
       maxWorkers: () => executorSettings.maxWorkers,
       cliPath: options.cliPath ?? defaultCliPath()
     },
@@ -585,7 +682,7 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
             observeComments: githubSetup.config['observeComments'] === true,
             observeCi: githubSetup.config['observeCi'] === true
           },
-          login: deployment(settings, { ...githubSetup, login: githubLogin() }).githubLogin,
+          login: deployment(settings, { ...githubSetup, login: githubLogin() }, feishuSetup).githubLogin,
           // 订阅 Thread 由组合根从 Thread/Ticket 行算出（轮询器自己不读库，§C.2）。
           subscribed: () => subscribedThreads(repo.threads.list(), repo.tickets.list()),
           now: nowMs,
@@ -610,6 +707,93 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
         })
       : null
 
+  // ---- Feishu 读侧（§I.3）：事件流长驻，回填/话题/群名每 60 s 一轮（测试手动推）
+  const feishuInstance = registry.instance(FEISHU_KIND)
+  const feishuDeployment = deployment(settings, githubSetup, feishuSetup)
+  const feishuCommands = (options.commands ?? new Commands()).withSignal()
+  const feishuKeys: FeishuKeys = {
+    chats: feishuChatsKey,
+    labels: sourceLabelsKey(FEISHU_KIND),
+    cursor: feishuCursorKey,
+    topics: feishuTopicsKey,
+    seen: threadSeenKey
+  }
+  // 配置由注册表校验过；这里再按 schema 解一次，只为拿到带默认值的类型化值。
+  const feishuConfig: FeishuConfig = feishuConfigSchema.parse(
+    feishuInstance === undefined || feishuInstance.configError !== undefined
+      ? {}
+      : feishuInstance.config
+  )
+  const feishuApi = createFeishuApi(feishuCommands, feishuConfig.cli)
+  // setup 完成、实例启用、配置有效、机器人身份读到了：四件齐了才读（§I.3 配置行）。
+  const feishuReady =
+    feishuProblem() === undefined &&
+    feishuSetup.enabled &&
+    feishuInstance !== undefined &&
+    feishuInstance.enabled &&
+    feishuInstance.configError === undefined &&
+    feishuDeployment.feishuBotId.length > 0
+  const feishuHost = createSourceContext({
+    engine,
+    store,
+    commands: feishuCommands,
+    instance: {
+      id: FEISHU_KIND,
+      enabled: feishuReady,
+      config: feishuConfig,
+      health: Object.fromEntries(registry.healthEntries(['feishu', 'history']))
+    },
+    // 每个 Source 只看自己的 setup 问题（Feishu 缺配置不代表 GitHub 不能用）。
+    configured: () => feishuProblem() === undefined,
+    triggerOf: (id) => repo.triggers.get(id),
+    notify: (input) => options.notify?.(input)
+  })
+  const feishuAbort = new AbortController()
+  const feishuBot = { botId: feishuDeployment.feishuBotId, appId: feishuDeployment.feishuAppId }
+  // 事件流：禁用（关停）后看门狗 5 s 内停掉子进程（§I.3）。
+  const feishuStream: FeishuStream | null = feishuReady
+    ? createFeishuStream({
+        commands: feishuCommands,
+        cli: feishuConfig.cli,
+        bot: feishuBot,
+        host: feishuHost,
+        keys: feishuKeys,
+        enabled: () => !closing,
+        signal: feishuAbort.signal,
+        now: nowMs,
+        schedule: (run, milliseconds) => {
+          const timer = setTimeout(run, milliseconds)
+          return () => clearTimeout(timer)
+        },
+        log: (message) => logger.info(message)
+      })
+    : null
+  const feishuBackfill: FeishuBackfill | null =
+    feishuStream === null
+      ? null
+      : createFeishuBackfill({
+          api: feishuApi,
+          bot: feishuBot,
+          config: feishuConfig,
+          host: feishuHost,
+          keys: feishuKeys,
+          now: nowMs,
+          signal: feishuAbort.signal,
+          log: (message) => logger.info(message),
+          // 水位线要的两个只读面：订阅了 Feishu 的 Thread 与 Ticket 的结束时刻（§I.3 话题轮询）。
+          subscribed: () =>
+            repo.threads
+              .list()
+              .filter((thread) => thread.ref.source === FEISHU_KIND)
+              .map((thread) => ({
+                ref: thread.ref,
+                ...(thread.lastAt === undefined ? {} : { lastAt: thread.lastAt }),
+                subscriptions: thread.subscriptions,
+                meta: thread.meta
+              })),
+          ticket: (id) => repo.tickets.get(id)
+        })
+
   // ---- passes：先做 effect，再评估，再把确定性评估的决定落库
   const passes = createPasses({
     effects,
@@ -631,6 +815,22 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
     // setup 未完成：循环在跑，但一轮都不读（Source 停在 setup/starting，不是 error）。
     if (poller === null || githubBlocked()) return { notifications: 0, triggers: 0, skipped: 0 }
     const result = await poller.poll()
+    refresh()
+    return result
+  }
+  /** 群名刷新失败不挡回填：上一次的名单原样保留（§I.3 群名刷新行）。 */
+  const refreshFeishuNames = async (): Promise<void> => {
+    if (feishuBackfill === null) return
+    try {
+      await refreshChatNames({ api: feishuApi, host: feishuHost, keys: feishuKeys, signal: feishuAbort.signal })
+    } catch (error) {
+      logger.warn(`the Feishu chat names could not be read: ${stringOf(error)}`)
+    }
+  }
+  const feishuOnce = async (): Promise<FeishuRoundResult | null> => {
+    if (feishuBackfill === null) return null
+    await refreshFeishuNames()
+    const result = await feishuBackfill.round()
     refresh()
     return result
   }
@@ -657,8 +857,18 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
       }, pollMs)
       timers.push(pollTimer)
     }
+    if (feishuBackfill !== null) {
+      // 第一轮立刻跑一次（安装完就能补上安装前一刻之后的），之后每分钟一轮。
+      void feishuOnce()
+      const feishuTimer = setInterval(() => {
+        void feishuOnce()
+      }, FEISHU_ROUND_MS)
+      timers.push(feishuTimer)
+    }
     for (const timer of timers) timer.unref?.()
   }
+  // 事件流不靠定时器：配置好了就长驻监听（§I.3 实时事件）。
+  const streaming = feishuStream === null ? null : feishuStream.run()
   refresh()
 
   let closed = false
@@ -669,6 +879,9 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
     // 监督先停：关停期间不再发现「终端没了」并去 launch 新会话。
     routerSupervision.stop()
     for (const timer of timers) clearInterval(timer)
+    // 先关事件流：看门狗与 abort 都会停子进程，再等循环真的收尾（§I.3「5 s 内停」）。
+    feishuAbort.abort()
+    if (streaming !== null) await streaming
     options.statusBar?.dispose()
     await passes.stop()
     await effects.drain()
@@ -686,6 +899,7 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
     ready,
     snapshot: () => stateSource.snapshot(),
     pollOnce,
+    feishuOnce,
     passOnce,
     port: () => http.port,
     resumeReport: () => resumeReport,
@@ -879,25 +1093,138 @@ function githubInstanceOf(input: {
   return { enabled, repository, cli, config: { ...config, repository, cli } }
 }
 
-/** 配置了 Feishu 时的 CLI（§I.3）：没配就 `undefined`——不查 lark-cli。 */
+/**
+ * 配置了 Feishu 时的 CLI（§I.3）：没配这个 Source 就是 `undefined`（不查 lark-cli）；
+ * 启用了但 CLI 空着是空串——那是一条 setup 问题（「配置了但缺 CLI」），不是「没配置」。
+ */
 function feishuCliOf(rawSources: Record<string, unknown>): string | undefined {
   const stored = block(rawSources['feishu'])
   if (flag(stored['enabled'], false) === false) return undefined
-  return text(block(stored['config'])['cli'])
+  return text(block(stored['config'])['cli']) ?? ''
+}
+
+/**
+ * Feishu 实例的配置与 setup 问题（§I.3 配置行）：`cli` 或机器人身份缺失就不读也不听。
+ * `botId` 是 open_id（自己消息的丢弃与「点名了机器人」都靠它）；未就绪时是空串。
+ */
+interface FeishuSetup {
+  readonly enabled: boolean
+  readonly config: Record<string, unknown>
+  readonly cli: string
+  readonly botId: string
+  readonly appId: string
+  readonly problem?: { readonly place: string; readonly code: string; readonly detail?: string }
 }
 
 /** 部署派生的事实（§E.11 的变量源）：仓库与账号来自设置与 setup 探针。 */
 function deployment(
   settings: Readonly<Record<string, unknown>>,
-  github: GithubSetup
+  github: GithubSetup,
+  feishu: FeishuSetup
 ): Deployment {
   return {
     repository: String(github.config['repository'] ?? ''),
     githubCli: String(github.config['cli'] ?? 'gh'),
     githubLogin: github.login || text(settings['githubLogin']) || '',
     githubCommitEmail: text(settings['githubCommitEmail']) ?? '',
-    feishuCli: '',
-    feishuBotId: '',
-    feishuAppId: ''
+    feishuCli: feishu.cli,
+    feishuBotId: feishu.botId,
+    feishuAppId: feishu.appId
+  }
+}
+/** 一段文本里的 JSON 对象（`lark-cli` 会在 JSON 前打提示行，从第一个 `{` 开始解析）。 */
+function jsonObject(text: string): Record<string, unknown> | undefined {
+  const start = text.indexOf('{')
+  if (start < 0) return undefined
+  try {
+    const parsed: unknown = JSON.parse(text.slice(start))
+    return typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed)
+      ? (parsed as Record<string, unknown>)
+      : undefined
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * Feishu 的 setup 探针（§I.3 配置行、§I.4）：缺 `cli` → `cli_missing`；`auth status` 说机器人
+ * 身份没就绪 → `bot_not_ready`；`bot/v3/info` 读不到 open_id → `bot_unreadable`。任一都让
+ * Source 进 setup 态：不读回填、不消费事件（§I.3）。
+ *
+ * 没存过实例时 `enabled` 是 false（与 GitHub 的默认相反）：Feishu 是可选的，没配置它就不该
+ * 把整个插件标成「等 setup」。拒绝可充当用户身份的配置（strict-mode）归 setup 票 #44。
+ */
+async function setupFeishu(input: {
+  readonly raw: Readonly<Record<string, unknown>>
+  readonly stored: Record<string, unknown>
+  readonly commands: CommandsHost
+  readonly log: (message: string) => void
+}): Promise<FeishuSetup> {
+  const config = block(input.stored['config'])
+  const enabled = flag(input.stored['enabled'], false)
+  const cli = text(config['cli']) ?? text(input.raw['feishuCli']) ?? ''
+  const merged = { ...config, cli }
+  if (cli === '') {
+    return {
+      enabled,
+      config: merged,
+      cli,
+      botId: '',
+      appId: '',
+      ...(enabled ? { problem: { place: FEISHU_KIND, code: 'cli_missing' } } : {})
+    }
+  }
+  if (!enabled) return { enabled, config: merged, cli, botId: '', appId: '' }
+  try {
+    const status = jsonObject(await input.commands.run(cli, ['auth', 'status']))
+    const appId = typeof status?.['appId'] === 'string' ? status['appId'] : ''
+    const identities = status?.['identities']
+    const bot =
+      typeof identities === 'object' && identities !== null
+        ? (identities as Record<string, unknown>)['bot']
+        : undefined
+    const botStatus =
+      typeof bot === 'object' && bot !== null
+        ? (bot as Record<string, unknown>)['status']
+        : undefined
+    if (!/^cli_[A-Za-z0-9]+$/.test(appId) || botStatus !== 'ready') {
+      return {
+        enabled,
+        config: merged,
+        cli,
+        botId: '',
+        appId,
+        problem: { place: FEISHU_KIND, code: 'bot_not_ready' }
+      }
+    }
+    const info = jsonObject(
+      await input.commands.run(cli, ['api', 'GET', '/open-apis/bot/v3/info', '--as', 'bot'])
+    )
+    const botRow = info?.['bot']
+    const botId =
+      typeof botRow === 'object' && botRow !== null
+        ? (botRow as Record<string, unknown>)['open_id']
+        : undefined
+    if (typeof botId !== 'string' || !/^ou_[A-Za-z0-9]+$/.test(botId)) {
+      return {
+        enabled,
+        config: merged,
+        cli,
+        botId: '',
+        appId,
+        problem: { place: FEISHU_KIND, code: 'bot_unreadable' }
+      }
+    }
+    return { enabled, config: merged, cli, botId, appId }
+  } catch (error) {
+    input.log(`the Feishu CLI could not read its bot identity: ${stringOf(error)}`)
+    return {
+      enabled,
+      config: merged,
+      cli,
+      botId: '',
+      appId: '',
+      problem: { place: FEISHU_KIND, code: 'bot_unreadable', detail: stringOf(error) }
+    }
   }
 }

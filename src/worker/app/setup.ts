@@ -356,7 +356,19 @@ async function probeFeishu(
   run: (program: string, args: readonly string[]) => Promise<string>
 ): Promise<readonly SetupIssue[]> {
   const cli = input.feishuCli
-  if (cli === undefined || cli.trim() === '') return []
+  // `undefined`：这个 Source 没配置（不查）。空串：配置了但没填 CLI——一条 setup 问题。
+  if (cli === undefined) return []
+  if (cli.trim() === '') {
+    return [
+      issue({
+        place: 'feishu',
+        code: 'cli_missing',
+        kind: 'missing',
+        detail: 'the Feishu Source has no CLI',
+        fix: 'set the Feishu CLI (lark-cli or its absolute path) on the Source page'
+      })
+    ]
+  }
   let text: string
   try {
     text = await run(cli, ['auth', 'status'])

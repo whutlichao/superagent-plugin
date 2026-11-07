@@ -10,7 +10,7 @@
 //
 // 本文件是 `src/worker/sources/` 里唯一允许 import `node:child_process` 的模块；`runtime/`
 // 的 Orca CLI 包装是另一条（§B），由后续票实现，不经过这里。
-import { execFile, type ExecFileError } from 'node:child_process'
+import { execFile, spawn, type ExecFileError } from 'node:child_process'
 import { basename, isAbsolute } from 'node:path'
 import { withoutSecretEnvironment } from '../infra/env.ts'
 
@@ -45,13 +45,66 @@ export interface RunOptions {
 }
 
 /**
- * Source kind 能用到的命令端口（§I.1 `CommandsHost`）：只有 `run` 与 `withSignal`。
- * Kind 拿不到环境变量、也拿不到底层的 `execFile`。
+ * Source kind 能用到的命令端口（§I.1 `CommandsHost`）：`run`、流式 `stream` 与 `withSignal`。
+ * Kind 拿不到环境变量、也拿不到底层的 `execFile` / `spawn`。
  */
 export interface CommandsHost {
   run(program: string, args: readonly string[], options?: RunOptions): Promise<string>
+  /**
+   * 起一个**长驻**子进程并逐行交付标准输出（§I.3 的事件消费）：`stdout` 按行回调（不含行尾），
+   * `stderr` 的诊断也按行给（脱敏后的尾巴留在退出读数里），退出时恰好回调一次 `onExit`。
+   * 失败与 `run` 同规矩：程序名必须在白名单里，argv 数组不经 shell。
+   */
+  stream(program: string, args: readonly string[], options: StreamOptions): CommandStream
   /** 绑定一个取消信号（例如一次评估的窗口）；返回的视图共享配置。 */
   withSignal(signal?: AbortSignal): CommandsHost
+}
+
+/** 流式子进程的退出读数：结束方式 + 标准错误的尾巴（诊断用，不含 argv，§I.4 脱敏）。 */
+export interface StreamExit {
+  readonly code: number | null
+  readonly stderr: string
+}
+
+/** 一次 `stream` 的选项：逐行回调 + 退出回调，另有与 `run` 相同的选项。 */
+export interface StreamOptions extends RunOptions {
+  readonly onLine: (line: string) => void
+  readonly onDiagnostic?: (line: string) => void
+  readonly onExit: (outcome: StreamExit) => void
+}
+
+/** 一个正在跑的子进程：`stop()` 关掉标准输入并发 SIGTERM（事件消费把它当停机信号）。 */
+export interface CommandStream {
+  stop(): void
+}
+
+/**
+ * 逐行切分：`data` 给的是任意块的文本，行可能被切开。`\r\n` 与 `\n` 都当行尾（Windows 上的
+ * CLI 输出）；退出时残留的不完整行由调用方用 `flush()` 交出去。
+ */
+function lineSplitter(emit: (line: string) => void): {
+  push(chunk: string): void
+  flush(): void
+} {
+  let buffer = ''
+  return {
+    push(chunk: string): void {
+      buffer += chunk
+      for (;;) {
+        const index = buffer.indexOf('\n')
+        if (index < 0) return
+        const line = buffer.slice(0, index).replace(/\r$/, '')
+        buffer = buffer.slice(index + 1)
+        emit(line)
+      }
+    },
+    flush(): void {
+      if (buffer.length === 0) return
+      const line = buffer.replace(/\r$/, '')
+      buffer = ''
+      emit(line)
+    }
+  }
 }
 
 /** `isGone` 的判定规则：`code` 必须命中；`message` 给出时，错误消息还要匹配它（如 403 仅在 locked 时）。 */
@@ -240,6 +293,55 @@ export class Commands implements CommandsHost {
         }
       )
     })
+  }
+
+  /**
+   * 起一个长驻子进程并逐行交付标准输出（§I.3 的事件消费）。与 `run` 同规矩：白名单、argv
+   * 数组、`shell: false`、中性环境变量；`stop()` 先关标准输入（CLI 把它当优雅停机的信号）
+   * 再 SIGTERM，所以禁用事件流不会留下孤儿进程。
+   */
+  stream(program: string, args: readonly string[], options: StreamOptions): CommandStream {
+    this.#assertAllowed(program)
+    const signal = mergeSignals(this.#signal, options.signal)
+    const child = spawn(program, [...args], {
+      cwd: options.cwd,
+      env: { ...process.env, ...this.#environment, ...NEUTRAL_ENVIRONMENT },
+      stdio: ['pipe', 'pipe', 'pipe'],
+      signal,
+      shell: false
+    })
+    let stderr = ''
+    let ended = false
+    // 退出只回调一次：`close` 与 `error` 都可能来（spawn 失败时只有 `error`）。
+    const finish = (code: number | null): void => {
+      if (ended) return
+      ended = true
+      out.flush()
+      err.flush()
+      options.onExit({ code, stderr: stderr.trim().slice(0, STDERR_LIMIT) })
+    }
+    const out = lineSplitter((line) => options.onLine(line))
+    const err = lineSplitter((line) => {
+      stderr = `${stderr}${line}\n`.slice(-STDERR_LIMIT)
+      options.onDiagnostic?.(line)
+    })
+    child.stdout?.setEncoding('utf8')
+    child.stderr?.setEncoding('utf8')
+    child.stdout?.on('data', (chunk) => out.push(chunk))
+    child.stderr?.on('data', (chunk) => err.push(chunk))
+    child.on('close', (code) => finish(code))
+    child.on('error', (error) => {
+      // spawn 失败（找不到程序之类）：错误消息进标准错误的尾巴，按「没有退出码」结束。
+      stderr = `${stderr}${error.message}\n`.slice(-STDERR_LIMIT)
+      finish(null)
+    })
+    return {
+      stop(): void {
+        if (ended) return
+        child.stdin?.end()
+        child.kill('SIGTERM')
+      }
+    }
   }
 
   /** 白名单与路径规则（§I.4）；拒绝发生在创建子进程之前。 */

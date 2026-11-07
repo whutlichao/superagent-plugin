@@ -15,7 +15,9 @@ import {
   MAX_OUTPUT_BYTES,
   NEUTRAL_ENVIRONMENT,
   STDERR_LIMIT,
-  isGone
+  isGone,
+  type CommandStream,
+  type StreamExit
 } from '../src/worker/sources/commands.ts'
 import { listFiles, readRepoFile } from './support/repo.ts'
 
@@ -254,5 +256,80 @@ describe('the port is the only way out', () => {
     const source = readRepoFile('src/worker/sources/commands.ts')
     assert.ok(source.includes('shell: false'), 'the port never asks for a shell')
     assert.ok(source.includes('maxBuffer: MAX_OUTPUT_BYTES'), 'the port caps output')
+  })
+})
+
+describe('the streaming variant of the port', () => {
+  test('a stream delivers stdout lines in order, then the exit code', async () => {
+    const commands = new Commands()
+    const lines: string[] = []
+    const diagnostics: string[] = []
+    const outcome = await new Promise<StreamExit>((resolve) => {
+      commands.stream('sh', ['-c', 'printf "one\\ntwo\\n"; printf "a warning\\n" >&2; exit 3'], {
+        onLine: (line) => lines.push(line),
+        onDiagnostic: (line) => diagnostics.push(line),
+        onExit: resolve
+      })
+    })
+    assert.deepEqual(lines, ['one', 'two'])
+    assert.deepEqual(diagnostics, ['a warning'])
+    assert.equal(outcome.code, 3)
+    // 标准错误的尾巴留在退出读数里（诊断用），但不回显 argv（§I.4 脱敏）。
+    assert.equal(outcome.stderr, 'a warning')
+    assert.equal(outcome.stderr.includes('one'), false)
+  })
+
+  test('a line split across chunks still arrives as one line', async () => {
+    const commands = new Commands()
+    const lines: string[] = []
+    const outcome = await new Promise<StreamExit>((resolve) => {
+      // 三个写：第一段没有换行，第二段补齐。
+      commands.stream('sh', ['-c', 'printf "hal"; printf "f\\nsecond\\n"'], {
+        onLine: (line) => lines.push(line),
+        onExit: resolve
+      })
+    })
+    assert.deepEqual(lines, ['half', 'second'])
+    assert.equal(outcome.code, 0)
+  })
+
+  test('stop ends an unbounded child instead of leaving it running', async () => {
+    const commands = new Commands()
+    const lines: string[] = []
+    let handle: CommandStream | undefined
+    // 等「第一行到了」用事件而不是轮询：子进程的输出走 I/O 事件，微任务轮询看不到它。
+    let arrived: () => void = () => undefined
+    const first = new Promise<void>((resolve) => {
+      arrived = resolve
+    })
+    const outcome = new Promise<StreamExit>((resolve) => {
+      // `exec` 让 spawn 出来的进程直接变成 `cat`（没有孙进程）：关标准输入或 SIGTERM 都能收尾。
+      handle = commands.stream('sh', ['-c', 'printf "ready\\n"; exec cat >/dev/null'], {
+        onLine: (line) => {
+          lines.push(line)
+          if (line === 'ready') arrived()
+        },
+        onExit: resolve
+      })
+    })
+    await first
+    handle?.stop()
+    const guard = new Promise<never>((_, reject) => {
+      const timer = setTimeout(() => reject(new Error('stop did not end the stream within 2 s')), 2000)
+      timer.unref?.()
+    })
+    const result = await Promise.race([outcome, guard])
+    // 停机是「进程结束」，退出码是 0（标准输入 EOF）还是 null（SIGTERM）都算数。
+    assert.equal(result.code === 0 || result.code === null, true, 'the child ended')
+    // 再停一次是无害的（真端口的 `stop()` 幂等）。
+    handle?.stop()
+  })
+
+  test('the whitelist refuses a program the stream may not run', () => {
+    const commands = new Commands()
+    assert.throws(
+      () => commands.stream('bash', ['-c', 'true'], { onLine: () => {}, onExit: () => {} }),
+      /not one of the allowed programs/
+    )
   })
 })

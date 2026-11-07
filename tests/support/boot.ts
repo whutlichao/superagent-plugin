@@ -45,7 +45,7 @@ export function settingsOf(stateDir: string): Record<string, unknown> {
     sources: {
       github: { enabled: true, config: { repository: 'acme/widgets', cli: 'gh', pollSeconds: 60 } }
     },
-    policy: { sources: { github: { allowed: ['alice'] } } }
+    policy: { sources: { github: { allowed: [{ id: 'alice' }] } } }
   }
 }
 

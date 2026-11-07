@@ -158,7 +158,8 @@ export interface SettingsVersionRecord {
   readonly revision: number
   readonly predecessor: number | null
   readonly at: IsoTime
-  readonly origin: 'panel' | 'tool' | 'sync'
+  /** 谁改的（§K.8）：面板、CLI、名单同步，或 operator（setup 字段唯一的外来来源）。 */
+  readonly origin: 'panel' | 'tool' | 'sync' | 'operator'
   readonly block: string
   readonly config: unknown
   readonly policyVersion: string | null

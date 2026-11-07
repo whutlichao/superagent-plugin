@@ -94,17 +94,15 @@ export interface Deployment {
   readonly feishuAppId: string
 }
 
-/** 准入表的一行（§K.1）：接收 scope 的 id、标签、旁注，以及三个格子是否可用。 */
-export interface AdmissionRow {
-  readonly id: string
-  readonly label: Localized | string
-  readonly note: Localized
-  readonly cells: {
-    readonly listedUnaddressed: boolean
-    readonly unlistedAddressed: boolean
-    readonly unlistedUnaddressed: boolean
-  }
-}
+// 准入行的形状住在 `policy/admission.ts`（§K.1）：policy 不 import sources（§C.2），
+// sources 可以 import policy 的类型。这里转出，kind 的实现只 import 本文件。
+export type {
+  AdmissionCellsConfig,
+  AdmissionRow,
+  AdmissionTableConfig,
+  Admission
+} from '../policy/admission.ts'
+import type { AdmissionRow } from '../policy/admission.ts'
 
 /** Policy 里属于某个 Source 的那一部分（§K.1、§I.1 `policy`）。 */
 export interface SourcePolicyPart<P = Record<string, unknown>> {

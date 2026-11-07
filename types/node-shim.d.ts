@@ -54,6 +54,43 @@ declare module 'node:child_process' {
     options: ExecFileOptions,
     callback: (error: ExecFileError | null, stdout: string, stderr: string) => void
   ): unknown
+
+  /**
+   * `spawn`：流式子进程（§I.3 的事件消费要逐行读标准输出）。只声明本仓库用到的成员：
+   * 三根管道、`signal`（取消即 SIGTERM）、`kill` 与退出回调。
+   */
+  export interface SpawnOptions {
+    cwd?: string
+    env?: Record<string, string | undefined>
+    signal?: AbortSignal
+    stdio?: readonly ('pipe' | 'ignore' | 'inherit')[]
+    /** 本仓库永远传 `false`：argv 数组直达 spawn，不经 shell（§O 命令注入）。 */
+    shell?: boolean
+  }
+  /** 一根输出管道：`setEncoding('utf8')` 之后 `data` 回调拿到字符串块。 */
+  export interface ChildStream {
+    setEncoding(encoding: 'utf8'): void
+    on(event: 'data', listener: (chunk: string) => void): void
+  }
+  /** 子进程的写入端（关闭它就是「请退出」，事件消费把它当停机信号）。 */
+  export interface ChildStdin {
+    end(chunk?: string): void
+    write(chunk: string): boolean
+  }
+  export interface ChildProcess {
+    readonly stdin: ChildStdin | null
+    readonly stdout: ChildStream | null
+    readonly stderr: ChildStream | null
+    readonly exitCode: number | null
+    kill(signal?: string): boolean
+    on(event: 'close', listener: (code: number | null) => void): void
+    on(event: 'error', listener: (error: Error) => void): void
+  }
+  export function spawn(
+    file: string,
+    args: readonly string[],
+    options: SpawnOptions
+  ): ChildProcess
 }
 
 /** `node:fs` 的同步子集（避免测试里出现异步竞态）。 */

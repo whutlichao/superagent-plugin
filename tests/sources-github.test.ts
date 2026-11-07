@@ -1021,7 +1021,11 @@ test('the channel reads the existing comments before writing, and appends a hidd
   commands.script(['api', 'repos/acme/widgets/issues/42/comments?per_page=100', '-q'], () => '')
   commands.script(['api', 'repos/acme/widgets/issues/42/comments', '-f'], () => '{}')
   const result = await githubKind.channel?.send(
-    { run: (program, args, options) => commands.run(program, args, options ?? {}), withSignal: () => commands },
+    {
+      run: (program, args, options) => commands.run(program, args, options ?? {}),
+      stream: (program, args, options) => commands.stream(program, args, options),
+      withSignal: () => commands
+    },
     {
       id: 'reply-1',
       channel: {
@@ -1057,7 +1061,11 @@ test('a comment that already carries the marker is not written again', async () 
     () => 'Done.\n\n<!-- superagent:reply-1 -->'
   )
   const result = await githubKind.channel?.send(
-    { run: (program, args, options) => commands.run(program, args, options ?? {}), withSignal: () => commands },
+    {
+      run: (program, args, options) => commands.run(program, args, options ?? {}),
+      stream: (program, args, options) => commands.stream(program, args, options),
+      withSignal: () => commands
+    },
     {
       id: 'reply-1',
       channel: { source: 'github', thread: 'github:42', address: { repo: 'acme/widgets', issue: '42' } },
@@ -1075,7 +1083,11 @@ test('a locked or deleted issue is gone; any other failure is an error the queue
     commands.script(['api', 'repos/acme/widgets/issues/42/comments?per_page=100', '-q'], () => '')
     commands.fail('gh', ['api', 'repos/acme/widgets/issues/42/comments', '-f'], error)
     return (await githubKind.channel?.send(
-      { run: (program, args, options) => commands.run(program, args, options ?? {}), withSignal: () => commands },
+      {
+      run: (program, args, options) => commands.run(program, args, options ?? {}),
+      stream: (program, args, options) => commands.stream(program, args, options),
+      withSignal: () => commands
+    },
       {
         id: 'reply-1',
         channel: { source: 'github', thread: 'github:42', address: { repo: 'acme/widgets', issue: '42' } },
