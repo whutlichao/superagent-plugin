@@ -22,6 +22,23 @@ export interface WorkerReport {
   via?: 'terminal'
 }
 
+/**
+ * 执行器在「启动成功」时一并报上来的执行事实（§E.1–§E.3）。终端句柄是 Assignment 的外部
+ * 身份（§D.1），worktree 的目录、短名与作业文本是 `ticket.execution` 的三项。分开是因为
+ * 内核（#9）先落地了状态迁移、把执行事实留给执行器票（#11）补齐；缺哪一项就不写哪一项，
+ * 不拿空串假装已知。
+ */
+export interface AssignmentLaunch {
+  /** Orca agent 终端句柄（`term_…`）。 */
+  readonly terminalId?: string
+  /** 建好（或复用）的 worktree 与交给 worker 的作业文本。 */
+  readonly workspace?: {
+    readonly short: string
+    readonly directory: string
+    readonly assignment: string
+  }
+}
+
 /** 主机重启打断 Assignment 时投递的恢复说明：先看现场，别重复已做的外部动作。 */
 const RECOVERY_NOTE =
   'The host restarted during this ticket. Inspect the current worktree, git history and GitHub state before continuing. Do not repeat an already completed external operation. Finish the original assignment and report its status.'
@@ -45,12 +62,20 @@ export class Assignments extends EnginePart {
    * 把一个未结束的 Assignment 标为 running，并给未结束的 Ticket 排队投递等待中的 Input，
    * 然后发出 `assignment.started`。
    */
-  started(ticketId: string, assignmentId: string): void {
+  started(ticketId: string, assignmentId: string, launch?: AssignmentLaunch): void {
     const ticket = this.require(ticketId)
     const assignment = ticket.assignments.find((item) => item.id === assignmentId)
     if (!assignment || assignment.state === 'ended') return
     assignment.state = 'running'
     assignment.startedAt ??= this.now()
+    if (launch?.terminalId !== undefined) assignment.terminalId = launch.terminalId
+    if (launch?.workspace !== undefined) {
+      ticket.execution = {
+        name: launch.workspace.short,
+        directory: launch.workspace.directory,
+        assignment: launch.workspace.assignment
+      }
+    }
     ticket.updatedAt = this.now()
     this.repo.tickets.save(ticket)
     if (liveTicket(ticket) && ticket.undelivered.length) {

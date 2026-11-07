@@ -211,13 +211,14 @@ export interface OrcaRuntime {
 | `ensureWorkspace` | 先 `listWorkspaces()` 按 `path`/`name` 复用；否则 `spawn orca worktree create --name <name> --repo <sel> --base-branch <ref> --branch <branch> --setup <p> --no-parent --json`，读 `result` 里的 worktree `id`/`path`/`branch` `[probe]`(`orca worktree create --help`) | `cli_failed`（带 CLI 的 `error.code`）、`cli_timeout`（120 s）、`locked`（同名 worktree 被占用） |
 | `listWorkspaces` | `host.call('workspace.list')` `[skill]` | `capability_denied` / `not_permitted` |
 | `openWorkspace` | `host.call('workspace.open')`；面板不直接调（面板无此方法） | `not_permitted`（浏览器客户端） |
-| `launchAgent` | 首选 `spawn orca agent launch --agent <id> --worktree path:<p> --model <m> --effort <e> --surface terminal --prompt <t> --json`；`model`/`effort` 缺省且 CLI 不可用时回落 `host.call('agent.launch', { workspaceId, agent, prompt })` `[probe]`(`orca agent launch --help`)/`[skill]` | `agent_gone`（回执无 terminalId）、`cli_failed`；**句柄字段名待 §附录 C S2 复核** |
+| `launchAgent` | 首选 `spawn orca agent launch --agent <id> --worktree path:<p> --model <m> --effort <e> --surface terminal --prompt <t> --json`，句柄取 `result.launch.outcome.handle`（旧宿主 `result.agentTerminalHandle`）；`model`/`effort` 缺省且 CLI 不可用时回落 `host.call('agent.launch', { workspaceId, agent, prompt })`（返回 `{ terminalId }`） `[probe]`(`orca agent launch --help`)/`[skill]` | `agent_gone`（回执无 terminalId）、`cli_failed`；字段名见附录 C S2 实测 |
 | `listAgents` | `host.call('agents.list')`；**只返回当前聚焦 workspace 的 agent** `[skill]`，所以只作提示，不作枚举真源 | `unavailable`（Orca 未就绪） |
 | `listTerminals` | `spawn orca terminal list --json`：`terminals[].handle/worktreeId/worktreePath/title/connected/orphaned` `[probe]`；这是「哪些 worker 终端还活着」的**唯一权威枚举** | `cli_failed`；解析失败按空集处理并记 warning |
 | `onAgentStatus` | `orca.events.on('agent.status.changed', …)`；事件须在 manifest `contributes.events` 列表 `[skill]` | 无（订阅失败即启动失败，`invalid_request`） |
-| `sendText` | `host.call('terminal.sendText', { terminalId, text, enter })` | `rate_limited`（`retryAfterMs`）、`not_permitted`（面板调用）、`too_large` |
+| `sendText` | `host.call('terminal.sendText', { terminalId, text, enter })`；宿主实现要求终端属于**当前聚焦**工作区（附录 C S1），Ticket worktree 通常不在，故实现需回落 `orca terminal send --terminal <h> --text <t> --enter --json` | `rate_limited`（`retryAfterMs`）、`not_permitted`（面板调用）、`too_large` |
 | `readTerminal` | `host.call('terminal.read', { terminalId, maxLines })`（上限 2000 行） | `unknown_method`（旧宿主，`supports` 已挡） |
 | `closeTerminal` | `spawn orca terminal close --terminal <h> --json`（Host API 无终端关闭） `[probe]` | `cli_failed`；终端已消失视为成功（幂等） |
+| `runCommand` | prepare 用（§E.3）：`spawn orca terminal create --worktree id:<ws> --command <cmd> --json` 起终端，再 `orca terminal read` 收尾；10 分钟预算 `[probe]`(`orca terminal create/read --help`) | `cli_failed`、`cli_timeout`；超时视为 prepare 失败 |
 | `notify` | `host.call('notifications.show')` | `capability_denied`，只记日志不抛 |
 | `setStatusBar` | `host.call('statusBar.update', { id, … })` | 同上 |
 | `storage`/`settings`/`secrets` | `orca.storage` / `orca.settings` / `orca.secrets`（与 `host.call` 等价） | `capability_denied`；`secrets.set` 在 `protection()==='unavailable'` 时 `action_failed` |
@@ -550,11 +551,11 @@ CREATE TABLE kv (
 
 | 项 | 决定 |
 | --- | --- |
-| 创建命令 | `orca worktree create --name superagent-<short> --repo path:<baseRepoPath> --base-branch <baseRef> --branch agent/<short> --setup skip --no-parent --json` `[probe]`(`--help` 的选项集) |
+| 创建命令 | `orca worktree create --name superagent-<short> --repo path:<baseRepoPath> --base-branch <baseRef> --branch agent/<short> --setup skip --no-parent --json` `[probe]`(`--help` 的选项集)；实测 2.3 s（附录 C S3），120 s 超时是给网络/大仓库的余量 |
 | base repo | 设置 `executor.baseRepo`：一个已存在于 Orca 的 repo（`orca repo list --json` 的 `id` 或 `path`）。缺省取「打开本插件的 workspace 所属 repo」不可靠，故**必须在设置里显式选**，setup 检查用 `orca repo list` 校验存在性 |
 | base ref | 设置 `executor.baseBranch`。`orca repo list --json` **不输出**默认 base ref（实测字段集里没有），所以插件不假装读得到它：未配置时显式传 `--base-branch HEAD`；配置时用 `orca repo search-refs --repo <sel> --query <ref> --json` 校验 ref 存在。人的默认 base ref 仍由 Orca 的 `orca repo set-base-ref` 管，插件不写它 |
-| 命名 | `name = 'superagent-' + short`，`branch = settings.executor.branchPrefix + short`（缺省 `agent/`）。`short` 来自 accept 时的 `worktree_name`（上游同字段），只允许 `[a-z0-9-]{3,40}`，冲突时追加 `-2` … |
-| 复用 | 先 `listWorkspaces()` 按 `path` 或 `branch` 命中即复用；崩溃恢复不重建 |
+| 命名 | `name = 'superagent-' + short`，`branch = settings.executor.branchPrefix + short`（缺省 `agent/`）。`short` 来自 accept 时的 `worktree_name`（上游同字段），只允许 `[a-z0-9-]{3,40}`，冲突时追加 `-2` …。**S3 实测**：Orca 自己也会给路径与分支加 `-2`（`displayName` 不变），所以创建后一律以回执的 `path`/`branch`/`id` 为准，请求值不作复用键 |
+| 复用 | 先 `listWorkspaces()` 按 `path`（回执记录的目录）或 `branch` 命中即复用；崩溃恢复不重建 |
 | setup hooks | 恒 `--setup skip`：仓库的 setup hook 不可控且可能联网；上游的 `prepare` 命令改到这里（§E.3） |
 | 归属 | `--no-parent`：Ticket worktree 互相独立，不挂在某个 agent 的 lineage 下 |
 | 清理 | 默认 `worktreeRetention: 'keep'`（永不自动删）。面板与 CLI 提供「Remove worktree」，二次确认；`onEnd` 策略可选（Ticket 结束 N 天后 `orca worktree rm`），默认关闭 |
@@ -569,7 +570,7 @@ CREATE TABLE kv (
 | agent id | 设置 `executor.agent`（缺省 `pi`，可覆盖为 `claude`、`codex` 等任一已装的 Orca agent id），setup 检查校验非空；不猜测 |
 | model / effort | 设置 `executor.model` / `executor.effort`，透传给 CLI；两个角色各自独立的模型设置在 `eval.model` 与 `executor.model` |
 | 开播语 | 短（≤ 400 字符）：角色声明 + Ticket id/短名 + 目录 + **CLI 绝对路径与 token 文件路径** + 「先读 `inbox/0.md`」。长正文一律写文件，不让终端吞长文本（§附录 C S1） |
-| 回执 | CLI 的 `result` 里取 terminal 句柄；取不到就用 `workspaceId` 在 `agents.list()` 里按 workspace 反查（最多 10 s，200 ms 间隔）。仍取不到 → `agent_gone` → 重试一次 → `failed` |
+| 回执 | CLI 的 `result.launch.outcome.handle`（`outcome.kind === 'terminal'`；旧宿主是 `result.agentTerminalHandle`）取 terminal 句柄；取不到就用 `workspaceId` 在 `agents.list()` 里按 workspace 反查（最多 10 s，200 ms 间隔）。仍取不到 → `agent_gone` → 重试一次 → `failed`（附录 C S2：宿主行不含 workspaceId，反查走 `OrcaRuntime.findAgent`） |
 | 会话形态 | 一个 Ticket 一个 agent 终端；重试与恢复**复用同一 worktree 与同一分支**，新建终端 |
 
 ### E.3 Assignment 生命周期
@@ -584,15 +585,16 @@ pending ──launch 成功──▶ running ──report(ready|dropped) / stop 
 - `running`：拿到 `terminalId` 并已投递 assignment 消息。`ticket.execution.assignment = { id, state, terminalId, startedAt, endedAt?, endReason? }`。
 - `ended`：`ready`/`dropped` 的 report、人的 stop、`failed`、或 host 重启的 `interrupted`。
 - **只有 Assignment 的最终 Report 能从执行侧结束 Ticket**（上游同）。
-- `prepare`：上游是「建目录的命令」，Orca 里 worktree 已由 `orca worktree create` 建好，所以 `prepare` 变成 **checkout 后置命令**：在 worktree 里 `terminal.create({ workspaceId, command })` 跑一次，`terminal.read` 收尾，10 分钟预算；失败记录输出并 `failed` 该 Ticket。命令文本支持 `${DSH_SUPERAGENT_*}` 形式的变量替换（**在插件内替换为 shell 单引号转义后的值，绝不拼接未转义文本**）。
-- 一次 Ticket 只跑一次 `prepare`；重试或人的新消息会重跑（上游同）。
+- `prepare`：上游是「建目录的命令」，Orca 里 worktree 已由 `orca worktree create` 建好，所以 `prepare` 变成 **checkout 后置命令**：在 worktree 里跑一次（seam 的 `runCommand`，宿主用 `orca terminal create --command …` + `orca terminal read` 实现），10 分钟预算；输出写 `<stateDir>/logs/prepare-<ticket>-<assignment>.log`，非零退出或超时让该 Ticket `failed`（不重试同一条命令）。命令文本支持 `${DSH_SUPERAGENT_*}` 形式的变量替换（**在插件内替换为 shell 单引号转义后的值，绝不拼接未转义文本**；替换归 §E.11 的票）。
+- 一次 Ticket 只跑一次 `prepare`；重试或人的新消息会重跑（上游同）。实现口径：一条 Assignment 一条命令，同一 Assignment 的 effect 重放不重跑。
 
 ### E.4 输入投递
 
 1. 引擎把 Input 写进 `ticket.inputs[]`，并 `enqueue('delivery', ticketId)`。
 2. `delivery` handler 渲染 Input 为 Markdown（含 Trigger 卡、`replies_to`、截断指针）写到 `<stateDir>/inbox/<ticket>/<seq>.md`。
-3. 若渲染文本 ≤ `executor.inlineLimit`（缺省 2000 字符）则直接 `sendText`，否则只发指针：
-   `[superagent] 新输入 #<n>，读它：<path>`。
+3. 若渲染文本 ≤ `executor.inlineLimit`（**缺省 1000 字符**，附录 C S1 实测：单行 1023 字节可送达、
+   1024 字节起在 canonical PTY 上永不送达而 `send` 仍回 `accepted:true`）**且是单行**则直接
+   `sendText`，否则只发一行指针：`[superagent] 新输入 #<n>，读它：<path>`。含换行的文本一律走指针。
 4. 发送恒带 `enter: true`；`accepted === true` 只代表**已接受写入**，不代表送达。确认送达用 `terminal.read` 回读最后 N 行里是否出现 `[superagent] #<n>`（可选，`executor.confirmDelivery` 缺省开）。
 5. 失败退避 2 s → 翻倍 → 60 s；`deliveryFailed` 记在 Ticket 上并在面板显示「Input undelivered」，直到一次成功、新 Assignment 或 Ticket 结束。
 
@@ -2025,3 +2027,34 @@ Orca 应用重启后端口文件是否过期。**影响**：§N.1 的端口选�
 复现方式（本票脚本未入库，等价代码）：起 `createServer` → `listen(0,'127.0.0.1')` → 记端口 →
 `closeAllConnections(); close()` → 立刻在**同一端口**再 `listen`，`hrtime` 记耗时取分位；
 跨进程用 `spawn(node, ['-e', …])` 让子进程绑定并退出后由父进程重绑。
+
+### S1/S2/S3 实测记录（#11，2026-11-07）
+
+**实测环境**：arm64 macOS 27.0.1，Node 25.0.0，Orca CLI 1.4.251。S1 用 `orca terminal create`
+起一个临时终端跑 `sh -c 'while IFS= read -r l; do printf "LEN[%s]\n" "${#l}"; done'`，逐条
+`orca terminal send --json` 后用 `orca terminal read --json` 取 `result.terminal.tail`，测完
+`orca terminal close`。S2 读 `orca agent launch --help` / `orca worktree create --help` 的原文，
+并用 `dd` 只读地取 `app.asar` 里的宿主方法表（读法同 S8）。S3 在
+`/Users/apple/orca/superagent-plugin` 上真建 5 个 worktree、验完全部 `worktree rm --force
+--delete-branch`（分支也确认删掉了）。
+
+| ID | 实测值 | 影响的设计行 | 已落地的决定 / 回落 |
+| --- | --- | --- | --- |
+| S1 | 单行 1000、1023 字符送达；**1024、1025、1200 字符永不送达**（`send` 仍回 `accepted: true`，`bytesWritten = n+1`）。含换行的 `--text` 在普通 PTY 上每行各提交一次（`p1\np2\np3` → 三次独立的 `read` 行；`--enter` 再补一次空提交）。回读：发出去的 `[superagent] #n` 在 250 ms 内出现在 `result.terminal.tail`（2/2）；1000 字符单行在 `tail` 里是一条完整行。宿主 `terminal.sendText` 要求终端属于**当前聚焦**工作区（app.asar 方法表），`terminal.read` 没有这个限制。 | §E.2 开播语、§E.4 的 `inlineLimit` 缺省值与「直发」语义、§B.3 `sendText` 落地 | `inlineLimit` 缺省 **1000**；只有**单行**渲染且 ≤ 上限才直发，其余一律一行指针（保守回落）；回读确认默认开（`accepted` 不算送达）；`sendText` 的实现需在 Ticket worktree 未聚焦时回落 `orca terminal send` |
+| S2 | `orca agent launch --json` 的终端句柄在 `result.launch.outcome.handle`（`outcome.kind === 'terminal'`；旧宿主是 `result.agentTerminalHandle`，同字段说明见 `orca worktree create --help`）。Host 方法 `agent.launch` 返回 `{ terminalId }`（app.asar 方法表；同一份代码用 `outcome.handle` 作 `reuseTerminal.handle` 再投 prompt）。`agents.list` 只投影**当前聚焦**工作区的行，且行里**没有** workspaceId（`tZr()` 先按 worktreeId 过滤再投影）。`terminal list --json` 的 `handle` 与两者是同一个 `term_…` id。 | §E.2 回执、§E.7 映射、§B.3 `launchAgent` | 以 `outcome.handle` 为权威字段、兼容 `agentTerminalHandle`；反查在 `OrcaRuntime` 上新增 `findAgent(workspaceId)`（宿主行不含 workspaceId，只靠 `agents.list` 做不到）；再不行用 `terminal.read` 探活 |
+| S3 | `worktree create`（`--setup skip --no-parent --base-branch <非 main 本地分支>`）**2317 ms**，`--base-branch HEAD` 2212 ms，`--setup run` 2134 ms。`--base-branch` 指向非 main 分支时新 worktree 的 HEAD 等于该分支 tip；`HEAD` 被接受并落在 base repo 的 HEAD。`--setup run` **没有**产生仓库 setup 脚本的产物（`.codegraph/` 与 `node_modules/` 都不存在）。重名时 Orca 自己给**路径与分支**加 `-2`（`displayName` 不变）；显式 `--branch` 重复时也会加 `-2`。省略 `--base-branch` 时 `baseRef` 是 `refs/remotes/origin/main`。 | §E.1 的 120 s 超时、`--setup skip` 语义、命名与复用 | 120 s 保留（实测 2.3 s，约 50 倍余量）；未配置 base ref 时显式传 `--base-branch HEAD`；创建后一律以回执的 `path`/`branch`/`id` 为准，请求值不作复用键；setup 恒 `skip`，不拿仓库钩子当 prepare |
+
+**三条结论**：
+
+1. **`accepted` 不是送达**：S1 的 1024+ 单行与 S2 的旧宿主字段都说明回执只证明「写进去了」。
+   因此 §E.4 第 4 步的回读确认是默认行为，且 `inlineLimit` 必须低于实测的 1024 字节单行上限。
+2. **终端句柄只有一个来源**：`outcome.handle`（旧宿主 `agentTerminalHandle`）、Host API 的
+   `terminalId`、`terminal list` 的 `handle` 是同一个 `term_…` id；反查只是兜底，不能替代回执。
+3. **起 worktree 不是慢操作**：2.3 s 说明 120 s 超时是给网络/大仓库的余量；但 setup 钩子必须
+   跳过——`--setup run` 没有产物这件事本身也说明钩子不可观测，不能拿它当 prepare。
+
+**复现方式（脚本未入库）**：`orca terminal create --worktree path:<repo> --command "sh -c '…'" --json`
+→ `orca terminal send --terminal <handle> --text <n 个字符> --enter --json` → `orca terminal read
+--terminal <handle> --limit 200 --json`；`orca worktree create --name <n> --repo path:<base>
+--base-branch <ref> --branch <b> --setup skip --no-parent --json` 用 `hrtime` 计时，
+`git -C <path> rev-parse HEAD` 对比 base tip，`ls <path>/.codegraph` 判断 setup 是否跑了。
