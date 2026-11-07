@@ -126,6 +126,7 @@ import { notePluginVersion } from './app/upgrade.ts'
 import { createSourceContext } from './app/source-context.ts'
 import { createSetupState, issuesOf, runSetupChecks } from './app/setup.ts'
 import type { SetupBudget, SetupCheckInput, SetupIssue, SetupProblem, SetupReport } from './app/setup.ts'
+import type { ProbeBudget } from './infra/deadline.ts'
 import {
   SourceRegistry,
   type ResolvedSourceInstance,
@@ -345,8 +346,11 @@ export interface BootHandle {
   syncSource(sourceId: string): Promise<{ readonly allowed: number }>
   /** 重读一个 Source 的行键显示名（§G.2 的 `source labels`）；Kind 没有这个能力时拒绝。 */
   refreshSourceLabels(sourceId: string): Promise<{ readonly added: number; readonly total: number }>
-  /** doctor 的八项诊断（§G.2、§N.4）：与 HTTP 的 `POST doctor` 同一份接线。 */
-  doctor(): Promise<DoctorResult>
+  /**
+   * doctor 的八项诊断（§G.2、§N.4）：与 HTTP 的 `POST doctor` 同一份接线。`budget` 是这次请求的
+   * 探针上限与取消线（§O）；面板路径不给（探针不限时，与 #64 之前逐字一致）。
+   */
+  doctor(budget?: ProbeBudget): Promise<DoctorResult>
   /**
    * Prompts 组的一次读数（§M.3）：当前版本与配置、每个分片的内置正文与占位符、
    * default-updated 的详情、历史、技能文件，以及「已保存 / 默认」两份全文。
@@ -701,12 +705,14 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
    */
   const doctorOptions: DoctorOptions = {
     stateDir: resolved,
-    run: (program, args) => commandPort.run(program, args),
+    // 探针的取消线与上限一路到 `execFile`（§O）：到这里为止都不丢。
+    run: (program, args, probe) => commandPort.run(program, args, probe),
     cliPath: options.cliPath ?? defaultCliPath(),
     now,
     inspectDatabase: () => store.inspect()
   }
-  const doctorNow = (): Promise<DoctorResult> => runDoctor(doctorOptions)
+  const doctorNow = (budget?: ProbeBudget): Promise<DoctorResult> =>
+    runDoctor(budget === undefined ? doctorOptions : { ...doctorOptions, budget })
   const githubInstance = githubInstanceOf({ raw: settings, stored: githubStored })
   const feishuCli = feishuCliOf(rawSources)
   const setupInput = (): SetupCheckInput => ({
@@ -1550,15 +1556,16 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
     },
     // doctor 与 `setup check` 走同一份 handler（§G.2「同一批 handler」）。
     ops: {
-      run: (program, args) => commandPort.run(program, args),
+      run: (program, args, probe) => commandPort.run(program, args, probe),
       cliPath: options.cliPath ?? defaultCliPath(),
       setupCheck: (budget) => checkSetup(budget),
-      doctor: doctorNow,
+      doctor: (budget) => doctorNow(budget),
       // `source labels`（§G.2）：与面板的「刷新显示名」同一次读取（`refreshedLabels`），
-      // 拒绝码用命令面的 `missing`/`not_syncable`（§G.2 的固定拒绝）。
-      sourceLabels: async (id) => {
+      // 拒绝码用命令面的 `missing`/`not_syncable`（§G.2 的固定拒绝）；`signal` 是 handler 的
+      // 预算取消线（§O），到点后读取被取消、名单不写。
+      sourceLabels: async (id, _at, signal) => {
         try {
-          const { labels } = await refreshedLabels(id)
+          const { labels } = await refreshedLabels(id, signal)
           refresh()
           return labels
         } catch (error) {
@@ -2068,9 +2075,14 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
    * （Feishu 的群名，#41）。未知 Source 给 `missing`、kind 没有这个能力给 `not_syncable`
    * （§G.2 的固定拒绝）——绝不编一个空标签表假装刷新成功。
    * 函数声明（而不是 `const`）：HTTP 的 `ops.sourceLabels` 在启动中就能到达。
+   *
+   * `signal` 是这次请求的取消线（§O）：到点后 kind 的读取被取消（信号经 `CommandsHost.withSignal`
+   * 进 `execFile`，子进程被 SIGTERM 掐掉），`refreshChatNames` 因此不会写名单——上一次的
+   * 标签表原样留着。
    */
   async function refreshedLabels(
-    id: string
+    id: string,
+    signal?: AbortSignal
   ): Promise<{ labels: Record<string, string>; added: number; total: number }> {
     const instance = registry.instance(id)
     if (instance === undefined) {
@@ -2087,12 +2099,14 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
       createSourceContext({
         engine,
         store,
-        commands: (options.commands ?? new Commands()).withSignal(),
+        // 取消线交给 kind：它的每一次 `lark-cli` 读取都带着同一个 signal（§O）。
+        commands: (options.commands ?? new Commands()).withSignal(signal),
         instance: { id, enabled: instance.enabled, config: instance.config, health: {} },
         configured: () => true,
         triggerOf: (triggerId) => repo.triggers.get(triggerId),
         notify: (input) => options.notify?.(input)
-      })
+      }),
+      signal
     )
     return {
       labels,

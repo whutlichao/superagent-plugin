@@ -1,6 +1,6 @@
 // `doctor` 的检查实现（§G.2 的 doctor 行、§N.4、§O）。
 //
-// 八项逐条给 `ok | warn | fail`：
+// 八项逐条给 `ok | warn | timeout | fail`：
 //   token        主 token 文件在不在、权限是否是 0600（**只 stat，不读值**）
 //   port         端口文件是否指向一个活着的端口（能连上 → ok；文件在但连不上 → warn）
 //   lock         `<stateDir>/lock`：有活实例 / 陈旧遗留 / 没有
@@ -14,6 +14,10 @@
 // 红线（§O、§N.5）：输出**不含 token、不含密钥值**。每条 `detail` 都是这里拼出来的固定句子；
 // 子进程的输出只用来判定，不原样回显（gh/lark 的输出里有账号名与 token 片段）。
 //
+// 预算（§O 的「超时」行）：handler 给 `budget` 时，每条 CLI 探针在自己的 2 s 上限内跑；到点先取消
+// （信号进 `execFile`）再把**这一项**标成 `timeout`，其余项照常给读数——没查完不能写成 ok，也
+// 不是 fail。整次调用的预算由 handler 的那层 `withDeadline` 兼顾，超了就 503（不留半份结果）。
+//
 // 依赖方向（§C.2）：本文件只 import `core/`、`infra/` 与 `app/` 的兄弟模块（类型在
 // `doctor-types.ts`，HTTP 与 CLI 两侧都从那里再导出）。
 // 需要跑子进程时经**注入的** `CommandsRunner`（组合根给 `sources/commands.ts` 的实现），
@@ -24,16 +28,29 @@ import { join } from 'node:path'
 import { LOCK_FILE, lockAgeMs, readLock, STALE_AFTER_MS } from '../infra/lock.ts'
 import { GITCONFIG_MODE, inspectWorkerGitConfig } from '../infra/gitconfig.ts'
 import { API_TOKEN_FILE, TOKEN_MODE } from '../infra/tokens.ts'
+import {
+  DeadlineError,
+  ProbeTimeout,
+  probeRunner,
+  type Probe,
+  type ProbeBudget,
+  type ProbeOptions
+} from '../infra/deadline.ts'
 import { DEFAULT_PORT, PORT_FILE, readPortRecord } from '../http/port-file.ts'
 import type { DatabaseInspection } from './store.ts'
 import { doctorCheck, doctorResult } from './doctor-types.ts'
-import type { DoctorCheck, DoctorResult } from './doctor-types.ts'
+import type { DoctorCheck, DoctorCheckName, DoctorResult } from './doctor-types.ts'
 
 /**
  * 跑一个子进程并返回它的标准输出。实现由组合根注入（生产用 `sources/commands.ts`），
  * 于是 doctor 不新增子进程出口，测试也可以给一个只回固定文本的 fake。
+ * `options` 是这次调用的取消线与上限（§O）：组合根把它原样交给 `Commands.run`。
  */
-export type CommandsRunner = (program: string, args: readonly string[]) => Promise<string>
+export type CommandsRunner = (
+  program: string,
+  args: readonly string[],
+  options?: ProbeOptions
+) => Promise<string>
 
 /** doctor 需要的接线。 */
 export interface DoctorOptions {
@@ -51,6 +68,11 @@ export interface DoctorOptions {
    * 结论是「还没建库」（warn），而不是抛错或替他建一个。
    */
   readonly inspectDatabase?: () => DatabaseInspection
+  /**
+   * 探针的时间预算（§O）：`probeMs` 是单条 CLI 探针的上限，`signal` 是整次调用的取消。
+   * 只在 HTTP handler 里给；启动与面板路径不给（与 #64 之前逐字一致：探针不限时）。
+   */
+  readonly budget?: ProbeBudget
 }
 
 /** 端口探测的上限（§O：HTTP handler 不做超过 10 s 的等待；doctor 更短）。 */
@@ -62,6 +84,8 @@ export async function runDoctor(options: DoctorOptions): Promise<DoctorResult> {
   const now = options.now ?? (() => new Date().toISOString())
   const portOpen = options.portOpen ?? defaultPortProbe
   const run = options.run ?? missingRunner
+  // 探针的上限与外部取消只由 `probeRunner` 装（§O）：setup 检查走同一条。
+  const probe = probeRunner(options.budget)
 
   const checks: DoctorCheck[] = []
   checks.push(checkToken(stateDir))
@@ -70,8 +94,8 @@ export async function runDoctor(options: DoctorOptions): Promise<DoctorResult> {
   checks.push(checkDatabase(options.inspectDatabase))
   checks.push(checkCli(options.cliPath))
   checks.push(checkGitConfig(stateDir))
-  checks.push(await checkGh(run))
-  checks.push(await checkLark(run))
+  checks.push(await checkGh(run, probe))
+  checks.push(await checkLark(run, probe))
 
   return doctorResult(checks, { stateDir, at: now() })
 }
@@ -250,8 +274,9 @@ function checkCli(cliPath: string | undefined): DoctorCheck {
  * `<stateDir>/worker-gitconfig`：在不在、权限对不对。**只 stat，不读内容**——里面的身份/helper
  * 不是秘密，但 doctor 的红线是「只报有没有」（§O）。
  *
- * 三档读数：存在且 0600 → ok；不存在 → warn（启动时没写：agent 账号或邮箱未配，或写失败）；
- * 权限过宽 → warn（里面没有 token，但仍然是只有属主该读的文件）。
+ * 三档读数（这一项不跑子进程，所以不会有 `timeout`）：存在且 0600 → ok；不存在 → warn（启动时
+ * 没写：agent 账号或邮箱未配，或写失败）；权限过宽 → warn（里面没有 token，但仍然是只有属主
+ * 该读的文件）。
  */
 function checkGitConfig(stateDir: string): DoctorCheck {
   const inspection = inspectWorkerGitConfig(stateDir)
@@ -277,11 +302,17 @@ function checkGitConfig(stateDir: string): DoctorCheck {
 // ---------------------------------------------------------------- gh / lark-cli
 
 /** `gh auth status`：退出码 0 即已登录（输出不回显：里面有账号名）。 */
-async function checkGh(run: CommandsRunner): Promise<DoctorCheck> {
+async function checkGh(run: CommandsRunner, probe: Probe): Promise<DoctorCheck> {
   try {
-    await run('gh', ['auth', 'status'])
+    await probe('the GitHub CLI auth check', (options) => run('gh', ['auth', 'status'], options))
     return doctorCheck('gh', 'ok', 'the GitHub CLI reports a signed-in account')
   } catch (error) {
+    const timedOut = timeoutCheck(
+      'gh',
+      error,
+      'run `superagent doctor` again in a moment, or run `gh auth status` yourself to see why it is slow'
+    )
+    if (timedOut !== undefined) return timedOut
     if (isMissingProgram(error)) {
       return doctorCheck(
         'gh',
@@ -295,11 +326,17 @@ async function checkGh(run: CommandsRunner): Promise<DoctorCheck> {
 }
 
 /** `lark-cli auth status` 的 bot 身份（Feishu 是可选的：没装只是 warn）。 */
-async function checkLark(run: CommandsRunner): Promise<DoctorCheck> {
+async function checkLark(run: CommandsRunner, probe: Probe): Promise<DoctorCheck> {
   let text: string
   try {
-    text = await run('lark-cli', ['auth', 'status'])
+    text = await probe('the lark-cli auth check', (options) => run('lark-cli', ['auth', 'status'], options))
   } catch (error) {
+    const timedOut = timeoutCheck(
+      'lark',
+      error,
+      'run `superagent doctor` again in a moment, or run `lark-cli auth status` yourself to see why it is slow'
+    )
+    if (timedOut !== undefined) return timedOut
     if (isMissingProgram(error)) {
       return doctorCheck(
         'lark',
@@ -318,6 +355,19 @@ async function checkLark(run: CommandsRunner): Promise<DoctorCheck> {
     default:
       return doctorCheck('lark', 'warn', 'lark-cli reported an unexpected bot status', 'run `lark-cli auth status` yourself to see why')
   }
+}
+
+/**
+ * 一条探针在自己的上限内没回来 → `timeout`（§O）：detail 只写固定句子与毫秒数（`what` 从不
+ * 包含 argv），提示重跑一次。
+ *
+ * 两种截止期分得清：`ProbeTimeout` 是**这一项**慢；普通 `DeadlineError` 是**整次调用**被取消
+ * （handler 的总预算、停机）——那不是这一项的读数，原样抛上去，不编一个结论（§O 的「不吞」）。
+ */
+function timeoutCheck(name: DoctorCheckName, error: unknown, hint: string): DoctorCheck | undefined {
+  if (error instanceof ProbeTimeout) return doctorCheck(name, 'timeout', error.message, hint)
+  if (error instanceof DeadlineError) throw error
+  return undefined
 }
 
 /**

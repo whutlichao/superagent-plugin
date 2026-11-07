@@ -16,7 +16,7 @@
 import { ApiError, ERROR_CODES } from './errors.ts'
 import { runWrite } from './idempotency.ts'
 import type { RouteDefinition, RouteHandler } from './routes.ts'
-import { DeadlineError, withDeadline, type HandlerBudget } from '../infra/deadline.ts'
+import { DeadlineError, withinBudget, withDeadline, type HandlerBudget, type ProbeBudget } from '../infra/deadline.ts'
 import type { SetupBudget } from '../app/setup-types.ts'
 import { rotateApiToken } from '../infra/tokens.ts'
 import { backupNow } from '../app/backup.ts'
@@ -35,8 +35,15 @@ import type { Store } from '../app/store.ts'
 /**
  * `source labels` 的端口：组合根把 SourceRegistry 包成这个方法（`kind.refreshLabels` 的
  * 单实例版本）。没有它时（本票的树）路由如实回 `unavailable`，而不是编一个空标签表。
+ *
+ * `signal` 是这次请求的取消线（§O）：到点之后读取被取消（信号进 `CommandsHost` → `execFile`），
+ * 上一次的名单原样留着（不写库）。
  */
-export type SourceLabelsPort = (source: string, at: string) => Promise<Record<string, string>>
+export type SourceLabelsPort = (
+  source: string,
+  at: string,
+  signal?: AbortSignal
+) => Promise<Record<string, string>>
 
 /** handler 需要的接线。全部可选：缺哪个，对应路由保持 `stub()`。 */
 export interface OpsPorts {
@@ -59,11 +66,16 @@ export interface OpsPorts {
   readonly setupCheck?: SetupCheckPort
   /**
    * `doctor` 的执行者：组合根把它与面板的 `doctor` 请求接在**同一份**接线（选项）上；
-   * 缺省时 handler 用本文件拼的那份选项（`store.inspect()` + 注入的 runner）。
+   * `budget` 是这次请求的探针上限与取消线（§O）。缺省时 handler 用本文件拼的那份选项
+   * （`store.inspect()` + 注入的 runner）。
    */
-  readonly doctor?: () => Promise<DoctorResult>
+  readonly doctor?: (budget?: ProbeBudget) => Promise<DoctorResult>
   /** `setup check` 的时间预算（§O）；缺省 `SETUP_CHECK_BUDGET`，测试注入小预算。 */
   readonly setupCheckBudget?: HandlerBudget
+  /** `doctor` 的时间预算（§O）；缺省 `DOCTOR_BUDGET`，测试注入小预算。 */
+  readonly doctorBudget?: HandlerBudget
+  /** `source labels` 的时间预算（§O）；缺省 `SOURCE_LABELS_BUDGET`，测试注入小预算。 */
+  readonly sourceLabelsBudget?: HandlerBudget
 }
 
 /**
@@ -88,6 +100,30 @@ export type SetupCheckPort = (budget?: SetupBudget) => Promise<{
  * 并写明「稍后重试」；**不**把超时折成一条「缺什么」的 setup 结论。
  */
 export const SETUP_CHECK_BUDGET: HandlerBudget = { probeMs: 2_000, totalMs: 9_000 }
+
+/**
+ * `POST doctor` 的时间预算（§O「超时」行）。
+ *
+ * 八项里只有两个子进程探针（`gh auth status`、`lark-cli auth status`），各给 2 s 上限：到点先
+ * 取消（信号进 `execFile`，子进程被 SIGTERM 掐掉），**只把这一项标成 `timeout`**，其余项照常
+ * 给读数（§G.2 的 doctor 行）；没查完不能写成 ok，也不是 fail。
+ *
+ * 整次 9 s 是**外居上限**：实测挂住两条 CLI 探针时最坏约 4.3 s（2 s + 2 s + 0.2 s 的端口探测），
+ * 再加文件 stat 与库自检。所以正常路径远不会到 9 s；它兜的是「端口探测或库自检这类非探针
+ * 路径挂住」（那些没有探针上限）。到点才返回固定码 `unavailable` + 「稍后重试」，不留半份
+ * 结果——一次没跑完的诊断不能当好结论看。总预算在 §O 的 10 s 天花板之下。
+ */
+export const DOCTOR_BUDGET: HandlerBudget = { probeMs: 2_000, totalMs: 9_000 }
+
+/**
+ * `POST sources/:id/labels` 的时间预算（§O「超时」行）。
+ *
+ * 刷新显示名是**一个**外部读取（`lark-cli im +chat-list --page-all`）：单条探针 2 s 到点就取消，
+ * 整次 5 s 是外居上限（将来这条路径多一个读取时它仍然成立）。与 doctor 不同，这是一次**动作**：
+ * 任一上限到点都返回固定码 `unavailable` + 「稍后重试」，不返回半份成功，也不写库（上一次的
+ * 名单原样留着，`kind.refreshLabels` 只在读成功后写）。总预算在 §O 的 10 s 天花板之下。
+ */
+export const SOURCE_LABELS_BUDGET: HandlerBudget = { probeMs: 2_000, totalMs: 5_000 }
 
 /** 一条被接线的路由：`<METHOD> <path>` → handler。 */
 export type OpsHandlers = ReadonlyMap<string, RouteHandler>
@@ -126,13 +162,16 @@ export function createOpsHandlers(options: {
   )
 
   // ---- source labels（§G.2「刷新显示名」）：读外部、写 kv，按 request id 幂等。
+  // §O 的预算：探针 2 s、整次 5 s；任一上限到点先取消（信号进 `CommandsHost` → `execFile`）
+  // 再返回 `unavailable`，不写库、不返回半份成功。
   const labels = options.ports?.sourceLabels
+  const labelsBudget = options.ports?.sourceLabelsBudget ?? SOURCE_LABELS_BUDGET
   if (labels !== undefined) {
     handlers.set('POST sources/:id/labels', ({ params, at, body, token, requestId }) => {
       const source = params['id'] ?? ''
       if (source.length === 0) throw new ApiError(ERROR_CODES.invalidParams, 'a source id is required')
       return idempotent(options.store, requestId ?? requestIdFrom(body), at, token, async () => {
-        const refreshed = await labels(source, at)
+        const refreshed = await labelsWithin(labels, source, at, labelsBudget)
         const result: SourceLabelsResult = { source, labels: refreshed }
         return result
       })
@@ -190,6 +229,8 @@ export function createOpsHandlers(options: {
   }
 
   // ---- doctor（§G.2、§N.4）：本地诊断；只报有没有，不报是什么。
+  // §O 的预算：单条 CLI 探针 2 s（到点只把这一项标 `timeout`，见 `app/doctor.ts`），整次 9 s
+  // 到点先取消再返回 `unavailable`——一次没跑完的诊断不留半份结果。
   const doctorOptions: DoctorOptions = {
     stateDir: options.stateDir,
     ...(options.ports?.run === undefined ? {} : { run: options.ports.run }),
@@ -200,10 +241,28 @@ export function createOpsHandlers(options: {
     now,
     inspectDatabase: () => options.store.inspect()
   }
+  const doctorPort = options.ports?.doctor
+  const doctorBudget = options.ports?.doctorBudget ?? DOCTOR_BUDGET
   handlers.set('POST doctor', async () => {
-    const result: DoctorResult =
-      options.ports?.doctor === undefined ? await runDoctor(doctorOptions) : await options.ports.doctor()
-    return result
+    const probeMs = doctorBudget.probeMs
+    return withDeadline(
+      (signal) => {
+        const budget: ProbeBudget = { ...(probeMs === undefined ? {} : { probeMs }), signal }
+        return doctorPort === undefined
+          ? runDoctor({ ...doctorOptions, budget })
+          : doctorPort(budget)
+      },
+      { ms: doctorBudget.totalMs, what: 'the doctor checks' }
+    ).catch((error: unknown) => {
+      if (error instanceof DeadlineError) {
+        throw new ApiError(
+          ERROR_CODES.unavailable,
+          `The doctor checks did not finish within ${doctorBudget.totalMs} ms; retry later`,
+          { reason: 'timeout' }
+        )
+      }
+      throw error
+    })
   })
 
   return handlers
@@ -249,6 +308,33 @@ function setupCheckWithin(
         ERROR_CODES.unavailable,
         `The setup check did not finish within ${budget.totalMs} ms; retry later`,
         { reason: 'timeout' }
+      )
+    }
+    throw error
+  })
+}
+
+/**
+ * 在预算内读一次显示名（§O）：探针上限与总预算各自到点都**先取消再拒绝**，两者都折成固定码
+ * `unavailable` + 「稍后重试」。
+ *
+ * 这是一次动作，所以不存在「部分完成」这种结论：没能读完就什么都不写（名单的写在 kind 里，
+ * 只在读成功后发生），调用方稍后重试。
+ */
+function labelsWithin(
+  port: SourceLabelsPort,
+  source: string,
+  at: string,
+  budget: HandlerBudget
+): Promise<Record<string, string>> {
+  const what = `the ${source} label read`
+  const ms = budget.probeMs ?? budget.totalMs
+  return withinBudget((signal) => port(source, at, signal), budget, what).catch((error: unknown) => {
+    if (error instanceof DeadlineError) {
+      throw new ApiError(
+        ERROR_CODES.unavailable,
+        `The ${source} label read did not finish within ${ms} ms; retry later`,
+        { source, reason: 'timeout' }
       )
     }
     throw error

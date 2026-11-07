@@ -197,16 +197,19 @@ export function healthMark(state: HealthState): Mark {
   }
 }
 
-/** doctor 的三档（§G.2、§N.4）：只报有没有。 */
-export type DoctorState = 'ok' | 'warn' | 'fail'
+/** doctor 的四档（§G.2、§N.4）：只报有没有；`timeout` 是「没查完」，单独一档。 */
+export type DoctorState = 'ok' | 'warn' | 'timeout' | 'fail'
 
-/** doctor 结论的标记：失败最重，警告提醒，就绪是成功。 */
+/** doctor 结论的标记：失败最重，超时是安静的中性档（不是警告），警告提醒，就绪是成功。 */
 export function doctorMark(state: DoctorState): Mark {
   switch (state) {
     case 'ok':
       return { labelKey: 'deployment.doctorState.ok', tone: 'success', icon: 'check' }
     case 'warn':
       return { labelKey: 'deployment.doctorState.warn', tone: 'warning', icon: 'warning' }
+    case 'timeout':
+      // 中性色：超时意味着「没结论」，不把一条没跑完的检查标成警告（那会被读成配置问题）。
+      return { labelKey: 'deployment.doctorState.timeout', tone: 'neutral', icon: 'info' }
     default:
       return { labelKey: 'deployment.doctorState.fail', tone: 'danger', icon: 'error' }
   }

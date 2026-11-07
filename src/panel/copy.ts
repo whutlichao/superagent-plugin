@@ -409,11 +409,12 @@ export const COPY = {
   'deployment.doctorRun': { zh: '运行诊断', en: 'Run doctor' },
   'deployment.doctorRunning': { zh: '正在诊断…', en: 'Running doctor…' },
   'deployment.doctorSummary': {
-    zh: '{ok} 就绪 · {warn} 警告 · {fail} 失败',
-    en: '{ok} ok · {warn} warn · {fail} fail'
+    zh: '{ok} 就绪 · {timeout} 超时 · {warn} 警告 · {fail} 失败',
+    en: '{ok} ok · {timeout} timed out · {warn} warn · {fail} fail'
   },
   'deployment.doctorState.ok': { zh: '就绪', en: 'Ok' },
   'deployment.doctorState.warn': { zh: '警告', en: 'Warning' },
+  'deployment.doctorState.timeout': { zh: '超时', en: 'Timed out' },
   'deployment.doctorState.fail': { zh: '失败', en: 'Failed' },
   'deployment.doctorCheck': { zh: '检查项', en: 'Check' },
   'deployment.doctorDetail': { zh: '结论', en: 'Detail' },

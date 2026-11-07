@@ -399,16 +399,17 @@ function RouterSection(props: { readonly locale: string; readonly view: Deployme
   )
 }
 
-/** doctor 的三档计数（一句话）。 */
+/** doctor 的四档计数（一句话）。 */
 function doctorSummary(locale: string, view: DoctorView): string {
   return translate(locale, 'deployment.doctorSummary', {
     ok: view.summary.ok,
+    timeout: view.summary.timeout,
     warn: view.summary.warn,
     fail: view.summary.fail
   })
 }
 
-/// 诊断结果（§G.2）：三档计数 + 每个检查项一行（结论与下一步都写在同一格里）。
+/// 诊断结果（§G.2）：四档计数 + 每个检查项一行（结论与下一步都写在同一格里）。
 function DoctorSection(props: { readonly locale: string; readonly view: DeploymentView }): OrcaElement {
   const locale = props.locale
   const result = read(doctor)

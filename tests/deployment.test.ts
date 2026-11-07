@@ -19,6 +19,7 @@ import { dispatch } from '../src/worker/cli/commands'
 import { parseArgs } from '../src/worker/cli/io'
 import { readApiToken } from '../src/worker/infra/tokens'
 import { openBoot, settingsOf } from './support/boot'
+import { openStore } from '../src/worker/app/store'
 import { tempStateDir } from './support/state'
 
 /** 一个被记录的 CLI 调用（断言「探针真的问了 CLI」与「没问多余的东西」）。 */
@@ -656,6 +657,114 @@ describe('the setup check on the composition root', () => {
       assert.deepEqual(h.handle.deployment().setup, before.setup)
     } finally {
       await h.cleanup()
+    }
+  })
+
+  test('a hanging doctor probe is a timeout on that item: the other checks keep their readings and nothing is written', async () => {
+    // 真 HTTP 往返（真库、真 loopback）：`gh auth status` 挂住，其余七项照常。
+    const h = await openBoot()
+    const store = openStore({ stateDir: h.stateDir })
+    try {
+      const port = h.handle.port() as number
+      const before = [...store.kvKeys()]
+      const written = h.commands.calls.length
+
+      // 从现在起 `gh auth status` 永不返回：探针 2 s 到点必须被取消，而不是陪着它挂。
+      h.commands.hang('gh', ['auth', 'status'])
+      const started = Date.now()
+      const doctor = await runCli(h.stateDir, port, ['doctor'])
+      const elapsed = Date.now() - started
+
+      // 跑完就是成功：200/退出 0，逐项结论在 `result.checks` 里（超时不是一个退出码）。
+      assert.equal(doctor.exit, 0, JSON.stringify(doctor.envelope))
+      const envelope = doctor.envelope as { ok: true; result: Record<string, unknown> }
+      assert.deepEqual(
+        (envelope.result['checks'] as readonly { name: string }[]).map((check) => check.name),
+        ['token', 'port', 'lock', 'database', 'cli', 'gitconfig', 'gh', 'lark']
+      )
+      const checks = envelope.result['checks'] as readonly {
+        name: string
+        state: string
+        detail: string
+        hint?: string
+      }[]
+      const gh = checks.find((check) => check.name === 'gh')
+      // 超时如实标记：不是 ok（不伪装查过了），也不是 fail（没查完不等于坏了）。
+      assert.equal(gh?.state, 'timeout')
+      assert.equal(String(gh?.detail).includes('2000 ms'), true, String(gh?.detail))
+      assert.equal(typeof gh?.hint, 'string', 'a timeout says what to do next')
+      // 四档计数如实：这一条是超时，没有 fail（跑完就是一次成功的诊断）。
+      const summary = envelope.result['summary'] as Record<string, number>
+      assert.equal(summary['timeout'], 1)
+      assert.equal(summary['fail'], 0)
+      // 其余项照常：端口真的回答，token 与库都读得到。
+      assert.equal(checks.find((check) => check.name === 'port')?.state, 'ok')
+      assert.equal(checks.find((check) => check.name === 'token')?.state, 'ok')
+      assert.equal(checks.find((check) => check.name === 'database')?.state, 'ok')
+      // §O 的探针上限：整次请求在 9 s 的总预算里返回（这里一定远早于它）。
+      assert.ok(elapsed < 5_000, `the handler returned after ${elapsed} ms`)
+
+      // 取消传到了 CLI：挂住的那次调用拿到的信号已经取消，并带着同一个上限。
+      const hung = h.commands.calls.slice(written).find((call) => call.program === 'gh')
+      assert.equal(hung?.options.signal?.aborted, true, 'the probe signal is aborted')
+      assert.equal(hung?.options.timeoutMs, 2_000, 'the subprocess gets the same cap')
+      // 诊断不写库。
+      assert.deepEqual([...store.kvKeys()], before)
+    } finally {
+      store.close()
+      await h.cleanup()
+    }
+  })
+
+  test('a hanging source-labels read returns unavailable inside the budget, cancels the read and keeps the old labels', async () => {
+    const stateDir = tempStateDir()
+    const h = await openBoot({
+      stateDir,
+      // Feishu 装上但不开：`source labels` 不看开关，读的是 kind 的 `refreshLabels`。
+      settings: {
+        ...settingsOf(stateDir),
+        sources: {
+          github: { enabled: true, config: { repository: 'acme/widgets', cli: 'gh', pollSeconds: 60 } },
+          feishu: { enabled: false, config: { cli: 'lark-cli' } }
+        }
+      },
+      scripts: (commands) => {
+        commands.script(['im', '+chat-list', '--as', 'bot'], () =>
+          JSON.stringify({ chats: [{ chat_id: 'oc_all', name: 'Build alerts', chat_mode: 'group' }] })
+        )
+      }
+    })
+    const store = openStore({ stateDir: stateDir })
+    try {
+      const port = h.handle.port() as number
+      // 先成功一次：名单写进 kv（证明「超时之后这份名单没有被覆盖成空表」）。
+      const first = await runCli(h.stateDir, port, ['source', 'labels', 'feishu'])
+      assert.equal(first.exit, 0, JSON.stringify(first.envelope))
+      assert.deepEqual(store.kvGet('source-labels:feishu'), { oc_all: 'Build alerts' })
+      const written = h.commands.calls.length
+
+      // 从现在起 `lark-cli im +chat-list` 永不返回：探针到点必须被取消，而不是陪着它挂。
+      h.commands.hang('lark-cli', ['im', '+chat-list'])
+      const started = Date.now()
+      const labels = await runCli(h.stateDir, port, ['source', 'labels', 'feishu'])
+      const elapsed = Date.now() - started
+
+      // 这是一次动作：超预算就是固定码 `unavailable` + 「稍后重试」，没有半份成功。
+      assert.equal(labels.exit, 3, JSON.stringify(labels.envelope))
+      const envelope = labels.envelope as { ok: false; error: { code: string; message: string } }
+      assert.equal(envelope.error.code, 'unavailable')
+      assert.ok(envelope.error.message.includes('retry later'), envelope.error.message)
+      assert.ok(elapsed < 5_000, `the handler returned after ${elapsed} ms`)
+
+      // 取消传到了 CLI：信号已取消（真实现里子进程被 SIGTERM 掐掉）。
+      const hung = h.commands.calls.slice(written).find((call) => call.program === 'lark-cli')
+      assert.equal(hung?.options.signal?.aborted, true, 'the read signal is aborted')
+      // 没有 DB 写入：上一次的名单原样留着。
+      assert.deepEqual(store.kvGet('source-labels:feishu'), { oc_all: 'Build alerts' })
+    } finally {
+      store.close()
+      await h.cleanup()
+      rmSync(stateDir, { recursive: true, force: true })
     }
   })
 

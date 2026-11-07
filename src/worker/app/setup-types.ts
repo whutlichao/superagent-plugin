@@ -6,6 +6,7 @@
 //
 // 红线（§O、§N.5）：结论只写「有没有 / 缺什么」，绝不出现 token、密钥或消息正文。
 import type { WorkerGitConfigWrite } from '../infra/gitconfig.ts'
+import type { ProbeBudget, ProbeOptions } from '../infra/deadline.ts'
 
 /** setup 问题归属的部件（决定谁被挡住，也决定面板放在哪张卡上）。 */
 export type SetupPlace = 'orca' | 'state' | 'executor' | 'github' | 'feishu'
@@ -81,21 +82,18 @@ export interface RepoSelectorLike {
 /**
  * 一次外部探针的取消信息（§O「超时」行）：截止期到点时 handler 先取消再拒绝，
  * 取消了还得让子进程知道——`Commands.run` 把 `signal` 交给 `execFile`，子进程被 SIGTERM 掐掉。
+ *
+ * 形状只有一份（`infra/deadline.ts` 的 `ProbeOptions`）：doctor 的探针经的是同一条取消线。
  */
-export interface SetupProbeOptions {
-  readonly signal?: AbortSignal
-  /** 探针的上限（毫秒）：实现该把它交给子进程（`execFile` 的 `timeout`）。 */
-  readonly timeoutMs?: number
-}
+export type SetupProbeOptions = ProbeOptions
 
 /**
  * 一次 setup 检查的时间预算：`probeMs` 是单条探针的上限，`signal` 是外部取消（HTTP handler
  * 的总预算）。两条都省略就是启动路径：探针不限时，与 #64 之前逐字一致。
+ *
+ * 与 doctor 的预算同形，所以只有 `infra/deadline.ts` 的 `ProbeBudget` 一份。
  */
-export interface SetupBudget {
-  readonly probeMs?: number
-  readonly signal?: AbortSignal
-}
+export type SetupBudget = ProbeBudget
 
 /** 外部世界的注入点；缺省的实现要么安全（不跑子进程）、要么如实失败。 */
 export interface SetupPorts {

@@ -659,14 +659,20 @@ function promptsHost(state: PanelState) {
   }
 }
 
-/** doctor 的三档都出现一次（check 只看渲染，不真跑子进程）。 */
+/** doctor 的四档都出现一次（check 只看渲染，不真跑子进程）。 */
 const DOCTOR_FIXTURE: DoctorView = {
   checks: [
     { name: 'token', state: 'ok', detail: 'the operator token file is present (0600)' },
+    {
+      name: 'gh',
+      state: 'timeout',
+      detail: 'the GitHub CLI auth check did not finish within 2000 ms',
+      hint: 'run `superagent doctor` again in a moment'
+    },
     { name: 'lark', state: 'warn', detail: 'lark-cli is not installed', hint: 'install lark-cli when you use Feishu' },
     { name: 'port', state: 'fail', detail: 'nothing answers on the recorded port' }
   ],
-  summary: { ok: 1, warn: 1, fail: 1 },
+  summary: { ok: 1, warn: 1, fail: 1, timeout: 1 },
   at: '2026-11-07T03:20:00.000Z',
   note: 'doctor diagnoses this machine (present or missing, never a value); the setup check decides whether the plugin may start: superagent setup check'
 }

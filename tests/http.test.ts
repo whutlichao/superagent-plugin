@@ -58,7 +58,7 @@ import { SCHEMA_VERSION } from '../src/worker/app/schema'
 import { runIdempotent } from '../src/worker/http/idempotency'
 import { createDecisionHandlers, withDecisionHandlers } from '../src/worker/http/decisions'
 import { POLICY_SYNC_BUDGET, createSettingsHandlers, withSettingsHandlers } from '../src/worker/http/settings'
-import { SETUP_CHECK_BUDGET } from '../src/worker/http/ops'
+import { DOCTOR_BUDGET, SETUP_CHECK_BUDGET, SOURCE_LABELS_BUDGET } from '../src/worker/http/ops'
 import type { OpsPorts } from '../src/worker/http/ops'
 import type { SetupBudget } from '../src/worker/app/setup-types'
 import { createSettings } from '../src/worker/app/settings'
@@ -752,6 +752,11 @@ test('the handler budgets stay under the §O ten-second ceiling, with a 2 s prob
   assert.ok(POLICY_SYNC_BUDGET.totalMs < 10_000, 'policy sync finishes inside ten seconds')
   // policy sync 是一次多页读取：没有逐探针上限，总预算就是它的线。
   assert.equal(POLICY_SYNC_BUDGET.probeMs, undefined)
+  // doctor 与 `source labels` 同形：2 s 一条探针，总预算各有一条（都低于 10 s 的天花板）。
+  assert.equal(DOCTOR_BUDGET.probeMs, 2_000)
+  assert.ok(DOCTOR_BUDGET.totalMs < 10_000, 'doctor finishes inside ten seconds')
+  assert.equal(SOURCE_LABELS_BUDGET.probeMs, 2_000)
+  assert.equal(SOURCE_LABELS_BUDGET.totalMs, 5_000)
 })
 
 test('a hanging setup check returns unavailable inside the budget, cancels the probes and writes nothing', async () => {
@@ -784,6 +789,111 @@ test('a hanging setup check returns unavailable inside the budget, cancels the p
     // 超时的请求什么都不写：幂等记录也没有（失败不缓存）。
     const written = harness.store.kvKeys().filter((key) => key.startsWith('request-id:'))
     assert.deepEqual(written, [])
+  } finally {
+    harness.close()
+  }
+})
+
+test('a hanging doctor probe marks that check timed out in a 200: the other checks keep their readings', async () => {
+  // 单条 CLI 探针到点 ≠ 整次失败（§O）：doctor 仍给 200，超时那一项标 `timeout`，其余项照常。
+  const harness = await startHarness({
+    ops: {
+      // 一个永不返回的子进程（真实现里信号进 `execFile`，子进程被 SIGTERM 掐掉）。
+      run: () => new Promise(() => undefined),
+      portOpen: async () => true,
+      doctorBudget: { probeMs: 10, totalMs: 500 }
+    }
+  })
+  try {
+    const before = [...harness.store.kvKeys()]
+    const started = Date.now()
+    const observed = await harness.call('/superagent/api/doctor', { method: 'POST', body: {} })
+    const elapsed = Date.now() - started
+    assert.equal(observed.status, 200, observed.text)
+    const result = resultOf(observed) as {
+      readonly checks: readonly { readonly name: string; readonly state: string; readonly detail: string; readonly hint?: string }[]
+      readonly summary: Record<string, number>
+    }
+    assert.equal(elapsed < 400, true, `the handler returned after ${elapsed} ms`)
+    // 八项照旧都在，顺序是设计里的顺序。
+    assert.deepEqual(
+      result.checks.map((check) => check.name),
+      ['token', 'port', 'lock', 'database', 'cli', 'gitconfig', 'gh', 'lark']
+    )
+    // 挂住的两条 CLI 探针：`timeout`（不是 ok），detail 是固定句子、带毫秒数、不抄子进程输出。
+    for (const name of ['gh', 'lark']) {
+      const check = result.checks.find((entry) => entry.name === name)
+      assert.equal(check?.state, 'timeout', name)
+      assert.ok(String(check?.detail).includes('10 ms'), String(check?.detail))
+      assert.equal(typeof check?.hint, 'string', `${name} 给下一步`)
+    }
+    // 其余项照常给读数（端口探测与库自检都真的跑了；超时没有把别的项带成 ok/fail）。
+    assert.equal(result.checks.find((entry) => entry.name === 'port')?.state, 'ok')
+    assert.equal(result.checks.find((entry) => entry.name === 'token')?.state, 'ok')
+    assert.equal(result.checks.find((entry) => entry.name === 'database')?.state, 'ok')
+    assert.equal(result.summary['timeout'], 2)
+    assert.equal(result.summary['fail'], 0)
+    // 诊断不写库。
+    assert.deepEqual(harness.store.kvKeys(), before)
+  } finally {
+    harness.close()
+  }
+})
+
+test('a doctor call that blows the whole budget returns unavailable and leaves no partial result', async () => {
+  // 非探针路径挂住（端口探测没有自己的探针上限？它有 200 ms；这里让注入的实现永挂）：
+  // 整次预算到点 → 固定码 `unavailable` + 「稍后重试」，不带半份结果。
+  const harness = await startHarness({
+    ops: {
+      portOpen: () => new Promise(() => undefined),
+      doctorBudget: { probeMs: 10, totalMs: 40 }
+    }
+  })
+  try {
+    const before = [...harness.store.kvKeys()]
+    const started = Date.now()
+    const observed = await harness.call('/superagent/api/doctor', { method: 'POST', body: {} })
+    const elapsed = Date.now() - started
+    assert.equal(observed.status, 503)
+    const error = failureOf(observed)
+    assert.equal(error.code, 'unavailable')
+    assert.ok(error.message.includes('retry later'), error.message)
+    assert.ok(elapsed < 1_000, `the handler returned after ${elapsed} ms`)
+    assert.deepEqual(harness.store.kvKeys(), before)
+  } finally {
+    harness.close()
+  }
+})
+
+test('a hanging source-labels read returns unavailable inside the budget, cancels the read and writes nothing', async () => {
+  let handed: { readonly signal?: AbortSignal } | undefined
+  const harness = await startHarness({
+    ops: {
+      // §O：2 s/条 + 5 s 总预算；用例把总预算压到 40 ms，断言的是「到点就返回」。
+      sourceLabelsBudget: { probeMs: 10, totalMs: 40 },
+      sourceLabels: (_source, _at, signal) => {
+        handed = { ...(signal === undefined ? {} : { signal }) }
+        return new Promise(() => undefined)
+      }
+    }
+  })
+  try {
+    const before = [...harness.store.kvKeys()]
+    const started = Date.now()
+    const observed = await harness.call('/superagent/api/sources/feishu/labels', {
+      method: 'POST',
+      headers: { 'x-superagent-request-id': 'labels-1' }
+    })
+    const elapsed = Date.now() - started
+    assert.equal(observed.status, 503)
+    const error = failureOf(observed)
+    assert.equal(error.code, 'unavailable')
+    assert.ok(error.message.includes('retry later'), error.message)
+    assert.ok(elapsed < 1_000, `the handler returned after ${elapsed} ms`)
+    // 取消传到了读取：真实现把它交给 `CommandsHost`，`lark-cli` 因此被 SIGTERM。
+    assert.equal(handed?.signal?.aborted, true)
+    // 超时的读取什么都不写：没有名单，也没有幂等记录（失败不缓存）。
+    assert.deepEqual(harness.store.kvKeys(), before)
   } finally {
     harness.close()
   }
