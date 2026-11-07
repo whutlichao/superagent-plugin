@@ -116,7 +116,7 @@ export interface RouterToolHost {
   readonly candidate: (triggerId: string) => Candidate | undefined
   /** 当前的 Policy 块（规则与 accept mode 是内容真相，§K.4）。 */
   readonly policy: () => AssessmentPolicy
-  /** 当前的 Policy 版本（§K.5；#25 之前是占位串）。 */
+  /** 当前的 Policy 版本（§K.5 的内容哈希）。 */
   readonly policyVersion: () => string
   /** `Engine.decide`。 */
   readonly decide: (triggerId: string, outcome: Outcome) => Decision

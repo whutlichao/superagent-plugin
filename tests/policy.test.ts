@@ -11,9 +11,16 @@
 import { describe, test } from 'node:test'
 import assert from 'node:assert/strict'
 import { Engine, MemoryRepositories, STRENGTHS } from '../src/worker/core/index.ts'
+import { createRepositories } from '../src/worker/app/repositories.ts'
+import { createPolicySettingsPort, createSettings } from '../src/worker/app/settings.ts'
+import type { SettingsOrigin, SettingsSaveResult } from '../src/worker/app/settings.ts'
+import { settingsVersionKey } from '../src/worker/app/kv.ts'
+import { openTempStore } from './support/state.ts'
 import type {
   AcceptMode,
   Candidate,
+  Mandate,
+  PolicyEffect,
   ScopeResult,
   Thread,
   Ticket,
@@ -25,15 +32,17 @@ import {
   ADMISSION_OPTIONS,
   assessmentOutcome,
   createPolicy,
-  UNVERSIONED_POLICY,
+  policyEffects,
+  policyVersion,
   validatePolicy
 } from '../src/worker/policy/index.ts'
 import type {
   AdmissionRow,
   AdmissionTableConfig,
+  PolicyBlock,
   PolicyKindView
 } from '../src/worker/policy/index.ts'
-import { object, string } from '../src/worker/infra/schema.ts'
+import { array, object, string } from '../src/worker/infra/schema.ts'
 
 /** 固定的测试时刻。 */
 const AT = '2026-11-07T00:00:00.000Z'
@@ -102,6 +111,25 @@ interface FixtureInput {
   readonly observe?: readonly string[]
   readonly allowed?: readonly { id: string; name?: string }[]
   readonly bots?: readonly string[]
+  /** 被停用的规则 id（`copy` 是夹具唯一的一条规则）。 */
+  readonly disabledRules?: readonly string[]
+  /** 夹具唯一那条规则的写法（影响面的测试要改它的名字或说明）。 */
+  readonly rule?: { readonly name?: string; readonly en?: string; readonly zh?: string }
+}
+
+/** 夹具 kind 的 Policy 部分 schema：`allowed` / `bots` 之外再认一个 kind 自有的监听键。 */
+const KIND_SCHEMA = object({
+  allowed: array(object({ id: string(), name: string().optional() }).strict()).default([]),
+  bots: array(object({ id: string() }).strict()).default([]),
+  syncChat: string().optional()
+}).strict()
+
+/** 夹具 kind：准入行 + 一个 kind 自有的监听键（`syncChat`，不属于 Policy 内容，§K.5）。 */
+function fixtureKind(observe: readonly string[]): PolicyKindView {
+  return {
+    rows: () => rowsOf(observe),
+    extras: (section: Record<string, unknown>) => KIND_SCHEMA.safeParse(section)
+  }
 }
 
 /** 造一个已校验的 Policy 块 + 它的 Gate；默认 observe 模式、只观察 `oc_team`。 */
@@ -109,7 +137,12 @@ function fixture(input: FixtureInput = {}) {
   const observe = input.observe ?? [TEAM]
   const raw = {
     rules: [
-      { id: 'copy', name: 'Copy fixes', instruction: { zh: '改错别字', en: 'Fix typos' }, enabled: true }
+      {
+        id: 'copy',
+        name: input.rule?.name ?? 'Copy fixes',
+        instruction: { zh: input.rule?.zh ?? '改错别字', en: input.rule?.en ?? 'Fix typos' },
+        enabled: !(input.disabledRules ?? []).includes('copy')
+      }
     ],
     acceptMode: input.acceptMode ?? 'observe',
     sources: {
@@ -122,7 +155,7 @@ function fixture(input: FixtureInput = {}) {
     eval: { timeoutSeconds: 300 }
   }
   const kinds = (source: string): PolicyKindView | undefined =>
-    source === 'chat' ? { rows: () => rowsOf(observe) } : undefined
+    source === 'chat' ? fixtureKind(observe) : undefined
   const parsed = validatePolicy(raw, { kinds })
   assert.equal(parsed.success, true, JSON.stringify(parsed))
   if (!parsed.success) throw new Error('unreachable')
@@ -130,7 +163,6 @@ function fixture(input: FixtureInput = {}) {
     block: () => parsed.data,
     sources: { scope: (trigger: Trigger) => scopeOf(trigger, observe) },
     rows: (source: string) => (source === 'chat' ? rowsOf(observe) : []),
-    version: () => UNVERSIONED_POLICY
   })
   return { policy, block: parsed.data }
 }
@@ -438,7 +470,6 @@ function fixtureRows(cells: Partial<Record<string, Partial<Record<string, boolea
     block: () => parsed.data,
     sources: { scope: (trigger: Trigger) => scopeOf(trigger, observe) },
     rows: (source: string) => (source === 'chat' ? kinds('chat')!.rows() : []),
-    version: () => UNVERSIONED_POLICY
   })
   return { policy }
 }
@@ -753,8 +784,7 @@ function engineHarness(initial: FixtureInput = {}) {
       block: () => current.block,
       sources: scope,
       rows: (source: string) => (source === 'chat' ? rowsOf(initial.observe ?? [TEAM]) : []),
-      version: () => UNVERSIONED_POLICY
-    })
+      })
   const engine = new Engine({
     repo,
     scope,
@@ -880,5 +910,622 @@ describe('accept mode and the assessment outcome (§K.4)', () => {
     assert.deepEqual(ticket?.mandate.basis.rules, ['copy'])
     assert.equal(ticket?.mandate.strength, 'inferred')
     assert.equal(ticket?.mandate.scope, 'one typo')
+  })
+})
+
+/**
+ * 一份用于版本测试的原始 Policy 块。`sources.chat` 带一个 kind 自有的键（`syncChat`），
+ * 它属于 Source 的监听配置，不属于谁能授权的 Policy（§K.5）。
+ */
+function rawPolicy(
+  overrides: {
+    readonly rules?: unknown[]
+    readonly acceptMode?: string
+    readonly allowed?: unknown[]
+    readonly bots?: unknown[]
+    readonly admission?: unknown
+    readonly syncChat?: string
+    readonly timeoutSeconds?: number
+  } = {}
+): unknown {
+  return {
+    rules: overrides.rules ?? [
+      { id: 'copy', name: 'Copy fixes', instruction: { zh: '改错别字', en: 'Fix typos' }, enabled: true }
+    ],
+    acceptMode: overrides.acceptMode ?? 'auto',
+    sources: {
+      chat: {
+        allowed: overrides.allowed ?? [{ id: MEMBER, name: 'Alice' }],
+        bots: overrides.bots ?? [{ id: BOT }],
+        admission: overrides.admission ?? { [TEAM]: { unlistedAddressed: 'explicit' } },
+        ...(overrides.syncChat === undefined ? {} : { syncChat: overrides.syncChat })
+      }
+    },
+    eval: { timeoutSeconds: overrides.timeoutSeconds ?? 300 }
+  }
+}
+
+/** 一份已校验的 Policy 块（失败直接让测试炸掉）。 */
+function blockOf(raw: unknown): PolicyBlock {
+  const parsed = validatePolicy(raw)
+  assert.equal(parsed.success, true, JSON.stringify(parsed))
+  if (!parsed.success) throw new Error('unreachable')
+  return parsed.data
+}
+
+describe('the policy version', () => {
+  test('is a twelve-character content hash of who may authorise, not of what the Sources listen to', () => {
+    const version = policyVersion(blockOf(rawPolicy()))
+    assert.match(version, /^[0-9a-f]{12}$/, 'sha256 的前 12 位十六进制（§K.5）')
+    assert.equal(policyVersion(blockOf(rawPolicy())), version, 'the same content hashes the same')
+    // 配置决定什么进入系统，Policy 决定谁能授权：kind 自有的监听键与 eval 预算都不参与。
+    assert.equal(policyVersion(blockOf(rawPolicy({ syncChat: 'oc_other' }))), version, 'listening config')
+    assert.equal(policyVersion(blockOf(rawPolicy({ timeoutSeconds: 120 }))), version, 'the eval budget')
+    // 键的书写顺序不是内容。
+    const reordered = blockOf({
+      eval: { timeoutSeconds: 300 },
+      sources: {
+        chat: {
+          admission: { [TEAM]: { unlistedAddressed: 'explicit' } },
+          bots: [{ id: BOT }],
+          allowed: [{ id: MEMBER, name: 'Alice' }]
+        }
+      },
+      acceptMode: 'auto',
+      rules: [
+        { id: 'copy', name: 'Copy fixes', instruction: { zh: '改错别字', en: 'Fix typos' }, enabled: true }
+      ]
+    })
+    assert.equal(policyVersion(reordered), version)
+  })
+
+  test('changes with every authorisation input: the rules, the accept mode, the lists and the admission table', () => {
+    const base = policyVersion(blockOf(rawPolicy()))
+    const variants: Readonly<Record<string, unknown>> = {
+      'a rule disabled': rawPolicy({
+        rules: [
+          { id: 'copy', name: 'Copy fixes', instruction: { zh: '改错别字', en: 'Fix typos' }, enabled: false }
+        ]
+      }),
+      'a rule instruction edited': rawPolicy({
+        rules: [
+          { id: 'copy', name: 'Copy fixes', instruction: { zh: '改错字', en: 'Fix spelling' }, enabled: true }
+        ]
+      }),
+      'a rule added': rawPolicy({
+        rules: [
+          { id: 'copy', name: 'Copy fixes', instruction: { zh: '改错别字', en: 'Fix typos' }, enabled: true },
+          { id: 'visual', name: 'Visual fixes', instruction: { zh: '改间距', en: 'Fix spacing' }, enabled: true }
+        ]
+      }),
+      'the accept mode lowered': rawPolicy({ acceptMode: 'observe' }),
+      'an identity removed from the allowed list': rawPolicy({ allowed: [] }),
+      'a bot removed from the bots list': rawPolicy({ bots: [] }),
+      'an admission cell narrowed': rawPolicy({ admission: { [TEAM]: { unlistedAddressed: 'inferred' } } }),
+      'an admission row added': rawPolicy({
+        admission: { [TEAM]: { unlistedAddressed: 'explicit' }, [TALK]: { listedUnaddressed: 'ignore' } }
+      })
+    }
+    for (const [what, raw] of Object.entries(variants)) {
+      assert.notEqual(policyVersion(blockOf(raw)), base, what)
+    }
+  })
+
+  test('treats a cell written out as its default as the same content', () => {
+    const written = rawPolicy({
+      admission: { [TEAM]: { listedUnaddressed: 'inferred', unlistedAddressed: 'ignore' } }
+    })
+    const omitted = rawPolicy({ admission: { [TEAM]: {} } })
+    assert.equal(policyVersion(blockOf(written)), policyVersion(blockOf(omitted)))
+  })
+})
+
+/**
+ * 一条 Gate 准入结果变成的 Mandate，可补上评估匹配到的规则（accept 时 `Evals.accept` 才写
+ * `basis.rules`）。复验读的就是 accept 写下的这一份，所以夹具直接用它。
+ */
+function mandateOf(
+  policy: ReturnType<typeof fixture>['policy'],
+  trigger: Trigger,
+  options: { readonly thread?: Thread; readonly tickets?: readonly Ticket[]; readonly rules?: readonly string[] } = {}
+): Mandate {
+  const gate = policy.gate(trigger, options.thread ?? thread(), [...(options.tickets ?? [ticket()])])
+  assert.equal(gate.admissible, true, JSON.stringify(gate))
+  if (!gate.admissible) throw new Error('unreachable')
+  return {
+    strength: gate.strength,
+    policyVersion: 'v1',
+    basis: { ...gate.basis, ...(options.rules === undefined ? {} : { rules: [...options.rules] }) },
+    actor: trigger.actor,
+    scope: 'small'
+  }
+}
+
+describe('revalidating a mandate under today\'s policy (§K.3)', () => {
+  test('an addressed mandate requires its sender to stay on the allowed list', () => {
+    const mandate = mandateOf(fixture().policy, inRow(TEAM, MEMBER, 'mention'))
+    assert.equal(mandate.basis.via, 'addressed')
+    assert.equal(fixture().policy.revalidate(mandate), true)
+    assert.equal(fixture({ allowed: [] }).policy.revalidate(mandate), false)
+  })
+
+  test('an explicit follow-up keeps its authority while the Thread is listened to; an inferred one needs auto', () => {
+    const listed = mandateOf(fixture().policy, inRow(TEAM, MEMBER), {
+      thread: thread(['ticket-1']),
+      rules: ['copy']
+    })
+    assert.equal(listed.basis.via, 'followup')
+    assert.equal(listed.strength, 'explicit')
+    // 人被移出名单不改变「这个 Thread 上已有工作」的事实：显式 follow-up 仍然成立。
+    assert.equal(fixture({ allowed: [] }).policy.revalidate(listed), true)
+    // 名单外的人经 follow-up 拿到的是推断强度：只有 auto 且匹配规则仍启用时才成立。
+    const guest = mandateOf(fixture().policy, inRow(TEAM, GUEST), {
+      thread: thread(['ticket-1']),
+      rules: ['copy']
+    })
+    assert.equal(guest.strength, 'inferred')
+    assert.equal(fixture({ acceptMode: 'auto' }).policy.revalidate(guest), true)
+    assert.equal(fixture({ acceptMode: 'observe' }).policy.revalidate(guest), false)
+    assert.equal(fixture({ acceptMode: 'auto', disabledRules: ['copy'] }).policy.revalidate(guest), false)
+  })
+
+  test('an admission mandate holds only while today\'s cell gives at least its strength and a listed sender stays listed', () => {
+    // 没有 Ticket 的 Thread 才走准入表；Thread 上已有 Ticket 时那是 follow-up（§K.2 第 3 条）。
+    const mandate = mandateOf(fixture().policy, inRow(TEAM, MEMBER), { tickets: [], rules: ['copy'] })
+    assert.equal(mandate.basis.via, 'admission')
+    assert.equal(mandate.strength, 'inferred')
+    assert.equal(fixture({ acceptMode: 'auto' }).policy.revalidate(mandate), true)
+    // 模式离开 auto：推断强度不再被接受。
+    assert.equal(fixture({ acceptMode: 'observe' }).policy.revalidate(mandate), false)
+    // 格子被收窄（inferred → ignore）。
+    assert.equal(
+      fixture({ acceptMode: 'auto', admission: { [TEAM]: { listedUnaddressed: 'ignore' } } }).policy.revalidate(
+        mandate
+      ),
+      false
+    )
+    // 名单内的人被移出名单就是撤销——即使「未名单、未点名」那一格给的是 inferred：
+    // 原来是 listed 的 Mandate 要求发送者仍在名单（§K.3）。
+    assert.equal(fixture({ acceptMode: 'auto', allowed: [] }).policy.revalidate(mandate), false)
+    assert.equal(
+      fixture({
+        acceptMode: 'auto',
+        allowed: [],
+        admission: { [TEAM]: { unlistedUnaddressed: 'inferred' } }
+      }).policy.revalidate(mandate),
+      false
+    )
+    // 行的可用性来自 Source 的监听配置：不再收这个群的全部消息，格子按 ignore 读。
+    assert.equal(fixture({ acceptMode: 'auto', observe: [] }).policy.revalidate(mandate), false)
+  })
+
+  test('an explicit admission mandate needs its cell at the same strength, but never auto mode', () => {
+    const explicit = fixture({ admission: { [TEAM]: { unlistedAddressed: 'explicit' } } })
+    const mandate = mandateOf(explicit.policy, inRow(TEAM, GUEST, 'mention'), {
+      tickets: [],
+      rules: ['copy']
+    })
+    assert.equal(mandate.basis.via, 'admission')
+    assert.equal(mandate.strength, 'explicit')
+    // 显式强度与 accept mode、规则无关。
+    assert.equal(
+      fixture({
+        admission: { [TEAM]: { unlistedAddressed: 'explicit' } },
+        acceptMode: 'off',
+        disabledRules: ['copy']
+      }).policy.revalidate(mandate),
+      true
+    )
+    // 格子降到推断强度就是「今天给不出同样的授权」。
+    assert.equal(
+      fixture({ admission: { [TEAM]: { unlistedAddressed: 'inferred' } }, acceptMode: 'auto' }).policy.revalidate(
+        mandate
+      ),
+      false
+    )
+  })
+
+  test('a bot mandate needs the bot listed, auto mode and every matched rule enabled', () => {
+    const mandate = mandateOf(fixture({ acceptMode: 'auto' }).policy, machine(), {
+      tickets: [],
+      rules: ['copy']
+    })
+    assert.equal(mandate.basis.via, 'bot')
+    assert.equal(fixture({ acceptMode: 'auto' }).policy.revalidate(mandate), true)
+    assert.equal(fixture({ acceptMode: 'observe' }).policy.revalidate(mandate), false, 'mode left auto')
+    assert.equal(fixture({ acceptMode: 'auto', bots: [] }).policy.revalidate(mandate), false, 'bot de-listed')
+    assert.equal(
+      fixture({ acceptMode: 'auto', disabledRules: ['copy'] }).policy.revalidate(mandate),
+      false,
+      'a matched rule was disabled'
+    )
+  })
+
+  test('a senderless CI event revalidates through its last cell', () => {
+    const input: FixtureInput = {
+      acceptMode: 'auto',
+      observe: [TEAM, CI],
+      admission: { [CI]: { unlistedUnaddressed: 'inferred' } }
+    }
+    const mandate = mandateOf(fixture(input).policy, senderless(), { tickets: [], rules: ['copy'] })
+    assert.equal(mandate.basis.via, 'admission')
+    assert.equal(fixture(input).policy.revalidate(mandate), true)
+    assert.equal(fixture({ ...input, acceptMode: 'observe' }).policy.revalidate(mandate), false)
+  })
+})
+
+describe('how a policy change affects live tickets (§K.5)', () => {
+  /** 一个 Source 的准入行（影响面读「今天的格子」时用它，与 Source 的监听配置同源）。 */
+  const rowsIn = (observe: readonly string[]) => (source: string): readonly AdmissionRow[] =>
+    source === 'chat' ? rowsOf(observe) : []
+  /** 一次变更的影响面：旧块是 `fixture({ acceptMode: 'auto' })`，行表收全部 `oc_team`。 */
+  const impact = (
+    previous: ReturnType<typeof fixture>,
+    next: ReturnType<typeof fixture>,
+    tickets: readonly Ticket[]
+  ): ReadonlyMap<string, PolicyEffect> =>
+    policyEffects(previous.block, next.block, tickets, { rows: rowsIn([TEAM]) })
+
+  test('names a matched rule that was disabled or rewritten, for explicit and inferred tickets alike', () => {
+    const old = fixture({ acceptMode: 'auto' })
+    const admitted = ticket({
+      mandate: mandateOf(old.policy, inRow(TEAM, MEMBER), { tickets: [], rules: ['copy'] })
+    })
+    const addressed = ticket({
+      id: 'ticket-2',
+      mandate: mandateOf(old.policy, inRow(TEAM, MEMBER, 'mention'), { tickets: [], rules: ['copy'] })
+    })
+    const disabled = impact(old, fixture({ acceptMode: 'auto', disabledRules: ['copy'] }), [admitted])
+    assert.deepEqual([...disabled], [
+      [admitted.id, { rules: [{ id: 'copy', name: 'Copy fixes', change: 'disabled' }] }]
+    ])
+    const rewritten = impact(old, fixture({ acceptMode: 'auto', rule: { en: 'Fix spelling' } }), [
+      addressed
+    ])
+    assert.deepEqual([...rewritten], [
+      [
+        addressed.id,
+        { rules: [{ id: 'copy', name: 'Copy fixes', change: 'changed', instruction: 'Fix spelling' }] }
+      ]
+    ])
+  })
+
+  test('lowers proactive work when the accept mode leaves auto, and leaves explicit tickets alone', () => {
+    const old = fixture({ acceptMode: 'auto' })
+    const inferred = ticket({
+      mandate: mandateOf(old.policy, inRow(TEAM, MEMBER), { tickets: [], rules: ['copy'] })
+    })
+    const explicit = ticket({
+      id: 'ticket-2',
+      mandate: mandateOf(old.policy, inRow(TEAM, MEMBER, 'mention'), { tickets: [], rules: ['copy'] })
+    })
+    const effects = impact(old, fixture({ acceptMode: 'observe' }), [inferred, explicit])
+    assert.deepEqual([...effects.keys()], [inferred.id], 'only the proactive ticket is affected')
+    assert.deepEqual(effects.get(inferred.id), { proactive: false })
+  })
+
+  test('reports a requester who can no longer start work: off the list, off the bots, or through a narrowed cell', () => {
+    const old = fixture({ acceptMode: 'auto' })
+    const addressed = ticket({
+      mandate: mandateOf(old.policy, inRow(TEAM, MEMBER, 'mention'), { tickets: [], rules: ['copy'] })
+    })
+    const delisted = impact(old, fixture({ acceptMode: 'auto', allowed: [] }), [addressed])
+    assert.deepEqual([...delisted], [
+      [addressed.id, { requesterAllowed: false, requester: { source: 'chat', id: MEMBER } }]
+    ])
+
+    const narrow = fixture({
+      acceptMode: 'auto',
+      admission: { [TEAM]: { unlistedUnaddressed: 'inferred' } }
+    })
+    const guest = ticket({
+      id: 'ticket-2',
+      mandate: mandateOf(narrow.policy, inRow(TEAM, GUEST), { tickets: [], rules: ['copy'] })
+    })
+    const narrowed = policyEffects(narrow.block, fixture({ acceptMode: 'auto' }).block, [guest], {
+      rows: rowsIn([TEAM])
+    })
+    assert.deepEqual([...narrowed], [
+      [guest.id, { requesterAllowed: false, requester: { source: 'chat', id: GUEST } }]
+    ])
+
+    const bot = ticket({
+      id: 'ticket-3',
+      mandate: mandateOf(old.policy, machine(), { tickets: [], rules: ['copy'] })
+    })
+    const unlisted = impact(old, fixture({ acceptMode: 'auto', bots: [] }), [bot])
+    assert.deepEqual([...unlisted], [
+      [bot.id, { requesterAllowed: false, requester: { source: 'chat', id: BOT } }]
+    ])
+  })
+
+  test('says nothing about untouched tickets, tickets already ended, or a change that keeps every authority', () => {
+    const old = fixture({ acceptMode: 'auto' })
+    const untouched = ticket({
+      mandate: mandateOf(old.policy, inRow(TEAM, MEMBER, 'mention'), { tickets: [], rules: ['copy'] })
+    })
+    const ended = ticket({
+      id: 'ticket-2',
+      ended: { at: AT, by: 'executor', outcome: 'completed' },
+      mandate: mandateOf(old.policy, inRow(TEAM, MEMBER), { tickets: [], rules: ['copy'] })
+    })
+    // 同一份内容：没有任何影响。
+    assert.equal(impact(old, fixture({ acceptMode: 'auto' }), [untouched, ended]).size, 0)
+    // 只放宽（名单变长）也不影响任何人。
+    const widened = fixture({ acceptMode: 'auto', allowed: [{ id: MEMBER }, { id: GUEST }] })
+    assert.equal(impact(old, widened, [untouched]).size, 0)
+    // 会伤害一个开着的 Ticket 的变更，对已结束的 Ticket 什么都不说（它不再被通知）。
+    const disabled = impact(old, fixture({ acceptMode: 'auto', disabledRules: ['copy'] }), [ended])
+    assert.equal(disabled.size, 0)
+  })
+})
+
+/**
+ * 一次 Policy 保存的集成夹具：**真库** + 真仓储 + 真引擎 + 真正的设置写入器（`app/settings.ts`
+ * 与它的 Policy 接线）。保存路径与生产同一条，所以断言的是「保存之后数据库、Ticket 输入与
+ * 评估里发生了什么」，而不是私有方法的返回值（§P.1）。
+ *
+ * 生效的 Policy 块从设置里读（与组合根的同一条读法），所以一次保存立刻改变 Gate、复验与
+ * 版本；没有保存过时回到夹具的初始块。
+ */
+function policySaveHarness(initial: FixtureInput = {}) {
+  const opened = openTempStore()
+  const observe = initial.observe ?? [TEAM]
+  const initialBlock = fixture(initial)
+  const repo = createRepositories(opened.store)
+  const scope = { scope: (trigger: Trigger) => scopeOf(trigger, observe) }
+  const rows = (source: string): readonly AdmissionRow[] => (source === 'chat' ? rowsOf(observe) : [])
+  const requests: Candidate[] = []
+  const stopped: string[] = []
+  const delivered: string[] = []
+  let sequence = 0
+  let engine: Engine
+
+  const settings = createSettings({
+    store: opened.store,
+    now: () => AT,
+    policy: createPolicySettingsPort({
+      kinds: (source) => (source === 'chat' ? fixtureKind(observe) : undefined),
+      rows,
+      openTickets: () => repo.tickets.open(),
+      changed: (from, to, effects) => engine.policyChanged(from, to, effects),
+      current: () => initialBlock.block
+    })
+  })
+
+  /** 生效的 Policy 块：已保存的那份，否则夹具的初始块（组合根读同一条）。 */
+  const liveBlock = (): PolicyBlock => {
+    const stored = settings.block('policy')?.config
+    if (stored === undefined) return initialBlock.block
+    const parsed = validatePolicy(stored, {
+      kinds: (source) => (source === 'chat' ? fixtureKind(observe) : undefined)
+    })
+    return parsed.success ? parsed.data : initialBlock.block
+  }
+
+  engine = new Engine({
+    repo,
+    scope,
+    policy: () => createPolicy({ block: liveBlock, sources: scope, rows }),
+    assessor: { request: (candidate: Candidate) => void requests.push(candidate) },
+    executor: {
+      start: () => undefined,
+      deliver: (ticket: Ticket) => void delivered.push(ticket.id),
+      stop: (_ticket, _assignment, reason) => void stopped.push(reason)
+    },
+    outbox: { send: () => undefined, status: () => undefined, withdraw: () => undefined },
+    now: () => AT
+  })
+
+  /** 一条名单内的人在团队群里写的、没点名的消息（每条一个新 id）。 */
+  const incoming = (): Trigger => {
+    sequence += 1
+    return message({ id: `trigger-${sequence}`, meta: { chatId: TEAM, direct: false } })
+  }
+
+  /** 收一条消息、跑一次评估并接受它；返回建出的 Ticket。 */
+  const accept = (rules: readonly string[] = ['copy']): Ticket => {
+    const trigger = incoming()
+    engine.receive(trigger)
+    engine.evaluateDue()
+    engine.decide(trigger.id, {
+      kind: 'accept',
+      title: 'Fix the copy',
+      scope: 'small',
+      reason: 'asked for it',
+      rules: [...rules]
+    })
+    const [ticket] = repo.tickets.list()
+    assert.notEqual(ticket, undefined, 'the accept created a ticket')
+    return ticket as Ticket
+  }
+
+  /** 保存一份 Policy 块（校验在写库之前，与生产一致）。 */
+  const save = (value: unknown, origin: SettingsOrigin = 'panel'): SettingsSaveResult =>
+    settings.save({
+      block: 'policy',
+      origin,
+      value,
+      validate: (candidate) =>
+        validatePolicy(candidate, {
+          kinds: (source) => (source === 'chat' ? fixtureKind(observe) : undefined)
+        })
+    })
+
+  return {
+    store: opened.store,
+    repo,
+    engine,
+    settings,
+    requests,
+    stopped,
+    delivered,
+    incoming,
+    accept,
+    save,
+    liveBlock,
+    cleanup: opened.cleanup
+  }
+}
+
+describe('a policy save (§K.5)', () => {
+  test('records the content hash and the affected tickets in the version history', () => {
+    const h = policySaveHarness({ acceptMode: 'auto' })
+    try {
+      const first = h.save(rawPolicy({ acceptMode: 'auto', admission: {} }))
+      assert.equal(first.policyVersion, policyVersion(h.liveBlock()))
+      const ticket = h.accept()
+      const second = h.save(
+        rawPolicy({
+          acceptMode: 'auto',
+          admission: {},
+          rules: [
+            { id: 'copy', name: 'Copy fixes', instruction: { zh: '改错别字', en: 'Fix typos' }, enabled: false }
+          ]
+        })
+      )
+      assert.notEqual(second.policyVersion, first.policyVersion, 'the version changed')
+      assert.deepEqual(second.affectedTickets, [ticket.id])
+      // 面板 History 读的就是这条快照（§K.5 第 5 条）：origin、policyVersion、受影响的 Ticket。
+      assert.deepEqual(h.store.kvGet(settingsVersionKey(second.revision)), {
+        at: AT,
+        origin: 'panel',
+        block: 'policy',
+        policyVersion: second.policyVersion,
+        affectedTickets: [ticket.id]
+      })
+      assert.equal(h.settings.block('policy')?.policyVersion, second.policyVersion)
+    } finally {
+      h.cleanup()
+    }
+  })
+
+  test('records no new revision when the content is unchanged', () => {
+    const h = policySaveHarness({ acceptMode: 'auto' })
+    try {
+      const value = rawPolicy({ acceptMode: 'auto', admission: {} })
+      h.save(value)
+      const again = h.save(value)
+      assert.equal(again.changed, false)
+      assert.equal(again.revision, 1)
+      assert.equal(h.settings.revision(), 1)
+      assert.deepEqual(h.store.kvGet(settingsVersionKey(2)), null)
+    } finally {
+      h.cleanup()
+    }
+  })
+
+  test('keeps the version when only the Source listening config changes, and notifies nobody', () => {
+    const h = policySaveHarness({ acceptMode: 'auto' })
+    try {
+      const first = h.save(rawPolicy({ acceptMode: 'auto', admission: {}, syncChat: 'oc_a' }))
+      const ticket = h.accept()
+      const second = h.save(rawPolicy({ acceptMode: 'auto', admission: {}, syncChat: 'oc_b' }))
+      assert.equal(second.changed, true, 'the saved config did change')
+      assert.equal(second.policyVersion, first.policyVersion, 'listening config is not policy content')
+      assert.deepEqual(second.affectedTickets, [])
+      const inputs = h.repo.tickets.get(ticket.id)?.inputs ?? []
+      assert.deepEqual(inputs.filter((input) => input.kind === 'policy-changed'), [])
+    } finally {
+      h.cleanup()
+    }
+  })
+
+  test('does not kill in-flight work: affected tickets get one policy-changed input and stay open', () => {
+    const h = policySaveHarness({ acceptMode: 'auto' })
+    try {
+      const first = h.save(rawPolicy({ acceptMode: 'auto', admission: {} }))
+      const ticket = h.accept()
+      // 让 Assignment 处于 running（像 launch 回执已到）：通知经投递送去，而不是重开开工。
+      const running = h.repo.tickets.get(ticket.id) as Ticket
+      running.assignments[0]!.state = 'running'
+      h.repo.tickets.save(running)
+      const second = h.save(
+        rawPolicy({
+          acceptMode: 'auto',
+          admission: {},
+          rules: [
+            { id: 'copy', name: 'Copy fixes', instruction: { zh: '改错别字', en: 'Fix typos' }, enabled: false }
+          ]
+        })
+      )
+      assert.deepEqual(h.delivered, [ticket.id], 'the notice goes through delivery to the running worker')
+      const after = h.repo.tickets.get(ticket.id)
+      assert.notEqual(after, undefined)
+      assert.equal(after?.ended, undefined, 'a policy change never revokes a mandate on its own')
+      assert.deepEqual(h.stopped, [], 'the running assignment is not interrupted')
+      const notices = (after?.inputs ?? []).filter((input) => input.kind === 'policy-changed')
+      assert.equal(notices.length, 1, 'one notice per affected ticket')
+      assert.deepEqual(notices[0], {
+        id: notices[0]?.id,
+        kind: 'policy-changed',
+        from: first.policyVersion,
+        to: second.policyVersion,
+        at: AT,
+        effect: { rules: [{ id: 'copy', name: 'Copy fixes', change: 'disabled' }] }
+      })
+    } finally {
+      h.cleanup()
+    }
+  })
+})
+
+describe('a policy change and the work in flight (§K.5)', () => {
+  test('restarts a running assessment under the new version and requeues its trigger', () => {
+    const h = policySaveHarness({ acceptMode: 'auto' })
+    try {
+      const first = h.save(rawPolicy({ acceptMode: 'auto', admission: {} }))
+      h.engine.receive(h.incoming())
+      h.engine.evaluateDue()
+      const running = h.requests.at(-1)
+      assert.notEqual(running, undefined)
+      assert.equal(running?.policyVersion, first.policyVersion)
+      const second = h.save(rawPolicy({ acceptMode: 'observe', admission: {} }))
+      // 在跑的评估被结束成 unavailable(policyChanged)，它的 Trigger 重新排队。
+      const [decided] = h.repo.decisions.byThread('chat:room')
+      assert.equal(decided?.kind, 'unavailable')
+      assert.deepEqual(decided?.reason, [{ code: 'policyChanged' }])
+      h.engine.evaluateDue()
+      const reassessed = h.requests.at(-1)
+      assert.notEqual(reassessed, undefined)
+      assert.notEqual(reassessed?.evalId, running?.evalId, 'the old assessment is discarded')
+      assert.equal(reassessed?.policyVersion, second.policyVersion, 'the new one runs under the new version')
+    } finally {
+      h.cleanup()
+    }
+  })
+
+  test('revokes a mandate that no longer holds: the ended ticket stays ended and the message goes back to the evaluation', () => {
+    const h = policySaveHarness({ acceptMode: 'auto' })
+    try {
+      h.save(rawPolicy({ acceptMode: 'auto', admission: {} }))
+      const ticket = h.accept()
+      // 工作交回的结局：Ticket 结束，Mandate 仍在。
+      h.engine.report(ticket.id, { state: 'ready', summary: 'done' })
+      assert.equal(h.repo.tickets.get(ticket.id)?.ended?.outcome, 'completed')
+      const assignments = h.repo.tickets.get(ticket.id)?.assignments.length ?? 0
+      // 收紧 Policy：推断强度不再被接受。
+      h.save(rawPolicy({ acceptMode: 'observe', admission: {} }))
+      const message = h.incoming()
+      h.engine.receive(message)
+      // 复验失败：Ticket 保持结束，等它的消息不被吞掉，而是回到评估。
+      const after = h.repo.tickets.get(ticket.id)
+      assert.notEqual(after?.ended, undefined, 'the ticket stays ended')
+      assert.equal(after?.assignments.length, assignments, 'no new assignment started')
+      assert.equal(
+        (h.repo.triggers.disposition(message.id)?.fanout ?? []).includes(ticket.id),
+        false,
+        'the Router is not told it reached the worker'
+      )
+      h.engine.evaluateDue()
+      const candidate = h.requests.at(-1)
+      assert.deepEqual(candidate?.triggers.map((trigger) => trigger.id), [message.id], 'it is evaluated')
+      // Thread 上仍有一张（已结束、没被人停的）Ticket：这条消息按 follow-up 得到显式强度，
+      // 可以走成一张新 Ticket，而不是被那张复验失败的 Ticket 吞掉（§K.2 第 3 条、§K.3）。
+      assert.equal(candidate?.strength, 'explicit')
+      assert.equal(candidate?.triggers.length, 1)
+    } finally {
+      h.cleanup()
+    }
   })
 })

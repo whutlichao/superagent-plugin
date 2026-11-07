@@ -11,6 +11,7 @@ import { doctorExitCode, orderChecks, stateRank, summarize } from '../src/worker
 import { GITCONFIG_MODE, workerGitConfigPath, writeWorkerGitConfig } from '../src/worker/infra/gitconfig'
 import type { DoctorCheck } from '../src/worker/http/api-types'
 import { openStore } from '../src/worker/app/store'
+import { SCHEMA_VERSION } from '../src/worker/app/schema'
 import { acquireLock } from '../src/worker/infra/lock'
 import { ensureApiToken, TOKEN_MODE } from '../src/worker/infra/tokens'
 import { DEFAULT_PORT, PORT_FILE } from '../src/worker/http/port-file'
@@ -184,8 +185,8 @@ test('the database check reads the schema version without migrating anything', a
     let inspected: ReturnType<typeof store.inspect>
     try {
       inspected = store.inspect()
-      assert.equal(inspected.schemaVersion, 1)
-      assert.equal(inspected.pluginVersion, 1)
+      assert.equal(inspected.schemaVersion, SCHEMA_VERSION)
+      assert.equal(inspected.pluginVersion, SCHEMA_VERSION)
       assert.equal(inspected.tables, store.tables().length)
       assert.equal(inspected.bytes > 0, true)
     } finally {
@@ -194,7 +195,7 @@ test('the database check reads the schema version without migrating anything', a
     result = await doctorOf(stateDir, { inspect: () => inspected })
     const database = checkOf(result.checks, 'database')
     assert.equal(database.state, 'ok')
-    assert.ok(database.detail.includes('schema 1'))
+    assert.ok(database.detail.includes(`schema ${SCHEMA_VERSION}`))
   } finally {
     rmSync(stateDir, { recursive: true, force: true })
   }

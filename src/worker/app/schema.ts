@@ -1,7 +1,8 @@
 // 建表语句与迁移步骤表（§D.2 要点 3、§N.6）：单调、逐级、每级一个事务。
 //
 // `kv['schema-version']` 是唯一版本源；`user_version` 只作为「读到版本之前」的镜像，
-// 免得迁移过程里两个版本源打架。v1 是新库直接建表，无历史包袱。
+// 免得迁移过程里两个版本源打架。v1 是新库直接建表，无历史包袱；v2 只有一处修正
+// （`settings_version.origin` 收第四种来源 `operator`，见 §K.8 与 §D.2）。
 
 /**
  * 建表步骤只需要 `exec`（`DatabaseSync` 结构上满足它）。用结构化类型而不是
@@ -145,16 +146,45 @@ CREATE TABLE prompt_version (
 );
 `
 
-/** 本插件支持的 schema 版本（首版为 1，§D.2 要点 3）。 */
-export const SCHEMA_VERSION = 1
+/**
+ * 版 2（§K.8 的四种设置来源 ↔ §D.2 的列）：`settings_version.origin` 补上 `operator`。
+ * 设计 §K.8 点名 `panel | tool | sync | operator`，v1 的 CHECK 只收前三个，于是 #20 把
+ * operator 记成了 `panel`——审计因此说谎。SQLite 改不了 CHECK，所以整表重建再复制：
+ * 逐行原样搬过去，一行不丢（这是数据修正，不是数据迁移）。
+ */
+const SCHEMA_V2_OPERATOR_ORIGIN = `
+CREATE TABLE settings_version_v2 (
+  revision     INTEGER PRIMARY KEY CHECK (revision > 0),
+  predecessor  INTEGER,
+  at           TEXT NOT NULL CHECK (at IS strftime('%Y-%m-%dT%H:%M:%fZ', at)),
+  origin       TEXT NOT NULL CHECK (origin IN ('panel', 'tool', 'sync', 'operator')),
+  block        TEXT NOT NULL,
+  config       TEXT NOT NULL CHECK (json_valid(config)),
+  policy_version TEXT
+);
+INSERT INTO settings_version_v2 (revision, predecessor, at, origin, block, config, policy_version)
+  SELECT revision, predecessor, at, origin, block, config, policy_version FROM settings_version;
+DROP TABLE settings_version;
+ALTER TABLE settings_version_v2 RENAME TO settings_version;
+`
+
+/** 本插件支持的 schema 版本（§D.2 要点 3：v1 建表，v2 补 operator 来源）。 */
+export const SCHEMA_VERSION = 2
 
 /** 单调的迁移步骤数组：每一项只升一级，永不回头。 */
 export const MIGRATIONS: readonly MigrationStep[] = [
   {
     from: 0,
-    to: SCHEMA_VERSION,
+    to: 1,
     run(db: SchemaDatabase): void {
       db.exec(SCHEMA_V1)
+    }
+  },
+  {
+    from: 1,
+    to: 2,
+    run(db: SchemaDatabase): void {
+      db.exec(SCHEMA_V2_OPERATOR_ORIGIN)
     }
   }
 ]
