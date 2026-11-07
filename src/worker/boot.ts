@@ -79,6 +79,7 @@ import {
 import type { Deployment } from './sources/kind.ts'
 import { OrcaExecutor, registerExecutorEffects, registerExecutorLifecycle, resolveExecutorSettings } from './executor/orca-executor.ts'
 import { launchCapacity } from './executor/slots.ts'
+import { retryTicket } from './executor/retry.ts'
 import { resumeAfterUpgrade, type ResumeReport } from './executor/resume.ts'
 import { DEFAULT_MAX_WORKERS } from './http/state.ts'
 import { createDomainHandlers, withDomainHandlers } from './http/domain.ts'
@@ -622,6 +623,10 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
     note: (ticketId, text) => engine.note(ticketId, text),
     requestStatus: (ticketId) => engine.requestStatus(ticketId),
     handback: (ticketId, triggerId, reason) => engine.handback(ticketId, triggerId, reason),
+    // 停止与重试是三条改变 Mandate 的操作里的两条（§E.5、§K.3）。重试的恢复说明由执行器
+    // 拼一次（`executor/retry.ts`），这里只把 Ticket 交给它——避免第二个说法。
+    stop: (ticketId, reason) => engine.stopTicket(ticketId, reason),
+    retry: (ticketId) => retryTicket(engine, ticketId),
     ticketOf: (id) => repo.tickets.get(id),
     tickets: () => repo.tickets.list(),
     // 读模型里的「已投递到该 Ticket」：归属判定与扇出/交回同一份记录（`followupOwners`）。

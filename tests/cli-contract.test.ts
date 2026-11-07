@@ -174,6 +174,18 @@ const WIRED: readonly (readonly [string, Case, Case])[] = [
     { argv: ['ticket', 'request-status', 'ticket-own'], exit: 0, resultKeys: ['asked', 'ticket'] },
     { argv: ['ticket', 'request-status', 'nope'], exit: 2, code: 'missing' }
   ],
+  // #29 的两条：重试新建一个 Assignment，停止要确认且只对未结束的 Ticket 成立（§G.2、§O）。
+  [
+    'ticket retry',
+    { argv: ['ticket', 'retry', 'ticket-own'], exit: 0, resultKeys: ['retried', 'assignment'] },
+    { argv: ['ticket', 'retry', 'ticket-ended'], exit: 2, code: 'not_retryable' }
+  ],
+  [
+    'ticket stop',
+    { argv: ['ticket', 'stop', 'ticket-own', '--yes', '--reason=Not needed'], exit: 0, resultKeys: ['stopped'] },
+    // 已经结束的 Ticket 不再改变状态：固定的 `already_ended`，不是 `refused`。
+    { argv: ['ticket', 'stop', 'ticket-ended', '--yes'], exit: 2, code: 'already_ended' }
+  ],
   // `trigger handback` 是 worker 的命令：Ticket 来自 assignment token（§G.2）。
   [
     'trigger handback',
@@ -196,8 +208,6 @@ const WIRED: readonly (readonly [string, Case, Case])[] = [
 const PENDING: readonly string[][] = [
   ['eval', 't-1'],
   ['eval-read', 't-1'],
-  ['ticket', 'retry', 't-1'],
-  ['ticket', 'stop', 't-1'],
   ['ticket', 'list'],
   ['trigger', 'requeue', 't-1'],
   ['thread', 'unsubscribe', 'k'],
@@ -303,7 +313,19 @@ function commandRoutes(): ReturnType<typeof withDomainHandlers> {
           if (triggerId !== 'trigger-1') throw new UserError('notReached')
           return ticketId === ticket.id
         },
-        ticketOf: (id) => (id === ticket.id ? ticket : undefined),
+        // 停止与重试的可用性由领域判定：这里只替身「能不能」与「是否已结束」两个事实。
+        stop: () => ticket,
+        retry: (ticketId) => {
+          if (ticketId === ticket.id) return ticket
+          if (ticketId === 'ticket-ended') throw new UserError('notRetryable')
+          throw new UserError('unknownTicket')
+        },
+        ticketOf: (id) =>
+          id === ticket.id
+            ? ticket
+            : id === 'ticket-ended'
+              ? { ...ticket, ended: { at: AT, by: 'human', outcome: 'stopped' } }
+              : undefined,
         tickets: () => [ticket]
       })
     ),

@@ -867,7 +867,7 @@ Router/Worker 用的命令（等价上游 `orchestrator_*` 工具）：
 | `POST triggers/:id/requeue`、`POST decisions/:id/dismiss` | 同名 | |
 | `POST triggers/:id/handback` | `trigger handback` | worker 的命令：Ticket 来自 assignment token，错误码 `not_owned`/`already_handed_back` |
 | `POST threads/:key/unsubscribe` | `thread unsubscribe` | |
-| `POST tickets/:id/retry`、`POST tickets/:id/stop`、`POST tickets/:id/note` | 同名 | |
+| `POST tickets/:id/retry`、`POST tickets/:id/stop`、`POST tickets/:id/note` | 同名 | stop 是破坏性动作：body `{confirm:true}`（CLI `--yes`）；错误码 `already_ended`/`not_retryable`/`missing` |
 | `POST tickets/:id/request-status` | 同名 | |
 | `POST executor/pause` | `pause/resume` | body `{paused}` |
 | `POST setup/check` | `setup check` | |
