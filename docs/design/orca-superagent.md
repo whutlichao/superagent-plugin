@@ -2200,3 +2200,67 @@ payload 的 worker 放到 `/tmp/<probe>/`，`orca plugin dev load /tmp/<probe> -
 `orca worktree rm --worktree <path> --force --delete-branch`。宿主侧证据用
 `grep -a "agent.status.changed" /Applications/Orca.app/Contents/Resources/app.asar` 与
 `..../app.asar.unpacked/out/shared/plugins/events/plugin-events.js` 的 schema 复核（只读）。
+
+### Router 启动实测记录（#16，2026-11-07）
+
+**测什么**：真实 `orca agent launch --surface terminal` 给 Router 终端返回什么、启动一次要
+多久；`terminal list` 的 `orphaned` 对一个后台 agent 终端意味着什么；`agent.status.changed`
+是否到达。**影响**：§F.1 的启动与保活判据、§F.5 的重启触发条件、§B.3 的回执解析。
+
+**实测环境**：arm64 macOS 27.0.1，Node 25.0.0，Orca CLI 1.4.251。步骤：在
+`/Users/apple/orca/superagent-plugin` 上 `orca worktree create --name
+superagent-router-spike16 --repo path:<base> --base-branch HEAD --setup skip --no-parent --json`
+→ 在该 worktree 里 `orca agent launch --agent pi --worktree path:<spike> --surface terminal
+--prompt "<一句 SPIKE 指令>" --json` → `terminal list/show/read` → `terminal close` →
+`worktree rm --force --delete-branch`。测完 `terminal list` 里已无该 worktree 的任何终端；
+未安装 dev 插件、未改宿主安装包。
+
+**实测回执（原样，id 截断）**：
+
+```json
+{
+  "outcome": {
+    "kind": "terminal",
+    "handle": "term_ce68d0f0-2d1d-4bfe-941a-b18840d8a6d9",
+    "paneKey": "bb711404-387b-41b1-8a0e-8cf6960cb465:1e6820ed-5ddf-4e39-bac8-0f17f0988c15"
+  },
+  "worktreeId": "5e134f6e-…::/…/superagent-router-spike16",
+  "receipt": { "mode": "terminal", "preferred": "terminal", "reason": "requested", "detail": "Started a terminal agent, as requested." },
+  "prompt": { "delivery": "submit", "outcome": "handed-to-terminal" },
+  "placement": { "groupId": "fff923df-…" },
+  "operationId": "1794029224309-…"
+}
+```
+
+| 项 | 实测值 | 影响 / 已落地的决定 |
+| --- | --- | --- |
+| 终端句柄 | **`result.outcome.handle`**（`outcome.kind === 'terminal'`），旁边带 `paneKey`。回执里**没有** `result.launch` 这一层，也没有 `agentTerminalHandle` / `terminalId` | §B.3 的解析顺序改为 `result.outcome.handle` → `result.launch.outcome.handle`（S2 的旧记录）→ `agentTerminalHandle` → `terminalId`。已改 `runtime/host-runtime.ts`，`tests/host-runtime.test.ts` 用这份原样回执钉住；否则每次 launch 都走 `agent_gone` 反查 |
+| 启动耗时 | 墙钟 **0.98 s**（含 agent CLI 与 prompt 交付） | §E.2 / §F.1 的 120 s launch 超时是余量，不是常态 |
+| prompt 交付 | `prompt.delivery: "submit"`、`prompt.outcome: "handed-to-terminal"`；`terminal read` 里出现 prompt 行 | 开播语只看 `--prompt`，不再补一次 `sendText` |
+| terminal 行 | 新终端是 `connected: true, orphaned: true`；`recordedPaneKey` 等于回执的 `paneKey`，`worktreeId` 等于 workspace id；`terminal show` 给真实 `tabId`/`leafId` 而 `orphaned` 仍为 `true` | **`orphaned` 不是死亡**：它表示「这个 pty 没有挂载到可见 pane」。后台会话（Router 的专用 worktree 通常不在 UI 里打开）永远如此。判活只看「枚举里没有」或 `connected === false`，否则 Router 每 3 s 被重启一次；`findAgent` 的反查同步放宽（`connected` 即可），否则永远反查不到自己刚起的会话 |
+| 关闭 | `terminal close --terminal <orphaned handle>` → `{ok:false, error:{code:"runtime_error", message:"tab_not_found"}}`（没有 tab 可关）；`worktree rm --force` 把 pty 一并收掉 | 重启/关停时关不掉 orphaned 终端不算重试理由；领域状态先变，终端回收是副作用（与 S7 同口径） |
+| 事件 | 本票未安装 dev 插件，**没有直接观察** Router 终端的 `agent.status.changed`；引 #12 的 S7 实测（同机同版本、terminal 面 `pi`）：启动与每一轮结束各一条 `done`，而 TUI 仍在运行 | §F.5 的「收到 `done` → 重启」在实测语义下会变成「每一轮都重启」。实现改为：`done` **不触发重启**，只用 `working → waiting` 做「疑似空转」观测；重启由 `listTerminals()` 的缺失/断连触发 |
+
+**结论**：
+
+1. **回执字段以 `result.outcome.handle` 为准**。这是本票对 §B.3 / S2 的唯一更正；旧字段全部
+   保留在解析链里，旧宿主不受影响。
+2. **`orphaned` 只说明「没有 pane」，`connected` 才说明「还连着」**。保活判据因此是
+   「不在枚举里 ∨ `connected=false`」；`orphaned` 只作为快照里的一条事实（面板可显示「后台
+   终端」）。派发说明里「gone or orphaned」的措辞按这条实测收窄。
+3. **`done` 是回合结束，不是会话结束**（与 S7 的记录一致）。§F.5 的 `done` 触发留给 DOC2
+   对齐；实现不再按 `done` 重启，避免每一轮都换 Router。
+4. **未证实（不写成事实）**：Router 终端的事件到达。它用的是与 #12 相同的一条
+   `agent launch --surface terminal` 路径，但没有在启用本插件的情况下观察过；S5（状态栏常驻）
+   仍归 #14/#45。本票的保活不依赖 S5 的结论：监督由组合根启动、自带 3 s 定时器，
+   `listTerminals()` 探活与 `agent.status.changed` 两条腿都在；S5 若回落（窗口关闭后 worker
+   不常驻），受影响的只是「定时器还有没有进程可跑」，那一条留在 #45 的 Limitations 里。
+
+**复现方式（脚本未入库）**：
+`orca worktree create --name superagent-router-spike16 --repo path:<base> --base-branch HEAD
+--setup skip --no-parent --json` →
+`orca agent launch --agent pi --worktree path:<spike> --surface terminal --prompt "<一句>" --json`
+→ `orca terminal list --json`（看 `connected`/`orphaned`）→ `orca terminal show --terminal <h>
+--json` → `orca terminal read --terminal <h> --limit 20 --json` →
+`orca terminal close --terminal <h> --json`（orphaned 终端会得 `tab_not_found`）→
+`orca worktree rm --worktree path:<spike> --force --delete-branch --json`。
