@@ -128,6 +128,10 @@ declare module 'node:fs' {
   export function existsSync(path: string): boolean
   export function mkdirSync(path: string, options: { readonly recursive: true }): void
   export function mkdtempSync(prefix: string): string
+  /** 解析全部符号链接后的绝对路径（`eval-read --path` 的包含判定，§O）。 */
+  export function realpathSync(path: string): string
+  /** 建一个符号链接（测试里造「链接逃逸」用例）。 */
+  export function symlinkSync(target: string, path: string): void
   export function unlinkSync(path: string): void
   export function renameSync(from: string, to: string): void
   export function rmSync(path: string, options?: { readonly recursive?: boolean; readonly force?: boolean }): void

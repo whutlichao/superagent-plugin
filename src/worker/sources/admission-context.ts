@@ -148,6 +148,39 @@ export interface AdmissionSettings {
   readonly timeoutMs: number
 }
 
+/** 缺省页数：一次评估最多读 5 页（§H.22 的 `admissionContextMaxPages`）。 */
+export const DEFAULT_ADMISSION_PAGES = 5
+
+/** 缺省窗口时限：30 s（§H.22 的 `admissionContextTimeoutMs`）。 */
+export const DEFAULT_ADMISSION_TIMEOUT_MS = 30_000
+
+/** 页数上限：再多就不叫「有界」窗口了。 */
+export const ADMISSION_PAGE_LIMIT = 20
+
+/** 窗口时限的上下界（毫秒）：低于 1 s 读不完一页，高于 2 min 会拖住评估。 */
+export const ADMISSION_TIMEOUT_MIN_MS = 1_000
+export const ADMISSION_TIMEOUT_MAX_MS = 120_000
+
+/**
+ * 从一份设置表里读评估窗口的两项（§H.12、§H.22）。键名是部署设置里的平铺键：
+ * `admissionContextMaxPages` 与 `admissionContextTimeoutMs`；缺失或越界时用缺省值——
+ * 「读不懂的部署设置」不该让评估停摆，面板仍会显示存下来的值。
+ */
+export function admissionSettingsOf(raw: Readonly<Record<string, unknown>>): AdmissionSettings {
+  const pages = integer(raw['admissionContextMaxPages'], 1, ADMISSION_PAGE_LIMIT)
+  const timeout = integer(raw['admissionContextTimeoutMs'], ADMISSION_TIMEOUT_MIN_MS, ADMISSION_TIMEOUT_MAX_MS)
+  return {
+    maxPages: pages ?? DEFAULT_ADMISSION_PAGES,
+    timeoutMs: timeout ?? DEFAULT_ADMISSION_TIMEOUT_MS
+  }
+}
+
+/** 一个在 `[minimum, maximum]` 内的整数；不是数字或越界时 undefined。 */
+function integer(value: unknown, minimum: number, maximum: number): number | undefined {
+  if (typeof value !== 'number' || !Number.isInteger(value)) return undefined
+  return value < minimum || value > maximum ? undefined : value
+}
+
 /** 读取中游标重复：说明分页实现坏了，窗口不可能完整。 */
 export class PaginationError extends Error {
   readonly cursor: string

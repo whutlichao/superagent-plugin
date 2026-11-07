@@ -174,6 +174,9 @@ export const ROUTE_TABLE: readonly RouteDefinition[] = [
 
   // ---- Router 的动作（§F.6）
   { method: 'POST', path: 'route', command: 'route', minimumRole: 'router', handler: stub },
+  // 评估面（§G.2 的 eval / eval-read）：router 与 operator 可用，assignment 越权（§O 角色行）。
+  { method: 'GET', path: 'eval/:id', command: 'eval', minimumRole: 'router', handler: stub },
+  { method: 'GET', path: 'eval-read/:id', command: 'eval-read', minimumRole: 'router', handler: stub },
   { method: 'POST', path: 'eval-decide/:id', command: 'eval-decide', minimumRole: 'router', handler: stub },
   { method: 'POST', path: 'policy-sync/:id', command: 'policy sync', minimumRole: 'router', handler: stub },
   { method: 'POST', path: 'triggers/:id/requeue', command: 'trigger requeue', minimumRole: 'router', handler: stub },

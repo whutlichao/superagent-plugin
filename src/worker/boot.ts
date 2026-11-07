@@ -98,6 +98,9 @@ import { resumeAfterUpgrade, type ResumeReport } from './executor/resume.ts'
 import { DEFAULT_MAX_WORKERS } from './http/state.ts'
 import { createDomainHandlers, withDomainHandlers } from './http/domain.ts'
 import { createAssessmentHandlers, withAssessmentHandlers } from './http/assessment.ts'
+import { createEvalHandlers, withEvalHandlers } from './http/eval.ts'
+import { createEvalTools } from './app/eval.ts'
+import { admissionSettingsOf } from './sources/admission-context.ts'
 import { createDecisionHandlers, withDecisionHandlers } from './http/decisions.ts'
 import { createPromptHandlers, withPromptHandlers } from './http/prompts.ts'
 import { createPromptVersions } from './app/prompts.ts'
@@ -773,6 +776,28 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
     ticketOf: (id) => repo.tickets.get(id),
     log: (message) => logger.warn(message)
   })
+  // Router 的两条评估读命令（§G.2 的 `eval` / `eval-read`）：窗口页数与超时来自部署设置
+  // （§H.22），语境经 kind 的 `threadContext`（§I.1），`--path` 只允许 base repo 与 Ticket
+  // worktree（§O）。候选、Trigger 与 worktree 都现读，重启后不必重建。
+  const evalAdmission = admissionSettingsOf(settings)
+  // base repo 的选择器可能只给了 name/id（§E.1）：能解析成路径就解析一次，解析不了就只认
+  // Ticket worktree——`--path` 因此仍然 fail closed（§O），而不是猜一个目录。
+  const baseRepoPath = await baseRepoPathOf(options.runtime, executorSettings.baseRepo)
+  const evalRoots = (): readonly string[] => [
+    ...(baseRepoPath === undefined ? [] : [baseRepoPath]),
+    ...repo.tickets
+      .list()
+      .flatMap((ticket) => (ticket.execution === undefined ? [] : [ticket.execution.directory]))
+  ]
+  const evalTools = createEvalTools({
+    candidate: (triggerId) => engine.candidate(triggerId),
+    trigger: (triggerId) => repo.triggers.get(triggerId),
+    threadContext: (trigger) => registry.threadContext(trigger, sourceSettings),
+    commands: commandPort,
+    admission: () => evalAdmission,
+    roots: evalRoots,
+    log: (message) => logger.info(message)
+  })
   // Prompt 配置的读/写面（§L.4、§L.5）：版本库、部署事实与「保存后通知 Router」都在这里接线。
   // 部署事实给的是**路径**（CLI 的绝对路径、调用者自己的 token 文件），绝不写 token 值（§D.6）；
   // 保存产生新版本时，Router 保活器把 revision 换成一条短消息排队——不重启会话（§F.4）。
@@ -790,14 +815,17 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
   })
   const routes: readonly RouteDefinition[] = withDecisionHandlers(
     withPromptHandlers(
-      withAssessmentHandlers(
-        withDomainHandlers(ROUTE_TABLE, domain),
-        createAssessmentHandlers({
-          tools: routerTools,
-          afterWrite: () => {
-            refresh()
-          }
-        })
+      withEvalHandlers(
+        withAssessmentHandlers(
+          withDomainHandlers(ROUTE_TABLE, domain),
+          createAssessmentHandlers({
+            tools: routerTools,
+            afterWrite: () => {
+              refresh()
+            }
+          })
+        ),
+        createEvalHandlers({ tools: evalTools })
       ),
       prompts
     ),
@@ -1379,6 +1407,29 @@ interface FeishuSetup {
   readonly botId: string
   readonly appId: string
   readonly problem?: { readonly place: string; readonly code: string; readonly detail?: string }
+}
+
+/**
+ * `executor.baseRepo` 的本地路径（`eval-read --path` 的根，§O）：`path:` 选择器直接用；
+ * `name:`/`id:` 去 `orca repo list` 里找一次。找不到或 CLI 不可用就返回 undefined——
+ * 根的缺失只会让 `--path` 拒绝，不会让 worker 启动失败。
+ */
+async function baseRepoPathOf(
+  runtime: Pick<OrcaRuntime, 'listRepos'>,
+  selector: { readonly path?: string; readonly name?: string; readonly id?: string } | undefined
+): Promise<string | undefined> {
+  if (selector === undefined) return undefined
+  if (selector.path !== undefined) return selector.path
+  try {
+    const repos = await runtime.listRepos()
+    return repos.find(
+      (repo) =>
+        (selector.id !== undefined && repo.id === selector.id) ||
+        (selector.name !== undefined && repo.name === selector.name)
+    )?.path
+  } catch {
+    return undefined
+  }
 }
 
 /** 部署派生的事实（§E.11 的变量源）：仓库与账号来自设置与 setup 探针。 */

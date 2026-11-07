@@ -154,6 +154,10 @@ export interface PromptSaveView extends PromptVersionSummary {
   readonly dropped: readonly string[]
 }
 
+// `eval-read --part` 的三种取值（§G.2、§I.1 的 `threadContext.read`）：CLI 的 `--part` 候选与
+// HTTP handler 的校验读同一份；与 `sources/admission-context.ts` 的 `ContextPartName` 同值。
+export const EVAL_READ_PARTS = ['root', 'parent', 'thread'] as const
+
 /** `read <resource>` 的分页默认与上限（§G.2 的 read 行：默认 20、上限 50）。 */
 export const READ_DEFAULT_LIMIT = 20
 export const READ_MAX_LIMIT = 50
