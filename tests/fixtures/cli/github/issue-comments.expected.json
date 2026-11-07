@@ -1,0 +1,58 @@
+{
+  "source": {
+    "command": "gh api 'repos/cli/cli/issues/14980/comments?per_page=1'",
+    "note": "真实输出（14 个字段的评论对象）；仓库、账号与正文替换成中性值。正文保留 @<agent> 的点名形态，用来断言 addressed=mention。"
+  },
+  "read": {
+    "program": "gh",
+    "args": [
+      "api",
+      "repos/acme/widgets/issues/42/comments",
+      "--paginate",
+      "--method",
+      "GET",
+      "-f",
+      "per_page=100"
+    ],
+    "why": "读评论必须显式 --method GET（`gh api -f` 默认改成 POST），per_page=100 是一页上限"
+  },
+  "trigger": {
+    "id": "83bb3e5d8e4b1642d483f5fbc94244d3",
+    "idRecipe": "key('github', 'comment', '6702566216', '2026-11-07T05:01:49Z')",
+    "source": "github",
+    "threads": [
+      {
+        "source": "github",
+        "id": "42"
+      }
+    ],
+    "actor": {
+      "source": "github",
+      "id": "alice"
+    },
+    "human": true,
+    "addressed": "mention",
+    "at": "2026-11-07T05:01:49Z",
+    "text": "@acme-agent please fix the login redirect before Friday.",
+    "url": "https://github.com/acme/widgets/issues/42#issuecomment-6702566216",
+    "channel": {
+      "source": "github",
+      "thread": "github:42",
+      "address": {
+        "repo": "acme/widgets",
+        "issue": "42"
+      }
+    },
+    "meta": {
+      "kind": "comment",
+      "repository": "acme/widgets",
+      "issue": 42,
+      "commentId": 6702566216,
+      "updatedAt": "2026-11-07T05:01:49Z"
+    }
+  },
+  "tally": {
+    "skipped": 0
+  },
+  "fixture": "tests/fixtures/cli/github/issue-comments.json"
+}

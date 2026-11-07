@@ -1,0 +1,48 @@
+[
+  {
+    "url": "https://api.github.com/repos/acme/widgets/issues/comments/1793370510",
+    "html_url": "https://github.com/acme/widgets/pull/45#issuecomment-1793370510",
+    "issue_url": "https://api.github.com/repos/acme/widgets/issues/45",
+    "id": 1793370510,
+    "node_id": "IC_kwDODKw3uc5q5KmO",
+    "user": {
+      "login": "acme-automation",
+      "id": 80420260,
+      "node_id": "MDQ6VXNlcjgwNDIwMjYw",
+      "avatar_url": "https://avatars.githubusercontent.com/u/80420260?v=4",
+      "gravatar_id": "",
+      "url": "https://api.github.com/users/acmeAutomation",
+      "html_url": "https://github.com/acmeAutomation",
+      "followers_url": "https://api.github.com/users/acmeAutomation/followers",
+      "following_url": "https://api.github.com/users/acmeAutomation/following{/other_user}",
+      "gists_url": "https://api.github.com/users/acmeAutomation/gists{/gist_id}",
+      "starred_url": "https://api.github.com/users/acmeAutomation/starred{/owner}{/repo}",
+      "subscriptions_url": "https://api.github.com/users/acmeAutomation/subscriptions",
+      "organizations_url": "https://api.github.com/users/acmeAutomation/orgs",
+      "repos_url": "https://api.github.com/users/acmeAutomation/repos",
+      "events_url": "https://api.github.com/users/acmeAutomation/events{/privacy}",
+      "received_events_url": "https://api.github.com/users/acmeAutomation/received_events",
+      "type": "User",
+      "user_view_type": "public",
+      "site_admin": false
+    },
+    "created_at": "2023-11-04T07:30:37Z",
+    "updated_at": "2023-11-04T07:30:37Z",
+    "body": "Thanks for the pull request. Please make sure the description names the issue this closes.",
+    "author_association": "CONTRIBUTOR",
+    "reactions": {
+      "url": "https://api.github.com/repos/acme/widgets/issues/comments/1793370510/reactions",
+      "total_count": 0,
+      "+1": 0,
+      "-1": 0,
+      "laugh": 0,
+      "hooray": 0,
+      "confused": 0,
+      "heart": 0,
+      "rocket": 0,
+      "eyes": 0
+    },
+    "performed_via_github_app": null,
+    "minimized": null
+  }
+]

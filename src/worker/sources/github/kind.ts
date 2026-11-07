@@ -64,8 +64,8 @@ export function createGithubKind(cli: string): SourceKind<GithubConfig> {
     kind: GITHUB_KIND,
     title: both('GitHub', 'GitHub'),
     description: both(
-      '轮询 GitHub 通知，读取 Issue 评论，并在原会话里回复。',
-      'Polls GitHub notifications, reads Issue comments and replies in the same conversation.'
+      '轮询 GitHub 通知，读取 Issue 与 PR 的会话、评论和评审，并在原会话里回复。',
+      'Polls GitHub notifications, reads Issues and pull requests with their comments and reviews, and replies in the same conversation.'
     ),
     schema: githubConfigSchema,
     fields: [
@@ -85,9 +85,27 @@ export function createGithubKind(cli: string): SourceKind<GithubConfig> {
         advanced: true
       },
       {
+        key: 'observeIssues',
+        type: 'switch',
+        label: both('接收仓库里的新 Issue', 'Observe new Issues'),
+        advanced: true
+      },
+      {
+        key: 'observePulls',
+        type: 'switch',
+        label: both('接收仓库里的新 PR', 'Observe new pull requests'),
+        advanced: true
+      },
+      {
         key: 'observeComments',
         type: 'switch',
         label: both('接收未点名的评论', 'Observe unaddressed comments'),
+        advanced: true
+      },
+      {
+        key: 'observeCi',
+        type: 'switch',
+        label: both('接收默认分支的 CI', 'Observe default-branch CI'),
         advanced: true
       }
     ],

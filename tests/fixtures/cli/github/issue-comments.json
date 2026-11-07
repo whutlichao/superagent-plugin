@@ -1,0 +1,49 @@
+[
+  {
+    "url": "https://api.github.com/repos/acme/widgets/issues/comments/6702566216",
+    "html_url": "https://github.com/acme/widgets/issues/42#issuecomment-6702566216",
+    "issue_url": "https://api.github.com/repos/acme/widgets/issues/42",
+    "id": 6702566216,
+    "node_id": "IC_kwDODKw3uc8AAAABj4ELSA",
+    "user": {
+      "login": "alice",
+      "id": 353311445,
+      "node_id": "U_kgDOFQ8a1Q",
+      "avatar_url": "https://avatars.githubusercontent.com/u/353311445?v=4",
+      "gravatar_id": "",
+      "url": "https://api.github.com/users/alice",
+      "html_url": "https://github.com/alice",
+      "followers_url": "https://api.github.com/users/alice/followers",
+      "following_url": "https://api.github.com/users/alice/following{/other_user}",
+      "gists_url": "https://api.github.com/users/alice/gists{/gist_id}",
+      "starred_url": "https://api.github.com/users/alice/starred{/owner}{/repo}",
+      "subscriptions_url": "https://api.github.com/users/alice/subscriptions",
+      "organizations_url": "https://api.github.com/users/alice/orgs",
+      "repos_url": "https://api.github.com/users/alice/repos",
+      "events_url": "https://api.github.com/users/alice/events{/privacy}",
+      "received_events_url": "https://api.github.com/users/alice/received_events",
+      "type": "User",
+      "user_view_type": "public",
+      "site_admin": false
+    },
+    "created_at": "2026-11-07T05:01:49Z",
+    "updated_at": "2026-11-07T05:01:49Z",
+    "body": "@acme-agent please fix the login redirect before Friday.",
+    "author_association": "NONE",
+    "pin": null,
+    "reactions": {
+      "url": "https://api.github.com/repos/acme/widgets/issues/comments/6702566216/reactions",
+      "total_count": 0,
+      "+1": 0,
+      "-1": 0,
+      "laugh": 0,
+      "hooray": 0,
+      "confused": 0,
+      "heart": 0,
+      "rocket": 0,
+      "eyes": 0
+    },
+    "performed_via_github_app": null,
+    "minimized": null
+  }
+]
