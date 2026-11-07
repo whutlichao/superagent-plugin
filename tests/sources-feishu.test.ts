@@ -1078,6 +1078,12 @@ test('a chat replies only where the Source still listens', async () => {
     ),
     true
   )
+  // 链接指向群；缺群 id 时给空链接（面板不假装有页面）。
+  assert.equal(
+    kind.channel?.link?.({ chatId: 'oc_all' }, {})?.url,
+    'https://applink.feishu.cn/client/chat/open?openChatId=oc_all'
+  )
+  assert.equal(kind.channel?.link?.({}, {})?.url, '')
 })
 
 test('a recalled or missing target message is gone, while every other failure retries', async () => {
