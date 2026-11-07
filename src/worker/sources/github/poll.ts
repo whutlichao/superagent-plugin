@@ -1,15 +1,18 @@
-// 通知轮询（§I.2「通知轮询」行）：一轮只做三件事——读通知、把对得上的那条读成 Issue 评论、
-// 翻成 Trigger 交给 Source 端口。游标按通知 id 存在 Source 自己的 kv 里（`github-cursor:<id>`）。
+// 通知轮询（§I.2「通知轮询」行）：一轮只做三件事——读通知、把每条通知的 subject 展开成
+// Issue/PR 读取、翻成 Trigger 交给 Source 端口。游标按通知 id 存在 Source 自己的 kv 里
+// （`github-cursor:<id>`），**整轮成功才推进**：被中断的一轮下一轮重读，而不是漏读（§I.6）。
 //
-// 失败姿态（§I.2 失败处理列）：单条通知失败只记这一轮失败，**游标不动**（下一轮重读）；连续
-// 三轮失败把 health 的 `github` 条目报成 error；任何一次成功清零。自身消息在这一层就被丢弃。
+// 失败姿态（§I.2 失败处理列）：单条失败留 `thread.meta.pollError`，下一轮重读（404 也一样：
+// 它可能是丢权限而不是消失）；连续三轮失败把 health 的 `github` 条目报成 error；任何一次
+// 成功清零。自身消息在这一层就被丢弃。
 //
-// 依赖纪律（§C.2）：本文件只 import core 的类型、命令端口与同目录的兄弟模块；它拿不到
+// 依赖纪律（§C.2）：本文件只 import core 的类型、命令端口的形状与同目录的兄弟模块；它拿不到
 // Engine、Store 或宿主，收 Trigger 只能经注入的 `host.receive`。KV 键名也不由这里拼：
 // `app/kv.ts` 是唯一命名处，组合根把构造函数（`cursorKey`）交进来（§D.3）。
-import type { HealthEntry, Trigger } from '../../core/index.ts'
+import { liveTicket } from '../../core/index.ts'
+import type { HealthEntry, Thread, Ticket, Trigger } from '../../core/index.ts'
 import type { SourceContext } from '../kind.ts'
-import type { GithubComment, GithubNotification } from './api.ts'
+import type { GithubNotification } from './api.ts'
 import { issueNumberOf, type GithubApi } from './api.ts'
 import { commentTrigger, isSelf } from './translate.ts'
 import type { GithubConfig } from './config.ts'
@@ -17,8 +20,24 @@ import type { GithubConfig } from './config.ts'
 /** 连续多少轮失败把 `github` 条目标成 error（§I.2：连续 3 轮）。 */
 export const FAILURES_BEFORE_ERROR = 3
 
+/**
+ * 订阅 Thread 的水位线（§I.3 的 `POLL_HORIZON_MS`，同上游语义）：最后一条 Trigger 或
+ * Ticket 结束后继续轮询两周；超过就标为过期、停止轮询，但 Thread 记录保留。
+ */
+export const POLL_HORIZON_MS = 14 * 24 * 3600_000
+
 /** 轮询端口：组合根接 `app/source-context.ts`，测试接一个记录收到的 Trigger 的替身。 */
-export type GithubPollHost = Pick<SourceContext, 'receive' | 'state' | 'report'>
+export type GithubPollHost = Pick<SourceContext, 'receive' | 'state' | 'report' | 'threads'>
+
+/** 一个有 Ticket 订阅的 GitHub Thread（组合根从 Thread 行与 Ticket 行算出）。 */
+export interface GithubSubscribedThread {
+  /** Issue/PR 号（Thread id 的数字部分）。 */
+  readonly issue: number
+  /** 有活着的 Ticket 订阅：无论水位线都轮询。 */
+  readonly live: boolean
+  /** 最后活动时刻（Thread 最后一条 Trigger 与每条 Ticket 结束时刻的最大者）。 */
+  readonly lastAt: string
+}
 
 /** 轮询器的依赖。 */
 export interface GithubPollerOptions {
@@ -32,15 +51,21 @@ export interface GithubPollerOptions {
    * 由组合根注入，Source 自己不拼字面量（§D.3）。
    */
   readonly cursorKey: (notificationId: string) => string
+  /** 有 Ticket 订阅的 Thread；缺省（或没有它）时不读订阅。 */
+  readonly subscribed?: () => readonly GithubSubscribedThread[]
+  /** 时钟（毫秒，水位线判定用）；缺省 `Date.now`。 */
+  readonly now?: () => number
   readonly log?: (message: string) => void
 }
 
 /** 一轮轮询的读数（面板与测试用）。 */
 export interface GithubPollResult {
-  /** 这一轮处理的通知数（含跳过的）。 */
+  /** 这一轮处理的通知数（含跳过的类型）。 */
   readonly notifications: number
-  /** 翻成 Trigger 并交给 Source 的条数。 */
+  /** 翻成 Trigger 并交给 Source 的条数（重复的不算）。 */
   readonly triggers: number
+  /** 这一轮跳过的畸形条目数（不是失败：§I.2「畸形条目跳过并计数」）。 */
+  readonly skipped: number
 }
 
 /** 一条通知的游标：上次处理到的 `updated_at` 与上一次的 `last_read_at`。 */
@@ -65,8 +90,54 @@ function cursorOf(value: unknown): Cursor | null {
 }
 
 /** 一条评论是否属于这一轮（`since` 过滤器之外再兜一层：编辑过的评论要重新出 Trigger）。 */
-function fresh(comment: GithubComment, since: string | null): boolean {
-  return since === null || comment.updatedAt >= since || comment.createdAt >= since
+function fresh(updatedAt: string, createdAt: string, since: string | null): boolean {
+  return since === null || updatedAt >= since || createdAt >= since
+}
+
+/** 一条 Thread 的引用（`github:<issue>`，§I.2 Thread 行）。 */
+const threadRef = (issue: number): { source: 'github'; id: string } => ({
+  source: 'github',
+  id: String(issue)
+})
+
+/**
+ * Thread 是否还在水位线内：活订阅永远在；否则从最后活动起算 `POLL_HORIZON_MS`。
+ * 时刻解析不出来的当作不在（宁可少读，也不无限轮询一个坏记录）。
+ */
+export function withinHorizon(thread: GithubSubscribedThread, nowMs: number): boolean {
+  if (thread.live) return true
+  const at = Date.parse(thread.lastAt)
+  return Number.isFinite(at) && nowMs - at < POLL_HORIZON_MS
+}
+
+/**
+ * 从 Thread 行与 Ticket 行算出「有订阅的 Thread」：`live` 看是否还有活 Ticket（有就无条件
+ * 轮询），`lastAt` 取 Thread 最后一条 Trigger 与各 Ticket 结束时刻的最大者（水位线用它）。
+ * 组合根（`boot.ts`）按 Source 过滤后交给轮询器；轮询器自己不读库（§C.2）。
+ */
+export function subscribedThreads(
+  threads: readonly Thread[],
+  tickets: readonly Ticket[]
+): readonly GithubSubscribedThread[] {
+  const byId = new Map(tickets.map((ticket) => [ticket.id, ticket] as const))
+  const found: GithubSubscribedThread[] = []
+  for (const thread of threads) {
+    if (thread.ref.source !== 'github' || thread.subscriptions.length === 0) continue
+    const issue = Number(thread.ref.id)
+    if (!Number.isInteger(issue) || issue <= 0) continue
+    const subscribed = thread.subscriptions.flatMap((id) => {
+      const ticket = byId.get(id)
+      return ticket === undefined ? [] : [ticket]
+    })
+    const times = [thread.lastAt ?? thread.createdAt, ...subscribed.map((ticket) => ticket.ended?.at ?? '')]
+      .flatMap((at) => {
+        const parsed = Date.parse(at)
+        return Number.isFinite(parsed) ? [parsed] : []
+      })
+    const lastAt = new Date(times.length === 0 ? Date.parse(thread.createdAt) : Math.max(...times)).toISOString()
+    found.push({ issue, live: subscribed.some((ticket) => liveTicket(ticket)), lastAt })
+  }
+  return found
 }
 
 /** 轮询器：`poll()` 可重复调用，游标与失败计数都在这个对象上。 */
@@ -79,47 +150,79 @@ export interface GithubPoller {
  */
 export function createGithubPoller(options: GithubPollerOptions): GithubPoller {
   const log = options.log ?? (() => undefined)
+  const nowMs = options.now ?? (() => Date.now())
   let failures = 0
+  /** 这一轮要写的游标；整轮成功才落盘（§I.2：被中断的一轮游标不动）。 */
+  let pending = new Map<string, Cursor>()
+  /** 已经标过过期的 Thread（同一进程只写一次 meta）。 */
+  const expired = new Set<number>()
 
   const report = (entry: HealthEntry): void => options.host.report('github', entry)
 
-  const fail = (error: unknown): void => {
+  const failRound = (error: unknown): void => {
     failures += 1
     const text = error instanceof Error ? error.message : String(error)
-    const detail = `notification poll failed ${failures} ${
-      failures === 1 ? 'time' : 'times'
-    }: ${text.slice(0, 200)}`
+    const detail = `poll failed ${failures} ${failures === 1 ? 'time' : 'times'}: ${text.slice(0, 200)}`
     if (failures >= FAILURES_BEFORE_ERROR) {
       report({ state: 'error', detail })
     }
     log(detail)
   }
 
-  const readNotification = async (notification: GithubNotification): Promise<number> => {
-    const key = options.cursorKey(notification.id)
-    const cursor = cursorOf(options.host.state.get(key))
-    if (cursor !== null && cursor.updatedAt === notification.updatedAt) return 0
-    const issue = issueNumberOf(notification.apiUrl)
-    const repository = notification.repository || options.config.repository
-    // 本票只读 Issue 评论；PR / Release 等通知记住位置就走（PR 面归 #17/#18）。
-    if (notification.type !== 'Issue' || issue === undefined) {
-      // 不是 Issue/PR 的通知（例如 Release）：记住位置，不读任何东西。
-      options.host.state.set(key, {
-        updatedAt: notification.updatedAt,
-        lastReadAt: notification.lastReadAt,
-        skipped: notification.type
-      } satisfies Cursor)
-      return 0
+  /** 单条 Thread 的失败写在它自己的 meta 上（§I.2 失败处理列）。 */
+  const recordPollError = (issue: number, error: unknown): void => {
+    const text = error instanceof Error ? error.message : String(error)
+    options.host.threads.patch(threadRef(issue), { pollError: text.slice(0, 2000) })
+  }
+
+  /** 读成功：清掉轮询错误与过期标记；页面地址记进 Thread 自己的 meta（§D.2）。 */
+  const recordSuccess = (issue: number, url: string | undefined): void => {
+    expired.delete(issue)
+    options.host.threads.patch(threadRef(issue), {
+      ...(url === undefined || url.length === 0 ? {} : { url }),
+      pollError: undefined,
+      pollExpired: undefined
+    })
+  }
+
+  /** 标一个超出水位线的 Thread 为过期：停止无意义轮询，但 Thread 记录保留（§I.2）。 */
+  const markExpired = (issue: number): void => {
+    if (expired.has(issue)) return
+    expired.add(issue)
+    options.host.threads.patch(threadRef(issue), { pollExpired: true })
+  }
+
+  /**
+   * 读一个 Thread 的会话：Issue/PR 本体、会话评论，PR 再读评审与评审评论（#18 只读不翻）。
+   * `pull` 已知时（通知的 subject.type 就是 PullRequest）跳过 issues/<n> 的探测读取。
+   */
+  const readThread = async (input: {
+    readonly repository: string
+    readonly issue: number
+    readonly since: string | null
+    readonly knownPull: boolean | undefined
+    readonly skip: (count: number) => void
+  }): Promise<number> => {
+    const { repository, issue, since, skip } = input
+    let isPull = input.knownPull === true
+    let url: string | undefined
+    if (input.knownPull === undefined) {
+      const read = await options.api.issue(repository, issue)
+      skip(read.skipped)
+      isPull = read.items[0]?.isPull === true
+      url = read.items[0]?.url
     }
-    const comments = await options.api.issueComments(
-      repository,
-      issue,
-      cursor?.lastReadAt ?? notification.lastReadAt
-    )
+    if (isPull) {
+      const pull = await options.api.pull(repository, issue)
+      skip(pull.skipped)
+      url = pull.items[0]?.url ?? url
+    }
+    const comments = await options.api.issueComments(repository, issue, since)
+    skip(comments.skipped)
     let received = 0
-    for (const comment of comments) {
+    for (const comment of comments.items) {
       if (isSelf(comment, options.login)) continue
-      if (!fresh(comment, cursor?.lastReadAt ?? notification.lastReadAt)) continue
+      if (!fresh(comment.updatedAt, comment.createdAt, since)) continue
       const trigger: Trigger = commentTrigger({
         repository,
         issue,
@@ -127,41 +230,123 @@ export function createGithubPoller(options: GithubPollerOptions): GithubPoller {
         login: options.login,
         observeComments: options.config.observeComments
       })
-      options.host.receive(trigger)
-      received += 1
+      // 同一版本评论重复读到只算一次（Trigger id 幂等，§I.2 Trigger id 行）。
+      if (options.host.receive(trigger) !== 'duplicate') received += 1
     }
-    // 只有读成功才推进游标：被中断的一轮会重读，而不是漏读（§I.2 / §I.6）。
-    options.host.state.set(key, {
-      updatedAt: notification.updatedAt,
-      lastReadAt: notification.lastReadAt
-    } satisfies Cursor)
+    if (isPull) {
+      // 评审与评审评论本票只读（每轮都读，失败记在 Thread 上）；翻译与回复归 #18。
+      skip((await options.api.pullReviews(repository, issue)).skipped)
+      skip((await options.api.pullComments(repository, issue)).skipped)
+    }
+    recordSuccess(issue, url)
     return received
   }
 
   return {
     async poll(): Promise<GithubPollResult> {
-      let notifications: readonly GithubNotification[]
-      try {
-        notifications = await options.api.notifications()
-      } catch (error) {
-        fail(error)
-        return { notifications: 0, triggers: 0 }
-      }
+      pending = new Map<string, Cursor>()
+      let skipped = 0
+      let notifications = 0
       let triggers = 0
+      /** 这一轮已经读过的 Issue/PR（通知与订阅两路只读一次）。 */
+      const read = new Set<number>()
+      let failed = false
       let firstError: unknown
-      for (const notification of notifications) {
+      const noteFailure = (error: unknown): void => {
+        failed = true
+        firstError ??= error
+      }
+      const addSkipped = (count: number): void => {
+        skipped += count
+      }
+
+      // 1) 通知：逐条 subject 展开成 Issue/PR 读取。
+      try {
+        const listing = await options.api.notifications()
+        addSkipped(listing.skipped)
+        notifications = listing.items.length
+        for (const notification of listing.items) {
+          try {
+            triggers += await readNotification(notification, read, addSkipped)
+          } catch (error) {
+            noteFailure(error)
+            const issue = issueNumberOf(notification.apiUrl)
+            if (issue !== undefined) recordPollError(issue, error)
+          }
+        }
+      } catch (error) {
+        noteFailure(error)
+      }
+
+      // 2) 订阅 Thread：凡有活 Ticket 订阅的都每轮读一次；超出水位线的标为过期、不再读。
+      for (const thread of options.subscribed?.() ?? []) {
+        if (!withinHorizon(thread, nowMs())) {
+          markExpired(thread.issue)
+          continue
+        }
+        if (read.has(thread.issue)) continue
         try {
-          triggers += await readNotification(notification)
+          triggers += await readThread({
+            repository: options.config.repository,
+            issue: thread.issue,
+            // 订阅 Thread 每轮全量读会话评论：幂等由 Trigger id 保证（§I.2 Trigger id 行）。
+            since: null,
+            knownPull: undefined,
+            skip: addSkipped
+          })
         } catch (error) {
-          firstError ??= error
-          fail(error)
+          noteFailure(error)
+          recordPollError(thread.issue, error)
         }
       }
-      if (firstError === undefined) {
+
+      // 3) 整轮成功才推进游标：被中断的一轮重读，而不是漏读（§I.2 / §I.6）。
+      if (failed) {
+        failRound(firstError)
+      } else {
+        for (const [key, value] of pending) options.host.state.set(key, value)
         failures = 0
-        report({ state: 'ready', detail: 'notification poll ok' })
+        report({
+          state: 'ready',
+          detail: `${notifications} notifications${skipped > 0 ? `; ${skipped} unreadable items skipped` : ''}`
+        })
       }
-      return { notifications: notifications.length, triggers }
+      return { notifications, triggers, skipped }
     }
+  }
+
+  /** 一条通知 → 它的 Issue/PR 读取与该条通知的游标（成功才进 `pending`）。 */
+  async function readNotification(
+    notification: GithubNotification,
+    read: Set<number>,
+    skip: (count: number) => void
+  ): Promise<number> {
+    const key = options.cursorKey(notification.id)
+    const cursor = cursorOf(options.host.state.get(key))
+    if (cursor !== null && cursor.updatedAt === notification.updatedAt) return 0
+    const issue = issueNumberOf(notification.apiUrl)
+    const repository = notification.repository || options.config.repository
+    if (issue === undefined || (notification.type !== 'Issue' && notification.type !== 'PullRequest')) {
+      // 不是 Issue/PR 的通知（Release、Discussion…）：记住位置，不读任何东西。
+      pending.set(key, {
+        updatedAt: notification.updatedAt,
+        lastReadAt: notification.lastReadAt,
+        ...(notification.type === '' ? {} : { skipped: notification.type })
+      })
+      return 0
+    }
+    read.add(issue)
+    const received = await readThread({
+      repository,
+      issue,
+      since: cursor?.lastReadAt ?? notification.lastReadAt,
+      knownPull: notification.type === 'PullRequest' ? true : undefined,
+      skip
+    })
+    pending.set(key, {
+      updatedAt: notification.updatedAt,
+      lastReadAt: notification.lastReadAt
+    })
+    return received
   }
 }

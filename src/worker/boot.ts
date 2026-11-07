@@ -35,7 +35,14 @@ import { notePluginVersion } from './app/upgrade.ts'
 import { createSourceContext } from './app/source-context.ts'
 import { SourceRegistry, type SourceSettingsView } from './sources/registry.ts'
 import { Commands, type CommandsHost } from './sources/commands.ts'
-import { createGithubApi, createGithubKind, createGithubPoller, GITHUB_KIND } from './sources/github/index.ts'
+import {
+  createGithubApi,
+  createGithubKind,
+  createGithubPoller,
+  githubSetupProblem,
+  subscribedThreads,
+  GITHUB_KIND
+} from './sources/github/index.ts'
 import type { GithubPollResult, GithubPoller } from './sources/github/index.ts'
 import type { Deployment } from './sources/kind.ts'
 import { OrcaExecutor, registerExecutorEffects, registerExecutorLifecycle, resolveExecutorSettings } from './executor/orca-executor.ts'
@@ -170,7 +177,7 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
       stateDir: resolved,
       ready: Promise.resolve(),
       snapshot: () => emptySnapshot(),
-      pollOnce: async () => ({ notifications: 0, triggers: 0 }),
+      pollOnce: async () => ({ notifications: 0, triggers: 0, skipped: 0 }),
       passOnce: async () => undefined,
       port: () => null,
       resumeReport: () => null,
@@ -383,9 +390,15 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
             repository: String(githubSetup.config['repository'] ?? ''),
             cli: String(githubSetup.config['cli'] ?? 'gh'),
             pollSeconds: Number(githubSetup.config['pollSeconds'] ?? 60),
-            observeComments: githubSetup.config['observeComments'] === true
+            observeIssues: githubSetup.config['observeIssues'] === true,
+            observePulls: githubSetup.config['observePulls'] === true,
+            observeComments: githubSetup.config['observeComments'] === true,
+            observeCi: githubSetup.config['observeCi'] === true
           },
           login: deployment(settings, githubSetup).githubLogin,
+          // 订阅 Thread 由组合根从 Thread/Ticket 行算出（轮询器自己不读库，§C.2）。
+          subscribed: () => subscribedThreads(repo.threads.list(), repo.tickets.list()),
+          now: nowMs,
           // 游标键的命名留在 `app/kv.ts`（§D.3）：Source 只拿到构造函数。
           cursorKey: githubCursorKey,
           host: createSourceContext({
@@ -425,7 +438,7 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
   effects.start()
 
   const pollOnce = async (): Promise<GithubPollResult> => {
-    if (poller === null) return { notifications: 0, triggers: 0 }
+    if (poller === null) return { notifications: 0, triggers: 0, skipped: 0 }
     const result = await poller.poll()
     refresh()
     return result
@@ -605,14 +618,22 @@ async function setupGithub(input: {
   const config = block(input.stored['config'])
   const enabled = flag(input.stored['enabled'], true)
   const repository = text(config['repository']) ?? text(input.raw['repository']) ?? ''
-  const cli = text(config['cli']) ?? text(input.raw['githubCli']) ?? 'gh'
+  // 显式写成空串的 cli 是「没配」而不是「回落到 gh」：设置页面把它清空后不能静默换回默认值。
+  const storedCli = config['cli']
+  const cli =
+    storedCli === undefined
+      ? text(input.raw['githubCli']) ?? 'gh'
+      : typeof storedCli === 'string' && storedCli.trim() === ''
+        ? ''
+        : text(storedCli) ?? ''
   const merged = { ...config, repository, cli }
-  if (repository === '') {
+  const problem = githubSetupProblem({ repository, cli })
+  if (problem !== undefined) {
     return {
       enabled,
       config: merged,
       login: text(input.raw['githubLogin']) ?? '',
-      problem: { place: GITHUB_KIND, code: 'repository_missing' }
+      problem: { place: GITHUB_KIND, code: problem }
     }
   }
   if (!enabled) return { enabled, config: merged, login: text(input.raw['githubLogin']) ?? '' }

@@ -1,0 +1,57 @@
+{
+  "source": {
+    "command": "gh api 'repos/cli/cli/issues/8294/comments?per_page=1'",
+    "note": "真实输出（PR 会话评论；字段集合与 Issue 评论相同）；仓库、账号与正文替换成中性值，正文不含点名。"
+  },
+  "read": {
+    "program": "gh",
+    "args": [
+      "api",
+      "repos/acme/widgets/issues/45/comments",
+      "--paginate",
+      "--method",
+      "GET",
+      "-f",
+      "per_page=100"
+    ],
+    "why": "PR 的会话评论走 issues/<n>/comments（评审与评审评论是另外两个端点）"
+  },
+  "trigger": {
+    "id": "1c3a12693a3848c566d33d61c702113e",
+    "idRecipe": "key('github', 'comment', '1793370510', '2023-11-04T07:30:37Z')",
+    "source": "github",
+    "threads": [
+      {
+        "source": "github",
+        "id": "45"
+      }
+    ],
+    "actor": {
+      "source": "github",
+      "id": "acme-automation"
+    },
+    "human": true,
+    "at": "2023-11-04T07:30:37Z",
+    "text": "Thanks for the pull request. Please make sure the description names the issue this closes.",
+    "url": "https://github.com/acme/widgets/pull/45#issuecomment-1793370510",
+    "channel": {
+      "source": "github",
+      "thread": "github:45",
+      "address": {
+        "repo": "acme/widgets",
+        "issue": "45"
+      }
+    },
+    "meta": {
+      "kind": "comment",
+      "repository": "acme/widgets",
+      "issue": 45,
+      "commentId": 1793370510,
+      "updatedAt": "2023-11-04T07:30:37Z"
+    }
+  },
+  "tally": {
+    "skipped": 0
+  },
+  "fixture": "tests/fixtures/cli/github/pull-conversation.json"
+}

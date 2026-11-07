@@ -6,6 +6,7 @@ import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { bootPlugin, type BootHandle } from '../../src/worker/boot.ts'
+import { readRepoJson } from './repo.ts'
 import { FakeOrcaRuntime } from './fake-orca-runtime.ts'
 import { FakeCommands } from './fake-commands.ts'
 
@@ -72,6 +73,10 @@ export async function openBoot(options: {
   const commands = new FakeCommands()
   commands.script('gh api user', () => 'acme-agent\n')
   commands.script('gh api notifications', () => JSON.stringify([NOTIFICATION]))
+  // 通知的 subject 先展开成 Issue 读取（§I.2「通知轮询」行），再读评论。
+  commands.script(['api', 'repos/acme/widgets/issues/42'], () =>
+    JSON.stringify(readRepoJson('tests/fixtures/cli/github/issue.json'))
+  )
   // 读评论与写评论是同一个路径、不同的参数形状：脚本必须带上区分两者的那一段
   // （读带 `--paginate`，写带 `-f body=…`），否则先注册的读脚本会把写调用也吃掉。
   commands.script(['api', 'repos/acme/widgets/issues/42/comments', '--paginate'], () =>
