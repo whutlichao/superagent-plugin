@@ -476,3 +476,20 @@ test('a message that failed three times stops being a system problem when the ti
     h.cleanup()
   }
 })
+
+test('the health counter counts unreachable drops and leaves withdrawals out', async () => {
+  const h = harness({ send: () => 'gone' })
+  try {
+    h.store.transaction(() => {
+      h.outbox.send(message('gone-1'))
+      h.outbox.send(message('gone-2'))
+      h.outbox.send(message('withdrawn-1'))
+      h.outbox.withdraw('withdrawn-1')
+    })
+    await h.effects.idle()
+    // §J.3：单条 drop 只计数、不算错误；撤回是人的动作，不混进 drop 计数。
+    assert.equal(h.store.outbox.countDropped(), 2)
+  } finally {
+    h.cleanup()
+  }
+})
