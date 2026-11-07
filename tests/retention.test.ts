@@ -1,6 +1,6 @@
 // 保留策略基线（§D.2 要点 5–6）：
 // - 阈值边界：Trigger/Disposition/Decision 90 天，已结算 Outbox 30 天；
-// - 未结束 Ticket 与其 Thread 永不清理；
+// - 未结束 Ticket 与其 Thread 永不清理：落在它视野里的 Trigger/Decision 也不删（#63）；
 // - 删除前写健康明细（`pruned: …`），不静默。
 import { assert, test } from 'orca/testing'
 import { DEFAULT_RETENTION, isoDaysBefore, prune, pruneDue, PRUNE_INTERVAL_MS } from '../src/worker/app/retention'
@@ -14,13 +14,17 @@ import {
 import { outboxSettled } from '../src/worker/app/retention-sql'
 import { AT, isoDaysAfter, openTempStore } from './support/state'
 
-/** 造一条 Trigger + Disposition + Trigger–Thread + Decision 的完整记录。 */
+/**
+ * 造一条 Trigger + Disposition + Trigger–Thread + Decision 的完整记录。
+ * `thread` 是它挂的 Thread（默认 `github:1`），`decision: false` 时不给它 Decision。
+ */
 function seedTrigger(
   store: ReturnType<typeof openTempStore>['store'],
   id: string,
   at: string,
-  extra: { readonly decision?: boolean } = {}
+  extra: { readonly thread?: string; readonly decision?: boolean } = {}
 ): void {
+  const thread = extra.thread ?? 'github:1'
   store.triggers.insert({
     id,
     source: 'github',
@@ -40,11 +44,11 @@ function seedTrigger(
     requeuedAt: null,
     body: {}
   })
-  store.triggerThreads.link({ threadKey: 'github:1', at, triggerId: id, human: true, primaryThread: false })
+  store.triggerThreads.link({ threadKey: thread, at, triggerId: id, human: true, primaryThread: false })
   if (extra.decision !== false) {
     store.decisions.put({
       id: `decision-${id}`,
-      threadKey: 'github:1',
+      threadKey: thread,
       at,
       kind: 'ignore',
       body: { reason: 'not-a-request' }
@@ -127,7 +131,7 @@ test('settled outbox goes after thirty days while pending outbox never does', ()
   }
 })
 
-test('unfinished tickets and their threads are never pruned', () => {
+test('unfinished tickets, their threads and what sits on them are never pruned', () => {
   const { store, cleanup } = openTempStore()
   try {
     const ancient = isoDaysAfter(AT, -365)
@@ -137,6 +141,7 @@ test('unfinished tickets and their threads are never pruned', () => {
       at: ancient,
       body: { inputs: [{ id: 'input-1' }], execution: { assignment: { state: 'running' } } }
     })
+    // 订阅集合的两种元素形态都认（读模型 `threadFrom` 也两种都认）。
     store.threads.put({
       key: 'github:1',
       source: 'github',
@@ -144,11 +149,150 @@ test('unfinished tickets and their threads are never pruned', () => {
       body: { eval: { id: 'eval-1' }, subscriptions: [{ ticketId: 'ticket-live' }] }
     })
     seedTrigger(store, 'old-trigger', ancient)
+
     const result = prune(store, { now: () => new Date(AT) })
-    assert.ok(result.pruned.triggers >= 1, 'old triggers do go')
+    assert.deepEqual(
+      result.pruned,
+      { triggers: 0, dispositions: 0, triggerThreads: 0, decisions: 0, outbox: 0, versionSnapshots: 0 },
+      'the trigger on an unfinished ticket’s thread is exempt, so nothing is deleted'
+    )
     assert.ok(store.tickets.get('ticket-live'), 'the unfinished ticket stays')
     assert.equal(store.tickets.get('ticket-live')?.open, true)
     assert.ok(store.threads.get('github:1'), 'its thread stays')
+    assert.ok(store.triggers.get('old-trigger'), 'the only trigger on that thread stays')
+    assert.ok(store.dispositions.get('old-trigger'), 'its disposition stays')
+    assert.deepEqual(
+      store.triggerThreads.timeline('github:1').items.map((item) => item.triggerId),
+      ['old-trigger'],
+      'its trigger_thread row stays'
+    )
+    assert.deepEqual(
+      store.decisions.byThread('github:1').map((decision) => decision.id),
+      ['decision-old-trigger'],
+      'the decision on that thread stays'
+    )
+  } finally {
+    cleanup()
+  }
+})
+
+test('the same ancient rows are pruned once the thread has no unfinished ticket left', () => {
+  const { store, cleanup } = openTempStore()
+  try {
+    const ancient = isoDaysAfter(AT, -100)
+    store.tickets.put({
+      id: 'ticket-done',
+      at: isoDaysAfter(AT, -150),
+      body: { ended: { at: isoDaysAfter(AT, -120), by: 'human', outcome: 'stopped' } }
+    })
+    store.threads.put({
+      key: 'github:1',
+      source: 'github',
+      meta: {},
+      body: { subscriptions: ['ticket-done'] }
+    })
+    seedTrigger(store, 'old', ancient)
+
+    const result = prune(store, { now: () => new Date(AT) })
+    assert.deepEqual(result.pruned, {
+      triggers: 1,
+      dispositions: 1,
+      triggerThreads: 1,
+      decisions: 1,
+      outbox: 0,
+      versionSnapshots: 0
+    })
+    assert.equal(store.triggers.get('old'), null, 'an ended ticket does not exempt the trigger')
+    assert.equal(store.dispositions.get('old'), null, 'nor its disposition')
+    assert.deepEqual(store.triggerThreads.timeline('github:1').items, [], 'nor its trigger_thread row')
+    assert.deepEqual(store.decisions.byThread('github:1'), [], 'nor the decision on that thread')
+  } finally {
+    cleanup()
+  }
+})
+
+test('the originating trigger of an unfinished ticket stays even with no subscription left', () => {
+  // 用户故事 32 的 Trigger→Ticket 历史：Ticket 页要展示它的起源 Trigger（`views/sources.ts`），
+  // 所以除了 Thread 订阅那条腿，Ticket 自己指着的 Trigger 也是豁免（人取消订阅后仍然成立）。
+  const { store, cleanup } = openTempStore()
+  try {
+    const ancient = isoDaysAfter(AT, -100)
+    store.tickets.put({
+      id: 'ticket-live',
+      at: ancient,
+      body: {
+        origin: { triggerId: 'origin', triggerIds: ['origin'] },
+        inputs: [{ id: 'input-1', kind: 'trigger', triggerId: 'follow-up', at: ancient }]
+      }
+    })
+    store.threads.put({ key: 'github:1', source: 'github', meta: {}, body: {} })
+    seedTrigger(store, 'origin', ancient)
+    seedTrigger(store, 'follow-up', ancient)
+    seedTrigger(store, 'unrelated', ancient, { thread: 'github:2' })
+
+    const result = prune(store, { now: () => new Date(AT) })
+    assert.equal(result.pruned.triggers, 1, 'only the trigger no unfinished ticket points at goes')
+    assert.ok(store.triggers.get('origin'), 'the ticket’s origin trigger stays')
+    assert.ok(store.triggers.get('follow-up'), 'a trigger that reached it as an input stays')
+    assert.equal(store.triggers.get('unrelated'), null, 'an unrelated trigger goes')
+  } finally {
+    cleanup()
+  }
+})
+
+test('a sweep leaves no dangling disposition, trigger_thread or decision row', () => {
+  const { store, cleanup } = openTempStore()
+  try {
+    const ancient = isoDaysAfter(AT, -100)
+    store.tickets.put({ id: 'ticket-live', at: ancient, body: { inputs: [] } })
+    store.tickets.put({
+      id: 'ticket-done',
+      at: ancient,
+      body: { ended: { at: ancient, by: 'human', outcome: 'stopped' } }
+    })
+    store.threads.put({
+      key: 'github:1',
+      source: 'github',
+      meta: {},
+      body: { subscriptions: ['ticket-live'] }
+    })
+    store.threads.put({
+      key: 'github:2',
+      source: 'github',
+      meta: {},
+      body: { subscriptions: ['ticket-done'] }
+    })
+    seedTrigger(store, 'kept', ancient)
+    seedTrigger(store, 'gone', ancient, { thread: 'github:2' })
+    // 一条没有任何 Thread 行、也没被未结束 Ticket 订阅的旧 Decision：按时间删。
+    store.decisions.put({ id: 'decision-orphan', threadKey: 'github:404', at: ancient, kind: 'ignore', body: {} })
+
+    const result = prune(store, { now: () => new Date(AT) })
+    assert.equal(result.pruned.triggers, 1)
+    assert.equal(result.pruned.decisions, 2)
+
+    const count = (sql: string): number => Number((store.sql.all(sql)[0] as Record<string, unknown>)['n'])
+    assert.equal(
+      count('SELECT count(*) AS n FROM disposition WHERE trigger_id NOT IN (SELECT id FROM trigger)'),
+      0,
+      'no disposition points at a deleted trigger'
+    )
+    assert.equal(
+      count('SELECT count(*) AS n FROM trigger_thread WHERE trigger_id NOT IN (SELECT id FROM trigger)'),
+      0,
+      'no trigger_thread row points at a deleted trigger'
+    )
+    assert.equal(
+      count('SELECT count(*) AS n FROM decision WHERE thread_key NOT IN (SELECT key FROM thread)'),
+      0,
+      'no decision points at a missing thread'
+    )
+    // 反方向也要成立：存活的一侧带着它的关联行，而不是「全删干净」也能通过。
+    assert.deepEqual(store.triggerThreads.timeline('github:1').items.map((item) => item.triggerId), ['kept'])
+    assert.ok(store.dispositions.get('kept'))
+    assert.deepEqual(store.decisions.byThread('github:1').map((decision) => decision.id), ['decision-kept'])
+    assert.equal(count('SELECT count(*) AS n FROM trigger_thread'), 1)
+    assert.equal(count('SELECT count(*) AS n FROM disposition'), 1)
   } finally {
     cleanup()
   }

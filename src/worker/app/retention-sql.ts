@@ -2,36 +2,86 @@
 // 让 `retention.ts` 只管顺序与明细，测试只需断言「删了什么」。
 //
 // 三条不删规则在 SQL 里就成立：
-// - Trigger/Disposition/Decision 只按 `at` 早于阈值删，不碰 Ticket/Thread 表；
+// - Trigger/Disposition/Decision 只删 `at` 早于阈值、且**不落在未结束 Ticket 视野里**的行
+//   （§D.2 要点 6、#63：未结束的 Ticket 与其 Thread 永不自动清理，所以它的 Trigger→Ticket
+//   历史也不能被时间阈值抹掉）；
 // - Outbox 只删「已结算」（sent/dropped）且结算时间早于 30 天的行；
 // - 版本快照族只删早于阈值的 `settings-version:*` / `prompt-version:*`（当前版本由调用方排除）。
 import { VERSION_SNAPSHOT_PREFIXES } from './kv'
 
-/** Trigger 与它的关联行（`trigger_thread` 无外键，按时间显式删）。 */
+/**
+ * 「这条 Thread 的订阅集合里还有未结束的 Ticket」——豁免谓词的两个用法共用它。
+ * 订阅集合是权威（§D.1：`thread.subscriptions[]`，`Tickets.subscribe` 写），元素形态与
+ * 读模型 `threadFrom`（`app/repositories.ts`）一致：Ticket id 文本，或 `{ticketId}` 投影。
+ * 未结束就是生成列 `ticket.open = 1`（领域侧同义谓词是 `core/model.ts` 的 `liveTicket`）。
+ * 走 `trigger_thread_by_trigger` / `thread` / `ticket` 的主键，只在到期的行上求值。
+ */
+const openTicketSubscriber = (thread: string): string => `EXISTS (
+        SELECT 1 FROM json_each(${thread}.body, '$.subscriptions') AS s
+         WHERE EXISTS (
+           SELECT 1 FROM ticket t
+            WHERE t.open = 1
+              AND t.id = COALESCE(
+                json_extract(CASE WHEN s.type = 'object' THEN s.value END, '$.ticketId'),
+                s.value)))`
+
+/**
+ * 一条 Trigger 是否落在未结束 Ticket 的视野里（两条腿，都只用既有状态）：
+ * - 它关联的某条 Thread 仍被未结束 Ticket 订阅（`trigger_thread` → `thread`）；
+ * - 它是某个未结束 Ticket 的起源 Trigger，或作为一条 Trigger Input 到达过它
+ *   （Ticket 页展示的 Trigger→Ticket 历史，用户故事 32；人取消订阅后这条腿仍然成立）。
+ */
+const keptTrigger = `(
+      EXISTS (
+        SELECT 1 FROM trigger_thread tt JOIN thread th ON th.key = tt.thread_key
+         WHERE tt.trigger_id = trigger.id AND ${openTicketSubscriber('th')})
+      OR EXISTS (
+        SELECT 1 FROM ticket t
+         WHERE t.open = 1
+           AND (json_extract(t.body, '$.origin.triggerId') = trigger.id
+                OR EXISTS (SELECT 1 FROM json_each(t.body, '$.inputs') AS i
+                            WHERE json_extract(i.value, '$.triggerId') = trigger.id))))`
+
+/**
+ * 一次保留 pass 要删的 Trigger：到期的（`at < ?`），且不落在未结束 Ticket 的视野里。
+ * 下面三条语句共用它——删除集合只有一个定义，关联行与 disposition 不会跟 Trigger 走散。
+ */
+const expiredTriggers = `SELECT id FROM trigger WHERE at < ? AND NOT ${keptTrigger}`
+
+/** Trigger（到期的、不受豁免的那些）。 */
 export const trigger = {
-  deleteBefore: 'DELETE FROM trigger WHERE at < ?'
+  deleteBefore: `DELETE FROM trigger WHERE id IN (${expiredTriggers})`
 } as const
 
 /**
- * Trigger–Thread 关联行：Trigger 被删时它的关联行必须一起走（表上没有外键，
- * 这里显式级联）。谓词走 `trigger_thread_by_trigger`，不扫关联表。
+ * Trigger–Thread 关联行：只有同样「到期且不受豁免」的 Trigger 的关联行跟着走（表上没有
+ * 外键，这里显式级联）；豁免 Trigger 的关联行一并保留。谓词走 `trigger_thread_by_trigger`。
+ *
+ * 顺序：先删关联行、再删 Trigger。这一步只动不受豁免的那些，而豁免只看**该 Trigger 自己**
+ * 的关联行与 Ticket，所以第二步重算谓词时判定不变。
  */
 export const triggerThread = {
-  deleteForOldTriggers:
-    'DELETE FROM trigger_thread WHERE trigger_id IN (SELECT id FROM trigger WHERE at < ?)'
+  deleteForOldTriggers: `DELETE FROM trigger_thread WHERE trigger_id IN (${expiredTriggers})`
 } as const
 
 /**
- * Disposition 不单独删：它靠 `ON DELETE CASCADE` 跟着 Trigger 走。
- * 这里只数一下「即将被级联删掉多少行」，让 health 明细说实话。
+ * Disposition 不单独删：它靠 `ON DELETE CASCADE` 跟着 Trigger 走（豁免的 Trigger 被保留，
+ * 它的 disposition 也就在）。这里只数一下「即将被级联删掉多少行」，让 health 明细说实话。
  */
 export const disposition = {
-  countBefore: 'SELECT count(*) AS n FROM disposition WHERE trigger_id IN (SELECT id FROM trigger WHERE at < ?)'
+  countBefore: `SELECT count(*) AS n FROM disposition WHERE trigger_id IN (${expiredTriggers})`
 } as const
 
-/** Decision：按决策时刻删。 */
+/**
+ * 一条 Decision 是否属于仍 open 的 Thread/Ticket：它的 Thread 的订阅集合里还有未结束的
+ * Ticket（与 Trigger 豁免同一条谓词，不新造状态）。
+ */
+const keptDecision = `EXISTS (
+    SELECT 1 FROM thread th WHERE th.key = decision.thread_key AND ${openTicketSubscriber('th')})`
+
+/** Decision：按决策时刻删，未结束 Ticket 的 Thread 上的不删。 */
 export const decision = {
-  deleteBefore: 'DELETE FROM decision WHERE at < ?'
+  deleteBefore: `DELETE FROM decision WHERE at < ? AND NOT ${keptDecision}`
 } as const
 
 /**
