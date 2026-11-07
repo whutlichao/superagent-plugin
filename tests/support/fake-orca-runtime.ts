@@ -7,7 +7,7 @@
 //   测试替身一旦进 `src/` 就会把那条断言改成假绿或被迫放宽；
 // - 它不是插件的一部分，不随插件发布；放在测试面也不影响 §C.2 的依赖方向。
 // 设计 §B.4 描述的是替身的**语义**（内存表、脚本注入、记录调用），位置是测试面。
-import { OrcaRuntimeError } from '../../src/worker/runtime/orca-runtime'
+import { OrcaRuntimeError } from '../../src/worker/runtime/orca-runtime.ts'
 import type {
   AgentHandle,
   AgentRow,
@@ -22,7 +22,7 @@ import type {
   WorkspaceHandle,
   WorkspaceInfo,
   WorkspaceSpec
-} from '../../src/worker/runtime/orca-runtime'
+} from '../../src/worker/runtime/orca-runtime.ts'
 
 /** 一次 `sendText` 的记录：执行器断言「发的是什么、有没有回车」。 */
 export interface SentText {

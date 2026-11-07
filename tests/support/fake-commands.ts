@@ -7,7 +7,15 @@
 //   cli.fail('gh', ['api', 'repos/acme/widgets'], new CliError('gh exited with code 1: ...', 404, 1))
 //   await poll(cli)
 //   assert.deepEqual(cli.calls.map((call) => call.program), ['gh', 'gh'])
-import { CliError, combineSignals, type CommandsHost, type RunOptions } from '../../src/worker/sources/commands.ts'
+import {
+  CliError,
+  combineSignals,
+  type CommandStream,
+  type CommandsHost,
+  type RunOptions,
+  type StreamExit,
+  type StreamOptions
+} from '../../src/worker/sources/commands.ts'
 
 /** 一次被记录的调用：程序、参数、选项与调用时收到的取消信号。 */
 export interface FakeCall {
@@ -16,6 +24,115 @@ export interface FakeCall {
   readonly options: RunOptions
   /** 调用时端口上绑定的信号（由 `withSignal` 合并进来）；测试据此断言「窗口取消后不再读」。 */
   readonly signal?: AbortSignal
+}
+
+/** 一次被记录的流式调用：程序、参数与调用时的流选项。 */
+export interface FakeStreamCall {
+  readonly program: string
+  readonly args: readonly string[]
+  readonly options: StreamOptions
+}
+
+/**
+ * 测试里的一条流式子进程（§I.6）：测试自己推标准输出行、标准错误诊断与退出码。连接之前的
+ * 推送先排队（脚本化的「一开始就退出」就靠它），连接之后立即交付。
+ */
+export class FakeStream {
+  readonly program: string
+  readonly args: readonly string[]
+  /** 已交付的标准输出行（断言用）。 */
+  readonly lines: string[] = []
+  /** 已交付的标准错误行（断言用）。 */
+  readonly diagnostics: string[] = []
+  readonly #queued: (
+    | { kind: 'line'; text: string }
+    | { kind: 'diagnostic'; text: string }
+    | { kind: 'exit'; code: number | null }
+  )[] = []
+  #options: StreamOptions | undefined
+  #exited = false
+  #stops = 0
+
+  constructor(program: string, args: readonly string[]) {
+    this.program = program
+    this.args = [...args]
+  }
+
+  /** 子进程是否已经被 `stream()` 建立（测试等它再推行）。 */
+  get attached(): boolean {
+    return this.#options !== undefined
+  }
+
+  /** 测试是否要求过停机（与真端口的 `stop()` 同义）。 */
+  get stopped(): boolean {
+    return this.#stops > 0
+  }
+
+  get stopCount(): number {
+    return this.#stops
+  }
+
+  /** 推一行标准输出。 */
+  out(line: string): this {
+    this.#deliver({ kind: 'line', text: line })
+    return this
+  }
+
+  /** 推一行标准错误诊断（就绪行与失败信息走这里）。 */
+  err(line: string): this {
+    this.#deliver({ kind: 'diagnostic', text: line })
+    return this
+  }
+
+  /** 结束子进程；连接之前调用就是「一启动就退出」。 */
+  exit(code: number | null = 0): this {
+    this.#deliver({ kind: 'exit', code })
+    return this
+  }
+
+  /** `stream()` 建立了子进程：把排队的动作按顺序交付。 */
+  attach(options: StreamOptions): void {
+    this.#options = options
+    for (const action of this.#queued.splice(0)) this.#apply(action)
+  }
+
+  /** 真端口 `stop()` 的替身：记一次停机，并像 SIGTERM 一样交付退出。 */
+  stop(): void {
+    this.#stops += 1
+    if (!this.#exited) this.exit(null)
+  }
+
+  #deliver(action: { kind: 'line'; text: string } | { kind: 'diagnostic'; text: string } | { kind: 'exit'; code: number | null }): void {
+    if (this.#options === undefined) {
+      this.#queued.push(action)
+      return
+    }
+    this.#apply(action)
+  }
+
+  #apply(action: { kind: 'line'; text: string } | { kind: 'diagnostic'; text: string } | { kind: 'exit'; code: number | null }): void {
+    const options = this.#options
+    if (options === undefined || this.#exited) return
+    if (action.kind === 'line') {
+      this.lines.push(action.text)
+      options.onLine(action.text)
+      return
+    }
+    if (action.kind === 'diagnostic') {
+      this.diagnostics.push(action.text)
+      options.onDiagnostic?.(action.text)
+      return
+    }
+    this.#exited = true
+    const outcome: StreamExit = { code: action.code, stderr: this.diagnostics.join('\n') }
+    options.onExit(outcome)
+  }
+}
+
+/** 一条流式脚本：匹配程序与参数前缀，交出预先造好的 `FakeStream`。 */
+interface StreamScript {
+  readonly matches: (program: string, args: readonly string[]) => boolean
+  readonly stream: FakeStream
 }
 
 /** 一条脚本：匹配程序与参数前缀（或自定义判定），返回标准输出或抛错。 */
@@ -40,7 +157,10 @@ function parse(matcher: string | readonly string[]): { program?: string; args: s
  */
 export class FakeCommands implements CommandsHost {
   readonly calls: FakeCall[] = []
+  /** 流式调用与 `run` 分开记：事件消费的断言读这一份。 */
+  readonly streams: FakeStreamCall[] = []
   readonly #scripts: Script[] = []
+  readonly #streamScripts: StreamScript[] = []
   readonly #signals: AbortSignal[] = []
 
   /** 脚本化一次或多次成功返回：`script('gh api notifications', () => json)`。 */
@@ -62,6 +182,37 @@ export class FakeCommands implements CommandsHost {
   /** 记录下来的程序序列（断言调用顺序用）。 */
   get programs(): string[] {
     return this.calls.map((call) => call.program)
+  }
+
+  /**
+   * 脚本化一个流式子进程（一次性：每次 `stream()` 落一条，用完了就轮到下一条）。
+   * 测试拿到 `FakeStream` 后自己推行、推诊断、结束它（§I.6：测试不 spawn）。
+   */
+  scriptStream(program: string, args: readonly string[] = []): FakeStream {
+    const stream = new FakeStream(program, args)
+    const matches = (candidate: string, received: readonly string[]): boolean => {
+      if (candidate !== program) return false
+      if (received.length < args.length) return false
+      return args.every((value, index) => received[index] === value)
+    }
+    // 一次性：每次 `stream()` 启动的都是新的子进程，用完了就轮到下一条脚本。
+    this.#streamScripts.push({ matches, stream })
+    return stream
+  }
+
+  /** 起一个假的流式子进程：没有脚本就失败（测试绝不跑真 CLI）。 */
+  stream(program: string, args: readonly string[], options: StreamOptions): CommandStream {
+    this.streams.push({ program, args: [...args], options })
+    const index = this.#streamScripts.findIndex((entry) => entry.matches(program, args))
+    if (index < 0) {
+      throw new Error(
+        `FakeCommands has no stream script for ${program} ${args.join(' ')}; tests never run a real CLI`
+      )
+    }
+    const entry = this.#streamScripts[index] as StreamScript
+    this.#streamScripts.splice(index, 1)
+    entry.stream.attach(options)
+    return { stop: () => entry.stream.stop() }
   }
 
   /** 便于断言「参数数组没有把消息正文拼成 shell 片段」。 */
@@ -133,6 +284,13 @@ class FakeCommandsView implements CommandsHost {
 
   run(program: string, args: readonly string[], options: RunOptions = {}): Promise<string> {
     return this.#inner.run(program, args, {
+      ...options,
+      signal: options.signal === undefined ? this.#signal : combine(this.#signal, options.signal)
+    })
+  }
+
+  stream(program: string, args: readonly string[], options: StreamOptions): CommandStream {
+    return this.#inner.stream(program, args, {
       ...options,
       signal: options.signal === undefined ? this.#signal : combine(this.#signal, options.signal)
     })
