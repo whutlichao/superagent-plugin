@@ -18,7 +18,10 @@ import type {
   SourcePolicyView,
   SourceSettingsCard
 } from '../src/panel/protocol'
+import { SETTINGS_GROUPS } from '../src/panel/protocol'
 import * as panelModule from '../src/panel/panel'
+import { SETTINGS_GROUP_BODIES, SETTINGS_GROUP_ORDER } from '../src/panel/settings'
+import { minimalPromptsView } from './support/prompts-view'
 
 /** 一份健康的 worker 快照（Settings 页读自己的请求，这一份只让面板壳起来）。 */
 function snapshot(): PanelState {
@@ -240,6 +243,7 @@ async function openSettings(options: {
 }) {
   const panel = await mount(panelModule, {
     host: mockHost({
+      storage: { 'panel.promptTab': 'edit' },
       requests: {
         state: () => snapshot(),
         deployment: () => ({
@@ -263,6 +267,8 @@ async function openSettings(options: {
         restartRouter: () => ({ state: 'ready', detail: '', terminalId: null, startedAt: null, restarts: 0, lastError: null }),
         'settings.read': () => (options.view ?? settingsView)(),
         'settings.history': () => options.history ?? historyView(),
+        // Prompts 组（#43）挂在同一张组表里：它的读数由自己那条请求提供，子页固定在编辑页。
+        prompts: () => minimalPromptsView(),
         'settings.save': (input) =>
           options.onSave?.(input as SettingsSaveInput) ?? {
             ok: true,
@@ -299,7 +305,7 @@ function saves(host: ReturnType<typeof mockHost>): SettingsSaveInput[] {
 }
 
 /** 已经打开的那一组（面板里默认 Sources；这一页一次只渲染当前组）。 */
-test('the Settings page shows the five groups in the design order, and Prompts is a placeholder', async () => {
+test('the Settings page shows the five groups in the design order, and Prompts is the real editor', async () => {
   const panel = await openSettings({})
   const labels = panel.findAll({ role: 'tab' }).map((tab) => tab.text)
   // 当前页的子 Tabs 是五组（§M.3 的顺序）；它嵌在导航的 Settings 项里。
@@ -312,7 +318,66 @@ test('the Settings page shows the five groups in the design order, and Prompts i
     COPY['settings.group.deployment'].en
   ])
   await groupTab(panel, 'prompts')
-  assert.ok(panel.find({ text: COPY['settings.prompts.placeholder'].en }), 'Prompts is a placeholder for #43')
+  // #43 的 Prompts 组是注册进来的真组件（`SETTINGS_GROUP_BODIES.prompts`），不是占位：
+  // 团队文本、分片与四个子页都在这一格里，子页默认停在编辑。
+  assert.ok(panel.find({ text: COPY['prompt.intro'].en }), 'the group opens on the edit page')
+  assert.ok(panel.find({ text: COPY['prompt.team'].en }), 'the team text section is the real one')
+  assert.ok(
+    panel.find({ type: 'Textarea', label: 'runtime/replies' }),
+    'the per-part overrides are the real ones'
+  )
+  assert.equal(
+    panel.valueOf({ type: 'Tabs', label: COPY['prompt.tabs'].en }),
+    'edit',
+    'the four sub-tabs live inside the group body'
+  )
+  for (const key of ['prompt.tab.edit', 'prompt.tab.full', 'prompt.tab.history', 'prompt.tab.skills'] as const) {
+    assert.ok(panel.find({ role: 'tab', text: COPY[key].en }), `the ${key} sub-tab is drawn by the real component`)
+  }
+  assert.deepEqual(panel.refusals, [])
+  assert.deepEqual(panel.errors, [])
+  await panel.unmount()
+})
+
+test('one group table: every group id has exactly one body, and each draws once', async () => {
+  // 只有一张组表（`settings.tsx` 的 `SETTINGS_GROUP_BODIES`）：键就是协议里的五个组 id，
+  // 一个 id 一行；重复的组表会让同一个 id 出现两次。
+  assert.deepEqual([...SETTINGS_GROUP_ORDER].sort(), [...SETTINGS_GROUPS].sort(), 'the order table is the five groups')
+  assert.equal(new Set(SETTINGS_GROUP_ORDER).size, SETTINGS_GROUP_ORDER.length, 'no group id is listed twice')
+  assert.deepEqual(
+    Object.keys(SETTINGS_GROUP_BODIES).sort(),
+    [...SETTINGS_GROUPS].sort(),
+    'exactly one body per group id'
+  )
+  for (const [groupId, body] of Object.entries(SETTINGS_GROUP_BODIES)) {
+    assert.equal(typeof body, 'function', `the ${groupId} group has a body to draw`)
+  }
+
+  // 渲染面：每组一段独有正文（只在这一组的组件里出现）；选一组就只画它，且只画一次。
+  const panel = await openSettings({})
+  const bodies = [
+    ['sources', COPY['settings.sources.intro'].en],
+    ['eval', COPY['settings.eval.intro'].en],
+    ['execution', COPY['settings.execution.intro'].en],
+    ['prompts', COPY['prompt.intro'].en],
+    ['deployment', COPY['settings.limits.title'].en]
+  ] as const
+  for (const [groupId, marker] of bodies) {
+    await groupTab(panel, groupId)
+    assert.equal(
+      panel.findAll({ text: marker }).length,
+      1,
+      `the ${groupId} group draws its body exactly once`
+    )
+    for (const [other, otherMarker] of bodies) {
+      if (other === groupId) continue
+      assert.equal(
+        panel.findAll({ text: otherMarker }).length,
+        0,
+        `the ${other} body is not drawn on the ${groupId} group`
+      )
+    }
+  }
   assert.deepEqual(panel.refusals, [])
   assert.deepEqual(panel.errors, [])
   await panel.unmount()

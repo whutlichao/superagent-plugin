@@ -2,7 +2,7 @@
 // 并把 worker 挂到同一个替身宿主上，所以面板的 `plugin.request` 真的会走到 worker 的处理器。
 //
 // 情景名单（§M.7）：booting、empty、healthy、needs-person、problems、paused、setup-missing、
-// long-lists、execution、source、deployment、zh、en、danger-confirm。
+// long-lists、execution、trigger、source、deployment、prompts、zh、en、danger-confirm。
 //
 // Overview（§M.2 的四块）由四个情景表达：empty（空态 + Source 概况）、needs-person（待人工行
 // 与它的直接动作）、problems（三类系统问题）、paused（暂停 + 恢复的二次确认）。
@@ -15,6 +15,14 @@ import { defineCheck } from 'orca/testing'
 import { HealthBoard } from '../worker/infra/health'
 import { DEFAULT_MACHINE_LIMITS } from '../worker/app/limits'
 import { deploymentView } from '../worker/app/deployment-view'
+import {
+  BUILT_IN_SKILLS,
+  composeSkill,
+  PROMPT_PARTS,
+  PROMPT_PART_KEYS,
+  skillFilePath,
+  TEAM_SECTIONS
+} from '../worker/app/prompts'
 import type {
   AttentionItem,
   DeploymentView,
@@ -22,6 +30,8 @@ import type {
   DoctorView,
   ExecutionFilter,
   HumanSlot,
+  PanelPromptsView,
+  PanelPromptPart,
   PanelState,
   PanelThread,
   PanelTicket,
@@ -549,6 +559,106 @@ function deploymentFixture(): DeploymentView {
   })
 }
 
+/**
+ * Prompts 组的读数（§M.3 的四个子页）：分片正文、角色与必保留占位符来自**真注册表**，
+ * 版本、历史、技能与两份全文是固定值——check 只看渲染，不读库、不拼真全文。
+ */
+function promptsFixture(): PanelPromptsView {
+  const stateDir = '/var/lib/superagent'
+  const textOf = (key: (typeof PROMPT_PART_KEYS)[number]): string => PROMPT_PARTS[key].lines.join('\n')
+  const parts: PanelPromptPart[] = PROMPT_PART_KEYS.map((key) => ({
+    key,
+    roles: [...PROMPT_PARTS[key].roles],
+    kind: PROMPT_PARTS[key].kind,
+    placement: PROMPT_PARTS[key].placement,
+    text: textOf(key),
+    placeholders: [...PROMPT_PARTS[key].placeholders],
+    base: `b-${key}`
+  }))
+  const config = {
+    team: { communication: 'Answer this team in short sentences, and in Chinese.' },
+    overrides: {
+      'runtime/replies': {
+        text: `${textOf('runtime/replies')}\nKeep every acknowledgement under twenty words.`,
+        base: 'b-runtime/replies'
+      }
+    },
+    skills: { 'team-review': 'Read the diff of every file you touched before you report.' }
+  }
+  return {
+    revision: 3,
+    saved: { revision: 3, predecessor: 2, at: '2026-11-07T03:20:00.000Z', origin: 'panel' },
+    config,
+    sections: [...TEAM_SECTIONS],
+    parts,
+    defaultChanged: ['runtime/replies'],
+    removedParts: [],
+    changes: [
+      {
+        part: 'runtime/replies',
+        base: 'b-old',
+        previous: 'Reply in one short paragraph.',
+        next: textOf('runtime/replies'),
+        removed: false
+      }
+    ],
+    history: [
+      { revision: 3, predecessor: 2, at: '2026-11-07T03:20:00.000Z', origin: 'panel' },
+      { revision: 2, predecessor: 1, at: '2026-11-06T09:10:00.000Z', origin: 'tool' },
+      { revision: 1, predecessor: null, at: '2026-11-05T18:00:00.000Z', origin: 'panel' }
+    ],
+    skills: [
+      ...BUILT_IN_SKILLS.map((skill) => ({
+        name: skill.name,
+        path: skillFilePath(stateDir, skill.name),
+        text: composeSkill(skill.kind),
+        readOnly: true
+      })),
+      {
+        name: 'team-review',
+        path: skillFilePath(stateDir, 'team-review'),
+        text: 'Read the diff of every file you touched before you report.',
+        readOnly: false
+      }
+    ],
+    stateDir,
+    maxChars: DEFAULT_MACHINE_LIMITS.promptMaxChars,
+    texts: {
+      saved: {
+        orchestrator: '# Superagent orchestrator\n\nAnswer this team in short sentences, and in Chinese.',
+        worker: '# Superagent worker\n\nAnswer this team in short sentences, and in Chinese.'
+      },
+      defaults: {
+        orchestrator: '# Superagent orchestrator\n\nBe concise and concrete.',
+        worker: '# Superagent worker\n\nBe concise and concrete.'
+      }
+    }
+  }
+}
+
+/** Prompts 组的情景：读数 + 预览/保存/恢复的确定答案（打开就停在 Prompts 的编辑页）。 */
+function promptsHost(state: PanelState) {
+  const view = promptsFixture()
+  return {
+    ...hostFor(state),
+    requests: {
+      ...hostFor(state).requests,
+      prompts: () => view,
+      'prompts.preview': (input: unknown) => {
+        const config = ((input ?? {}) as { config?: unknown }).config ?? {}
+        return { ok: true, config, dropped: [], texts: view.texts.saved }
+      },
+      'prompts.save': () => view,
+      'prompts.restore': () => view,
+      // Prompts 是 Settings 页的一组：组框架自己的读数与历史也要答得上。
+      'settings.read': () => settingsFixture(),
+      'settings.history': () => ({ revision: 1, history: [] })
+    },
+    // 打开面板就停在 Settings 的 Prompts 组（`settings.group` 是这个 atom 的 id）。
+    storage: { 'panel.page': 'settings', 'settings.group': 'prompts' }
+  }
+}
+
 /** doctor 的三档都出现一次（check 只看渲染，不真跑子进程）。 */
 const DOCTOR_FIXTURE: DoctorView = {
   checks: [
@@ -623,13 +733,13 @@ function deploymentHost(state: PanelState) {
       setupCheck: () => ({ checked: true, problems: [] }),
       rotateToken: () => ({ rotated: true, tokenFile: '/var/lib/superagent/api-token' }),
       restartRouter: () => deploymentFixture().router,
-      // Settings 页（#42）：五个组里本情景看到的是 Deployment 组，读数与历史各一条请求。
+      // Settings 页（#42）：五个组里本情景看的是 Deployment 组，读数与历史各一条请求。
       'settings.read': () => settingsFixture(),
       'settings.history': () => ({ revision: 1, history: [] })
     },
-    // 打开面板就停在 Settings：check 渲染的是 Deployment 组本身（keyed atom 读插件存储，
-    // 所以用 mockHost 的 `storage` 播种；`persisted` 不喂 `persist: 'storage'` 的 atom）。
-    storage: { 'panel.page': 'settings' }
+    // 打开面板就停在 Settings 的 Deployment 组（keyed atom 读插件存储，所以用 mockHost 的
+    // `storage` 播种；`persisted` 不喂 `persist: 'storage'` 的 atom）。
+    storage: { 'panel.page': 'settings', 'settings.group': 'deployment' }
   }
 }
 
@@ -709,6 +819,13 @@ export default defineCheck({
       setupMissing: true,
       error: true,
       problems: [problem('health', 'health:router', 'router', 'restarts 5 in 10 min')],
+      activity: { received: 5, evaluated: 4, accepted: 1, ignored: 3 }
+    })
+  ),
+  /** Prompts 组：三个团队段、每个分片一个字段、可读的占位符、历史与技能各自都在。 */
+  prompts: promptsHost(
+    snapshot({
+      sources: { enabled: 1, problems: 0 },
       activity: { received: 5, evaluated: 4, accepted: 1, ignored: 3 }
     })
   ),

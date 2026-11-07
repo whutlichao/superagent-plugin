@@ -47,6 +47,12 @@ afterEach(async () => {
 const pauseCalls = (host: ReturnType<typeof mockHost>): number =>
   host.callsOf('plugin.request').filter((params) => (params as { name?: string }).name === 'pause').length
 
+/**
+ * 页头导航的 Tabs：Settings 页里还有分组与子页的 Tabs（§M.3），所以按页头标题定位
+ * ——`findAll` 只回最内层匹配，裸 `{ type: 'Tabs' }` 会指向里面那一层。
+ */
+const NAV_TABS = { type: 'Tabs', label: COPY['panel.title'].en }
+
 /** 七项的文案，按语言。 */
 const navLabels = (locale: string): string[] =>
   (['overview', 'source', 'trigger', 'eval', 'execution', 'settings', 'search'] as const).map((page) =>
@@ -95,10 +101,10 @@ test('remembers the page it was left on, and goes back to it when reopened', asy
     host: mockHost({ requests: { state: () => healthyState() }, storage: { 'panel.page': 'settings' } }),
     locale: 'en'
   })
-  assert.equal(panel.valueOf({ type: 'Tabs' }), 'settings', 'reopens the remembered page')
+  assert.equal(panel.valueOf(NAV_TABS), 'settings', 'reopens the remembered page')
 
-  await panel.select({ type: 'Tabs' }, 'search')
-  assert.equal(panel.valueOf({ type: 'Tabs' }), 'search')
+  await panel.select(NAV_TABS, 'search')
+  assert.equal(panel.valueOf(NAV_TABS), 'search')
   assert.equal(panel.persisted.storage['panel.page'], 'search', 'the page is mirrored in plugin storage')
 
   const remembered = panel.persisted
@@ -285,7 +291,7 @@ test('a setup problem points at Settings, and Settings is one press away', async
   panel = await mount(panelModule, { host: mockHost({ requests: { state: () => setupMissing } }), locale: 'en' })
   assert.ok(panel.find({ text: new RegExp(COPY['setup.missing'].en) }))
   await panel.press({ text: COPY['setup.openSettings'].en })
-  assert.equal(panel.valueOf({ type: 'Tabs' }), 'settings')
+  assert.equal(panel.valueOf(NAV_TABS), 'settings')
 })
 
 test('the worker-reported problems are visible on the overview', async () => {

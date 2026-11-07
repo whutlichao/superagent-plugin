@@ -840,6 +840,178 @@ export interface PanelState {
   readonly tickets?: readonly PanelTicket[]
 }
 
+// ---------------------------------------------------------------------------
+// Prompts 组（§M.3 的四个子页、§L.3 占位符、§L.4 版本/历史/default-updated、§L.6 技能）
+// ---------------------------------------------------------------------------
+
+/**
+ * Prompts 组的四个子页（§M.3）：编辑、全文、历史、技能。取值是面板的语言，导航与
+ * 存储的校验都读这一处（旧版本留下的值按「编辑」渲染）。
+ */
+export const PROMPT_TABS = ['edit', 'full', 'history', 'skills'] as const
+export type PromptTab = (typeof PROMPT_TABS)[number]
+
+/** 一个值是否是一个子页（存储里的旧值也走它）。 */
+export function isPromptTab(value: unknown): value is PromptTab {
+  return typeof value === 'string' && (PROMPT_TABS as readonly string[]).includes(value)
+}
+
+/** 团队可编辑三段（与 worker 的 `TEAM_SECTIONS` 同值；面板不 import worker，§C.2）。 */
+export const PROMPT_TEAM_SECTIONS = ['communication', 'scope', 'delivery'] as const
+export type PromptTeamSection = (typeof PROMPT_TEAM_SECTIONS)[number]
+
+/** 一个值是否是团队段（存下来的键、`sections` 列表都用这一处判定）。 */
+export function isPromptTeamSection(value: unknown): value is PromptTeamSection {
+  return typeof value === 'string' && (PROMPT_TEAM_SECTIONS as readonly string[]).includes(value)
+}
+
+/**
+ * Full prompt 的对比基准（§M.3：「与『已保存』或『默认』的行级对比」）：两个基准都要求，
+ * 于是「用哪一份当左边」只有这一处枚举。
+ */
+export const PROMPT_DIFF_BASES = ['saved', 'default'] as const
+export type PromptDiffBase = (typeof PROMPT_DIFF_BASES)[number]
+
+/** 一个值是否是基准之一。 */
+export function isPromptDiffBase(value: unknown): value is PromptDiffBase {
+  return typeof value === 'string' && (PROMPT_DIFF_BASES as readonly string[]).includes(value)
+}
+
+/** 一条 override：团队正文 + 它编辑自的内置文本键（§L.4 的 `base`）。 */
+export interface PanelPromptOverride {
+  readonly text: string
+  /** 编辑自的内置文本键；缺省表示「没记过」（旧版本或刚生成的 override）。 */
+  readonly base?: string
+}
+
+/**
+ * 一份保存下来的提示词配置（= worker 的 `PromptConfig`）：团队三段、每个分片的 override
+ * 与团队技能。面板编辑的就是这个形状，保存时原样发给 worker 校验。
+ */
+export interface PanelPromptConfig {
+  readonly team?: Readonly<Partial<Record<PromptTeamSection, string>>>
+  readonly overrides?: Readonly<Record<string, PanelPromptOverride>>
+  /** 团队技能：名字 → 正文（§L.6；不是分片，只以文件存在）。 */
+  readonly skills?: Readonly<Record<string, string>>
+}
+
+/** 一个分片在面板上的读数：内置正文（模板）、角色、必保留占位符与它正文的键。 */
+export interface PanelPromptPart {
+  readonly key: string
+  readonly roles: readonly string[]
+  readonly kind: 'built-in' | 'team' | 'generated'
+  /** `prompt` 拼进提示词；`skill` 只写成文件（§L.6，编辑页不给 override）。 */
+  readonly placement: 'prompt' | 'skill'
+  /** 本版本的内置正文（生成段就是模板，占位符还在）。 */
+  readonly text: string
+  /** 模板必须保留的占位符（§L.3；空的表示这一段没有）。 */
+  readonly placeholders: readonly string[]
+  /** 当前内置正文的键（§L.4：override 的 `base` 等于它就是「已按当前默认审过」）。 */
+  readonly base: string
+}
+
+/** 一条 default-updated：旧默认、新默认，以及「本版本已经没有这一段」（§L.4）。 */
+export interface PanelPromptChange {
+  readonly part: string
+  readonly base: string | null
+  readonly previous: string | null
+  readonly next: string | null
+  readonly removed: boolean
+}
+
+/**
+ * 一条被拒的原因（§L.6、§L.3 的固定码）：码 + 哪一段 + 填槽值。面板按 `code` 翻译、
+ * 按 `part` 把字段标成不合法，**从不解析 message**——与设置块保存被拒的 `issues[]` 同口径。
+ */
+export interface PanelPromptIssue {
+  /** `missing_placeholder` / `reserved_skill_name` / `invalid_skill_name` / `too_long` / … */
+  readonly code: string
+  /** 出问题的分片键或技能名；`too_long` 这类整份配置的问题为 `null`。 */
+  readonly part: string | null
+  readonly values: Readonly<Record<string, string>>
+}
+
+/** 一个不可变的提示词版本（§L.4 的版本表一行）。 */
+export interface PanelPromptVersion {
+  readonly revision: number
+  readonly predecessor: number | null
+  readonly at: string
+  readonly origin: 'panel' | 'tool'
+}
+
+/** 一个技能文件（§L.6）：内置只读，团队技能可增删改；路径是稳定约定。 */
+export interface PanelPromptSkill {
+  readonly name: string
+  readonly path: string
+  readonly text: string
+  readonly readOnly: boolean
+}
+
+/** 两个角色的全文（Full prompt 页按角色看一份）。 */
+export interface PanelPromptTexts {
+  readonly orchestrator: string
+  readonly worker: string
+}
+
+/**
+ * Prompts 组的读数（§M.3）：当前版本、配置、每个分片的内置正文、default-updated、历史、
+ * 技能文件与两份全文（已保存与默认）。面板只画它，不在面板侧重算任何一条规则。
+ */
+export interface PanelPromptsView {
+  readonly revision: number
+  readonly saved: PanelPromptVersion | null
+  readonly config: PanelPromptConfig
+  readonly sections: readonly PromptTeamSection[]
+  readonly parts: readonly PanelPromptPart[]
+  /**
+   * 内置文本自编辑以来变过的分片键（§L.4）。与 `prompts get` 的 `default_changed` 同一个读数：
+   * CLI 与面板读同一份事实，只有渲染不同。
+   */
+  readonly defaultChanged: readonly string[]
+  /** 本版本已没有、保存时会丢弃的分片键（§L.4 第四条）。 */
+  readonly removedParts: readonly string[]
+  readonly changes: readonly PanelPromptChange[]
+  readonly history: readonly PanelPromptVersion[]
+  readonly skills: readonly PanelPromptSkill[]
+  /** 技能路径的根（`<stateDir>/skills/<name>/SKILL.md`，面板显示路径用）。 */
+  readonly stateDir: string
+  /** §L.6 的 `promptMaxChars`：这一份配置的体量上限（保存与全文共用）。 */
+  readonly maxChars: number
+  /** 两份全文：已保存的配置，与「全部默认」（diff 的右边）各一份。 */
+  readonly texts: { readonly saved: PanelPromptTexts; readonly defaults: PanelPromptTexts }
+}
+
+/** 一次保存：配置 + 它基于的版本号（§L.4 第二条，不匹配就是 `stale_revision`）。 */
+export interface PromptSaveRequest {
+  readonly config: PanelPromptConfig
+  readonly baseRevision: number
+}
+
+/** 恢复一个版本（`revision: 0` = 恢复默认）：再存一个新版本，不改历史（§L.4）。 */
+export interface PromptRestoreRequest {
+  readonly revision: number
+  readonly baseRevision: number
+}
+
+/** 预览一份草稿：与保存同一份校验，只回拼好的全文（不写库）。 */
+export interface PromptPreviewRequest {
+  readonly config: PanelPromptConfig
+}
+
+/**
+ * 预览一份草稿的结果：与保存**同一份校验**，只是不写库。合法时给拼好的全文与「保存会写下的
+ * 配置」；不合法时给 `issues[]`（填槽值还在，所以面板能说清哪一段、缺什么）。
+ */
+export type PanelPromptPreview =
+  | {
+      readonly ok: true
+      readonly config: PanelPromptConfig
+      /** 与默认逐字相同、保存时会被丢弃的 override 键（§L.6）。 */
+      readonly dropped: readonly string[]
+      readonly texts: PanelPromptTexts
+    }
+  | { readonly ok: false; readonly issues: readonly PanelPromptIssue[] }
+
 /** 面板可发起的动作：暂停/恢复处理（§M.2 的 Overview 主操作，破坏性，需行内二次确认）。 */
 export interface PauseInput {
   readonly paused: boolean
@@ -882,12 +1054,13 @@ export interface FocusOutcome {
 
 /**
  * Settings 页的五个组（§M.3）：顺序即语义，导航表与页面都读它。
- * Prompts 组的内容归 #43：本票只给框架与占位（见 `SETTINGS_GROUP_OWNER`）。
+ * 组体只有一张表（`settings.tsx` 的 `SETTINGS_GROUP_BODIES`）：Prompts 那一格由 #43 的
+ * `prompts.tsx` 注册进去，其余四组由 #42 实现（见 `SETTINGS_GROUP_OWNER`）。
  */
 export const SETTINGS_GROUPS = ['sources', 'eval', 'execution', 'prompts', 'deployment'] as const
 export type SettingsGroupId = (typeof SETTINGS_GROUPS)[number]
 
-/** 本票已实现内容的组；`prompts` 由 #43 填（占位处不留死链）。 */
+/** 每组的内容由谁交付（`/` 表示两组交接）。 */
 export const SETTINGS_GROUP_OWNER: Readonly<Record<SettingsGroupId, string>> = {
   sources: '#42',
   eval: '#42',
@@ -1218,6 +1391,10 @@ export const PLUGIN_REQUESTS = [
   'source.setEnabled',
   'source.sync',
   'source.labels',
+  'prompts',
+  'prompts.preview',
+  'prompts.save',
+  'prompts.restore',
   'settings.read',
   'settings.save',
   'settings.history',
@@ -1323,6 +1500,26 @@ declare module 'orca' {
     rotateToken: { output: RotateTokenView }
     /** 人显式要求重启 Router（破坏性；面板先做行内二次确认）；返回重启后的读数。 */
     restartRouter: { output: DeploymentRouter }
+    /**
+     * Prompts 组的一次读数（§M.3）：当前配置与版本、每个分片的内置正文与占位符、
+     * default-updated 的详情、历史、技能文件，以及「已保存 / 默认」两份全文。
+     */
+    prompts: { output: PanelPromptsView }
+    /**
+     * 预览一份草稿的全文（§M.3 的 Full prompt）：与保存同一份校验（占位符、技能名、体量
+     * 上限），只是不写库——被拒时按固定码拒绝，面板据此给出可读的原因。
+     */
+    'prompts.preview': { input: PromptPreviewRequest; output: PanelPromptPreview }
+    /**
+     * 保存一份配置（§L.4）：带 `baseRevision`，不匹配是 `stale_revision`（草稿不丢）；
+     * 成功后回整个读数，因此一次保存 = 一次请求。
+     */
+    'prompts.save': { input: PromptSaveRequest; output: PanelPromptsView }
+    /**
+     * 恢复某个版本或默认（§L.4：再存一个新版本，单向追加，不改历史）：回整个读数，
+     * 面板因此直接回到编辑页看到恢复后的文本。
+     */
+    'prompts.restore': { input: PromptRestoreRequest; output: PanelPromptsView }
     /**
      * Settings 页的一次读数（§M.3）：Sources / Eval / Execution / Deployment 四个可编辑组。
      * Prompts 组的内容由 #43 提供，不在本请求里。

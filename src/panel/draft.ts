@@ -212,8 +212,17 @@ function noticeBar(locale: string, notice: DraftNotice, dirty: boolean): SaveBar
   }
 }
 
+/** 保存栏「N changes」怎么数（只有页面自己能回答时才传：例如 Prompts 的 override 记的
+ * `base` 是账，不是一次编辑）。 */
+export type SaveBarChangeCount<V> = (state: DraftState<V>) => number
+
 /** 按状态给出保存栏的文字与按钮状态（§M.3 的五条）。 */
-export function saveBar<V>(locale: string, state: DraftState<V>, saved?: V): SaveBar {
+export function saveBar<V>(
+  locale: string,
+  state: DraftState<V>,
+  saved?: V,
+  countChanges?: SaveBarChangeCount<V>
+): SaveBar {
   if (state.phase === 'clean') return { visible: false }
   const dirty = state.draft !== undefined && (saved === undefined || !same(state.draft.value, saved))
   const notice = state.notice
@@ -224,7 +233,10 @@ export function saveBar<V>(locale: string, state: DraftState<V>, saved?: V): Sav
   if (state.phase === 'awaitingRevision') {
     return { visible: true, status: translate(locale, 'draft.saved'), dirty: false, busy: true, canSave: false }
   }
-  const count = state.draft ? changedLeafCount(state.draft.base, state.draft.value) : 0
+  const draft = state.draft
+  let count = 0
+  if (countChanges !== undefined) count = countChanges(state)
+  else if (draft !== undefined) count = changedLeafCount(draft.base, draft.value)
   const key: CopyKey = count === 1 ? 'draft.changeOne' : 'draft.changes'
   return { visible: true, status: translate(locale, key, { count }), dirty, busy: false, canSave: dirty }
 }

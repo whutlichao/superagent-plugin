@@ -980,6 +980,177 @@ test('a configured Feishu source consumes events, runs a round, and stops on shu
   }
 })
 
+// §M.2 的「打开/关闭」、§I.3 的实时事件与回填：面板的开关写设置（origin=panel）后由组合根
+// 的 Source 运行时通知事件流与回填——关掉后子进程立即停、下一轮不再发 CLI，重新打开再起。
+test('the panel switch stops the event stream and the backfill in place', async () => {
+  let first: FakeStream | undefined
+  let second: FakeStream | undefined
+  const config = { cli: 'lark-cli', chats: [{ chatId: 'oc_all', listen: 'all' }] }
+  const harness = await openBoot({
+    boot: async (stateDir, runtime, commands) => {
+      scriptFeishuIdentity(commands)
+      first = commands.scriptStream('lark-cli', CONSUMER_ARGS)
+      commands.script(['im', '+chat-list'], () =>
+        JSON.stringify({ chats: [{ chat_id: 'oc_all', name: 'Build alerts', chat_mode: 'group' }] })
+      )
+      commands.script(['im', '+chat-messages-list'], () => historyPage([]))
+      return bootPlugin({
+        runtime,
+        readSettings: async () => settingsWithFeishu(stateDir, { enabled: true, config }),
+        commands,
+        stateDir,
+        disableTimers: true
+      })
+    }
+  })
+  try {
+    await until(() => first?.attached === true)
+    const larkCalls = (): number =>
+      harness.commands.calls.filter((call) => call.program === 'lark-cli').length
+
+    // 关闭：卡片 off、health paused/disabled；事件流立即停（子进程收到退出，不等看门狗）。
+    const off = harness.handle.setSourceEnabled('feishu', false)
+    const card = off.items.find((item) => item.id === 'feishu')
+    assert.equal(card?.enabled, false)
+    assert.equal(card?.state, 'off')
+    assert.deepEqual(
+      card?.health.filter((entry) => entry.name === 'feishu'),
+      [{ name: 'feishu', state: 'paused', detail: 'disabled' }]
+    )
+    await until(() => first?.stopped === true)
+
+    // 回填的下一轮：一个 `lark-cli` 调用都不发。
+    const before = larkCalls()
+    assert.equal(await harness.handle.feishuOnce(), null)
+    assert.equal(larkCalls(), before, 'a disabled Source issues no CLI call')
+
+    // 重新打开：事件流再起一次，回填恢复（同一个回填对象，读的还是同一份游标）。
+    second = harness.commands.scriptStream('lark-cli', CONSUMER_ARGS)
+    const on = harness.handle.setSourceEnabled('feishu', true)
+    assert.equal(on.items.find((item) => item.id === 'feishu')?.enabled, true)
+    await until(() => second?.attached === true)
+    const round = await harness.handle.feishuOnce()
+    assert.equal(round?.chats, 1, 'the backfill runs again')
+    assert.deepEqual(round?.failures, [])
+  } finally {
+    await harness.cleanup()
+  }
+})
+
+test('a Feishu Source disabled at boot reads its bot identity when the panel opens it', async () => {
+  let child: FakeStream | undefined
+  const config = { cli: 'lark-cli', chats: [{ chatId: 'oc_all', listen: 'all' }] }
+  const harness = await openBoot({
+    scripts: (commands) => {
+      scriptFeishuIdentity(commands)
+      child = commands.scriptStream('lark-cli', CONSUMER_ARGS)
+      commands.script(['im', '+chat-list'], () =>
+        JSON.stringify({ chats: [{ chat_id: 'oc_all', name: 'Build alerts', chat_mode: 'group' }] })
+      )
+      commands.script(['im', '+chat-messages-list'], () => historyPage([]))
+    },
+    boot: async (stateDir, runtime, commands) =>
+      bootPlugin({
+        runtime,
+        readSettings: async () => settingsWithFeishu(stateDir, { enabled: false, config }),
+        commands,
+        stateDir,
+        disableTimers: true
+      })
+  })
+  try {
+    // 启动时关着：不跑身份探针、不起事件流、不读回填（关掉的 Source 不发 CLI）。
+    assert.deepEqual(harness.commands.streams, [])
+    assert.deepEqual(
+      harness.commands.calls.filter((call) => call.program === 'lark-cli'),
+      [],
+      'no lark-cli call before the Source is opened'
+    )
+    assert.equal(await harness.handle.feishuOnce(), null)
+
+    // 面板打开：补读身份（`auth status` + bot info），然后起事件流、回填也能跑了。
+    harness.handle.setSourceEnabled('feishu', true)
+    await until(() => child?.attached === true)
+    assert.ok(
+      harness.commands.calls.some(
+        (call) => call.program === 'lark-cli' && call.args[0] === 'auth' && call.args[1] === 'status'
+      ),
+      'the bot identity is read when the panel opens the Source'
+    )
+    assert.equal((await harness.handle.feishuOnce())?.chats, 1)
+  } finally {
+    await harness.cleanup()
+  }
+})
+
+// §G.2 的 `source labels`：HTTP/CLI 与面板用同一次读取；未知 Source 是 `missing`，kind 没有
+// 刷新能力是 `not_syncable`（固定拒绝），绝不回一个空标签表假装成功。
+test('`source labels` returns the refreshed map and refuses what has none', async () => {
+  const config = { cli: 'lark-cli', chats: [{ chatId: 'oc_all', listen: 'all' }] }
+  const harness = await openBoot({
+    scripts: (commands) => {
+      scriptFeishuIdentity(commands)
+      commands.scriptStream('lark-cli', CONSUMER_ARGS)
+      commands.script(['im', '+chat-list'], () =>
+        JSON.stringify({ chats: [{ chat_id: 'oc_all', name: 'Build alerts', chat_mode: 'group' }] })
+      )
+      commands.script(['im', '+chat-messages-list'], () => historyPage([]))
+    },
+    boot: async (stateDir, runtime, commands) =>
+      bootPlugin({
+        runtime,
+        readSettings: async () => settingsWithFeishu(stateDir, { enabled: true, config }),
+        commands,
+        stateDir,
+        disableTimers: true
+      })
+  })
+  try {
+    const port = harness.handle.port()
+    assert.notEqual(port, null, 'the worker listens')
+    const target = {
+      stateDir: harness.stateDir,
+      stateDirSource: 'argument' as const,
+      port: port as number,
+      baseUrl: `http://127.0.0.1:${port}/superagent/api`,
+      token: readApiToken(harness.stateDir),
+      tokenSource: 'argument' as const,
+      tokenFile: null
+    }
+    const run = (argv: readonly string[]) =>
+      dispatch({ parsed: parseArgs(argv), target, sleep: async () => undefined })
+
+    // 刷新成功：返回 `chat_id -> name` 表（与面板读的 kv 是同一份）。
+    const refreshed = await run(['source', 'labels', 'feishu'])
+    assert.equal(refreshed.exit, 0, JSON.stringify(refreshed.envelope))
+    const result = (refreshed.envelope as { result: Record<string, unknown> }).result
+    assert.equal(result['source'], 'feishu')
+    assert.deepEqual(result['labels'], { oc_all: 'Build alerts' })
+    const store = openStore({ stateDir: harness.stateDir })
+    assert.deepEqual(store.kvGet(sourceLabelsKey('feishu')), { oc_all: 'Build alerts' })
+    store.close()
+
+    // 未知 Source：`missing`（§G.2 的固定拒绝，HTTP 404）。
+    const unknown = await run(['source', 'labels', 'nope'])
+    assert.equal(unknown.exit, 2)
+    assert.equal(
+      (unknown.envelope as { error?: { code?: string } }).error?.code,
+      'missing',
+      'an unknown Source is missing, not an internal error'
+    )
+
+    // 已安装但没有 `refreshLabels` 的 kind：`not_syncable`。
+    const github = await run(['source', 'labels', 'github'])
+    assert.equal(github.exit, 2)
+    assert.equal(
+      (github.envelope as { error?: { code?: string } }).error?.code,
+      'not_syncable'
+    )
+  } finally {
+    await harness.cleanup()
+  }
+})
+
 test('a Feishu source without a CLI stays in setup and never starts a stream', async () => {
   const harness = await openBoot({
     boot: async (stateDir, runtime, commands) =>

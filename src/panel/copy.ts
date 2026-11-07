@@ -291,6 +291,9 @@ export const COPY = {
   },
   'page.notFound': { zh: '没有这一页。', en: 'No such page.' },
 
+  // ---- Settings 的分组（§M.3：五组 + Prompts 的四个子页）----
+  // 组名只有一处：`settings.group.*`（在 #42 的 Settings 段里）。
+
   // ---- Search 页（§M.1 的第 7 项、§M.2 的 Search 行）----
   'search.label': { zh: '搜索', en: 'Search' },
   'search.placeholder': {
@@ -599,6 +602,116 @@ export const COPY = {
   'diff.folded': { zh: '… {count} 行未改动', en: '… {count} unchanged lines' },
   'prompt.sameAsSaved': { zh: '与已保存内容相同。', en: 'Same as the saved text.' },
 
+  // ---- Prompts 组（§M.3 的四个子页、§L.3 占位符、§L.4 版本与 default-updated、§L.6 技能）----
+  'prompt.tabs': { zh: '提示词子页', en: 'Prompt pages' },
+  'prompt.tab.edit': { zh: '编辑', en: 'Edit' },
+  'prompt.tab.full': { zh: '全文', en: 'Full prompt' },
+  'prompt.tab.history': { zh: '历史', en: 'History' },
+  'prompt.tab.skills': { zh: '技能', en: 'Skills' },
+  'prompt.intro': {
+    zh: '团队可改的文本在这里；保存会生成一个新版本，正在跑的会话不会被改写（下一条消息带新修订号）。',
+    en: 'The text the team owns lives here. Saving makes a new version; running sessions are not rewritten (their next message carries the new revision).'
+  },
+  'prompt.versionLine': { zh: '修订 {revision} · {at} · {origin}', en: 'Revision {revision} · {at} · {origin}' },
+  'prompt.versionNone': { zh: '还没保存过：全部跟随内置文本。', en: 'Never saved: every part follows the built-in text.' },
+  'prompt.origin.panel': { zh: '面板', en: 'panel' },
+  'prompt.origin.tool': { zh: '命令行', en: 'CLI' },
+  'prompt.team': { zh: '团队文本', en: 'Team text' },
+  'prompt.teamIntro': {
+    zh: '三段团队文本拼在角色分片之后、订阅与回复之前。留空即跟随内置文本。',
+    en: 'The three team sections sit after the role parts, before subscriptions and replies. Empty means the built-in text.'
+  },
+  'prompt.section.communication': { zh: '沟通', en: 'Communication' },
+  'prompt.section.scope': { zh: '工单范围', en: 'Ticket scope' },
+  'prompt.section.delivery': { zh: '交付要求', en: 'Delivery requirements' },
+  'prompt.parts': { zh: '内置分片', en: 'Built-in parts' },
+  'prompt.partsIntro': {
+    zh: '每个分片都可以覆盖；覆盖后内置更新不再自动进来，除非你改回默认。',
+    en: 'Every part can be overridden. An override stops following built-in updates until you go back to the default.'
+  },
+  'prompt.changed': { zh: '已修改', en: 'Changed' },
+  'prompt.useDefault': { zh: '还原本段：{part}', en: 'Use the default: {part}' },
+  'prompt.placeholders': { zh: '必保留占位符：{list}', en: 'Required placeholders: {list}' },
+  'prompt.roles': { zh: '读它的角色：{list}', en: 'Read by: {list}' },
+  'prompt.role.orchestrator': { zh: '主会话', en: 'orchestrator' },
+  'prompt.role.worker': { zh: '执行器', en: 'worker' },
+  'prompt.saveHint': {
+    zh: '保存会校验占位符、技能名与体量上限（{limit} 字符）；任何一条不合格都整单拒绝，没有部分保存。',
+    en: 'Saving checks the placeholders, the skill names and the {limit}-character cap; any failure refuses the whole save.'
+  },
+  'prompt.skillPlacement': {
+    zh: '这一段写进技能文件，不拼进提示词正文。',
+    en: 'This part is written to a skill file, not into the prompt itself.'
+  },
+  'prompt.full.baseline': { zh: '对比基准', en: 'Compare with' },
+  'prompt.base.saved': { zh: '已保存', en: 'the saved text' },
+  'prompt.base.default': { zh: '默认', en: 'the default' },
+  'prompt.diffAgainst': { zh: '与{base}的行级对比', en: 'Line diff against {base}' },
+  'prompt.full.role': { zh: '角色', en: 'Role' },
+  'prompt.full.text': { zh: '组装后的全文 · {role}', en: 'Assembled text · {role}' },
+  'prompt.full.intro': {
+    zh: '全文由分片、团队文本与部署事实拼成；生成段的值由系统填，改不了。',
+    en: 'The text is assembled from the parts, the team text and the deployment facts; the generated values are filled by the system and cannot be edited.'
+  },
+  'prompt.full.previewFailed': { zh: '草稿预览失败：{reason}', en: 'The draft could not be previewed: {reason}' },
+  'prompt.history.intro': {
+    zh: '每个版本都只能读；恢复某个版本是再存一个新版本，历史不改写。',
+    en: 'Every version is read-only; restoring one saves a new version, it never rewrites history.'
+  },
+  'prompt.history.empty': { zh: '还没有版本。', en: 'No version yet.' },
+  'prompt.restore': { zh: '恢复这个版本', en: 'Restore this version' },
+  'prompt.restoreHint': {
+    zh: '恢复会生成新版本并回到编辑页；正在跑的会话不被重启。',
+    en: 'Restoring makes a new version and returns to the edit page; running sessions are not restarted.'
+  },
+  'prompt.restored': { zh: '已恢复为修订 {revision}。', en: 'Restored as revision {revision}.' },
+  'prompt.defaultUpdated': { zh: '有分片的内置文本已更新', en: 'Built-in text changed under an override' },
+  'prompt.defaultUpdatedIntro': {
+    zh: '这些分片被覆盖过，之后内置文本又变了。旧默认与新默认都在下面：保留你的文本（按新默认重新记账），或用新默认。',
+    en: 'These parts were overridden, then the built-in text changed. Both defaults are below: keep your text (re-based on the new default) or take the new default.'
+  },
+  'prompt.previous': { zh: '旧默认', en: 'Old default' },
+  'prompt.next': { zh: '新默认', en: 'New default' },
+  'prompt.adoptDefault': { zh: '用新默认：{part}', en: 'Use the new default: {part}' },
+  'prompt.keepMine': { zh: '保留我的文本：{part}', en: 'Keep my text: {part}' },
+  'prompt.removedPart': { zh: '这一段在本版本里已不存在，保存时会被丢弃。', en: 'This part no longer exists in this version; saving drops it.' },
+  'prompt.skills.team': { zh: '团队技能', en: 'Team skills' },
+  'prompt.skills.builtIn': { zh: '内置技能（只读）', en: 'Built-in skills (read-only)' },
+  'prompt.skills.intro': {
+    zh: '技能是文件：<stateDir>/skills/<name>/SKILL.md。提示词只写路径与「开工前读它」，所以改技能不用改提示词版本。',
+    en: 'Skills are files: <stateDir>/skills/<name>/SKILL.md. The prompt only carries the path and the instruction to read it first, so editing a skill does not touch the prompt version.'
+  },
+  'prompt.skills.name': { zh: '技能名', en: 'Skill name' },
+  'prompt.skills.add': { zh: '新建技能', en: 'New skill' },
+  'prompt.skills.remove': { zh: '删除技能：{name}', en: 'Delete skill: {name}' },
+  'prompt.skills.path': { zh: '路径：{path}', en: 'Path: {path}' },
+  'prompt.skills.empty': { zh: '还没有团队技能。', en: 'No team skill yet.' },
+  'prompt.skills.text': { zh: '技能正文：{name}', en: 'Skill text: {name}' },
+  'prompt.skills.nameHint': {
+    zh: '1–64 个 a-z、0-9 与 -，不能与内置技能重名；名字不合规时保存会被拒绝并说明原因。',
+    en: '1-64 characters of a-z, 0-9 and -; a built-in name is reserved. A bad name is refused at save time with the reason.'
+  },
+  'prompt.error.missing_placeholder': {
+    zh: '这段模板必须保留 {placeholders}：那是系统要填的值。',
+    en: 'This template must keep {placeholders}: the system fills those in.'
+  },
+  'prompt.error.reserved_skill_name': {
+    zh: '{skill} 是内置技能的名字，内置技能只读；换一个技能名。',
+    en: '{skill} is a built-in skill and built-in skills are read-only; use another skill name.'
+  },
+  'prompt.error.invalid_skill_name': {
+    zh: '技能名只能是 1–64 个 a-z、0-9 与 -。',
+    en: 'A skill name is 1-64 characters of a-z, 0-9 and -.'
+  },
+  'prompt.error.too_long': {
+    zh: '合计 {actual} 个字符，超过上限 {limit}；缩短一段团队文本、覆盖或团队技能后重试。',
+    en: 'The text is {actual} characters, over the {limit}-character limit; shorten a team section, an override or a team skill.'
+  },
+  'prompt.error.invalid_part': { zh: '这一段不能为空。', en: 'This part cannot be empty.' },
+  'prompt.error.unknown_part': { zh: '这一段在本版本里不存在。', en: 'This part does not exist in this version.' },
+  'prompt.error.invalid_config': { zh: '这份配置的形状不对，无法保存。', en: 'This configuration has the wrong shape and cannot be saved.' },
+  'prompt.error.generic': { zh: '保存被拒绝：{reason}', en: 'The save was refused: {reason}' },
+
   // ---- 表格列与分组 ----
   'column.name': { zh: '名称', en: 'Name' },
   'column.state': { zh: '状态', en: 'State' },
@@ -613,6 +726,8 @@ export const COPY = {
   'column.at': { zh: '时间', en: 'When' },
   'column.source': { zh: '来源', en: 'Source' },
   'column.rule': { zh: '规则', en: 'Rule' },
+  'column.revision': { zh: '修订', en: 'Revision' },
+  'column.origin': { zh: '来源', en: 'Origin' },
 
   // ---- 术语（§M.5 的译名）----
   'term.source': { zh: '来源', en: 'Source' },
@@ -980,10 +1095,6 @@ export const COPY = {
   },
   'settings.retry': { zh: '重试', en: 'Retry' },
   'settings.saveRestart': { zh: '已保存 · 重启插件后生效', en: 'Saved · takes effect after the plugin restarts' },
-  'settings.prompts.placeholder': {
-    zh: '提示词组由 #43 提供（团队文本、override、全文 diff 与 Skills）。这里只保留组位。',
-    en: 'The Prompts group is delivered by #43 (team text, overrides, the full-prompt diff and Skills). This is only the slot.'
-  },
   'settings.rows.add': { zh: '添加一行', en: 'Add row' },
   'settings.rows.remove': { zh: '删除这一行', en: 'Remove this row' },
   'settings.rows.empty': { zh: '还没有行', en: 'No rows yet' },

@@ -3,11 +3,13 @@
 // 保存中显示进度；失败显示字段级 issues；冲突（409）问「这一段在别处被改过，要重新载入吗」。
 //
 // 分工：
-// - 读面只来自 `plugin.request('settings.read' / 'settings.history')`（worker 侧 `app/settings-view.ts`）；
+// - 读面只来自 `plugin.request('settings.read' / 'settings.history')`（worker 侧 `app/settings-view.ts`；
+//   Prompts 组读它自己的 `prompts`，本文件不代读）；
 // - 写面只有一条：`plugin.request('settings.save')`，worker 里走与 HTTP/CLI 同一个
 //   `PUT settings/:block` handler（来源恒为 panel，账号类字段先跑 #44 的探针）；
 // - 草稿状态机在 `draft.ts`（纯的），本文件只把组、块与控件接起来；
-// - Prompts 组的内容归 #43：这里只给占位，替换点就是 `SETTINGS_GROUP_BODIES.prompts`。
+// - Prompts 组的内容归 #43，在 `prompts.tsx`：本文件是唯一的组表，把那个组件注册成
+//   `SETTINGS_GROUP_BODIES.prompts`（组框架、保存栏语义与顺序都不用改）。
 import {
   atom,
   Button,
@@ -46,6 +48,7 @@ import {
   type SaveBar
 } from './draft'
 import { Deployment, openDeployment, resetDeployment } from './deployment'
+import { openPrompts, Prompts, resetPrompts } from './prompts.tsx'
 import { markLabel, sourceMark } from './marks'
 import type {
   AdmissionRowView,
@@ -207,11 +210,18 @@ function invalidPathsOf(groupId: SettingsGroupId): readonly string[] {
 
 /**
  * 打开 Settings：读一次设置读数与历史，并把 Deployment 组的读数读进来（它自己管错误态与动作）。
+ * 停在 Prompts 组时连它那一份读数一起读（那组自带读取、草稿与保存栏）。
  * 由面板的导航调用——渲染里发请求会在写 atom 时抛。
  */
 export async function openSettings(): Promise<void> {
   active = true
-  await Promise.all([loadSettings(), loadHistory(), openDeployment()])
+  const shown = read(group)
+  await Promise.all([
+    loadSettings(),
+    loadHistory(),
+    openDeployment(),
+    shown === 'prompts' ? openPrompts() : Promise.resolve()
+  ])
 }
 
 /** 读一份设置读数；这是设置页唯一的读请求。 */
@@ -282,6 +292,7 @@ export function resetSettings(): void {
   set(busy, false)
   set(actionError, '')
   resetDeployment()
+  resetPrompts()
 }
 
 /** 把一个保存结果折成保存栏要的 notice（字段路径带上块名，能落到具体控件）。 */
@@ -1424,32 +1435,26 @@ function DeploymentGroup(props: { readonly locale: string; readonly data: Settin
 }
 
 // ---------------------------------------------------------------------------
-// Prompts 组（#43 的占位；替换点就是这个组件）
+// Prompts 组（#43：团队文本、override、full-text diff、历史与技能；组件自带读取与保存栏）
 // ---------------------------------------------------------------------------
 
 /**
- * Prompts 组的占位。#43 交付团队文本/override/全文 diff/Skills 时，把
- * `SETTINGS_GROUP_BODIES.prompts` 指向那个组件即可（组框架、保存栏语义与顺序都不用改）。
+ * Prompts 组的组体。#43 的 `Prompts` 自己管读数、草稿、保存栏与四个子页，所以这里只给它
+ * 组位（`data` 是框架给其他组的 `settings.read` 读数，Prompts 不读它）。
  */
-function PromptsPlaceholder(props: { readonly locale: string; readonly data: SettingsPageView }): OrcaElement {
+function PromptsGroup(props: { readonly locale: string; readonly data: SettingsPageView }): OrcaElement {
   void props.data
-  return (
-    <Stack gap="sm">
-      <Section title={translate(props.locale, 'settings.group.prompts')}>
-        <Hint text={translate(props.locale, 'settings.prompts.placeholder')} />
-      </Section>
-    </Stack>
-  )
+  return <Prompts locale={props.locale} />
 }
 
-/** 五组的内容表：Prompts 是 #43 的替换点，其余四组由本票实现。 */
+/** 五组的内容表：只有这一张（组 id → 组体），新增一组就加一行。 */
 export const SETTINGS_GROUP_BODIES: Readonly<
   Record<SettingsGroupId, (props: { readonly locale: string; readonly data: SettingsPageView }) => OrcaElement>
 > = {
   sources: SourcesGroup,
   eval: EvalGroup,
   execution: ExecutionGroup,
-  prompts: PromptsPlaceholder,
+  prompts: PromptsGroup,
   deployment: DeploymentGroup
 }
 
@@ -1633,6 +1638,8 @@ export function Settings(props: { readonly locale: string }): OrcaElement {
         onChange={(next) => {
           if (!SETTINGS_GROUPS.includes(next as SettingsGroupId)) return
           set(group, next as SettingsGroupId)
+          // Prompts 组自带读数：切过去时读一次（其余组的读数由 `openSettings` 读过）。
+          if (next === 'prompts') void openPrompts()
         }}
       >
         {SETTINGS_GROUPS.map((groupId) => (
