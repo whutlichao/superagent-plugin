@@ -613,6 +613,52 @@ describe('the setup check on the composition root', () => {
     }
   })
 
+  test('a hanging CLI makes setup check return unavailable inside the budget and apply nothing', async () => {
+    // 一次真的 HTTP 往返（真库、真 loopback）：boot 时 `gh` 读账号失败一次，于是 setup 有待查的
+    // 问题；之后同一条命令挂住（§O 的超时用例）。
+    const h = await openBoot({
+      scripts: (commands) => {
+        commands.fail(
+          'gh',
+          ['api', 'user'],
+          Object.assign(new Error('gh auth status exited with code 1'), { code: 1 }),
+          { once: true }
+        )
+      }
+    })
+    try {
+      const port = h.handle.port() as number
+      const before = h.handle.deployment()
+      assert.equal(before.setup.length > 0, true, 'the boot left a setup problem behind')
+      const written = h.commands.calls.length
+
+      // 从现在起 `gh api user` 永不返回：探针到点必须被取消，而不是陪着它挂。
+      h.commands.hang('gh', ['api', 'user'])
+      const started = Date.now()
+      const check = await runCli(h.stateDir, port, ['setup', 'check'])
+      const elapsed = Date.now() - started
+
+      // 固定码：`unavailable`（exit 3）与「稍后重试」——不折成一条编出来的 setup 结论。
+      assert.equal(check.exit, 3, JSON.stringify(check.envelope))
+      const envelope = check.envelope as { ok: false; error: { code: string; message: string } }
+      assert.equal(envelope.error.code, 'unavailable')
+      assert.ok(envelope.error.message.includes('retry later'), envelope.error.message)
+      // §O 的探针上限是 2 s：整次请求在 9 s 的总预算里返回（这里一定远早于它）。
+      assert.ok(elapsed < 5_000, `the handler returned after ${elapsed} ms`)
+
+      // 取消传到了 CLI：这次调用拿到的信号已经取消，并且它同时带着同一个上限。
+      const hung = h.commands.calls.slice(written).find((call) => call.program === 'gh')
+      assert.equal(hung?.options.signal?.aborted, true, 'the probe signal is aborted')
+      assert.equal(hung?.options.timeoutMs, 2_000, 'the subprocess gets the same cap')
+
+      // 什么都没应用：setup 结论还是启动时那一条（超时的检查一半都没落地）。
+      assert.equal(h.handle.snapshot().health.setupMissing, true)
+      assert.deepEqual(h.handle.deployment().setup, before.setup)
+    } finally {
+      await h.cleanup()
+    }
+  })
+
   test('a base repository that Orca does not have is an executor setup problem', async () => {
     const h = await openBoot({
       boot: async (stateDir, runtime, commands) => {

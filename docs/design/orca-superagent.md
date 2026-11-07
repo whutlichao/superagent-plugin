@@ -1754,7 +1754,7 @@ $ orca plugin types <dir> --json
 
 ### P.2 测试套件（`orca plugin test .` 会跑所有 `*.test.ts(x)`）
 
-快照（本机 Orca 1.4.251、Node 25；截至 #64 合并，`scripts/check.sh` 的实测读数）：**89 个文件、1574 条测试、170 个 suite、fail 0**。下表按模块
+快照（本机 Orca 1.4.251、Node 25；截至 #64 合并，`scripts/check.sh` 的实测读数）：**89 个文件、1576 条测试、170 个 suite、fail 0**。下表按模块
 分组，每行都是 `tests/` 下的真实文件；「对应上游」写上游同名测试面，合并与改名的地方直接写出
 去向（§R.2 是同一件事的反向对照）。**没有落地的一项**单独列在表末。
 

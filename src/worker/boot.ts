@@ -725,7 +725,8 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
       account: text(settings['githubLogin']) ?? ''
     },
     ports: {
-      run: (program, args) => commandPort.run(program, args),
+      // 探针的上限与取消信号一路到 `execFile`（§O 的超时行）：到这里为止都不丢。
+      run: (program, args, probe) => commandPort.run(program, args, probe),
       repos: () => options.runtime.listRepos(),
       searchRefs: (selector, query) => options.runtime.searchRefs(selector, query)
     }
