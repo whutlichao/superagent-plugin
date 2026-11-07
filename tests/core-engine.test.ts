@@ -126,6 +126,8 @@ function harness(policyOverrides: Partial<Policy> = {}) {
       t.meta.blocked ? { listened: false as const, reason: 'chat not allowed' } : { listened: true as const, observed: false }
   }
   const messages: { id: string; status: ReplyStatus }[] = []
+  /** 被停止时撤回整张 Ticket 的消息（`§J.1` 撤回行）：记录 Ticket 与保留的收尾消息。 */
+  const withdrawnTickets: { ticketId: string; keep: readonly string[] }[] = []
   const queue: Outbox = {
     send: (message) => {
       if (!messages.some((item) => item.id === message.id)) messages.push({ id: message.id, status: 'pending' })
@@ -133,6 +135,9 @@ function harness(policyOverrides: Partial<Policy> = {}) {
     status: (id) => messages.find((item) => item.id === id)?.status,
     withdraw: (id) => {
       withdrawn.push(id)
+    },
+    withdrawTicket: (ticketId, keep = []) => {
+      withdrawnTickets.push({ ticketId, keep })
     }
   }
   const engine = new Engine({
@@ -185,6 +190,7 @@ function harness(policyOverrides: Partial<Policy> = {}) {
     engine,
     messages,
     withdrawn,
+    withdrawnTickets,
     requests,
     assessor,
     executor,
@@ -379,7 +385,8 @@ describe('eval', () => {
           messages.push({ id: message.id })
         },
         status: () => undefined,
-        withdraw: () => undefined
+        withdraw: () => undefined,
+        withdrawTicket: () => undefined
       },
       // 执行器建目录失败时必须整体回滚：Decision、Ticket、确认一个都不留。
       prepareTicket: () => {
@@ -1217,6 +1224,12 @@ describe('outcomes', () => {
       outcome: 'stopped',
       reason: 'Human asked to stop'
     })
+    // 停止撤回这张 Ticket 还没发出的消息，但保留收尾消息（§J.1 撤回行）。
+    assert.deepEqual(h.withdrawnTickets, [
+      { ticketId, keep: [key('stopped', ticketId)] }
+    ])
+    // 收尾消息与撤回在同一个事务里排队。
+    assert.ok(h.messages.some((item) => item.id === key('stopped', ticketId)))
   })
 })
 

@@ -802,7 +802,8 @@ function engineHarness(initial: FixtureInput = {}) {
     outbox: {
       send: () => undefined,
       status: () => undefined,
-      withdraw: () => undefined
+      withdraw: () => undefined,
+      withdrawTicket: () => undefined
     },
     now: () => AT
   })
@@ -1313,7 +1314,12 @@ function policySaveHarness(initial: FixtureInput = {}) {
       deliver: (ticket: Ticket) => void delivered.push(ticket.id),
       stop: (_ticket, _assignment, reason) => void stopped.push(reason)
     },
-    outbox: { send: () => undefined, status: () => undefined, withdraw: () => undefined },
+    outbox: {
+      send: () => undefined,
+      status: () => undefined,
+      withdraw: () => undefined,
+      withdrawTicket: () => undefined
+    },
     now: () => AT
   })
 

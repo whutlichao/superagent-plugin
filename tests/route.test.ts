@@ -95,7 +95,12 @@ function harness(options: { acceptMode?: AcceptMode; version?: string } = {}) {
       deliver: () => undefined,
       stop: () => undefined
     },
-    outbox: { send: () => undefined, status: () => undefined, withdraw: () => undefined },
+    outbox: {
+      send: () => undefined,
+      status: () => undefined,
+      withdraw: () => undefined,
+      withdrawTicket: () => undefined
+    },
     now: () => AT
   })
   const tools: RouterTools = createRouterTools({

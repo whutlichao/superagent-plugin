@@ -28,6 +28,7 @@ import type {
   EffectKindCount,
   EffectRecord,
   OutboxRecord,
+  OutboxWaitingRow,
   PromptVersionRecord,
   SettingsVersionRecord,
   ThreadMeta,
@@ -158,6 +159,19 @@ export interface EffectRepository {
 export interface OutboxRepository {
   put(record: OutboxRecord): void
   get(id: string): OutboxRecord | null
+  /**
+   * 一个分组（`ticket:<id>|<channel>` 或 channel 地址）里仍待发的行，按 `reply` effect 的
+   * `seq` 升序：**顺序**只看这一组（§J.1：不同 Ticket、无 Ticket 的消息互不等待）。
+   */
+  waiting(channel: string): readonly OutboxWaitingRow[]
+  /** 一张 Ticket 仍待发的消息（撤回用，§J.1）。 */
+  pendingOfTicket(ticketId: string): readonly OutboxRecord[]
+  /** `at` 之后被 drop 的行，最新在前（面板 Source 页的 24 h 窗口，§J.1）。 */
+  droppedSince(at: string): readonly OutboxRecord[]
+  /** 连续失败达到 `minAttempts` 的待发行，最老在前（§J.3 system problems）。 */
+  failing(minAttempts: number): readonly OutboxWaitingRow[]
+  /** 不可达而 drop 的条数（撤回不算；health 只计数、不算错误，§J.3）。 */
+  countDropped(): number
 }
 
 /** 设置版本仓储（§D.4 写者：`app/settings.ts`）。 */
@@ -718,6 +732,53 @@ function createOutboxRepository(sql: SqlAccess): OutboxRepository {
     get(id: string): OutboxRecord | null {
       const row = sql.one('SELECT * FROM outbox WHERE id = ?', [id])
       return row === undefined ? null : outboxFrom(row)
+    },
+    waiting(channel: string): readonly OutboxWaitingRow[] {
+      // `reply` effect 的 seq 就是入队序（§J.1）；没有 effect 行（不该发生）按 null 读，
+      // 排序时忽略它，避免一条坏行永久挡住同组。
+      return sql
+        .all(
+          `SELECT o.*, e.seq AS effect_seq, COALESCE(e.attempts, 0) AS attempts
+             FROM outbox o
+             LEFT JOIN effect e ON e.kind = 'reply' AND e.key = o.id
+            WHERE o.status = 'pending' AND o.channel = ?`,
+          [channel]
+        )
+        .map(outboxWaitingFrom)
+        .sort(byEffectSeq)
+    },
+    pendingOfTicket(ticketId: string): readonly OutboxRecord[] {
+      return sql
+        .all("SELECT * FROM outbox WHERE ticket_id = ? AND status = 'pending' ORDER BY id", [ticketId])
+        .map(outboxFrom)
+    },
+    droppedSince(at: string): readonly OutboxRecord[] {
+      return sql
+        .all(
+          "SELECT * FROM outbox WHERE status = 'dropped' AND dropped_at >= ? ORDER BY dropped_at DESC, id",
+          [at]
+        )
+        .map(outboxFrom)
+    },
+    failing(minAttempts: number): readonly OutboxWaitingRow[] {
+      return sql
+        .all(
+          `SELECT o.*, e.seq AS effect_seq, e.attempts AS attempts
+             FROM outbox o
+             JOIN effect e ON e.kind = 'reply' AND e.key = o.id
+            WHERE o.status = 'pending' AND e.attempts >= ?`,
+          [minAttempts]
+        )
+        .map(outboxWaitingFrom)
+        .sort(byEffectSeq)
+    },
+    countDropped(): number {
+      return Number(
+        field(
+          sql.one("SELECT COUNT(*) AS n FROM outbox WHERE status = 'dropped' AND dropped_reason <> 'withdrawn'"),
+          'n'
+        )
+      )
     }
   }
 }
@@ -841,6 +902,22 @@ function outboxFrom(row: unknown): OutboxRecord {
     droppedAt: nullableText(field(row, 'dropped_at')),
     droppedReason: nullableText(field(row, 'dropped_reason'))
   }
+}
+
+/** 从 `outbox` + `effect` 的连接行读出待发行（§J.1 顺序：`seq` 是入队序）。 */
+function outboxWaitingFrom(row: unknown): OutboxWaitingRow {
+  return {
+    record: outboxFrom(row),
+    seq: nullableNumber(field(row, 'effect_seq')),
+    attempts: Number(field(row, 'attempts'))
+  }
+}
+
+/** 按 `reply` effect 的 `seq` 升序；没有 `seq` 的行排在最后（不参与「更早」的判断）。 */
+function byEffectSeq(left: OutboxWaitingRow, right: OutboxWaitingRow): number {
+  if (left.seq === null) return 1
+  if (right.seq === null) return -1
+  return left.seq - right.seq
 }
 
 /** 从 `settings_version` 行读出记录。 */
