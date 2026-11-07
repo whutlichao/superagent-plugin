@@ -204,11 +204,11 @@ export class Engine {
 
   /**
    * 人重试一个 worker 报告 failed/blocked（或 Input 投递失败）的 Ticket：卡住的 Assignment
-   * 结束，在同一个 Mandate 下开一个新的。
+   * 结束，在同一个 Mandate 下开一个新的。`note` 是随新 Assignment 投递的恢复说明（§E.5）。
    * @throws UserError Ticket 未知、已结束或不可重试。
    */
-  retryTicket(ticketId: string): Ticket {
-    return this.repo.atomic(() => this.tickets.retry(ticketId))
+  retryTicket(ticketId: string, note?: string): Ticket {
+    return this.repo.atomic(() => this.tickets.retry(ticketId, note))
   }
 
   // 执行器
@@ -230,6 +230,25 @@ export class Engine {
   inputsDelivered(ticketId: string, assignmentId: string, inputIds: string[]): void {
     this.repo.atomic(() => {
       this.assignments.delivered(ticketId, assignmentId, inputIds)
+    })
+  }
+
+  /**
+   * 执行器报告运行该 Ticket 的 Assignment 结束了（agent 的 `waiting`/`done`），Ticket
+   * 仍然开着；重复的事件什么都不做。
+   */
+  assignmentEnded(ticketId: string, assignmentId: string, reason: string): void {
+    this.repo.atomic(() => {
+      this.assignments.ended(ticketId, assignmentId, reason)
+    })
+  }
+
+  /**
+   * 执行器报告这个 Assignment 的终端已经不在：无条件结束它并用恢复说明重建（§E.10）。
+   */
+  assignmentLost(ticketId: string, assignmentId: string): void {
+    this.repo.atomic(() => {
+      this.assignments.lost(ticketId, assignmentId)
     })
   }
 
@@ -351,6 +370,8 @@ export type EngineForExecutor = Pick<
   | 'turnEnded'
   | 'deliveryFailed'
   | 'assignmentInterrupted'
+  | 'assignmentEnded'
+  | 'assignmentLost'
   | 'report'
   | 'markUnrelated'
   | 'handback'

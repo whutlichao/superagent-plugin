@@ -23,9 +23,13 @@ import {
   writeInboxFile,
   type DeliverySettings
 } from './deliver.ts'
+import { createBackgroundTracker, type BackgroundTracker } from './background.ts'
 import { launchTicketAgent, type LaunchSettings } from './launch.ts'
 import { runPrepare } from './prepare.ts'
+import { resumeAssignments, type ResumeReport } from './resume.ts'
 import { countSlots, DEFAULT_MAX_WORKERS, mayLaunch, mayWake, type SlotCounts } from './slots.ts'
+import { createStatusHandler, type AgentStatusHandler } from './status.ts'
+import { closeAssignmentTerminal } from './stop.ts'
 import { ensureTicketWorkspace, type WorkspaceSettings } from './workspace.ts'
 import { resolveAgentSetting } from '../app/agent-defaults.ts'
 
@@ -92,6 +96,26 @@ export interface RegisterExecutorOptions {
   /** 注入的等待（投递回读用）；测试不 sleep。 */
   readonly wait?: (milliseconds: number) => Promise<void>
   readonly log?: (message: string) => void
+}
+
+/** 生命周期（§E.5、§E.7–§E.10）要的依赖：seam、领域写入、仓储与注入的时钟。 */
+export interface RegisterLifecycleOptions {
+  readonly runtime: OrcaRuntime
+  readonly engine: EngineForExecutor
+  readonly records: ExecutorRecords
+  /** 毫秒时钟（后台计时的起点与 30 分钟判定）。 */
+  readonly now: () => number
+  readonly log?: (message: string) => void
+}
+
+/** 启动时接上的一件事：resume 的结局（日志与面板用）。 */
+export interface ExecutorLifecycle {
+  /** 30 分钟后台工作（§E.9）：`poll()` 由 pass 定时调用，`state()` 给面板读。 */
+  readonly background: BackgroundTracker
+  /** `agent.status.changed` 的四态映射（§E.7）。 */
+  readonly status: AgentStatusHandler
+  /** 启动时认领或重建仍在跑的 Assignment（§E.10）。 */
+  resume(): Promise<ResumeReport>
 }
 
 /** 一个设置项的字符串读法：去空白、空串当没有。 */
@@ -224,6 +248,37 @@ export function renderAssignmentBrief(options: {
   ].join('\n')
 }
 
+/**
+ * 把执行器生命周期接到一处：状态事件交给 §E.7 的映射，并同时喂给 §E.9 的后台计时；启动时
+ * 用同一个 seam 做 §E.10 的恢复。组合根只调这一个函数，三个行为因此共享同一份仓储读口。
+ */
+export function registerExecutorLifecycle(options: RegisterLifecycleOptions): ExecutorLifecycle {
+  const background = createBackgroundTracker({
+    records: options.records,
+    runtime: options.runtime,
+    now: options.now,
+    ...(options.log === undefined ? {} : { log: options.log })
+  })
+  const status = createStatusHandler({
+    engine: options.engine,
+    records: options.records,
+    runtime: options.runtime,
+    background,
+    ...(options.log === undefined ? {} : { log: options.log })
+  })
+  return {
+    background,
+    status,
+    resume: () =>
+      resumeAssignments({
+        runtime: options.runtime,
+        engine: options.engine,
+        records: options.records,
+        ...(options.log === undefined ? {} : { log: options.log })
+      })
+  }
+}
+
 /** `Executor` 端口：只把启动/投递意图排进效果队列，真正的 I/O 在 handler 里（§J.2）。 */
 export class OrcaExecutor implements Executor {
   readonly #effects: ExecutorEffectQueue
@@ -256,9 +311,11 @@ export class OrcaExecutor implements Executor {
    */
   stop(ticket: Ticket, assignment: Assignment, _reason?: string): void {
     if (assignment.terminalId === undefined) return
-    void this.#runtime.closeTerminal(assignment.terminalId).catch((error: unknown) => {
-      this.#log(`close ${assignment.terminalId} for ${ticket.id} failed: ${messageOf(error)}`)
-    })
+    // 事务已经提交（Assignment 已 ended）；终端关闭只是它的外部副作用，失败只记日志。
+    void closeAssignmentTerminal(
+      { ticket, assignment },
+      { runtime: this.#runtime, log: this.#log }
+    )
   }
 }
 
