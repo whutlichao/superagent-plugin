@@ -20,6 +20,7 @@ import { CliError, isGone, type GoneRule } from '../commands.ts'
 import { array, object, string } from '../../infra/schema.ts'
 import type { GithubConfig } from './config.ts'
 import { githubConfigSchema } from './config.ts'
+import { rateLimited } from './api.ts'
 import { mentionsAgent } from './translate.ts'
 
 /** 这个 kind 的稳定 id。 */
@@ -33,12 +34,10 @@ export const GONE_RULES: readonly GoneRule[] = [{ code: 404 }, { code: 410 }, { 
 
 /**
  * 403 也可以是限流（它会自己恢复），所以不能一律当 `gone`：只有非限流的 403
- * （锁定、无权限）才是永久失败，其余一律抛错重试（§I.2）。
+ * （锁定、无权限）才是永久失败，其余一律抛错重试（§I.2）。限流的判定与 CI 读同一处。
  */
-const RATE_LIMITED = /rate limit|secondary rate|abuse detection/i
-
 export function githubGone(error: unknown): boolean {
-  if (error instanceof CliError && error.code === 403 && RATE_LIMITED.test(error.message)) return false
+  if (rateLimited(error)) return false
   return isGone(error, GONE_RULES)
 }
 
@@ -170,7 +169,7 @@ export function createGithubKind(cli: string): SourceKind<GithubConfig> {
       {
         key: 'observeCi',
         type: 'switch',
-        label: both('接收默认分支的 CI', 'Observe default-branch CI'),
+        label: both('接收 CI 变化', 'Observe CI changes'),
         advanced: true
       }
     ],
@@ -351,8 +350,8 @@ export function createGithubKind(cli: string): SourceKind<GithubConfig> {
             id: 'ci',
             label: both('CI 检查', 'CI checks'),
             note: both(
-              '默认分支的 CI 变化没有发送者，只用最后一格判定。',
-              'A default-branch CI change has no sender, so only the last cell speaks.'
+              'CI 变化没有发送者，只用最后一格判定。',
+              'A CI change has no sender, so only the last cell speaks.'
             ),
             cells: {
               listedUnaddressed: false,
