@@ -16,6 +16,16 @@ export const ERROR_CODES = {
   invalidParams: 'invalid_params',
   /** 参数内容不合法（越界、未知枚举）。 */
   invalidValue: 'invalid_value',
+  /** 评估载荷不是文档里的形状（§G.2 的 eval-decide）。 */
+  invalidAssessment: 'invalid_assessment',
+  /** 评估没有把每条启用规则恰好判定一次（§K.4 第 1 条）。 */
+  incompleteRules: 'incomplete_rules',
+  /** 评估期间 Policy 变了：按新版本重评，不写 Decision（§K.5）。 */
+  policyChanged: 'policy_changed',
+  /** 评估所指的 Eval 已结束：决定来晚了，不写 Decision（§K.7）。 */
+  tooLate: 'too_late',
+  /** `route` 一次超过 20 条（§G.1 限额行）。 */
+  tooManyItems: 'too_many_items',
   /** 固定拒绝：调用方不该重试。 */
   refused: 'refused',
   /** 设置/prompt 的 base revision 已过期。 */
@@ -64,6 +74,10 @@ export function statusForErrorCode(code: string): number {
     case ERROR_CODES.refused:
     case ERROR_CODES.staleRevision:
     case ERROR_CODES.tooLong:
+    case ERROR_CODES.incompleteRules:
+    case ERROR_CODES.policyChanged:
+    case ERROR_CODES.tooLate:
+    case ERROR_CODES.tooManyItems:
       return 400
     case ERROR_CODES.unauthorized:
       return 401

@@ -16,6 +16,7 @@ import type { Executor } from '../core/ports.ts'
 import type { EngineForExecutor } from '../core/engine.ts'
 import { Later, type EffectHandlerOptions, type EffectKind, type EffectPayloads } from '../app/effects.ts'
 import type { OrcaRuntime, RepoSelector } from '../runtime/orca-runtime.ts'
+import { mandateInstructions } from './mandate.ts'
 import {
   deliverPendingInputs,
   DEFAULT_CONFIRM_DELIVERY,
@@ -274,6 +275,8 @@ export function renderAssignmentBrief(options: {
 }): string {
   const { ticket, trigger } = options
   const request = trigger === undefined ? '(the originating message is not stored any more)' : briefBody(trigger.text, trigger.url ?? trigger.id)
+  // 主动接受的票在开播就收窄范围（§K.4 第 5 条）：显式票没有这一段。
+  const mandate = mandateInstructions(ticket.mandate)
   return [
     '# Assignment',
     '',
@@ -283,6 +286,7 @@ export function renderAssignmentBrief(options: {
     `- mandate: ${ticket.mandate.strength} · policy ${ticket.mandate.policyVersion} · scope ${ticket.mandate.scope}`,
     `- requested by: ${ticket.mandate.actor.source}:${ticket.mandate.actor.id}`,
     `- origin: ${trigger?.url ?? ticket.origin.triggerId}`,
+    ...(mandate === '' ? [] : ['', '## Mandate', '', mandate]),
     '',
     '## Request',
     '',

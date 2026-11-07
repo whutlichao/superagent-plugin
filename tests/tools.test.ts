@@ -40,6 +40,7 @@ import {
   failureEnvelope,
   parseArgs,
   render,
+  REPEATABLE_FLAGS,
   successEnvelope
 } from '../src/worker/cli/io'
 import { API_TOKEN_FILE, TOKENS_DIR, ROUTER_TOKEN_FILE } from '../src/worker/infra/tokens'
@@ -627,6 +628,19 @@ test('--token is accepted for debugging, and the parser never puts it into messa
 test('a repeated flag is invalid_params instead of the last one silently winning', () => {
   assert.throws(
     () => parseArgs(['status', '--state-dir', '/a', '--state-dir', '/b']),
+    (error: unknown) => error instanceof ApiError && error.code === 'invalid_params'
+  )
+})
+
+test('--item is the one repeatable flag: each value is kept in order for route', () => {
+  assert.deepEqual(REPEATABLE_FLAGS, ['item'])
+  const parsed = parseArgs(['route', '--item', '{"kind":"ignore"}', '--item={"kind":"stop"}'])
+  assert.deepEqual(parsed.repeated['item'], ['{"kind":"ignore"}', '{"kind":"stop"}'])
+  // 单次也给在 `repeated` 里：命令只有一处读法。
+  assert.deepEqual(parseArgs(['route', '--item={}']).repeated['item'], ['{}'])
+  // 其余 flag 照旧不可重复。
+  assert.throws(
+    () => parseArgs(['status', '--decisions', 'a', '--decisions', 'b']),
     (error: unknown) => error instanceof ApiError && error.code === 'invalid_params'
   )
 })

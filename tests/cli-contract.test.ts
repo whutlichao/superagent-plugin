@@ -17,10 +17,12 @@ import { dispatch } from '../src/worker/cli/commands'
 import { parseArgs } from '../src/worker/cli/io'
 import { main } from '../src/worker/cli/main'
 import { createDomainHandlers, withDomainHandlers } from '../src/worker/http/domain'
+import { createAssessmentHandlers, withAssessmentHandlers } from '../src/worker/http/assessment'
+import { createRouterTools } from '../src/worker/app/assessment'
+import type { Candidate, Decision, Ticket } from '../src/worker/core/index'
 import { ROUTE_TABLE } from '../src/worker/http/routes'
 import { AT, tempStateDir } from './support/state'
 import { startTestServer, type TestServer } from './support/cli-server'
-import type { Ticket } from '../src/worker/core/index'
 
 /** 一条契约用例。`ok` 为真时断言成功，否则断言 `error.code` 与退出码。 */
 interface Case {
@@ -35,6 +37,8 @@ interface Case {
   readonly token?: 'operator' | 'router' | 'assignment' | null
   /** 这条用例不该发出 HTTP 请求（未落地命令的固定拒绝）。 */
   readonly offline?: boolean
+  /** 喂给 stdin 的正文（`--assessment -` 这类 `<file|->` 参数）。 */
+  readonly stdin?: string
 }
 
 /** 已接线命令的成功 + 固定拒绝。 */
@@ -94,6 +98,35 @@ const WIRED: readonly (readonly [string, Case, Case])[] = [
   ],
   // 本票接线的 Worker 三条（§G.2 的 report / reply / ack）：打到真的领域 handler。
   [
+    'route',
+    {
+      argv: ['route', '--item', '{"kind":"ignore","trigger_id":"trigger-1","reason":"chatter"}'],
+      exit: 0,
+      resultKeys: ['results'],
+      token: 'router'
+    },
+    { argv: ['route'], exit: 2, code: 'invalid_params' }
+  ],
+  [
+    'eval-decide',
+    {
+      argv: ['eval-decide', 'trigger-1', '--assessment', '-'],
+      exit: 0,
+      resultKeys: ['decision', 'reason'],
+      token: 'router',
+      stdin:
+        '{"decision":"ignore","direction":{"implementation_requested":false,"target_basis":"undetermined","requires_design_decision":false,"evidence":"chatter"},"rule_assessments":[],"reason":"chatter"}'
+    },
+    // 没有 Eval 持有它：固定的 too_late，不是 internal。
+    {
+      argv: ['eval-decide', 'nope', '--assessment', '-'],
+      exit: 2,
+      code: 'too_late',
+      token: 'router',
+      stdin: '{}'
+    }
+  ],
+  [
     'reply',
     {
       argv: ['reply', '--purpose', 'attention', '--text', 'Need a decision', '--human-action', 'Which branch?'],
@@ -132,10 +165,8 @@ const WIRED: readonly (readonly [string, Case, Case])[] = [
 
 /** 未落地命令：唯一的用例就是那条固定的 `unavailable`（离线，退出 3）。 */
 const PENDING: readonly string[][] = [
-  ['route'],
   ['eval', 't-1'],
   ['eval-read', 't-1'],
-  ['eval-decide', 't-1'],
   ['ticket', 'retry', 't-1'],
   ['ticket', 'stop', 't-1'],
   ['ticket', 'note', 't-1', '--text=a note'],
@@ -176,17 +207,74 @@ function ticketForCommands(): Ticket {
   }
 }
 
+/**
+ * Router 命令的替身宿主：`trigger-1` 有一个显式的候选，其余 trigger 没有 Eval（too_late）。
+ * 领域写入被固定为一条 ignore Decision（route / eval-decide 的形状与错误码是这里的断言面，
+ * 真正的领域行为在 `route.test.ts` 用真 Engine 覆盖）。
+ */
+function commandRouterTools() {
+  const ticket = ticketForCommands()
+  const decision: Decision = {
+    id: 'decision-1',
+    evalId: 'eval-1',
+    threadKey: 'github:acme/widgets#42',
+    triggerIds: ['trigger-1'],
+    policyVersion: 'v1',
+    at: AT,
+    kind: 'ignore',
+    reason: [{ code: 'noRuleMatched' }],
+    strength: 'explicit'
+  }
+  const trigger = {
+    id: 'trigger-1',
+    source: 'github',
+    threads: [{ source: 'github', id: 'acme/widgets#42' }],
+    actor: { source: 'github', id: 'alice' },
+    human: true,
+    at: AT,
+    text: 'please fix this',
+    meta: {}
+  }
+  const candidate: Candidate = {
+    evalId: 'eval-1',
+    thread: {
+      key: 'github:acme/widgets#42',
+      ref: { source: 'github', id: 'acme/widgets#42' },
+      createdAt: AT,
+      subscriptions: [],
+      correlated: [],
+      pending: [],
+      meta: {}
+    },
+    triggers: [trigger],
+    strength: 'explicit',
+    policyVersion: 'v1',
+    tickets: []
+  }
+  return createRouterTools({
+    candidate: (triggerId) => (triggerId === 'trigger-1' ? candidate : undefined),
+    policy: () => ({ acceptMode: 'observe', rules: [] }),
+    policyVersion: () => 'v1',
+    decide: () => decision,
+    attach: () => ticket,
+    ticketOf: (id) => (id === ticket.id ? ticket : undefined)
+  })
+}
+
 /** 真领域 handler 的接线：report/reply/ack 的写入口换成记录用的替身（它们各自有专门测试）。 */
 function commandRoutes(): ReturnType<typeof withDomainHandlers> {
   const ticket = ticketForCommands()
-  return withDomainHandlers(
-    ROUTE_TABLE,
-    createDomainHandlers({
-      report: () => ticket,
-      reply: () => ({ id: 'reply-1', status: 'pending', reused: false }),
-      ticketOf: (id) => (id === ticket.id ? ticket : undefined),
-      tickets: () => [ticket]
-    })
+  return withAssessmentHandlers(
+    withDomainHandlers(
+      ROUTE_TABLE,
+      createDomainHandlers({
+        report: () => ticket,
+        reply: () => ({ id: 'reply-1', status: 'pending', reused: false }),
+        ticketOf: (id) => (id === ticket.id ? ticket : undefined),
+        tickets: () => [ticket]
+      })
+    ),
+    createAssessmentHandlers({ tools: commandRouterTools() })
   )
 }
 
@@ -204,7 +292,8 @@ async function runCase(server: TestServer, entry: Case): Promise<{ readonly exit
   const result = await dispatch({
     parsed: parseArgs(entry.argv),
     target: server.target(token),
-    sleep: async () => undefined
+    sleep: async () => undefined,
+    ...(entry.stdin === undefined ? {} : { stdin: async () => entry.stdin as string })
   })
   if (entry.offline === true) {
     assert.equal(server.requests.length, before, `${entry.argv.join(' ')} refuses before the wire`)
@@ -276,6 +365,27 @@ test('every command that has not landed yet refuses with a fixed unavailable, of
       assert.equal(exit, 3, `${argv.join(' ')}: not-ready exit`)
       assertFailure(envelope, 'unavailable')
     }
+  } finally {
+    server.close()
+  }
+})
+
+test('route accepts its decisions from stdin too, not only repeated --item', async () => {
+  const server = await startTestServer({ routes: commandRoutes() })
+  try {
+    const decisions = JSON.stringify([
+      { kind: 'ignore', trigger_id: 'trigger-1', reason: 'chatter' }
+    ])
+    const { exit, envelope } = await runCase(server, {
+      argv: ['route', '--decisions', '-'],
+      exit: 0,
+      token: 'router',
+      stdin: decisions
+    })
+    assert.equal(exit, 0, JSON.stringify(envelope))
+    const view = envelope as { readonly ok?: unknown; readonly result?: { readonly results?: readonly unknown[] } }
+    assert.equal(view.ok, true)
+    assert.equal(view.result?.results?.length, 1, 'the batch from stdin ran')
   } finally {
     server.close()
   }
@@ -375,7 +485,7 @@ test('read applies the documented page defaults and caps before it goes to the w
     // §G.2 的 read 行：默认 20、上限 50。上限在客户端就判（`invalid_value`，退出 2），
     // 不发一次注定被拒的请求。
     const { readQuery, readPath } = await import('../src/worker/cli/commands')
-    const args = (flags: Record<string, string>) => ({ positionals: [], flags, text: false })
+    const args = (flags: Record<string, string>) => ({ positionals: [], flags, repeated: {}, text: false })
     assert.deepEqual(readQuery('threads', args({})), { limit: 20 })
     assert.deepEqual(readQuery('threads', args({ limit: '5', offset: '10' })), { limit: 5, offset: 10 })
     assert.deepEqual(readQuery('models', args({})), {}, 'non-paged resources get no limit')

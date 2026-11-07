@@ -357,6 +357,11 @@ export const COPY = {
   'reason.startedTicket': { zh: '已经开过工单 {ticket}', en: 'Already started ticket {ticket}' },
   'reason.acceptedBefore': { zh: '触发 {trigger} 之前已接单', en: 'Trigger {trigger} was accepted before' },
   'reason.routed': { zh: '已转给工单 {ticket}', en: 'Routed to ticket {ticket}' },
+  'reason.explicitRouted': {
+    zh: '名单里的人明确请求，由 Router 接单',
+    en: 'Explicit request from an allowed sender routed by the Router'
+  },
+  'reason.humanStop': { zh: '有人要求停止', en: 'A person asked to stop' },
   'reason.forwarded': {
     zh: '已扇出给该线程的工单',
     en: 'Forwarded to the worker of the Ticket already on this Thread'

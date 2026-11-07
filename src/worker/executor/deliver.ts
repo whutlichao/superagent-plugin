@@ -9,6 +9,7 @@ import { mkdirSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import type { Ticket, TicketInput, Trigger } from '../core/model.ts'
 import type { OrcaRuntime } from '../runtime/orca-runtime.ts'
+import { mandateInstructions } from './mandate.ts'
 
 /** 直发上限的缺省值（§E.4；S1 实测单行 1023 字节可送达，留出余量取 1000）。 */
 export const DEFAULT_INLINE_LIMIT = 1000
@@ -166,6 +167,8 @@ export function renderInputMarkdown(
   repliesTo: string | undefined = repliesToOf(trigger)
 ): string {
   const body = bodyOf(input, trigger)
+  // 主动票的每一条 Input 都重复收窄句：worker 的上下文可能只含这一条。
+  const mandate = mandateInstructions(ticket.mandate)
   const lines = [
     `[superagent] #${seq}`,
     '',
@@ -177,6 +180,7 @@ export function renderInputMarkdown(
     ...(trigger === undefined ? [] : [`- thread: ${trigger.source}:${trigger.threads[0]?.id ?? ''}`]),
     ...(trigger?.url === undefined ? [] : [`- url: ${trigger.url}`]),
     ...(repliesTo === undefined ? [] : [`- replies_to: ${repliesTo}`]),
+    ...(mandate === '' ? [] : ['', '## Mandate', '', mandate]),
     '',
     '## Body',
     '',

@@ -63,6 +63,10 @@ test('every error-code family maps to the status §G.3 item 8 fixes', () => {
     ['invalid_value', 400],
     ['invalid_assessment', 400],
     ['invalid_config', 400],
+    ['incomplete_rules', 400],
+    ['policy_changed', 400],
+    ['too_late', 400],
+    ['too_many_items', 400],
     ['refused', 400],
     ['stale_revision', 400],
     ['too_long', 400],
@@ -749,11 +753,13 @@ test('the route table carries every row §G.3 names', () => {
     'POST admin/rotate-token',
     'POST decisions/:id/dismiss',
     'POST doctor',
+    'POST eval-decide/:id',
     'POST executor/pause',
     'POST policy-sync/:id',
     'POST prompts/preview',
     'POST reply',
     'POST report',
+    'POST route',
     'POST router/restart',
     'POST setup/check',
     'POST sources/:id/labels',
@@ -1010,8 +1016,8 @@ test('every route refuses a role below its minimum with not_permitted_role', asy
         checked += 1
       }
     }
-    // 35 条路由：30 条高于 assignment（5 条是 assignment 档），13 条是 operator → 43 次拒绝。
-    assert.equal(checked, 43, 'every route above assignment refuses it, and every operator route refuses router')
+    // 37 条路由：32 条高于 assignment（5 条是 assignment 档），13 条是 operator → 45 次拒绝。
+    assert.equal(checked, 45, 'every route above assignment refuses it, and every operator route refuses router')
   } finally {
     harness.close()
   }
@@ -1193,7 +1199,9 @@ test('the actual port is written to the state directory, and close removes it', 
 })
 
 test('an occupied port makes the server try the next one and record the port it got', async () => {
-  const base = await pickPreferredPort()
+  // base 与 base+1 都空闲才断言「+1」：pickPreferredPort 只保证 base，另一个并发测试文件
+  // 的系统分配端口可能正好拿走 base+1（这个 helper 本来就是为这条断言准备的）。
+  const base = await twoFreePorts()
   const release = await occupy(base)
   const harness = await startHarness({ preferredPort: base })
   try {
