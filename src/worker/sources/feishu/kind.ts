@@ -13,6 +13,8 @@ import type { FeishuConfig } from './config.ts'
 import { feishuConfigSchema } from './config.ts'
 import { runFeishuSync } from './sync.ts'
 import { FEISHU_SOURCE } from './translate.ts'
+import { feishuFind, feishuThreadContext } from './read.ts'
+import type { FeishuContextOptions } from './read.ts'
 
 /** 这个 kind 的稳定 id。 */
 export const FEISHU_KIND = 'feishu'
@@ -88,11 +90,15 @@ export function feishuScope(trigger: ScopeInput, config: FeishuConfig): ScopeRes
 }
 
 /**
- * 造一个 Feishu kind。`cli` 是配置的机器人 `lark-cli`：Channel 与名单同步都需要它，而
- * `SourceChannel.send` / `sync.run` 的签名里没有配置（§I.1），所以由组合根在注册时闭包进来
- * （设置变了就重新注册，与设计 §N.2 的「重启后生效」一致）。
+ * 造一个 Feishu kind。`cli` 是配置的机器人 `lark-cli`：Channel、名单同步、语境读与图片下载
+ * 都需要它，而 `SourceChannel.send` / `sync.run` / `threadContext.image` 的签名里没有配置
+ * （§I.1），所以由组合根在注册时闭包进来（设置变了就重新注册，与设计 §N.2 的「重启后生效」
+ * 一致）。`options.stateDir` 是图片落盘的位置（§H.17：`<stateDir>/inbox/images`）。
  */
-export function createFeishuKind(cli = 'lark-cli'): SourceKind<FeishuConfig> {
+export function createFeishuKind(
+  cli = 'lark-cli',
+  options: FeishuContextOptions = {}
+): SourceKind<FeishuConfig> {
   return {
     kind: FEISHU_KIND,
     title: both('飞书', 'Feishu'),
@@ -182,6 +188,13 @@ export function createFeishuKind(cli = 'lark-cli'): SourceKind<FeishuConfig> {
       send: (host, message) => sendFeishu(host, cli, message),
       link: (address, links) => feishuLink(address, links)
     },
+    /**
+     * 读面（§I.3 线程上下文/图片两行）：五种读法 + 按 id 取图。语境只读 Trigger 自己锚定的
+     * 消息与会话；图片落盘在 `<stateDir>/inbox/images`。
+     */
+    threadContext: feishuThreadContext(cli, options),
+    /** 搜索（§I.3 find 行）：三类输入只产出搜索词；没有可推导的 Thread key 时不编一个。 */
+    find: feishuFind,
     /**
      * Policy 的 Feishu 部分（§K.1、§I.3 准入行）：每个配置的群一行，再加「其他群」与
      * 「私聊」。行 id 与 `scope` 的 `row` 逐字相同（`<chatId>` / `other` / `direct`），

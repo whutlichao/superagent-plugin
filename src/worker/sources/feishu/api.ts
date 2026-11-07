@@ -33,6 +33,21 @@ export interface FeishuChatQuery {
   readonly until?: string
   readonly pageToken?: string
   readonly pageSize?: number
+  /** 时间序：回填用 `asc`；`around` 的「更早一页」需要 `desc`（CLI 的缺省也是 `desc`）。 */
+  readonly order?: 'asc' | 'desc'
+}
+
+/** 按 id 批量读消息需要的参数（`+messages-mget`，一条 Trigger 的 message/root/parent）。 */
+export interface FeishuMessageQuery {
+  readonly messageIds: readonly string[]
+  readonly chatId: string
+  readonly direct: boolean
+}
+
+/** 一次按 id 读的读数：能读懂的消息 + 畸形条目数。 */
+export interface FeishuMessagePage {
+  readonly messages: readonly FeishuMessage[]
+  readonly skipped: number
 }
 
 /** 读一页话题回复需要的参数。 */
@@ -52,6 +67,8 @@ export interface FeishuApi {
   chatMessages(query: FeishuChatQuery): Promise<FeishuPage>
   /** 一个话题的回复，按创建时间升序（分页）。 */
   threadMessages(query: FeishuThreadQuery): Promise<FeishuPage>
+  /** 按 id 读消息（`+messages-mget`）；一次最多 50 个 id，读不懂的条目只记数。 */
+  messages(query: FeishuMessageQuery): Promise<FeishuMessagePage>
 }
 
 /** 一页的默认大小（lark-cli 上限 50）。 */
@@ -109,9 +126,13 @@ function pageOf(page: Record<string, unknown>, chatId: string, direct: boolean):
  */
 export function createFeishuApi(commands: CommandsHost, cli: string): FeishuApi {
   /** 分页参数（三条命令同名同义）。 */
-  const pageArgs = (pageSize: number | undefined, pageToken: string | undefined): string[] => [
+  const pageArgs = (
+    pageSize: number | undefined,
+    pageToken: string | undefined,
+    order: 'asc' | 'desc' = 'asc'
+  ): string[] => [
     '--order',
-    'asc',
+    order,
     '--page-size',
     String(pageSize ?? DEFAULT_PAGE_SIZE),
     ...(pageToken === undefined ? [] : ['--page-token', pageToken])
@@ -153,7 +174,7 @@ export function createFeishuApi(commands: CommandsHost, cli: string): FeishuApi 
         'bot',
         '--chat-id',
         query.chatId,
-        ...pageArgs(query.pageSize, query.pageToken),
+        ...pageArgs(query.pageSize, query.pageToken, query.order),
         ...(query.since === undefined ? [] : ['--start', query.since]),
         ...(query.until === undefined ? [] : ['--end', query.until])
       ])
@@ -171,6 +192,32 @@ export function createFeishuApi(commands: CommandsHost, cli: string): FeishuApi 
         ...pageArgs(query.pageSize, query.pageToken)
       ])
       return pageOf(parseObject(output), query.chatId, query.direct)
+    },
+
+    async messages(query: FeishuMessageQuery): Promise<FeishuMessagePage> {
+      // 没有 id 就不起子进程：一次「读空」不该花掉一个 CLI 调用。
+      if (query.messageIds.length === 0) return { messages: [], skipped: 0 }
+      const output = await commands.run(cli, [
+        'im',
+        '+messages-mget',
+        '--as',
+        'bot',
+        '--message-ids',
+        query.messageIds.join(','),
+        // 反应是正文之外的加料，读语境不需要；CLI 仍会自动展开 `thread_replies`，
+        // 那是它的输出契约，我们只取匹配的这一条（不把展开内容当正文）。
+        '--no-reactions'
+      ])
+      const parsed = parseObject(output)
+      const rows = messagesOf(parsed)
+      const messages: FeishuMessage[] = []
+      let skipped = 0
+      for (const entry of rows) {
+        const message = feishuHistoryOf(entry, { chatId: query.chatId, direct: query.direct })
+        if (message === undefined) skipped += 1
+        else messages.push(message)
+      }
+      return { messages, skipped }
     }
   }
 }

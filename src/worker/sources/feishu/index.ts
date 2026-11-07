@@ -14,6 +14,26 @@ export {
 } from './channel.ts'
 export { membersOf, runFeishuSync } from './sync.ts'
 export type { FeishuMember } from './sync.ts'
+export { admissionImageKeys, downloadFeishuImage, feishuImageRef } from './image.ts'
+export type { FeishuImageRef, FeishuImageRequest } from './image.ts'
+export {
+  AROUND_OLDER_PAGE,
+  AROUND_SIDE,
+  FEISHU_READ_PAGE_SIZE,
+  feishuFind,
+  feishuRead,
+  feishuReadStatus,
+  feishuThreadContext
+} from './read.ts'
+export type {
+  FeishuContextOptions,
+  FeishuMany,
+  FeishuOne,
+  FeishuReadRequest,
+  FeishuReadResult,
+  FeishuReadSection,
+  FeishuReadStatus
+} from './read.ts'
 export type { FeishuApi, FeishuChat, FeishuChatQuery, FeishuPage, FeishuThreadQuery } from './api.ts'
 export {
   CONSUMER_ARGS,
