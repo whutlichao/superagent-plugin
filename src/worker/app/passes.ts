@@ -71,8 +71,9 @@ export class Passes implements PassesPort {
 
   constructor(options: PassesOptions) {
     this.#options = options
-    // `passes` 条目由本调度器独占写入（§N.4 写者表）。
-    this.#entry = options.health.claim('passes', { state: 'ready', detail: 'ready' })
+    // `passes` 条目由本调度器独占写入（§N.4 写者表）。刚 claim、还没有跑过一轮时是
+    // `starting`（§J.3 四档之一），第一轮成功后才说 ready。
+    this.#entry = options.health.claim('passes', { state: 'starting', detail: 'not run yet' })
   }
 
   start(): void {
@@ -140,7 +141,11 @@ export class Passes implements PassesPort {
     try {
       this.#options.effects.kick()
       await this.#options.effects.idle()
-      if (this.#options.closing?.() === true) return
+      if (this.#options.closing?.() === true) {
+        // 关停不是失败，但这一轮确实没做完：条目说 `paused`（「不在跑」）而不是 ready。
+        this.#entry.set({ state: 'paused', detail: 'closing' })
+        return
+      }
       this.#options.engine.evaluateDue()
       this.succeeded()
     } catch (error) {

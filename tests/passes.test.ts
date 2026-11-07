@@ -78,6 +78,15 @@ function harness() {
   }
 }
 
+test('the passes entry starts as starting and turns ready only after a pass succeeds', async () => {
+  const h = harness()
+  // §J.3 的四档：刚 claim、还没有报告过时是 `starting`，不是假就绪。
+  assert.deepEqual(h.board.all().passes, { state: 'starting', detail: 'not run yet' })
+  h.passes.request()
+  await h.passes.idle()
+  assert.deepEqual(h.board.all().passes, { state: 'ready', detail: 'ready' })
+})
+
 test('a pass runs the due effects first and then the due evaluations', async () => {
   const h = harness()
   h.passes.request()
@@ -202,6 +211,6 @@ test('closing stops a pass before it evaluates, leaving the effects it already r
   await h.passes.idle()
   // 关停判定在 effect 之后、评估之前：这一轮不再 evaluateDue。
   assert.deepEqual(h.calls, ['effects'])
-  // 关停不是失败：健康保持 ready。
-  assert.deepEqual(h.board.all().passes, { state: 'ready', detail: 'ready' })
+  // 关停不是失败（不报 error），但这一轮没做完：条目说 `paused`（§J.3 四档）。
+  assert.deepEqual(h.board.all().passes, { state: 'paused', detail: 'closing' })
 })
