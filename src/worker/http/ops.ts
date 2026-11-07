@@ -55,6 +55,11 @@ export interface OpsPorts {
    * 一个没有组合根的测试服务器不能假装「检查过了」。
    */
   readonly setupCheck?: SetupCheckPort
+  /**
+   * `doctor` 的执行者：组合根把它与面板的 `doctor` 请求接在**同一份**接线（选项）上；
+   * 缺省时 handler 用本文件拼的那份选项（`store.inspect()` + 注入的 runner）。
+   */
+  readonly doctor?: () => Promise<DoctorResult>
 }
 
 /** `setup check` 的端口：返回组合根的重跑结论（`BootHandle.checkSetup`）。 */
@@ -180,7 +185,8 @@ export function createOpsHandlers(options: {
     inspectDatabase: () => options.store.inspect()
   }
   handlers.set('POST doctor', async () => {
-    const result: DoctorResult = await runDoctor(doctorOptions)
+    const result: DoctorResult =
+      options.ports?.doctor === undefined ? await runDoctor(doctorOptions) : await options.ports.doctor()
     return result
   })
 

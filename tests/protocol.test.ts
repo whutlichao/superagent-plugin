@@ -14,8 +14,21 @@ test('the worker push is the one state.changed event, carrying a monotonic revis
   assert.deepEqual([...PLUGIN_PANEL_EVENTS], ['state.changed'])
 })
 
-test('the panel declares the state snapshot and the pause action, nothing more', () => {
-  assert.deepEqual([...PLUGIN_REQUESTS], ['state', 'pause', 'check', 'ticket.retry', 'terminal.focus'])
+test('the panel declares the state snapshot, the Overview actions and the Deployment group requests', () => {
+  // 每个票据追加自己那一组请求：Overview 的 `check`/`ticket.retry`/`terminal.focus`（#37）与
+  // Deployment 组的读数、doctor、重跑探针、轮换 token、重启 Router（#47）。
+  assert.deepEqual([...PLUGIN_REQUESTS], [
+    'state',
+    'pause',
+    'check',
+    'ticket.retry',
+    'terminal.focus',
+    'deployment',
+    'doctor',
+    'setupCheck',
+    'rotateToken',
+    'restartRouter'
+  ])
 })
 
 test('the state request returns the shared PanelState shape, not a loose object', () => {

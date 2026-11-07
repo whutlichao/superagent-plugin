@@ -694,3 +694,158 @@ describe('doctor and the setup check are different questions', () => {
     }
   })
 })
+
+// ---------------------------------------------------------------------------
+// 部署页的读数（§M.3 Deployment）：组合根把 setup、限额、暂停、health 与 Router 拼成一份，
+// 面板只读它；轮换主 token 与 doctor 也从同一份接线来（§D.6、§G.2、§O）。
+// ---------------------------------------------------------------------------
+
+/** 用指定 token 跑一条 CLI 命令（真的 loopback HTTP；token 可以是一个已经作废的）。 */
+async function runCliWith(stateDir: string, port: number, token: string | null, argv: readonly string[]) {
+  return dispatch({
+    parsed: parseArgs(argv),
+    target: {
+      stateDir,
+      stateDirSource: 'argument' as const,
+      port,
+      baseUrl: `http://127.0.0.1:${port}/superagent/api`,
+      token,
+      tokenSource: 'argument' as const,
+      tokenFile: null
+    },
+    sleep: async () => undefined
+  })
+}
+
+/** `ApiError.toJSON()` 的错误码（dispatch 的信封）。 */
+function codeOf(result: Awaited<ReturnType<typeof dispatch>>): string | undefined {
+  const envelope = result.envelope as { ok?: boolean; error?: { code?: string } }
+  return envelope.ok === false ? envelope.error?.code : undefined
+}
+
+describe('the deployment read the panel renders', () => {
+  test('carries the state directory, the limits in force, paused and the real health board', async () => {
+    const boot = await openBoot()
+    try {
+      const view = boot.handle.deployment()
+      assert.equal(view.stateDir, boot.stateDir)
+      assert.deepEqual({ ...view.limits }, {
+        promptMaxChars: 200_000,
+        admissionContextMaxPages: 10,
+        admissionContextTimeoutMs: 15_000,
+        retentionDays: 90
+      })
+      assert.deepEqual(view.setup, [], 'a complete deployment has no setup problem')
+      assert.equal(view.paused, false)
+
+      // health 明细就是健康板上那些条目（#45 的写者已 claim 过），按名字序、无假条目。
+      const names = view.health.map((entry) => entry.name)
+      for (const name of ['runtime', 'passes', 'models', 'router']) {
+        assert.ok(names.includes(name), `the health board reports ${name}`)
+      }
+      assert.deepEqual(names, [...names].sort(), 'entries are read in name order')
+      assert.equal(new Set(names).size, names.length, 'each entry appears once')
+      assert.ok(view.health.every((entry) => entry.state !== undefined))
+
+      // 暂停由 `app/pause.ts` 这一个写者；面板读到的是写后的值。
+      boot.handle.setPaused(true)
+      assert.equal(boot.handle.deployment().paused, true)
+      boot.handle.setPaused(false)
+      assert.equal(boot.handle.deployment().paused, false)
+
+      // Router 读数与 `routerStatus()` 同一份（这里是「还没起来」，不是二手字段）。
+      assert.equal(view.router.terminalId, boot.handle.routerStatus().terminalId)
+      assert.equal(view.router.restarts, boot.handle.routerStatus().restarts)
+      assert.equal(view.router.state, boot.handle.routerStatus().state)
+    } finally {
+      await boot.cleanup()
+    }
+  })
+
+  test('the limits come from the machine settings, and a bad value falls back to the design default', async () => {
+    const stateDir = tempStateDir()
+    const boot = await openBoot({
+      stateDir,
+      settings: {
+        ...settingsOf(stateDir),
+        promptMaxChars: 500_000,
+        admissionContextMaxPages: 4,
+        admissionContextTimeoutMs: 7000,
+        retention: { days: 30 }
+      }
+    })
+    try {
+      assert.deepEqual({ ...boot.handle.deployment().limits }, {
+        promptMaxChars: 500_000,
+        admissionContextMaxPages: 4,
+        admissionContextTimeoutMs: 7000,
+        retentionDays: 30
+      })
+    } finally {
+      await boot.cleanup()
+    }
+
+    const broken = tempStateDir()
+    const second = await openBoot({
+      stateDir: broken,
+      settings: { ...settingsOf(broken), promptMaxChars: 0, admissionContextMaxPages: -1, admissionContextTimeoutMs: 1.5 }
+    })
+    try {
+      // 限额只接受正整数：写坏的值回落缺省值，而不是被当成 0 或小数用。
+      assert.deepEqual({ ...second.handle.deployment().limits }, {
+        promptMaxChars: 200_000,
+        admissionContextMaxPages: 10,
+        admissionContextTimeoutMs: 15_000,
+        retentionDays: 90
+      })
+    } finally {
+      await second.cleanup()
+    }
+  })
+
+  test('rotating the operator token rewrites the file, reports the path and never the value', async () => {
+    const boot = await openBoot()
+    try {
+      const port = boot.handle.port()
+      assert.notEqual(port, null, 'the leader serves the loopback API')
+      const before = readApiToken(boot.stateDir)
+      assert.notEqual(before, null)
+
+      const result = boot.handle.rotateToken()
+      const after = readApiToken(boot.stateDir)
+      assert.equal(result.rotated, true)
+      assert.equal(result.tokenFile, join(boot.stateDir, 'api-token'))
+      assert.notEqual(after, before, 'the file holds a new token')
+      assert.equal(JSON.stringify(result).includes(after as string), false, 'the token value is never returned')
+
+      // 鉴权每次请求都读那个文件：旧 token 立刻 401，新 token 照常读 state（§D.6）。
+      const stale = await runCliWith(boot.stateDir, port as number, before, ['status'])
+      assert.equal(codeOf(stale), 'unauthorized')
+      const fresh = await runCliWith(boot.stateDir, port as number, after, ['status'])
+      assert.equal(fresh.exit, 0)
+    } finally {
+      await boot.cleanup()
+    }
+  })
+
+  test('doctor runs the machine diagnosis through the same wiring as the CLI', async () => {
+    // 这台「机器」上 `gh` 是登录好的（缺省脚本只覆盖了 `gh api user`）；lark-cli 没装 → warn。
+    const boot = await openBoot({
+      scripts: (commands) => commands.script('gh auth status', () => 'github.com\n  Logged in to github.com as acme-agent\n')
+    })
+    try {
+      const result = await boot.handle.doctor()
+      assert.equal(result.stateDir, boot.stateDir)
+      // 缺省脚本化的两个登录（gh 的 auth status 与 lark-cli）是 warn，不是 fail；
+      // token、端口、锁、库、CLI 路径与 worker git 配置在这台「机器」上都齐。
+      assert.equal(result.summary.fail, 0, JSON.stringify(result.checks))
+      assert.equal(result.checks.length, 8)
+      assert.equal(result.note.includes('superagent setup check'), true)
+      const token = result.checks.find((check) => check.name === 'token')
+      assert.equal(token?.state, 'ok')
+      assert.equal(JSON.stringify(result).includes(readApiToken(boot.stateDir) as string), false, 'doctor never prints the token')
+    } finally {
+      await boot.cleanup()
+    }
+  })
+})

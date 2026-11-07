@@ -11,7 +11,7 @@
 // `OrcaRuntime` 与端口进入。
 import { mkdirSync } from 'node:fs'
 import { join } from 'node:path'
-import type { PanelState } from '../panel/protocol'
+import type { DeploymentView, PanelState } from '../panel/protocol'
 import { Engine } from './core/index.ts'
 import type { Store } from './app/store.ts'
 import { openStore } from './app/store.ts'
@@ -25,8 +25,14 @@ import {
   TOKENS_DIR,
   ensureApiToken,
   issueAssignmentToken,
-  issueRouterToken
+  issueRouterToken,
+  rotateApiToken
 } from './infra/tokens.ts'
+import { deploymentView } from './app/deployment-view.ts'
+import { machineLimits } from './app/limits.ts'
+import { runDoctor } from './app/doctor.ts'
+import type { DoctorOptions } from './app/doctor.ts'
+import type { DoctorResult } from './app/doctor-types.ts'
 import { createRepositories } from './app/repositories.ts'
 import {
   createPolicy,
@@ -206,6 +212,12 @@ export interface BootHandle {
    * **不重启 Orca**。`checked: false` 表示检查时本来就没有问题——没有可检查的东西。
    */
   checkSetup(): Promise<SetupCheckOutcome>
+  /** Deployment 页的读数（§M.3）：setup 问题、状态目录、机器限额、暂停、health 与 Router。 */
+  deployment(): DeploymentView
+  /** doctor 的八项诊断（§G.2、§N.4）：与 HTTP 的 `POST doctor` 同一份接线。 */
+  doctor(): Promise<DoctorResult>
+  /** 轮换主 token（§D.6、§O）：只回 token 文件路径，绝不回 token 值。 */
+  rotateToken(): { readonly rotated: boolean; readonly tokenFile: string }
   shutdown(): Promise<void>
 }
 
@@ -327,6 +339,27 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
       focusTerminal: (terminalId: string): Promise<void> => options.runtime.focusTerminal(terminalId),
       // follower 不读库、不跑探针：它没有可以做检查的东西。
       checkSetup: async () => ({ checked: false, problem: null, issues: [], restarted: false }),
+      // 部署页读到的是「这一进程只跟着另一个实例」：没有自己的 health，也不假装在跑。
+      deployment: () =>
+        deploymentView({
+          stateDir: resolved,
+          setup: [],
+          limits: machineLimits(settings),
+          paused: true,
+          health: {},
+          router: emptyRouterSnapshot()
+        }),
+      // 诊断与轮换由那个真正持有 stateDir 的实例做。
+      doctor: async () => {
+        throw Object.assign(new Error('another instance owns the state directory; run doctor through it'), {
+          code: 'refused'
+        })
+      },
+      rotateToken: () => {
+        throw Object.assign(new Error('another instance owns the state directory; it owns the token'), {
+          code: 'refused'
+        })
+      },
       shutdown: async () => undefined
     }
     return follower
@@ -348,6 +381,20 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
   const githubStored = block(rawSources[GITHUB_KIND])
   const commandPort: CommandsHost =
     options.commands ?? new Commands({ configuredPrograms: () => [text(settings['githubCli'])] })
+  // 机器限额（§H.12、§H.22）：设置里写了的用写的，没写的用缺省值；启动时读一次。
+  const limits = machineLimits(settings)
+  /**
+   * `doctor` 的接线（§G.2、§N.4）：HTTP 的 `POST doctor` 与面板的 `doctor` 请求走**同一份**选项，
+   * 于是两处读数永远一致。只 stat 文件、不读 secret（§O）。
+   */
+  const doctorOptions: DoctorOptions = {
+    stateDir: resolved,
+    run: (program, args) => commandPort.run(program, args),
+    cliPath: options.cliPath ?? defaultCliPath(),
+    now,
+    inspectDatabase: () => store.inspect()
+  }
+  const doctorNow = (): Promise<DoctorResult> => runDoctor(doctorOptions)
   const githubInstance = githubInstanceOf({ raw: settings, stored: githubStored })
   const feishuCli = feishuCliOf(rawSources)
   const setupInput = (): SetupCheckInput => ({
@@ -897,7 +944,8 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
     ops: {
       run: (program, args) => commandPort.run(program, args),
       cliPath: options.cliPath ?? defaultCliPath(),
-      setupCheck: () => checkSetup()
+      setupCheck: () => checkSetup(),
+      doctor: doctorNow
     },
     log: (line) => logger.info('http request', { method: line.method, path: line.path, status: line.status, ms: line.ms })
   })
@@ -1246,6 +1294,22 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
     // 面板不能直接聚焦终端（§M.2）：worker 跑 `orca terminal focus --terminal <handle>`。
     focusTerminal: (terminalId: string): Promise<void> => options.runtime.focusTerminal(terminalId),
     checkSetup,
+    // Deployment 页的三条读数（§M.3）：状态目录与限额只读；health 是健康板；Router 只读快照。
+    deployment: () =>
+      deploymentView({
+        stateDir: resolved,
+        setup: setup.issues(),
+        limits,
+        paused: paused.paused(),
+        health: board.all(),
+        router: routerSupervision.snapshot()
+      }),
+    doctor: doctorNow,
+    rotateToken: () => {
+      // §D.6、§O：只回文件路径；值不出现在任何读数里。
+      const rotated = rotateApiToken(resolved)
+      return { rotated: true, tokenFile: rotated.path }
+    },
     shutdown
   }
 }
