@@ -47,6 +47,23 @@ function eventually(run: (booted: BootHandle) => void, onError: (message: string
     .catch((error: unknown) => onError(error instanceof Error ? error.message : String(error)))
 }
 
+/** 一个错误的可读信息（面板的错误态要显示原因，而不是「undefined」）。 */
+function messageOf(error: unknown): string {
+  return error instanceof Error && error.message !== '' ? error.message : String(error)
+}
+
+/**
+ * 一个错误的拒绝码：领域错误自带 `code`（例如 `notRetryable`），宿主错误自带 Host 码；
+ * 都没有时用调用给出的缺省码——不把未知错误伪装成成功。
+ */
+function codeOf(error: unknown, fallback: string): string {
+  const code =
+    typeof error === 'object' && error !== null
+      ? (error as { code?: unknown }).code
+      : undefined
+  return typeof code === 'string' && code !== '' ? code : fallback
+}
+
 /**
  * 插件入口：Orca 在插件启用时调用一次。它登记贡献点、接上面板契约与状态栏，并把 boot
  * 的异步序列交给 `bootPlugin`；`deactivate()` 按 §E.5 的顺序收尾。
@@ -84,7 +101,8 @@ export default function activate(orca: OrcaWorkerApi): void {
       return null
     })
 
-  // 面板契约（§M.6）：`state` 读真快照；`pause` 写暂停状态并返回改后的快照。
+  // 面板契约（§M.6）：`state` 读真快照；`pause` 写暂停状态并返回改后的快照；
+  // `check` 重跑一遍读模型；`ticket.retry`/`terminal.focus` 是 Overview 行上的直接动作。
   host.handleRequest('state', async () => (await ready()).snapshot())
   host.handleRequest('pause', async (input) => {
     const paused = (input as { paused?: unknown } | null)?.paused
@@ -92,6 +110,40 @@ export default function activate(orca: OrcaWorkerApi): void {
       throw Object.assign(new Error('pause needs { paused: boolean }'), { code: 'invalid_params' })
     }
     return (await ready()).setPaused(paused)
+  })
+  host.handleRequest('check', async () => {
+    const booted = await ready()
+    return booted.refresh()
+  })
+  host.handleRequest('ticket.retry', async (input) => {
+    const ticketId = (input as { ticketId?: unknown } | null)?.ticketId
+    if (typeof ticketId !== 'string' || ticketId === '') {
+      throw Object.assign(new Error('ticket.retry needs { ticketId: string }'), {
+        code: 'invalid_params'
+      })
+    }
+    const booted = await ready()
+    try {
+      return booted.retryTicket(ticketId)
+    } catch (error) {
+      // 领域的 `notRetryable` / 找不到工单都折成面板能显示的拒绝（§G.2 的固定错误面）。
+      throw Object.assign(new Error(messageOf(error)), { code: codeOf(error, 'invalid_params') })
+    }
+  })
+  host.handleRequest('terminal.focus', async (input) => {
+    const terminalId = (input as { terminalId?: unknown } | null)?.terminalId
+    if (typeof terminalId !== 'string' || terminalId === '') {
+      throw Object.assign(new Error('terminal.focus needs { terminalId: string }'), {
+        code: 'invalid_params'
+      })
+    }
+    const booted = await ready()
+    try {
+      await booted.focusTerminal(terminalId)
+      return { focused: true }
+    } catch (error) {
+      throw Object.assign(new Error(messageOf(error)), { code: codeOf(error, 'action_failed') })
+    }
   })
 
   host.register(COMMANDS.pause, () => {

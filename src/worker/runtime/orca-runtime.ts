@@ -269,6 +269,11 @@ export interface OrcaRuntime {
   ): Promise<{ readonly lines: readonly string[]; readonly truncated: boolean }>
   closeTerminal(terminalId: string): Promise<void>
   /**
+   * 把一台终端切到前台（§M.2「面板不能直接做的两件事」之一）。面板没有这个宿主能力，
+   * 实现走 `orca terminal focus --terminal <handle>`；找不到终端时抛 `agent_gone`。
+   */
+  focusTerminal(terminalId: string): Promise<void>
+  /**
    * 在工作区里跑一条一次性命令并等它结束（prepare，§E.3）。宿主没有直接等价方法：实现用
    * `orca terminal create --command …` 起终端，再 `orca terminal read` 收尾（附录 C S1/S3 的
    * 实测 CLI 可用）。超时按 `timeoutMs` 交给 `cli_timeout`。

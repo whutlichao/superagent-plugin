@@ -15,8 +15,9 @@ export function healthyState(overrides: Partial<PanelState> = {}): PanelState {
       error: false,
       paused: false,
       setupMissing: false,
+      sources: { enabled: 0, problems: 0 },
       activity: { received: 4, evaluated: 3, accepted: 1, ignored: 2, ended: 0 },
-      executor: { running: 0, maxWorkers: 4 }
+      executor: { running: 0, maxWorkers: 4, humanSlot: 'free' }
     },
     attention: {
       answer: 0,
@@ -24,6 +25,7 @@ export function healthyState(overrides: Partial<PanelState> = {}): PanelState {
       problems: 0,
       items: []
     },
+    problems: [],
     ...overrides
   }
 }
@@ -121,7 +123,9 @@ test('a hidden panel asks the worker nothing', async () => {
   const host = mockHost({ requests: { state: () => healthyState() } })
   panel = await mount(panelModule, { host, visible: false })
   assert.deepEqual(host.callsOf('plugin.request'), [])
-  assert.ok(panel.find({ text: COPY['boot.starting'].en }), 'it says it is waiting to start')
+  // 隐藏时没有读数可画：显示的是加载态（骨架 + 进度），而不是假装已经读到了什么。
+  assert.equal(panel.findAll({ type: 'Skeleton' }).length, 3, 'it shows the loading placeholders')
+  assert.ok(panel.find({ type: 'Progress' }))
 })
 
 test('a cold start asks once, retries once after two seconds, and does not keep polling', async () => {
@@ -185,7 +189,10 @@ test('a page in flight shows the loading state, then the empty state', async () 
     'the shell draws one of the two states'
   )
   assert.ok(panel.find({ text: COPY['overview.nothingNeedsYou'].en }), 'a healthy worker says nothing needs you')
-  assert.ok(panel.find({ text: /4 received|received/ }), 'the 24 h flow is on the overview')
+  assert.ok(
+    panel.find({ text: new RegExp(COPY['overview.flowReceived'].en) }),
+    'the 24 h flow is on the overview'
+  )
 })
 
 test('an error state names the reason and offers a retry that works', async () => {
@@ -281,15 +288,22 @@ test('a setup problem points at Settings, and Settings is one press away', async
   assert.equal(panel.valueOf({ type: 'Tabs' }), 'settings')
 })
 
-test('the worker-reported problem count is visible on the overview', async () => {
+test('the worker-reported problems are visible on the overview', async () => {
+  // #37 把占位的一行数字换成了真行：#J.3 的三类来源各一行，点行去归属页。
   const problems = healthyState({
     health: { ...healthyState().health, error: true },
-    attention: { answer: 0, review: 0, problems: 2, items: [] }
+    attention: { answer: 0, review: 0, problems: 2, items: [] },
+    problems: [
+      { id: 'health:assessment', kind: 'health', name: 'assessment', detail: 'waiting 2, failed 1' },
+      { id: 'unavailable:d1', kind: 'unavailable', name: 'thread-7', detail: 'no answer' }
+    ]
   })
   panel = await mount(panelModule, { host: mockHost({ requests: { state: () => problems } }), locale: 'zh-CN' })
+  assert.ok(panel.find({ text: /assessment/ }), 'the health entry that broke')
+  assert.ok(panel.find({ text: /thread-7/ }), 'the decision that needs a person')
   assert.ok(
-    panel.find({ text: new RegExp(translate('zh-CN', 'overview.problemCount', { count: 2 })) }),
-    'the count is shown in words, not as a bare number'
+    panel.summary().some((line) => line.includes(translate('zh-CN', 'overview.problems'))),
+    'the section is titled in the panel language'
   )
 })
 

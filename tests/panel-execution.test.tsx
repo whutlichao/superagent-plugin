@@ -20,10 +20,12 @@ function snapshot(tickets?: readonly PanelTicket[]): PanelState {
       error: false,
       paused: false,
       setupMissing: false,
+      sources: { enabled: 0, problems: 0 },
       activity: { received: 4, evaluated: 3, accepted: 1, ignored: 2, ended: 0 },
-      executor: { running: 1, maxWorkers: 4 }
+      executor: { running: 1, maxWorkers: 4, humanSlot: 'free' }
     },
     attention: { answer: 0, review: 0, problems: 0, items: [] },
+    problems: [],
     ...(tickets === undefined ? {} : { tickets })
   }
 }
@@ -136,7 +138,7 @@ test('the worker read model turns a real ticket into its Execution row', () => {
       }
     ],
     activity: () => ({ received: 1, evaluated: 1, accepted: 1, ignored: 0, ended: 1 }),
-    load: () => ({ running: 1, maxWorkers: 2 }),
+    load: () => ({ running: 1, maxWorkers: 2, humanSlot: 'free' }),
     hasError: () => false,
     setupMissing: () => false,
     paused: () => false
@@ -152,18 +154,27 @@ test('the worker read model carries the system problem count the panel must surf
   const source = createRefreshableStateSource({
     tickets: () => [],
     activity: () => ({ received: 0, evaluated: 0, accepted: 0, ignored: 0, ended: 0 }),
-    load: () => ({ running: 0, maxWorkers: 2 }),
+    load: () => ({ running: 0, maxWorkers: 2, humanSlot: 'free' }),
     hasError: () => false,
     setupMissing: () => false,
     paused: () => false,
-    problems: () => 2
+    problems: () => [
+      { id: 'health:assessment', kind: 'health', name: 'assessment', detail: 'waiting 2, failed 1' },
+      { id: 'unavailable:d1', kind: 'unavailable', name: 'thread-7', detail: 'no answer' }
+    ]
   })
   assert.equal(source.snapshot().attention.problems, 2, 'the snapshot carries the unresolved count')
+  assert.equal(source.snapshot().problems.length, 2, 'the rows the panel draws')
+  assert.deepEqual(
+    source.snapshot().problems.map((row) => row.kind),
+    ['health', 'unavailable'],
+    'both sources are carried'
+  )
   // 没有读口时保持 0：面板壳的夹具与桩不假装有系统问题。
   const stub = createRefreshableStateSource({
     tickets: () => [],
     activity: () => ({ received: 0, evaluated: 0, accepted: 0, ignored: 0, ended: 0 }),
-    load: () => ({ running: 0, maxWorkers: 2 }),
+    load: () => ({ running: 0, maxWorkers: 2, humanSlot: 'free' }),
     hasError: () => false,
     setupMissing: () => false,
     paused: () => false

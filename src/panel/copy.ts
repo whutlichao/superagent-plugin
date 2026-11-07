@@ -68,21 +68,40 @@ export const COPY = {
   },
   'state.loadMore': { zh: '加载更多', en: 'Load more' },
 
-  // ---- Overview 页（本票只交付壳；读数由 #37 填实）----
+  // ---- Overview 页（§M.2 ①–④；本票的四块内容）----
   'overview.nothingNeedsYou': { zh: '没有需要你处理的事。', en: 'Nothing needs you.' },
   'overview.awaitingYou': { zh: '待人工', en: 'Needs you' },
   'overview.otherTickets': { zh: '其他工单', en: 'Other tickets' },
+  'overview.sources': {
+    zh: '来源：{enabled} 个启用，{problems} 个有问题',
+    en: 'Sources: {enabled} enabled, {problems} problems'
+  },
+  'overview.actions': { zh: '本页操作', en: 'Overview actions' },
+  'overview.answer': { zh: '回答', en: 'Answer' },
+  'overview.review': { zh: '评审', en: 'Review' },
+  'overview.openTerminal': { zh: '打开终端', en: 'Open terminal' },
+  'overview.checked': {
+    zh: '已检查：{waiting} 个待人工，{problems} 个系统问题。',
+    en: 'Checked: {waiting} waiting, {problems} problems.'
+  },
   'execution.empty': { zh: '没有工单。', en: 'No tickets.' },
   'overview.problems': { zh: '系统问题', en: 'System problems' },
-  'overview.problemCount': { zh: '系统问题：{count}', en: 'System problems: {count}' },
+  'overview.problemsEmpty': { zh: '没有系统问题。', en: 'No system problems.' },
+  'overview.problemKind.health': { zh: '健康错误', en: 'Health error' },
+  'overview.problemKind.reply': { zh: '回复失败', en: 'Reply failing' },
+  'overview.problemKind.unavailable': { zh: '未完成的评估', en: 'Unavailable' },
+  'overview.replyFailed': { zh: '反复尝试后仍未发出', en: 'Not delivered after repeated attempts' },
   'overview.flow': { zh: '24 小时流水', en: 'Last 24 hours' },
-  'overview.flowReceived': { zh: '收到 {count}', en: '{count} received' },
-  'overview.flowEvaluated': { zh: '评估 {count}', en: '{count} evaluated' },
-  'overview.flowAccepted': { zh: '接单 {count}', en: '{count} accepted' },
-  'overview.flowIgnored': { zh: '忽略 {count}', en: '{count} ignored' },
-  'overview.flowEnded': { zh: '结束 {count}', en: '{count} ended' },
+  'overview.flowReceived': { zh: '收到', en: 'Received' },
+  'overview.flowEvaluated': { zh: '评估', en: 'Evaluated' },
+  'overview.flowAccepted': { zh: '接单', en: 'Accepted' },
+  'overview.flowIgnored': { zh: '忽略', en: 'Ignored' },
+  'overview.flowEnded': { zh: '结束', en: 'Ended' },
   'overview.executor': { zh: '执行器负载', en: 'Executor load' },
   'overview.executorLoad': { zh: '运行中 {running} / {maxWorkers}', en: '{running} / {maxWorkers} running' },
+  'overview.executorHuman': { zh: '人类槽：{slot}', en: 'Human slot: {slot}' },
+  'overview.humanSlot.free': { zh: '空闲', en: 'free' },
+  'overview.humanSlot.used': { zh: '占用', en: 'in use' },
   'processing.paused': { zh: '处理已暂停。', en: 'Processing is paused.' },
   'setup.missing': {
     zh: '部署检查还没通过，Superagent 不能开始工作。',

@@ -15,7 +15,7 @@ test('the worker push is the one state.changed event, carrying a monotonic revis
 })
 
 test('the panel declares the state snapshot and the pause action, nothing more', () => {
-  assert.deepEqual([...PLUGIN_REQUESTS], ['state', 'pause'])
+  assert.deepEqual([...PLUGIN_REQUESTS], ['state', 'pause', 'check', 'ticket.retry', 'terminal.focus'])
 })
 
 test('the state request returns the shared PanelState shape, not a loose object', () => {
@@ -27,10 +27,12 @@ test('the state request returns the shared PanelState shape, not a loose object'
       error: false,
       paused: false,
       setupMissing: false,
+      sources: { enabled: 0, problems: 0 },
       activity: { received: 0, evaluated: 0, accepted: 0, ignored: 0, ended: 0 },
-      executor: { running: 0, maxWorkers: 4 }
+      executor: { running: 0, maxWorkers: 4, humanSlot: 'free' }
     },
-    attention: { answer: 1, review: 0, problems: 0, items: [item] }
+    attention: { answer: 1, review: 0, problems: 0, items: [item] },
+    problems: []
   }
   assert.equal(state.attention.items[0]?.title, 'Fix it')
 })
