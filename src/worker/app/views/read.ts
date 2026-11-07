@@ -349,7 +349,12 @@ export function parseCursor(value: string): TimelineCursor | undefined {
   if (separator <= 0) return undefined
   const at = value.slice(0, separator)
   const triggerId = value.slice(separator + 1)
-  if (triggerId.length === 0 || !Number.isFinite(Date.parse(at))) return undefined
+  // 必须是 `Date#toISOString()` 的形态：文本比较即时间比较（§D.2 要点 1），别的写法会让
+  // `(at, trigger_id)` 的行值比较按字典序而不是时间序走。
+  const parsed = Date.parse(at)
+  if (triggerId.length === 0 || !Number.isFinite(parsed) || new Date(parsed).toISOString() !== at) {
+    return undefined
+  }
   return { at, triggerId }
 }
 
