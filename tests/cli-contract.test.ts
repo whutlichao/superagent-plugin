@@ -62,7 +62,8 @@ const WIRED: readonly (readonly [string, Case, Case])[] = [
   ],
   [
     'setup check',
-    // #44 之前是明说的 stub：形状固定为 unavailable，绝不冒充「检查过了」。
+    // 没有组合根的测试服务器不给 setup 端口：形状固定为 unavailable，绝不冒充「检查过了」。
+    // 真的重跑（含「已无问题时 refused」）由 `deployment.test.ts` 在真组合根上断言。
     { argv: ['setup', 'check'], exit: 3, code: 'unavailable' },
     { argv: ['setup', 'check'], exit: 2, code: 'not_permitted_role', token: 'router' }
   ],

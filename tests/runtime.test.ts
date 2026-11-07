@@ -65,7 +65,20 @@ test('a mention becomes a ticket, an agent, a comment and a panel row', async ()
       (call) => call.args[1] === 'repos/acme/widgets/issues/42/comments' && call.args[2] === '-f'
     )
     assert.equal(posts.length >= 1, true, 'the acknowledgement was written')
-    assert.deepEqual(h.commands.calls[0]?.program, 'gh')
+    // setup 探针也走同一个命令端口（`git --version`、`gh api user`），所以断言的是
+    // 「通知确实经 gh 轮询过」，且整轮没有任何白名单之外的程序被启动（§I.4）。
+    assert.equal(
+      h.commands.calls.some((call) => call.program === 'gh' && call.args[1] === 'notifications'),
+      true,
+      'the notifications were polled through gh'
+    )
+    for (const call of h.commands.calls) {
+      assert.equal(
+        ['gh', 'git', 'sh', 'orca', 'lark-cli'].includes(call.program),
+        true,
+        `only whitelisted programs run: ${call.program}`
+      )
+    }
 
     // worker 用 CLI 报 ready，再回结果；两条评论按「先确认后结果」发出。
     const token = assignmentToken(h.stateDir, ticket.assignment!.id)

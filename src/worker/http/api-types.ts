@@ -8,6 +8,7 @@
 // 纪律：**没有 `any`**；跨边界的 JSON 形状用 `unknown` 的受控别名 `JsonValue`（§C.2）。
 // 所有时间字段是 ISO-8601 文本（与库一致，§D.2 要点 1）。
 import type { HealthEntry, LoadView, SetupProblem, StateView } from './state.ts'
+import type { SetupIssue } from '../app/setup-types.ts'
 export type {
   DoctorCheck,
   DoctorCheckName,
@@ -33,10 +34,14 @@ export interface PauseResult {
   readonly changed: boolean
 }
 
-/** `setup check` 的结果（#44 接管 wiring；本票的 stub 明说没做完）。 */
+/** `setup check` 的结果（§G.2、§N.1）：重跑后的第一条问题与全部具名问题。 */
 export interface SetupCheckResult {
   readonly problem: SetupProblem | null
   readonly checked: boolean
+  /** 是否有循环被重新武装（Source 轮询 / Router 监督）。 */
+  readonly restarted: boolean
+  /** 全部具名问题（面板一条条列，`problem` 只是最靠前的那条）。 */
+  readonly issues: readonly SetupIssue[]
 }
 
 /** `source labels` 的结果：kind 与它刷新后的行键显示名。 */

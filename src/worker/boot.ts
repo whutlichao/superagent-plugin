@@ -35,13 +35,14 @@ import { Effects, ROUTER_EFFECT_KEY } from './app/effects.ts'
 import { createPasses } from './app/passes.ts'
 import { notePluginVersion } from './app/upgrade.ts'
 import { createSourceContext } from './app/source-context.ts'
+import { createSetupState, issuesOf, runSetupChecks } from './app/setup.ts'
+import type { SetupCheckInput, SetupIssue, SetupProblem, SetupReport } from './app/setup.ts'
 import { SourceRegistry, type SourceSettingsView } from './sources/registry.ts'
 import { Commands, type CommandsHost } from './sources/commands.ts'
 import {
   createGithubApi,
   createGithubKind,
   createGithubPoller,
-  githubSetupProblem,
   subscribedThreads,
   GITHUB_KIND
 } from './sources/github/index.ts'
@@ -125,7 +126,23 @@ export interface BootHandle {
   refresh(): PanelState
   /** 写暂停状态（唯一写者是 `app/pause.ts`）并刷新快照。 */
   setPaused(paused: boolean): PanelState
+  /**
+   * `superagent setup check`（§G.2）：重跑探针、把结论应用到各部分并重新武装挂起的循环，
+   * **不重启 Orca**。`checked: false` 表示检查时本来就没有问题——没有可检查的东西。
+   */
+  checkSetup(): Promise<SetupCheckOutcome>
   shutdown(): Promise<void>
+}
+
+/** `setup check` 的读数（HTTP handler 与面板共用）。 */
+export interface SetupCheckOutcome {
+  /** 是否真的重跑了一次（本来就没有问题时为 false：`setup check` 拒绝空跑）。 */
+  readonly checked: boolean
+  /** 现在的第一条 setup 问题（`SETUP_PLACES` 顺序）。 */
+  readonly problem: SetupProblem | null
+  readonly issues: readonly SetupIssue[]
+  /** 挂起的循环是否被重新武装（Source 轮询与 Router 监督）。 */
+  readonly restarted: boolean
 }
 
 /** 模块位置推出的 CLI 绝对路径（`src/worker/boot.ts` → `src/bin/superagent.mjs`）。 */
@@ -207,6 +224,8 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
       notifyPromptRevision: () => undefined,
       refresh: () => emptySnapshot(),
       setPaused: () => emptySnapshot(),
+      // follower 不读库、不跑探针：它没有可以做检查的东西。
+      checkSetup: async () => ({ checked: false, problem: null, issues: [], restarted: false }),
       shutdown: async () => undefined
     }
     return follower
@@ -222,27 +241,69 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
   const paused = createPausedState(store, now)
   const repo = createRepositories(store)
 
-  // ---- 设置与 setup 探针
+  // ---- 设置与 setup 探针（§N.1、§I.4）：一次只告诉人缺什么，不把「没配置」写成 error
   const executorSettings = resolveExecutorSettings(settings)
   const rawSources = block(settings['sources'])
   const githubStored = block(rawSources[GITHUB_KIND])
-  const githubSetup = await setupGithub({
-    raw: settings,
-    stored: githubStored,
-    commands: options.commands ?? new Commands({ configuredPrograms: () => [text(settings['githubCli'])] }),
-    log: (message) => logger.info(message)
+  const commandPort: CommandsHost =
+    options.commands ?? new Commands({ configuredPrograms: () => [text(settings['githubCli'])] })
+  const githubInstance = githubInstanceOf({ raw: settings, stored: githubStored })
+  const feishuCli = feishuCliOf(rawSources)
+  const setupInput = (): SetupCheckInput => ({
+    stateDir: resolved,
+    agent: executorSettings.agent,
+    ...(executorSettings.model === undefined ? {} : { model: executorSettings.model }),
+    ...(executorSettings.baseRepo === undefined ? {} : { baseRepo: executorSettings.baseRepo }),
+    ...(executorSettings.baseBranch === undefined ? {} : { baseRef: executorSettings.baseBranch }),
+    repository: githubInstance.repository,
+    githubCli: githubInstance.cli,
+    githubEnabled: githubInstance.enabled,
+    ...(feishuCli === undefined ? {} : { feishuCli }),
+    ports: {
+      run: (program, args) => commandPort.run(program, args),
+      repos: () => options.runtime.listRepos(),
+      searchRefs: (selector, query) => options.runtime.searchRefs(selector, query)
+    }
   })
+  // 读不到的账号回落到设置里的值（§I.2：自身消息的判定要一个账号）。
+  const fallbackLogin = text(settings['githubLogin']) ?? ''
+  const githubSetup: GithubSetup = {
+    enabled: githubInstance.enabled,
+    config: githubInstance.config,
+    login: fallbackLogin
+  }
+  const setup = createSetupState(await runSetupChecks(setupInput()))
   const sourceSettings: SourceSettingsView = settingsView(settings, githubSetup.enabled, githubSetup.config)
-  const setupProblem = githubSetup.problem ?? undefined
 
   // ---- 注册表与 kind
   const registry = new SourceRegistry({ health: board, settings: () => sourceSettings })
   registry.register(createGithubKind(String(githubSetup.config['cli'] ?? 'gh')))
-  if (githubSetup.problem !== undefined || !githubSetup.enabled) {
-    registry.healthEntries(['github']).get('github')?.set({
-      state: 'paused',
-      detail: githubSetup.problem?.code ?? 'disabled'
-    })
+  const githubHealth = registry.healthEntries(['github']).get('github')
+  /**
+   * 把 setup 结论落到各部分：Source 的 setup 问题写 `starting`（**不是** error，§N.4），
+   * `orca` CLI 缺失才是 runtime error（§I.4：其余 setup 问题都不该让插件看起来「坏了」）。
+   */
+  function applySetup(report: SetupReport): void {
+    setup.apply(report)
+    const githubIssues = issuesOf(report.issues, 'github')
+    if (githubIssues.length > 0) {
+      githubHealth?.set({ state: 'starting', detail: githubIssues[0]?.code ?? 'setup' })
+    } else if (!githubSetup.enabled) {
+      githubHealth?.set({ state: 'paused', detail: 'disabled' })
+    }
+    if (issuesOf(report.issues, 'orca').length > 0) {
+      runtimeHealth.set({ state: 'error', detail: 'cli_missing' })
+    } else if (runtimeHealth.get()?.state === 'error') {
+      runtimeHealth.set({ state: 'ready', detail: 'booted' })
+    }
+  }
+  applySetup(setup.report())
+  const githubLogin = (): string => setup.report().githubLogin || fallbackLogin
+  const githubBlocked = (): boolean => setup.blocked('github')
+  const githubProblem = (): GithubSetup['problem'] => {
+    const found = issuesOf(setup.issues(), 'github')[0]
+    if (found === undefined) return undefined
+    return { place: found.place, code: found.code, detail: found.detail }
   }
 
   // ---- 领域与执行器
@@ -269,8 +330,9 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
 
   // ---- Router（§F.1–§F.5）：专用 worktree、terminal 面的常驻会话、relay 与保活监督
   const roles = resolveRoles(settings)
-  const deploymentFacts = deployment(settings, githubSetup)
-  const routerEnabled = setupProblem === undefined && executorSettings.baseRepo !== undefined
+  const deploymentFacts = deployment(settings, { ...githubSetup, login: githubLogin() })
+  // setup 未完成（或没选 base repo）时 Router 保持 paused；`setup check` 之后会重新问这个函数。
+  const routerEnabled = (): boolean => !setup.blocked('executor') && executorSettings.baseRepo !== undefined
   const relayDays = relayRetentionDays(settings)
   const routerSupervision = createRouterSupervision({
     runtime: options.runtime,
@@ -400,7 +462,7 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
       return { running: counts.running, maxWorkers: executorSettings.maxWorkers }
     },
     hasError: () => Object.values(board.all()).some((entry) => entry.state === 'error'),
-    setupMissing: () => setupProblem !== undefined,
+    setupMissing: () => setup.missing(),
     paused: () => paused.paused()
   })
 
@@ -411,6 +473,37 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
     return next
   }
   options.statusBar?.publish(statusBarView(stateSource.snapshot()))
+
+  /**
+   * `superagent setup check`（§G.2）：重跑探针、把新结论应用到各部分，并重新武装被挂起的循环。
+   * 不重启 Orca、不重建库、不动 worker 终端（§N.1）。本来就没有问题时拒绝空跑（返回
+   * `checked: false`，由 HTTP handler 折成固定拒绝）。
+   *
+   * 用的是本进程启动时读到的设置：Orca Settings 里的改动仍要重启 worker 才生效（§N.2 只对
+   * 面板里的设置承诺即时生效）；人修好的外部条件（`gh auth login`、在 Orca 里加仓库）当场可见。
+   */
+  const checkSetup = async (): Promise<SetupCheckOutcome> => {
+    if (!setup.missing()) {
+      return { checked: false, problem: null, issues: [], restarted: false }
+    }
+    const githubWasBlocked = githubBlocked()
+    const routerWasEnabled = routerEnabled()
+    const report = await runSetupChecks(setupInput())
+    applySetup(report)
+    refresh()
+    // 刚解锁的循环从现在开始干活：Source 轮询下一轮就发请求，Router 监督真的建会话。
+    const routerArmed = !routerWasEnabled && routerEnabled()
+    if (routerArmed) await routerSupervision.start()
+    // 轮询器只在配置完整时才存在；配置缺项不是探针重跑能修的（设置是启动时读的），
+    // 所以这里的「重新武装」只看 gate 是否打开。
+    const githubArmed = githubWasBlocked && !githubBlocked()
+    return {
+      checked: true,
+      problem: setup.problem(),
+      issues: report.issues,
+      restarted: routerArmed || githubArmed
+    }
+  }
 
   // ---- 命令面（HTTP + CLI 共用同一份 handler）
   const domain = createDomainHandlers({
@@ -437,11 +530,17 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
         Object.fromEntries(
           Object.entries(board.all()).map(([name, entry]) => [name, { ...entry, at: now() }])
         ),
-      setup: () => ({ problem: setupProblem ?? null }),
+      setup: () => ({ problem: setup.problem() }),
       paused: () => paused.paused(),
-      loops: () => loopEntries(board, githubSetup.enabled && setupProblem === undefined),
+      loops: () => loopEntries(board, githubSetup.enabled && !githubBlocked()),
       maxWorkers: () => executorSettings.maxWorkers,
       cliPath: options.cliPath ?? defaultCliPath()
+    },
+    // doctor 与 `setup check` 走同一份 handler（§G.2「同一批 handler」）。
+    ops: {
+      run: (program, args) => commandPort.run(program, args),
+      cliPath: options.cliPath ?? defaultCliPath(),
+      setupCheck: () => checkSetup()
     },
     log: (line) => logger.info('http request', { method: line.method, path: line.path, status: line.status, ms: line.ms })
   })
@@ -468,8 +567,10 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
   }
 
   // ---- Source 轮询（§I.2）：只有 setup 完成且实例启用时才启动
+  // 轮询器只要**配置**完整就建：setup 问题（账号读不到等）由 `pollOnce` 的门挡住，
+  // 于是 `setup check` 把它们修好之后，下一轮轮询就真的开始了——不必重启 Orca（§N.1）。
   const poller: GithubPoller | null =
-    setupProblem === undefined && githubSetup.enabled
+    githubSetup.enabled && githubInstance.repository !== '' && githubInstance.cli !== ''
       ? createGithubPoller({
           api: createGithubApi(
             (options.commands ?? new Commands()).withSignal(),
@@ -484,7 +585,7 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
             observeComments: githubSetup.config['observeComments'] === true,
             observeCi: githubSetup.config['observeCi'] === true
           },
-          login: deployment(settings, githubSetup).githubLogin,
+          login: deployment(settings, { ...githubSetup, login: githubLogin() }).githubLogin,
           // 订阅 Thread 由组合根从 Thread/Ticket 行算出（轮询器自己不读库，§C.2）。
           subscribed: () => subscribedThreads(repo.threads.list(), repo.tickets.list()),
           now: nowMs,
@@ -499,9 +600,9 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
               enabled: githubSetup.enabled,
               config: githubSetup.config,
               health: Object.fromEntries(registry.healthEntries(['github'])),
-              ...(githubSetup.problem === undefined ? {} : { problem: githubSetup.problem })
+              ...(githubProblem() === undefined ? {} : { problem: githubProblem() })
             },
-            configured: () => setupProblem === undefined,
+            configured: () => !githubBlocked(),
             triggerOf: (id) => repo.triggers.get(id),
             notify: (input) => options.notify?.(input)
           }),
@@ -527,7 +628,8 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
   effects.start()
 
   const pollOnce = async (): Promise<GithubPollResult> => {
-    if (poller === null) return { notifications: 0, triggers: 0, skipped: 0 }
+    // setup 未完成：循环在跑，但一轮都不读（Source 停在 setup/starting，不是 error）。
+    if (poller === null || githubBlocked()) return { notifications: 0, triggers: 0, skipped: 0 }
     const result = await poller.poll()
     refresh()
     return result
@@ -601,6 +703,7 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
       paused.setPaused(value, now(), 'operator')
       return refresh()
     },
+    checkSetup,
     shutdown
   }
 }
@@ -745,6 +848,44 @@ function assignmentTokenFile(store: Store, stateDir: string, assignmentId: strin
   return issued.path
 }
 
+
+/** GitHub 实例的配置（§I.2 配置行）：只解析，不碰子进程。 */
+interface GithubInstance {
+  readonly enabled: boolean
+  readonly repository: string
+  readonly cli: string
+  readonly config: Record<string, unknown>
+}
+
+/**
+ * 解析 GitHub 实例的配置（§I.2）。两处回落是刻意的：
+ * - `repository`：Source 配置优先，其次是清单级的同名设置；
+ * - `cli`：**只有完全没写**才回落到 `gh`；显式写成空串是「没配」，不能静默换回默认值。
+ */
+function githubInstanceOf(input: {
+  readonly raw: Readonly<Record<string, unknown>>
+  readonly stored: Record<string, unknown>
+}): GithubInstance {
+  const config = block(input.stored['config'])
+  const enabled = flag(input.stored['enabled'], true)
+  const repository = text(config['repository']) ?? text(input.raw['repository']) ?? ''
+  const storedCli = config['cli']
+  const cli =
+    storedCli === undefined
+      ? text(input.raw['githubCli']) ?? 'gh'
+      : typeof storedCli === 'string' && storedCli.trim() === ''
+        ? ''
+        : text(storedCli) ?? ''
+  return { enabled, repository, cli, config: { ...config, repository, cli } }
+}
+
+/** 配置了 Feishu 时的 CLI（§I.3）：没配就 `undefined`——不查 lark-cli。 */
+function feishuCliOf(rawSources: Record<string, unknown>): string | undefined {
+  const stored = block(rawSources['feishu'])
+  if (flag(stored['enabled'], false) === false) return undefined
+  return text(block(stored['config'])['cli'])
+}
+
 /** 部署派生的事实（§E.11 的变量源）：仓库与账号来自设置与 setup 探针。 */
 function deployment(
   settings: Readonly<Record<string, unknown>>,
@@ -760,49 +901,3 @@ function deployment(
     feishuAppId: ''
   }
 }
-
-/** GitHub 的 setup 探针（§I.4）：缺 repository/cli 就不轮询；`gh` 读不到账号也不轮询。 */
-async function setupGithub(input: {
-  readonly raw: Readonly<Record<string, unknown>>
-  readonly stored: Record<string, unknown>
-  readonly commands: CommandsHost
-  readonly log: (message: string) => void
-}): Promise<GithubSetup> {
-  const config = block(input.stored['config'])
-  const enabled = flag(input.stored['enabled'], true)
-  const repository = text(config['repository']) ?? text(input.raw['repository']) ?? ''
-  // 显式写成空串的 cli 是「没配」而不是「回落到 gh」：设置页面把它清空后不能静默换回默认值。
-  const storedCli = config['cli']
-  const cli =
-    storedCli === undefined
-      ? text(input.raw['githubCli']) ?? 'gh'
-      : typeof storedCli === 'string' && storedCli.trim() === ''
-        ? ''
-        : text(storedCli) ?? ''
-  const merged = { ...config, repository, cli }
-  const problem = githubSetupProblem({ repository, cli })
-  if (problem !== undefined) {
-    return {
-      enabled,
-      config: merged,
-      login: text(input.raw['githubLogin']) ?? '',
-      problem: { place: GITHUB_KIND, code: problem }
-    }
-  }
-  if (!enabled) return { enabled, config: merged, login: text(input.raw['githubLogin']) ?? '' }
-  try {
-    const login = (
-      await input.commands.run(cli, ['api', 'user', '--jq', '.login'])
-    ).trim()
-    return { enabled, config: merged, login }
-  } catch (error) {
-    input.log(`the GitHub CLI could not read its account: ${stringOf(error)}`)
-    return {
-      enabled,
-      config: merged,
-      login: text(input.raw['githubLogin']) ?? '',
-      problem: { place: GITHUB_KIND, code: 'account_unreadable', detail: stringOf(error) }
-    }
-  }
-}
-

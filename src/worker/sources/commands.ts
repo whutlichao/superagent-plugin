@@ -12,6 +12,7 @@
 // 的 Orca CLI 包装是另一条（§B），由后续票实现，不经过这里。
 import { execFile, type ExecFileError } from 'node:child_process'
 import { basename, isAbsolute } from 'node:path'
+import { withoutSecretEnvironment } from '../infra/env.ts'
 
 /** 允许运行的程序（§I.4）。超出这个集合的一律拒绝，先于任何子进程创建。 */
 export const ALLOWED_PROGRAMS = ['gh', 'lark-cli', 'git', 'orca', 'sh'] as const
@@ -225,7 +226,8 @@ export class Commands implements CommandsHost {
         args,
         {
           cwd: options.cwd,
-          env: { ...process.env, ...this.#environment, ...NEUTRAL_ENVIRONMENT },
+          // 先合并再剥（§O）：哪怕调用方显式配置了一个秘密变量，子进程也拿不到它。
+          env: withoutSecretEnvironment({ ...process.env, ...this.#environment, ...NEUTRAL_ENVIRONMENT }),
           signal,
           timeout: timeoutMs,
           maxBuffer: MAX_OUTPUT_BYTES,

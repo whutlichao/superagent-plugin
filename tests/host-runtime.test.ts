@@ -120,3 +120,57 @@ describe('the launch receipt on Orca 1.4.251', () => {
     assert.equal(await runtime.findAgent('ws:router'), null)
   })
 })
+
+// setup 探针要用的两条只读仓库查询（§E.1 base repo / base ref 行）：
+// `orca repo list --json` 的仓库行与 `orca repo search-refs --json` 的命中 ref。
+// 它们只读、不建 worktree；探针因此不会因为「查一下」而改动操作者的 Orca。
+describe('the repo probes of the setup check', () => {
+  test('repo list reads id/path/displayName from the CLI envelope', async () => {
+    const cli = fakeCli((args) =>
+      args[0] === 'repo' && args[1] === 'list'
+        ? {
+            repos: [
+              { id: 'repo-1', path: '/repos/widgets', displayName: 'widgets' },
+              // 缺 id 或 path 的行不是可用的仓库：跳过而不是编一个。
+              { displayName: 'broken' }
+            ]
+          }
+        : {}
+    )
+    const runtime = createHostRuntime(fakeHost(), { cli })
+    assert.deepEqual(await runtime.listRepos(), [
+      { id: 'repo-1', path: '/repos/widgets', name: 'widgets' }
+    ])
+    assert.deepEqual(cli.calls[0], ['repo', 'list'])
+  })
+
+  test('search-refs passes the selector and the query, and returns the refs', async () => {
+    const cli = fakeCli(() => ({ refs: ['main', 'origin/main'], truncated: false }))
+    const runtime = createHostRuntime(fakeHost(), { cli })
+    assert.deepEqual(await runtime.searchRefs({ path: '/repos/widgets' }, 'main'), ['main', 'origin/main'])
+    assert.deepEqual(cli.calls[0], [
+      'repo',
+      'search-refs',
+      '--repo',
+      'path:/repos/widgets',
+      '--query',
+      'main'
+    ])
+    // 名称与 id 选择器用同一条规则（与 worktree create 的 `--repo` 前缀一致）。
+    await runtime.searchRefs({ id: 'repo-1' }, 'release')
+    assert.equal(cli.calls[1]?.[3], 'id:repo-1')
+  })
+
+  test('a missing orca CLI surfaces as a seam error, not as an empty list', async () => {
+    const cli: OrcaCli = {
+      async run() {
+        throw Object.assign(new Error('spawn orca ENOENT'), { code: 'cli_missing' })
+      }
+    }
+    const runtime = createHostRuntime(fakeHost(), { cli })
+    await assert.rejects(runtime.listRepos(), (error: unknown) => {
+      assert.equal((error as { code?: string }).code, 'cli_missing')
+      return true
+    })
+  })
+})
