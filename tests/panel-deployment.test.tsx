@@ -95,7 +95,7 @@ function doctorOf(overrides: Partial<DoctorView> = {}): DoctorView {
       { name: 'token', state: 'ok', detail: 'the operator token file is present (0600)' },
       { name: 'gh', state: 'warn', detail: 'the agent GitHub CLI is not signed in', hint: 'run gh auth login' }
     ],
-    summary: { ok: 1, warn: 1, fail: 0 },
+    summary: { ok: 1, warn: 1, fail: 0, timeout: 0 },
     at: '2026-11-07T03:20:00.000Z',
     note: 'doctor diagnoses this machine',
     ...overrides
@@ -379,15 +379,21 @@ test('the Router block shows the terminal, since when, the restart count, and Re
 test('the doctor block runs the diagnosis and lists every check with its state and hint', async () => {
   let runs = 0
   const mounted = await openDeployment(() => view({}), {
-    // 一次真包含三项（一条 fail、一条 warn、一条 ok）的诊断。
+    // 一次真包含四项（一条 fail、一条 timeout、一条 warn、一条 ok）的诊断。
     doctor: {
       ...doctorOf(),
       checks: [
         { name: 'token', state: 'ok', detail: 'the operator token file is present (0600)' },
         { name: 'gh', state: 'warn', detail: 'the agent GitHub CLI is not signed in', hint: 'run gh auth login' },
+        {
+          name: 'lark',
+          state: 'timeout',
+          detail: 'the lark-cli auth check did not finish within 2000 ms',
+          hint: 'run `superagent doctor` again in a moment'
+        },
         { name: 'port', state: 'fail', detail: 'nothing answers on the recorded port' }
       ],
-      summary: { ok: 1, warn: 1, fail: 1 }
+      summary: { ok: 1, warn: 1, fail: 1, timeout: 1 }
     }
   })
 
@@ -395,21 +401,26 @@ test('the doctor block runs the diagnosis and lists every check with its state a
   assert.equal(requests(mounted.host, 'doctor').length, 1)
   assert.equal(mounted.findAll({ type: 'Table' }).length, 1, 'the checks are a table')
   const rendered = JSON.stringify(mounted.tree())
-  for (const name of ['token', 'gh', 'port']) assert.ok(rendered.includes(`"${name}"`), `the check ${name}`)
+  for (const name of ['token', 'gh', 'lark', 'port']) assert.ok(rendered.includes(`"${name}"`), `the check ${name}`)
   assert.ok(rendered.includes('not signed in'), 'the conclusion')
   assert.ok(rendered.includes('run gh auth login'), 'the hint')
   assert.ok(
     mounted.find({
       text: COPY['deployment.doctorSummary'].en
         .replace('{ok}', '1')
+        .replace('{timeout}', '1')
         .replace('{warn}', '1')
         .replace('{fail}', '1')
     }),
-    'the three counts'
+    'the four counts'
   )
-  for (const state of ['ok', 'warn', 'fail'] as const) {
+  // 四档各一条文案：`timeout` 是自己的词（不是 warn），四条互不相同。
+  for (const state of ['ok', 'warn', 'timeout', 'fail'] as const) {
     assert.ok(rendered.includes(JSON.stringify(COPY[`deployment.doctorState.${state}`].en)), `the ${state} state`)
   }
+  const labels = ['ok', 'warn', 'timeout', 'fail'] as const
+  assert.equal(new Set(labels.map((state) => COPY[`deployment.doctorState.${state}`].en)).size, 4, 'four distinct words')
+  assert.equal(new Set(labels.map((state) => COPY[`deployment.doctorState.${state}`].zh)).size, 4, 'four distinct words')
 
   // 「运行诊断」再跑一次（人不重启就重跑）。
   runs = requests(mounted.host, 'doctor').length

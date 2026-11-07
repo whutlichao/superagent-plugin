@@ -12,11 +12,10 @@
 import { accessSync, constants } from 'node:fs'
 import { isAbsolute } from 'node:path'
 import { writeWorkerGitConfig, type WorkerGitConfigWrite } from '../infra/gitconfig.ts'
-import { rethrowIfDeadline, withDeadline } from '../infra/deadline.ts'
+import { probeRunner, rethrowIfDeadline, type Probe as ProbeRunner } from '../infra/deadline.ts'
 import type {
   RepoRow,
   RepoSelectorLike,
-  SetupBudget,
   SetupCheckInput,
   SetupGitConfigIdentity,
   SetupIssue,
@@ -87,25 +86,7 @@ function messageOf(error: unknown): string {
  * 一次探针的出口：有预算时套上截止期（到点先取消再拒绝，§O），没预算时原样跑。
  * `what` 是人读的名字，**不是** argv（错误文案可能进日志与面板，§O 的命令注入面）。
  */
-type Probe = <T>(what: string, work: (options: SetupProbeOptions) => Promise<T>) => Promise<T>
-
-/**
- * 按预算造一个 `Probe`。探针的上限同时交给实现（`timeoutMs`）：信号掐不掉的子进程靠它兜。
- * 外部取消（handler 的总预算）与探针上限走同一个 `DeadlineError`。
- */
-function probeOf(budget: SetupBudget | undefined): Probe {
-  const ms = budget?.probeMs
-  const outer = budget?.signal
-  return <T>(what: string, work: (options: SetupProbeOptions) => Promise<T>): Promise<T> => {
-    if (ms === undefined) return work({})
-    const options: SetupProbeOptions = { timeoutMs: ms }
-    return withDeadline((signal) => work({ ...options, signal }), {
-      ms,
-      what,
-      ...(outer === undefined ? {} : { signal: outer })
-    })
-  }
-}
+type Probe = ProbeRunner
 
 /** 缺省的子进程出口：一切都按「程序不在」处理，而不是去碰操作者的机器。 */
 const missingRunner = async (program: string): Promise<string> => {
@@ -521,7 +502,8 @@ export async function runSetupChecks(input: SetupCheckInput): Promise<SetupRepor
   const absolute = ports.isAbsolute ?? isAbsolute
   const writable = ports.writable ?? ((path: string) => accessSync(path, constants.W_OK))
   const run = ports.run ?? missingRunner
-  const probe = probeOf(input.budget)
+  // 探针的上限与外部取消只由 `probeRunner` 装（§O）；doctor 走同一条。
+  const probe = probeRunner(input.budget)
   const repos = ports.repos ?? (async () => [])
   const searchRefs: NonNullable<SetupPorts['searchRefs']> =
     ports.searchRefs ??

@@ -261,7 +261,7 @@ async function openSettings(options: {
             lastError: null
           }
         }),
-        doctor: () => ({ checks: [], summary: { ok: 0, warn: 0, fail: 0 }, at: '2026-11-07T03:00:00.000Z', note: 'doctor' }),
+        doctor: () => ({ checks: [], summary: { ok: 0, warn: 0, fail: 0, timeout: 0 }, at: '2026-11-07T03:00:00.000Z', note: 'doctor' }),
         setupCheck: () => ({ checked: false, problems: [] }),
         rotateToken: () => ({ rotated: false, tokenFile: '' }),
         restartRouter: () => ({ state: 'ready', detail: '', terminalId: null, startedAt: null, restarts: 0, lastError: null }),

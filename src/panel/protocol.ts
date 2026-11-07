@@ -667,16 +667,20 @@ export interface RotateTokenView {
 /** doctor 的一条结论（§G.2、§N.4）：只报有没有，不报是什么。 */
 export interface DoctorCheckView {
   readonly name: string
-  readonly state: 'ok' | 'warn' | 'fail'
+  /**
+   * 四档：`ok` / `warn` / `fail` 是结论；`timeout` 是**没结论**——那条探针在自己的上限内
+   * 没回来（§O），既不能显示成 ok（伪装查过了）也不能显示成 warn（那是「可选/未配置」）。
+   */
+  readonly state: 'ok' | 'warn' | 'timeout' | 'fail'
   readonly detail: string
-  /** 给人下一步做什么（只有 warn/fail 才有）。 */
+  /** 给人下一步做什么（warn/fail/timeout 才有）。 */
   readonly hint?: string
 }
 
 /** doctor 的完整结果（§G.2 的 `doctor` 行；面板与 CLI 读同一份形状）。 */
 export interface DoctorView {
   readonly checks: readonly DoctorCheckView[]
-  readonly summary: { readonly ok: number; readonly warn: number; readonly fail: number }
+  readonly summary: { readonly ok: number; readonly warn: number; readonly fail: number; readonly timeout: number }
   readonly at: string
   /** 一句分工说明：doctor 是诊断，能不能开工由 setup 检查决定。 */
   readonly note: string

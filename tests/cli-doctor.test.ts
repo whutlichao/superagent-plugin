@@ -7,7 +7,15 @@ import { assert, test } from 'orca/testing'
 import { mkdirSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { runDoctor, botStatus, defaultPortProbe } from '../src/worker/app/doctor'
-import { doctorExitCode, orderChecks, stateRank, summarize } from '../src/worker/app/doctor-types'
+import { DeadlineError } from '../src/worker/infra/deadline'
+import {
+  DOCTOR_STATES,
+  doctorExitCode,
+  doctorResult,
+  orderChecks,
+  stateRank,
+  summarize
+} from '../src/worker/app/doctor-types'
 import { GITCONFIG_MODE, workerGitConfigPath, writeWorkerGitConfig } from '../src/worker/infra/gitconfig'
 import type { DoctorCheck } from '../src/worker/http/api-types'
 import { openStore } from '../src/worker/app/store'
@@ -88,7 +96,7 @@ test('the eight checks are always reported, in the design order', async () => {
       'ok', // gh 已登录（注入的 runner）
       'ok' // lark-cli 的 bot 身份 ready（注入的 runner）
     ])
-    assert.deepEqual(result.summary, { ok: 3, warn: 2, fail: 3 })
+    assert.deepEqual(result.summary, { ok: 3, warn: 2, fail: 3, timeout: 0 })
     assert.equal(doctorExitCode(result), 1, 'a fail makes the doctor exit non-zero')
     assert.equal(result.at, AT)
     assert.equal(result.stateDir, stateDir)
@@ -268,12 +276,85 @@ test('the result is ordered, counted and mapped to an exit code in one place', (
   const checks: readonly DoctorCheck[] = [
     { name: 'lark', state: 'ok', detail: 'x' },
     { name: 'token', state: 'fail', detail: 'x', hint: 'y' },
-    { name: 'port', state: 'warn', detail: 'x', hint: 'y' }
+    { name: 'port', state: 'warn', detail: 'x', hint: 'y' },
+    { name: 'gh', state: 'timeout', detail: 'x', hint: 'y' }
   ]
-  assert.deepEqual(orderChecks(checks).map((check) => check.name), ['token', 'port', 'lark'])
-  assert.deepEqual(summarize(checks), { ok: 1, warn: 1, fail: 1 })
-  assert.equal(stateRank('fail') < stateRank('warn'), true)
+  assert.deepEqual(orderChecks(checks).map((check) => check.name), ['token', 'port', 'gh', 'lark'])
+  // 四档各计一次；`timeout` 不折进 warn（那是「可选/未配置」）。
+  assert.deepEqual(summarize(checks), { ok: 1, warn: 1, fail: 1, timeout: 1 })
+  // 排序权重：fail → timeout → warn → ok（超时是「没结论」，比警告靠前、比失败靠后）。
+  assert.deepEqual([...DOCTOR_STATES], ['fail', 'timeout', 'warn', 'ok'])
+  assert.equal(stateRank('fail') < stateRank('timeout'), true)
+  assert.equal(stateRank('timeout') < stateRank('warn'), true)
   assert.equal(stateRank('warn') < stateRank('ok'), true)
+  // 退出码只按 fail：一条 timeout 不算失败（200 就是 0，判定口径在 setup 检查）。
+  assert.equal(doctorExitCode(doctorResult([{ name: 'gh', state: 'timeout', detail: 'x', hint: 'y' }], { stateDir: '/x', at: AT })), 0)
+})
+
+test('a probe that misses its budget is a timeout: the other checks keep their real readings', async () => {
+  const stateDir = tempStateDir()
+  const handed: { readonly signal?: AbortSignal; readonly timeoutMs?: number }[] = []
+  try {
+    ensureApiToken(stateDir)
+    writeFileSync(join(stateDir, PORT_FILE), String(DEFAULT_PORT), 'utf8')
+    // `gh` 永远不回来；`lark-cli` 正常。预算只在 handler 里给，这里注入 10 ms 让用例快到能跑。
+    const run = (program: string, _args: readonly string[], options?: { signal?: AbortSignal; timeoutMs?: number }) => {
+      handed.push({ ...(options ?? {}) })
+      if (program === 'gh') return new Promise<string>(() => undefined)
+      return Promise.resolve(JSON.stringify({ identities: { bot: { status: 'ready' } } }))
+    }
+    const result = await runDoctor({
+      stateDir,
+      run,
+      now: () => AT,
+      portOpen: async () => true,
+      budget: { probeMs: 10 }
+    })
+    const gh = checkOf(result.checks, 'gh')
+    assert.equal(gh.state, 'timeout', 'a hung probe is never reported as ok')
+    assert.equal(gh.detail.includes('10 ms'), true, 'the detail names the budget')
+    assert.equal(typeof gh.hint, 'string', 'a timeout carries the next step')
+    // 其余项照常：端口与 lark 读到真读数，token/库/CLI/gitconfig 各自给结论。
+    assert.equal(checkOf(result.checks, 'port').state, 'ok')
+    assert.equal(checkOf(result.checks, 'lark').state, 'ok')
+    assert.equal(checkOf(result.checks, 'token').state, 'ok')
+    assert.equal(checkOf(result.checks, 'database').state, 'warn')
+    assert.deepEqual(
+      result.checks.map((check) => check.name),
+      ['token', 'port', 'lock', 'database', 'cli', 'gitconfig', 'gh', 'lark']
+    )
+    // 四档计数：一项 timeout，没有 fail（超时不是坏掉）。
+    assert.deepEqual(result.summary, { ok: 4, warn: 3, fail: 0, timeout: 1 })
+    // 取消真的到了子进程那一层：挂住的那次调用拿到已取消的信号与同一个上限。
+    assert.equal(handed[0]?.timeoutMs, 10)
+    assert.equal(handed[0]?.signal?.aborted, true)
+    // 没有 fail：doctor 的退出码口径不看 timeout。
+    assert.equal(doctorExitCode(result), 0)
+  } finally {
+    rmSync(stateDir, { recursive: true, force: true })
+  }
+})
+
+test('a cancelled whole call is not a timed-out check: the deadline is rethrown', async () => {
+  const stateDir = tempStateDir()
+  try {
+    ensureApiToken(stateDir)
+    // 整次调用已经被取消（handler 的总预算/停机）：探针不该编一条 `timeout` 结论。
+    const controller = new AbortController()
+    controller.abort()
+    await assert.rejects(
+      runDoctor({
+        stateDir,
+        run: () => Promise.reject(Object.assign(new Error('aborted'), { name: 'AbortError' })),
+        now: () => AT,
+        portOpen: async () => true,
+        budget: { probeMs: 10, signal: controller.signal }
+      }),
+      (error: unknown) => error instanceof DeadlineError
+    )
+  } finally {
+    rmSync(stateDir, { recursive: true, force: true })
+  }
 })
 
 test('a doctor result with only warnings and oks exits 0', async () => {

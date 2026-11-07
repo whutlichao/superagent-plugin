@@ -2,7 +2,7 @@
 //
 // CLI 与面板读同一份类型：每条命令的输入/输出在这里写一次，`http/ops.ts` 的 handler 与
 // `cli/commands.ts` 的命令表都按它取参数，`cli-contract.test.ts` 按它断言形状。
-// 依赖方向（§C.2）：`cli → http/handlers`；doctor 的三档类型在 `app/doctor-types.ts`，
+// 依赖方向（§C.2）：`cli → http/handlers`；doctor 的四档类型在 `app/doctor-types.ts`，
 // 由这里再导出，于是 CLI 只认这一个入口。
 //
 // 纪律：**没有 `any`**；跨边界的 JSON 值就写 `unknown`（读面在 handler 里按形状收窄，§C.2）。

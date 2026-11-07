@@ -1152,7 +1152,8 @@ export function ticketListQuery(args: CommandArgs): Record<string, string | numb
 /**
  * HTTP 结果 → 信封 + 退出码。`status` 与 `doctor` 有各自更细的退出码：
  * - `status`：0 正常 / 1 未就绪或运行时错误 / 2 非 runtime 部件报错 / 3 等 setup（§N.4）；
- * - `doctor`：有 `fail` → 1，否则 0（warn 只是「可选/未配置」）。
+ * - `doctor`：跑完就是 0——`fail`/`warn`/`timeout` 都不折算成退出码（判定口径在 setup 检查，
+ *   见下面的 `name === 'doctor'` 分支）。
  */
 export function fromResponse(command: CommandDefinition, response: CliResponse): DispatchResult {
   if (!response.ok) {
@@ -1163,9 +1164,10 @@ export function fromResponse(command: CommandDefinition, response: CliResponse):
   }
   const name = command.name.join(' ')
   if (name === 'doctor') {
-    // doctor 跑完就是成功：逐项结论在 `result.checks`/`summary` 里。**不**把 fail 折算成
-    // 退出码——§G.1 的 1 是「内部错误」，而「gh 没登录」不是内部错误；要不要按 fail 退出由
-    // #44 的 setup 探针定（设计只给 `status` 规定了 0/1/2/3 的判定口径）。
+    // doctor 跑完就是成功：逐项结论在 `result.checks`/`summary` 里（四档，含 `timeout`）。**不**把
+    // fail/timeout 折算成退出码——§G.1 的 1 是「内部错误」，而「gh 没登录」或「这项没查完」
+    // 都不是内部错误；要不要按 fail 退出由 #44 的 setup 探针定（设计只给 `status` 规定了
+    // 0/1/2/3 的判定口径）。
     return { envelope: { ok: true, result: response.result }, exit: EXIT.ok }
   }
   if (name === 'status') {
