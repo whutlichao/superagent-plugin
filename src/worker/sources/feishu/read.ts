@@ -418,7 +418,7 @@ const TRAILING = /[)\],.;:!?，。；、）】]+$/
 /**
  * `find`（§I.3、§M.2 Search）：把消息 id、群 id、链接解析成**搜索词**，`threads` 留空。
  *
- * 为什么不产出 Thread key（coordinator 裁决）：
+ * 为什么不产出 Thread key（`find` 是纯函数，推不出来就不编）：
  * - Feishu 的 Thread key 是 `<chatId>:<rootId>`（私聊是 `<chatId>:direct`）。消息 id 只说明
  *   是哪条消息，说明不了它在哪个群、根消息是谁；消息链接（`…/message/link/open?token=…`）
  *   的 token 不透明。`find` 是纯函数、没有 I/O，推不出来就不能编。
