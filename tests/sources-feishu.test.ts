@@ -10,12 +10,23 @@ import assert from 'node:assert/strict'
 import { readRepoFile, readRepoJson } from './support/repo.ts'
 import { FakeCommands } from './support/fake-commands.ts'
 import { key } from '../src/worker/core/index.ts'
-import type { Trigger } from '../src/worker/core/index.ts'
+import type { OutboundMessage, Trigger } from '../src/worker/core/index.ts'
 import { feishuChatsKey, feishuCursorKey, feishuTopicsKey, sourceLabelsKey, threadSeenKey } from '../src/worker/app/kv.ts'
 import { cliFailure, FakeStream } from './support/fake-commands.ts'
 import { openBoot } from './support/boot.ts'
 import { bootPlugin } from '../src/worker/boot.ts'
 import { feishuConfigSchema } from '../src/worker/sources/feishu/config.ts'
+import { createFeishuKind } from '../src/worker/sources/feishu/kind.ts'
+import type { SyncContext } from '../src/worker/sources/kind.ts'
+import { FakeHealthBoard } from './support/health-board.ts'
+import { openStore } from '../src/worker/app/store.ts'
+import { savedSettingsVersion } from '../src/worker/app/settings.ts'
+import {
+  SYNC_FIRST_DELAY_MS,
+  SYNC_MAX_DELAY_MS,
+  createPolicySync
+} from '../src/worker/app/policy-sync.ts'
+import type { PolicyBlock } from '../src/worker/policy/index.ts'
 import { createFeishuApi } from '../src/worker/sources/feishu/api.ts'
 import {
   POLL_HORIZON_MS,
@@ -24,6 +35,7 @@ import {
   withinHorizon
 } from '../src/worker/sources/feishu/poll.ts'
 import type { FeishuKeys } from '../src/worker/sources/feishu/poll.ts'
+import { wordCount, checkedImText } from '../src/worker/infra/text.ts'
 import {
   feishuEventOf,
   feishuHistoryOf,
@@ -893,7 +905,11 @@ function scriptFeishuIdentity(cli: FakeCommands, options: { botReady?: boolean }
 }
 
 /** 一份带 Feishu 的设置（GitHub 侧保持可用，这样 `setupMissing` 只反映 Feishu 的问题）。 */
-function settingsWithFeishu(stateDir: string, feishu: Record<string, unknown>): Record<string, unknown> {
+function settingsWithFeishu(
+  stateDir: string,
+  feishu: Record<string, unknown>,
+  policySources: Record<string, unknown> = { github: { allowed: [{ id: 'alice' }] } }
+): Record<string, unknown> {
   return {
     stateDir,
     agent: 'pi',
@@ -904,7 +920,7 @@ function settingsWithFeishu(stateDir: string, feishu: Record<string, unknown>): 
       github: { enabled: true, config: { repository: 'acme/widgets', cli: 'gh', pollSeconds: 60 } },
       feishu
     },
-    policy: { sources: { github: { allowed: ['alice'] } } }
+    policy: { sources: policySources }
   }
 }
 
@@ -1002,6 +1018,476 @@ test('a Feishu source whose bot identity is not ready stays in setup', async () 
   try {
     assert.equal(harness.handle.snapshot().health.setupMissing, true)
     assert.deepEqual(harness.commands.streams, [])
+  } finally {
+    await harness.cleanup()
+  }
+})
+
+// ---------------------------------------------------------------- Channel（§I.3、§J.1）
+
+/** 一条出站消息（Channel 的输入）。 */
+function replyMessage(text = 'Done', address: Record<string, string> = {}): OutboundMessage {
+  return {
+    id: 'reply-0123456789abcdef0123456789abcdef',
+    channel: { source: 'feishu', thread: 'feishu:oc_all', address: { chatId: 'oc_all', messageId: 'om_root', ...address } },
+    text,
+    kind: 'reply'
+  }
+}
+
+test('a reply lands in the topic of its root message with the message id as the idempotency key', async () => {
+  const cli = new FakeCommands()
+  cli.script(['im', '+messages-reply'], () => JSON.stringify({ code: 0, data: { message_id: 'om_sent' } }))
+  const kind = createFeishuKind('lark-cli')
+  assert.equal(await kind.channel?.send(cli, replyMessage()), 'sent')
+  assert.deepEqual(cli.args, [
+    [
+      'im',
+      '+messages-reply',
+      '--as',
+      'bot',
+      '--message-id',
+      'om_root',
+      '--text',
+      'Done',
+      '--idempotency-key',
+      'reply-0123456789abcdef0123456789abcdef'
+    ]
+  ])
+})
+
+test('a chat replies only where the Source still listens', async () => {
+  const kind = createFeishuKind('lark-cli')
+  const allowed = kind.channel?.allowed
+  assert.ok(allowed !== undefined)
+  const config = feishuConfigSchema.parse({
+    chats: [{ chatId: 'oc_all', listen: 'all' }],
+    directMessages: false
+  })
+  assert.equal(allowed({ chatId: 'oc_all', messageId: 'om_root' }, config), true)
+  assert.equal(allowed({ chatId: 'oc_other', messageId: 'om_root' }, config), false)
+  assert.equal(allowed({ chatId: 'oc_dm', messageId: 'om_root', direct: 'true' }, config), false)
+  assert.equal(
+    allowed({ chatId: 'oc_other', messageId: 'om_root' }, feishuConfigSchema.parse({ otherChats: 'mentions' })),
+    true
+  )
+  assert.equal(
+    allowed(
+      { chatId: 'oc_dm', messageId: 'om_root', direct: 'true' },
+      feishuConfigSchema.parse({ directMessages: true })
+    ),
+    true
+  )
+  // 链接指向群；缺群 id 时给空链接（面板不假装有页面）。
+  assert.equal(
+    kind.channel?.link?.({ chatId: 'oc_all' }, {})?.url,
+    'https://applink.feishu.cn/client/chat/open?openChatId=oc_all'
+  )
+  assert.equal(kind.channel?.link?.({}, {})?.url, '')
+})
+
+test('a recalled or missing target message is gone, while every other failure retries', async () => {
+  const kind = createFeishuKind('lark-cli')
+  const send = async (error: Error): Promise<'sent' | 'gone' | undefined> => {
+    const cli = new FakeCommands()
+    cli.fail('lark-cli', ['im', '+messages-reply'], error)
+    return kind.channel?.send(cli, replyMessage())
+  }
+  // 撤回：飞书的 230011（也认文本里的 withdrawn，不同版本的 CLI 会放进别的码里）。
+  assert.equal(await send(cliFailure('lark-cli', { code: 230011, exitCode: 1 })), 'gone')
+  assert.equal(
+    await send(cliFailure('lark-cli', { code: 230020, exitCode: 1, stderr: 'the message was withdrawn' })),
+    'gone'
+  )
+  // 找不到：2300xx + not found。
+  assert.equal(
+    await send(cliFailure('lark-cli', { code: 230012, exitCode: 1, stderr: '{"code":230012,"msg":"message not found"}' })),
+    'gone'
+  )
+  // 其余（限流、超时、权限、没有业务码）：抛错让 outbox 退避重试，绝不 drop。
+  await assert.rejects(send(cliFailure('lark-cli', { code: 99991400, exitCode: 1 })), /exited with code 1/)
+  await assert.rejects(send(cliFailure('lark-cli', { exitCode: 1 })), /exited with code 1/)
+  // 没有目标消息：地址本身说明永远送不到。
+  const noTarget = new FakeCommands()
+  assert.equal(
+    await kind.channel?.send(noTarget, {
+      ...replyMessage(),
+      channel: { source: 'feishu', thread: 'feishu:oc_all', address: { chatId: 'oc_all' } }
+    }),
+    'gone'
+  )
+  assert.deepEqual(noTarget.calls, [])
+})
+
+test('the hundred-word ceiling refuses before any CLI call, counted across Chinese and English', async () => {
+  // 分词规则只有一份（§I.3：中英混排按上游分词规则）。
+  assert.equal(wordCount('Done'), 1)
+  assert.equal(wordCount('中文 and English'), 3)
+  assert.equal(wordCount('word '.repeat(100)), 100)
+  assert.equal(wordCount('我们修复了登录问题，请重试。'.repeat(12)), 96)
+  assert.equal(wordCount('我们修复了登录问题，请重试。'.repeat(13)), 104)
+  assert.equal(wordCount('我们修复了登录问题，please retry。'.repeat(12)), 84)
+  assert.throws(() => checkedImText('我们修复了登录问题，请重试。'.repeat(13)), /has 104 words; maximum is 100/)
+
+  const kind = createFeishuKind('lark-cli')
+  const cli = new FakeCommands()
+  await assert.rejects(
+    kind.channel?.send(cli, replyMessage('我们修复了登录问题，请重试。'.repeat(13))) ?? Promise.resolve(),
+    /maximum is 100/
+  )
+  assert.deepEqual(cli.calls, [], 'nothing was sent')
+  // 恰好一百词可以发（上限是上限，不是目标）。
+  cli.script(['im', '+messages-reply'], () => '{}')
+  assert.equal(await kind.channel?.send(cli, replyMessage('word '.repeat(100).trim())), 'sent')
+})
+
+/** 名单同步看到的引擎面：命令端口与自己的实例配置（`SyncContext`）。 */
+function syncHost(cli: FakeCommands): SyncContext {
+  const config = feishuConfigSchema.parse({ cli: 'lark-cli' })
+  return {
+    commands: cli,
+    config: <C extends Record<string, unknown>>(kind: string): C | undefined =>
+      kind === 'feishu' ? (config as unknown as C) : undefined
+  }
+}
+
+/** `+chat-members-list` 的一次输出（真实字段集合：users / bots / has_more / truncations）。 */
+function membersPage(users: readonly Record<string, unknown>[], extra: Record<string, unknown> = {}): string {
+  return JSON.stringify({ chat_id: 'oc_sync', users, bots: [], user_total: users.length, has_more: false, ...extra })
+}
+
+test('the sync makes the sync chat members the allowed list, and refuses an incomplete one', async () => {
+  const kind = createFeishuKind('lark-cli')
+  const sync = kind.policy?.sync
+  assert.ok(sync !== undefined, 'Feishu declares a policy sync')
+  // 只有点名了来源群的 part 才能同步（§I.1 `sync.ready`）。
+  assert.equal(sync.ready({ syncChat: 'oc_sync' }), true)
+  assert.equal(sync.ready({ syncChat: '' }), false)
+
+  const cli = new FakeCommands()
+  cli.script(['im', '+chat-members-list'], () =>
+    membersPage([
+      { member_id: 'ou_bob', name: 'Robert' },
+      { member_id: 'ou_new', name: 'New' }
+    ])
+  )
+  const part = {
+    allowed: [
+      { id: 'ou_bob', name: 'Bob' },
+      { id: 'ou_left', name: 'Left' }
+    ],
+    bots: [],
+    syncChat: 'oc_sync'
+  }
+  const signal = new AbortController().signal
+  const next = await sync.run(syncHost(cli), part, signal)
+  // 留下的人按原顺序更新名字，新成员追加，离开的人移除（§I.3 同步行）。
+  assert.deepEqual(next, {
+    allowed: [
+      { id: 'ou_bob', name: 'Robert' },
+      { id: 'ou_new', name: 'New' }
+    ],
+    bots: [],
+    syncChat: 'oc_sync'
+  })
+  assert.deepEqual(cli.args, [
+    [
+      'im',
+      '+chat-members-list',
+      '--as',
+      'bot',
+      '--chat-id',
+      'oc_sync',
+      '--member-types',
+      'user',
+      '--page-all',
+      '--page-limit',
+      '0'
+    ]
+  ])
+  // 取消信号经端口绑定到这次读（同步被停机时不会再发请求）。
+  assert.equal(cli.calls[0]?.options.signal, signal)
+
+  // 名单不完整：服务端截断或还有下一页时绝不把半份名单当成全部
+  // （那会把没读到的成员踢出允许名单）。
+  for (const extra of [{ has_more: true }, { truncations: [{ limit: 100, member_type: 'user' }] }]) {
+    const incomplete = new FakeCommands()
+    incomplete.script(['im', '+chat-members-list'], () => membersPage([{ member_id: 'ou_bob', name: 'Bob' }], extra))
+    await assert.rejects(sync.run(syncHost(incomplete), part, signal), /incomplete/)
+  }
+})
+
+/** 一份只有 Feishu 部分的 Policy 块（同步测试的最小块）。 */
+function policyWithFeishu(part: Record<string, unknown>): PolicyBlock {
+  return {
+    rules: [],
+    acceptMode: 'observe',
+    sources: { feishu: { allowed: [], bots: [], admission: {}, ...part } },
+    eval: { timeoutSeconds: 300 }
+  }
+}
+
+/** 一个记录调度与取消的手工调度器（§P.1：不 sleep）。 */
+function manualSchedule() {
+  const scheduled: { run: () => void; milliseconds: number; cancelled: boolean }[] = []
+  return {
+    scheduled,
+    delays: () => scheduled.map((entry) => entry.milliseconds),
+    schedule(run: () => void, milliseconds: number): () => void {
+      const entry = { run, milliseconds, cancelled: false }
+      scheduled.push(entry)
+      return () => {
+        entry.cancelled = true
+      }
+    },
+    /** 触发最近一次尚未取消的调度（重试链的下一跳）。 */
+    fire(): void {
+      const entry = [...scheduled].reverse().find((item) => !item.cancelled)
+      assert.ok(entry !== undefined, 'something was scheduled')
+      entry.cancelled = true
+      entry.run()
+    }
+  }
+}
+
+test('a policy sync writes the members into the allow list and reports its own health entry', async () => {
+  const board = new FakeHealthBoard()
+  const schedule = manualSchedule()
+  const cli = new FakeCommands()
+  cli.script(['im', '+chat-members-list'], () =>
+    membersPage([
+      { member_id: 'ou_bob', name: 'Robert' },
+      { member_id: 'ou_new', name: 'New' }
+    ])
+  )
+  let current = policyWithFeishu({ allowed: [], syncChat: 'oc_sync' })
+  const saved: PolicyBlock[] = []
+  const runner = createPolicySync({
+    current: () => current,
+    revision: () => 0,
+    save: (policy) => {
+      saved.push(policy)
+      current = policy
+    },
+    syncable: () => ['feishu'],
+    run: (_id, part, signal) => createFeishuKind('lark-cli').policy!.sync!.run(syncHost(cli), part, signal),
+    health: board,
+    now: () => '2026-11-07T00:00:00.000Z',
+    schedule: schedule.schedule,
+    signal: new AbortController().signal
+  })
+
+  // 「立即同步」就是一次 `sync`：名单保存为 origin=sync 的 Policy 新版本（保存端口注入）。
+  const part = await runner.sync('feishu')
+  assert.deepEqual(part['allowed'], [
+    { id: 'ou_bob', name: 'Robert' },
+    { id: 'ou_new', name: 'New' }
+  ])
+  assert.equal(saved.length, 1)
+  assert.deepEqual(saved[0]?.sources['feishu']?.allowed, part['allowed'])
+  // 同步健康条目独立于 feishu/history（§N.4：写者是设置层）。
+  assert.deepEqual(board.entries['sync:feishu'], { state: 'ready', detail: '2 allowed' })
+  assert.equal(board.held('sync:feishu'), true)
+  assert.deepEqual(schedule.delays(), [], 'success schedules no retry')
+})
+
+test('a sync that changes nothing saves nothing, and a non-syncable Source is refused', async () => {
+  const board = new FakeHealthBoard()
+  const cli = new FakeCommands()
+  cli.script(['im', '+chat-members-list'], () => membersPage([{ member_id: 'ou_bob', name: 'Bob' }]))
+  let saves = 0
+  const runner = createPolicySync({
+    current: () => policyWithFeishu({ allowed: [{ id: 'ou_bob', name: 'Bob' }], syncChat: 'oc_sync' }),
+    revision: () => 3,
+    save: () => {
+      saves += 1
+    },
+    syncable: () => ['feishu'],
+    run: (_id, part, signal) => createFeishuKind('lark-cli').policy!.sync!.run(syncHost(cli), part, signal),
+    health: board,
+    now: () => '2026-11-07T00:00:00.000Z',
+    schedule: manualSchedule().schedule,
+    signal: new AbortController().signal
+  })
+  await runner.sync('feishu')
+  assert.equal(saves, 0, 'an unchanged list does not write a new policy version')
+  assert.deepEqual(board.entries['sync:feishu'], { state: 'ready', detail: '1 allowed' })
+  // 没有点名同步群（或实例没开）的 Source 不能同步。
+  await assert.rejects(runner.sync('github'), /cannot sync now/)
+})
+
+test('a failed sync reports an error and retries after 1 minute, doubling to 1 hour', async () => {
+  const board = new FakeHealthBoard()
+  const schedule = manualSchedule()
+  const cli = new FakeCommands()
+  // 先连续失败（同步在退避里反复重试），最后放一次成功（清掉退避）。
+  for (let attempt = 0; attempt < 8; attempt += 1) {
+    cli.next('lark-cli', ['im', '+chat-members-list'], cliFailure('lark-cli', { code: 99991400, exitCode: 1 }))
+  }
+  cli.script(['im', '+chat-members-list'], () => membersPage([{ member_id: 'ou_bob', name: 'Bob' }]))
+  const runner = createPolicySync({
+    current: () => policyWithFeishu({ allowed: [], syncChat: 'oc_sync' }),
+    revision: () => 0,
+    save: () => {},
+    syncable: () => ['feishu'],
+    run: (_id, part, signal) => createFeishuKind('lark-cli').policy!.sync!.run(syncHost(cli), part, signal),
+    health: board,
+    now: () => '2026-11-07T00:00:00.000Z',
+    schedule: schedule.schedule,
+    signal: new AbortController().signal
+  })
+
+  await assert.rejects(runner.sync('feishu'), /exited with code 1/)
+  assert.equal(board.entries['sync:feishu']?.state, 'error')
+  assert.deepEqual(schedule.delays(), [SYNC_FIRST_DELAY_MS])
+  assert.equal(SYNC_FIRST_DELAY_MS, 60_000)
+  // 连续失败：1 min → 2 → 4 → 8 → 16 → 32 → 60 min（封顶 1 小时）。
+  const seconds: number[] = [60]
+  while (schedule.delays().length < 7) {
+    const before = schedule.delays().length
+    schedule.fire()
+    await until(() => schedule.delays().length > before)
+    seconds.push((schedule.delays().at(-1) ?? 0) / 1000)
+  }
+  assert.deepEqual(seconds, [60, 120, 240, 480, 960, 1920, 3600])
+  assert.equal(SYNC_MAX_DELAY_MS, 3_600_000)
+  // 再失败一次停在封顶值，不会无限增长。
+  const before = schedule.delays().length
+  schedule.fire()
+  await until(() => schedule.delays().length > before)
+  assert.equal(schedule.delays().at(-1), SYNC_MAX_DELAY_MS)
+
+  // 一次成功清掉退避：健康回到 ready，之后不再排新的重试。
+  const scheduledBefore = schedule.delays().length
+  schedule.fire()
+  await until(() => board.entries['sync:feishu']?.state === 'ready')
+  assert.deepEqual(board.entries['sync:feishu'], { state: 'ready', detail: '1 allowed' })
+  assert.equal(schedule.delays().length, scheduledBefore, 'success does not schedule another retry')
+})
+
+test('starting a sync runs every syncable Source once, and stopping cancels the pending retry', async () => {
+  const board = new FakeHealthBoard()
+  const schedule = manualSchedule()
+  const cli = new FakeCommands()
+  cli.script(['im', '+chat-members-list'], () => membersPage([{ member_id: 'ou_bob', name: 'Bob' }]))
+  const runner = createPolicySync({
+    current: () => policyWithFeishu({ allowed: [], syncChat: 'oc_sync' }),
+    revision: () => 0,
+    save: () => {},
+    syncable: () => ['feishu'],
+    run: (_id, part, signal) => createFeishuKind('lark-cli').policy!.sync!.run(syncHost(cli), part, signal),
+    health: board,
+    now: () => '2026-11-07T00:00:00.000Z',
+    schedule: schedule.schedule,
+    signal: new AbortController().signal
+  })
+  // 启动时一次：每个可同步的 Source 各跑一次。
+  await runner.start()
+  assert.equal(cli.calls.length, 1)
+  assert.deepEqual(board.entries['sync:feishu'], { state: 'ready', detail: '1 allowed' })
+
+  // 失败后的待重试在停机时被取消（`stop`），不会在关闭后还去读 CLI。
+  const broken = new FakeCommands()
+  broken.fail('lark-cli', ['im', '+chat-members-list'], cliFailure('lark-cli', { exitCode: 1 }))
+  // 第二个驱动器用自己的一块健康板：`sync:<id>` 只有一个写者（§N.4）。
+  const retryBoard = new FakeHealthBoard()
+  const failing = createPolicySync({
+    current: () => policyWithFeishu({ allowed: [], syncChat: 'oc_sync' }),
+    revision: () => 0,
+    save: () => {},
+    syncable: () => ['feishu'],
+    run: (_id, part, signal) => createFeishuKind('lark-cli').policy!.sync!.run(syncHost(broken), part, signal),
+    health: retryBoard,
+    now: () => '2026-11-07T00:00:00.000Z',
+    schedule: schedule.schedule,
+    signal: new AbortController().signal
+  })
+  await assert.rejects(failing.sync('feishu'), /exited with code 1/)
+  assert.equal(schedule.scheduled.at(-1)?.cancelled, false)
+  failing.stop()
+  assert.equal(schedule.scheduled.at(-1)?.cancelled, true)
+})
+
+test('a configured Feishu source syncs its allow list at startup and on demand', async () => {
+  const config = { cli: 'lark-cli', chats: [{ chatId: 'oc_all', listen: 'all' }] }
+  let reads = 0
+  const harness = await openBoot({
+    boot: async (stateDir, runtime, commands) => {
+      scriptFeishuIdentity(commands)
+      commands.script(['im', '+chat-members-list'], () => {
+        reads += 1
+        return membersPage([{ member_id: 'ou_bob', name: 'Bob' }])
+      })
+      return bootPlugin({
+        runtime,
+        readSettings: async () =>
+          settingsWithFeishu(
+            stateDir,
+            { enabled: true, config },
+            // 同步来源群就是接收的群：成员成为允许名单。
+            { github: { allowed: [{ id: 'alice' }] }, feishu: { allowed: [], syncChat: 'oc_all' } }
+          ),
+        commands,
+        stateDir,
+        disableTimers: true
+      })
+    }
+  })
+  try {
+    // 启动时一次（生产不等它；测试等这个 promise）。
+    await harness.handle.policySync()
+    assert.equal(reads, 1)
+    // 手动「立即同步」再读一次，返回新的 part。
+    const part = await harness.handle.syncPolicy('feishu')
+    assert.equal(reads, 2)
+    assert.deepEqual(part['allowed'], [{ id: 'ou_bob', name: 'Bob' }])
+    // 保存的是 origin=sync 的 Policy 版本（§K.8），名字来自群里。
+    const store = openStore({ stateDir: harness.stateDir })
+    const saved = savedSettingsVersion(store, 'policy')
+    store.close()
+    assert.equal(saved?.origin, 'sync')
+    const savedPolicy = saved?.config as { sources: { feishu: { allowed: unknown[]; syncChat: string } } }
+    assert.deepEqual(savedPolicy.sources.feishu.allowed, [{ id: 'ou_bob', name: 'Bob' }])
+    assert.equal(savedPolicy.sources.feishu.syncChat, 'oc_all')
+  } finally {
+    await harness.cleanup()
+  }
+})
+
+test('a Feishu configuration that can act as a user is disabled with its setup problem', async () => {
+  const harness = await openBoot({
+    boot: async (stateDir, runtime, commands) => {
+      // 同一个 lark-cli 既登录了机器人也登录了人：配置可充当用户身份，插件拒绝以用户身份运行。
+      commands.script('lark-cli auth status', () =>
+        JSON.stringify({
+          appId: BOT.appId,
+          brand: 'feishu',
+          identities: { bot: { status: 'ready' }, user: { status: 'ready' } },
+          identity: 'bot'
+        })
+      )
+      commands.script(['api', 'GET', '/open-apis/bot/v3/info'], () =>
+        JSON.stringify({ bot: { open_id: BOT.botId, app_name: 'Superagent' } })
+      )
+      return bootPlugin({
+        runtime,
+        readSettings: async () =>
+          settingsWithFeishu(stateDir, { enabled: true, config: { cli: 'lark-cli', chats: [] } }),
+        commands,
+        stateDir,
+        disableTimers: true
+      })
+    }
+  })
+  try {
+    // 实例被 setup 问题挡住：不启动事件流，也不做名单同步。
+    assert.equal(harness.handle.snapshot().health.setupMissing, true)
+    assert.deepEqual(harness.commands.streams, [])
+    await harness.handle.policySync()
+    assert.deepEqual(
+      harness.commands.calls.filter((call) => call.args.includes('+chat-members-list')),
+      []
+    )
   } finally {
     await harness.cleanup()
   }

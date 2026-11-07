@@ -321,7 +321,8 @@ describe('the Feishu message event fixture', () => {
     const [call] = expected.channelCalls as { program: string; args: string[]; result: string }[]
     assert.equal(call?.program, 'lark-cli')
     // 回复落在话题根消息上（Feishu 的话题回复语义）。
-    assert.deepEqual(call?.args.slice(0, 4), ['im', '+message-reply', '--as', 'bot'])
+    // 命令名是本机 lark-cli 1.0.96 的实测值（`im +messages-reply`；`+message-reply` 不存在）。
+    assert.deepEqual(call?.args.slice(0, 4), ['im', '+messages-reply', '--as', 'bot'])
     assert.equal(call?.args[call.args.indexOf('--message-id') + 1], event.root_id)
     assert.equal(call?.result, 'sent')
   })

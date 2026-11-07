@@ -40,7 +40,12 @@ import { createDeterministicAssessor } from './app/assessor.ts'
 import { createRouterTools } from './app/assessment.ts'
 import { createOutbox, registerReplyEffects } from './app/outbox.ts'
 import { createPausedState } from './app/pause.ts'
-import { savedSettingsVersion } from './app/settings.ts'
+import {
+  createPolicySettingsPort,
+  createSettings,
+  savedSettingsVersion
+} from './app/settings.ts'
+import { createPolicySync, type PolicySync } from './app/policy-sync.ts'
 import {
   feishuChatsKey,
   feishuCursorKey,
@@ -159,6 +164,10 @@ export interface BootHandle {
   pollOnce(): Promise<GithubPollResult>
   /** 一轮 Feishu 回填（含话题轮询与群名刷新）；没有可用实例时 `null`。 */
   feishuOnce(): Promise<FeishuRoundResult | null>
+  /** 启动时那一轮名单同步的 promise（生产不等它；测试与诊断等它）。 */
+  policySync(): Promise<void>
+  /** 手动「立即同步」：跑一次某个 Source 的名单同步（面板按钮与 `policy sync` 命令共用）。 */
+  syncPolicy(id: string): Promise<Record<string, unknown>>
   /** 一轮 pass（先到期的 effect，再到期评估与评估决定）。 */
   passOnce(): Promise<void>
   /** 实际监听的端口；follower/未监听时 `null`。 */
@@ -281,6 +290,10 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
       snapshot: () => emptySnapshot(),
       pollOnce: async () => ({ notifications: 0, triggers: 0, skipped: 0 }),
       feishuOnce: async () => null,
+      policySync: async () => undefined,
+      syncPolicy: async () => {
+        throw new Error('another instance owns the state directory; it does the list sync')
+      },
       passOnce: async () => undefined,
       port: () => null,
       resumeReport: () => null,
@@ -450,6 +463,21 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
     if (!parsed.success) return policyBlock
     return parsed.data
   }
+  /**
+   * 设置块的保存器（§K.8、§K.5）：Policy 块的内容哈希与变更投递走 `policy/*` 与引擎。
+   * 名单同步（§I.3）以 origin=`sync` 写 Policy 块，因此和面板保存共用这一条写路径。
+   */
+  const settingsWriter = createSettings({
+    store,
+    now,
+    policy: createPolicySettingsPort({
+      kinds: policyKind,
+      rows: (source) => policyKind(source)?.rows() ?? [],
+      openTickets: () => repo.tickets.list(),
+      changed: (from, to, effects) => engine.policyChanged(from, to, effects),
+      current: effectivePolicy
+    })
+  })
   const policy = createPolicy({
     block: effectivePolicy,
     sources: registry,
@@ -937,6 +965,56 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
           ticket: (id) => repo.tickets.get(id)
         })
 
+  // ---- 名单同步（§I.3「同步」行、§N.4 的 `sync:<id>` 健康条目）：启动时一次、手动
+  // 「立即同步」、失败按 1 min→1 h 退避。能同步的条件：setup 完成、实例启用、part 点名了
+  // 同步来源群。保存走 `settingsWriter`（origin=`sync`），所以策略版本与变更投递同一条路。
+  const lifetimeAbort = new AbortController()
+  const policySyncable = (): string[] => {
+    if (!feishuSetup.enabled || feishuProblem() !== undefined) return []
+    const instance = registry.instance(FEISHU_KIND)
+    const sync = registry.kind(FEISHU_KIND)?.policy?.sync
+    if (
+      instance === undefined ||
+      !instance.enabled ||
+      instance.configError !== undefined ||
+      sync === undefined
+    ) {
+      return []
+    }
+    const part = effectivePolicy().sources[FEISHU_KIND]
+    return part !== undefined && sync.ready(part) ? [FEISHU_KIND] : []
+  }
+  const policySync: PolicySync = createPolicySync({
+    current: effectivePolicy,
+    revision: () => settingsWriter.blockRevision('policy'),
+    save: (policy, expectedRevision) => {
+      settingsWriter.save({
+        block: 'policy',
+        value: policy,
+        origin: 'sync',
+        expectedRevision,
+        validate: (value) => validatePolicy(value, { kinds: policyKind })
+      })
+    },
+    syncable: policySyncable,
+    run: (id, part, signal) => {
+      const sync = registry.kind(id)?.policy?.sync
+      return sync === undefined
+        ? Promise.reject(new Error(`The ${id} Source does not sync`))
+        : sync.run(feishuHost, part, signal)
+    },
+    health: board,
+    now,
+    schedule: (run, milliseconds) => {
+      // 测试关闭定时器：失败照记健康，但不在测试进程里排真实的重试。
+      if (options.disableTimers === true) return () => undefined
+      const timer = setTimeout(run, milliseconds)
+      return () => clearTimeout(timer)
+    },
+    signal: lifetimeAbort.signal,
+    log: (message) => logger.info(message)
+  })
+
   // ---- passes：先做 effect，再评估，再把确定性评估的决定落库
   const passes = createPasses({
     effects,
@@ -1014,6 +1092,8 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
   }
   // 事件流不靠定时器：配置好了就长驻监听（§I.3 实时事件）。
   const streaming = feishuStream === null ? null : feishuStream.run()
+  // 名单同步的「启动时一次」：不等它（一次 CLI 读最多 60 s，不该挡住首屏），失败只写健康与日志。
+  const startupSync = policySync.start()
   refresh()
 
   let closed = false
@@ -1024,7 +1104,9 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
     // 监督先停：关停期间不再发现「终端没了」并去 launch 新会话。
     routerSupervision.stop()
     for (const timer of timers) clearInterval(timer)
-    // 先关事件流：看门狗与 abort 都会停子进程，再等循环真的收尾（§I.3「5 s 内停」）。
+    // 名单同步的待重试先取消；再关事件流（看门狗与 abort 都会停子进程）。
+    lifetimeAbort.abort()
+    policySync.stop()
     feishuAbort.abort()
     if (streaming !== null) await streaming
     options.statusBar?.dispose()
@@ -1045,6 +1127,8 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
     snapshot: () => stateSource.snapshot(),
     pollOnce,
     feishuOnce,
+    policySync: () => startupSync,
+    syncPolicy: (id) => policySync.sync(id),
     passOnce,
     port: () => http.port,
     resumeReport: () => resumeReport,
