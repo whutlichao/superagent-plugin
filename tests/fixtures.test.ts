@@ -7,6 +7,7 @@ import { describe, test } from 'node:test'
 import assert from 'node:assert/strict'
 import { readRepoFile, readRepoJson, listFiles } from './support/repo.ts'
 import { key } from '../src/worker/core/ids.ts'
+import { mentionsAgent as mentions } from '../src/worker/sources/github/translate.ts'
 
 /** 夹具目录（相对仓库根）。 */
 const FIXTURES = 'tests/fixtures/cli'
@@ -20,6 +21,12 @@ interface Expected {
   readonly expandsTo?: Record<string, unknown>
   readonly readCursor?: Record<string, unknown>
   readonly channelCalls?: readonly Record<string, unknown>[]
+  readonly read?: { readonly program: string; readonly args: readonly string[]; readonly why?: string }
+  readonly thread?: { readonly source: string; readonly id: string; readonly key: string }
+  readonly shape?: Record<string, unknown>
+  readonly pull?: number
+  readonly review?: Record<string, unknown>
+  readonly comment?: Record<string, unknown>
   readonly tally?: Record<string, number>
 }
 
@@ -32,7 +39,14 @@ describe('fixture layout', () => {
       fixtures.sort(),
       [
         `${FIXTURES}/feishu/message-event.jsonl`,
-        `${FIXTURES}/github/notifications.json`
+        `${FIXTURES}/github/issue-comments.json`,
+        `${FIXTURES}/github/issue.json`,
+        `${FIXTURES}/github/notifications.json`,
+        `${FIXTURES}/github/pull-as-issue.json`,
+        `${FIXTURES}/github/pull-conversation.json`,
+        `${FIXTURES}/github/pull-review-comments.json`,
+        `${FIXTURES}/github/pull-reviews.json`,
+        `${FIXTURES}/github/pull.json`
       ],
       'the representative GitHub and Feishu fixtures'
     )
@@ -46,7 +60,14 @@ describe('fixture layout', () => {
     }
     assert.deepEqual(expected.sort(), [
       `${FIXTURES}/feishu/message-event.expected.json`,
-      `${FIXTURES}/github/notifications.expected.json`
+      `${FIXTURES}/github/issue-comments.expected.json`,
+      `${FIXTURES}/github/issue.expected.json`,
+      `${FIXTURES}/github/notifications.expected.json`,
+      `${FIXTURES}/github/pull-as-issue.expected.json`,
+      `${FIXTURES}/github/pull-conversation.expected.json`,
+      `${FIXTURES}/github/pull-review-comments.expected.json`,
+      `${FIXTURES}/github/pull-reviews.expected.json`,
+      `${FIXTURES}/github/pull.expected.json`
     ])
   })
 })
@@ -96,6 +117,130 @@ describe('the GitHub notifications fixture', () => {
     assert.equal(expansion.cursor.key, 'github-cursor:26977600684')
     assert.equal(expansion.cursor.value, '2026-11-06T12:40:45Z')
     assert.deepEqual(expected.tally, { skipped: 0 })
+  })
+})
+
+describe('the GitHub read fixtures', () => {
+  // 订阅读取的五个端点（§I.2「订阅读取」行）：Issue、Issue 评论、PR、评审、评审评论。
+  // 与 notifications.json 同一份脱敏规则：字段集合来自真实输出，只换中性值。
+  const issue = readRepoJson<Record<string, unknown>>(`${FIXTURES}/github/issue.json`)
+  const issueExpected = readRepoJson<Expected>(`${FIXTURES}/github/issue.expected.json`)
+  const pullAsIssue = readRepoJson<Record<string, unknown>>(`${FIXTURES}/github/pull-as-issue.json`)
+  const pullAsIssueExpected = readRepoJson<Expected>(`${FIXTURES}/github/pull-as-issue.expected.json`)
+  const pull = readRepoJson<Record<string, unknown>>(`${FIXTURES}/github/pull.json`)
+  const pullExpected = readRepoJson<Expected>(`${FIXTURES}/github/pull.expected.json`)
+  const issueComments = readRepoJson<Record<string, unknown>[]>(`${FIXTURES}/github/issue-comments.json`)
+  const issueCommentsExpected = readRepoJson<Expected>(`${FIXTURES}/github/issue-comments.expected.json`)
+  const conversation = readRepoJson<Record<string, unknown>[]>(`${FIXTURES}/github/pull-conversation.json`)
+  const conversationExpected = readRepoJson<Expected>(`${FIXTURES}/github/pull-conversation.expected.json`)
+  const reviews = readRepoJson<Record<string, unknown>[]>(`${FIXTURES}/github/pull-reviews.json`)
+  const reviewsExpected = readRepoJson<Expected>(`${FIXTURES}/github/pull-reviews.expected.json`)
+  const reviewComments = readRepoJson<Record<string, unknown>[]>(`${FIXTURES}/github/pull-review-comments.json`)
+  const reviewCommentsExpected = readRepoJson<Expected>(`${FIXTURES}/github/pull-review-comments.expected.json`)
+
+  test('the Issue read has no pull_request, and its expected shape names thread 42', () => {
+    assert.equal('pull_request' in issue, false)
+    assert.equal(issueExpected.thread?.key, 'github:42')
+    assert.deepEqual(issueExpected.read?.args, ['api', 'repos/acme/widgets/issues/42'])
+    const shape = issueExpected.shape as Record<string, unknown>
+    assert.equal(issue.number, shape.number)
+    assert.equal(issue.title, shape.title)
+    assert.equal(issue.html_url, shape.url)
+    assert.equal(shape.isPull, false)
+  })
+
+  test('the same PR read through issues/<n> carries pull_request, which is the only PR test', () => {
+    assert.equal(typeof pullAsIssue.pull_request, 'object')
+    assert.equal(pullAsIssueExpected.thread?.key, 'github:45')
+    assert.deepEqual(pullAsIssueExpected.read?.args, ['api', 'repos/acme/widgets/issues/45'])
+    assert.equal((pullAsIssueExpected.shape as Record<string, unknown>).isPull, true)
+    assert.equal(pullAsIssue.number, pullAsIssueExpected.shape?.number)
+  })
+
+  test('the PR read keeps its real width, including the base repository object', () => {
+    const base = pull.base as { repo: Record<string, unknown> }
+    // 真实 PR 输出的 base.repo 是一整份仓库对象（40 余个键）：解析器不能假设窄形状。
+    assert.ok(Object.keys(base.repo).length > 30)
+    assert.equal(base.repo.full_name, 'acme/widgets')
+    assert.deepEqual(pullExpected.read?.args, ['api', 'repos/acme/widgets/pulls/45'])
+    assert.equal(pullExpected.thread?.key, 'github:45')
+    assert.equal(pull.merged, pullExpected.shape?.merged)
+  })
+
+  test('the comment fixtures translate to the Trigger their expected files describe', () => {
+    const pairs = [
+      { comments: issueComments, expected: issueCommentsExpected, issue: 42 },
+      { comments: conversation, expected: conversationExpected, issue: 45 }
+    ] as const
+    for (const { comments: list, expected, issue: number } of pairs) {
+      assert.equal(list.length, 1)
+      const comment = list[0] as Record<string, unknown>
+      const user = comment.user as Record<string, unknown>
+      const trigger = expected.trigger as {
+        id: string
+        idRecipe: string
+        threads: { source: string; id: string }[]
+        actor: { source: string; id: string }
+        human: boolean
+        addressed?: string
+        at: string
+        text: string
+        url: string
+        channel: { source: string; thread: string; address: Record<string, string> }
+        meta: Record<string, unknown>
+      }
+      // id 由 `key()` 复算：改夹具就要改期望，两边不能各说各话。
+      assert.equal(
+        trigger.id,
+        key('github', 'comment', String(comment.id), String(comment.updated_at))
+      )
+      assert.deepEqual(trigger.threads, [{ source: 'github', id: String(number) }])
+      assert.equal(trigger.actor.id, user.login)
+      assert.equal(trigger.human, user.type !== 'Bot')
+      assert.equal(trigger.addressed, mentions(trigger.text, 'acme-agent') ? 'mention' : undefined)
+      assert.equal(trigger.at, comment.updated_at)
+      assert.equal(trigger.text, comment.body)
+      assert.equal(trigger.url, comment.html_url)
+      assert.deepEqual(trigger.channel, {
+        source: 'github',
+        thread: `github:${number}`,
+        address: { repo: 'acme/widgets', issue: String(number) }
+      })
+      assert.equal(trigger.meta.commentId, comment.id)
+      assert.deepEqual(expected.tally, { skipped: 0 })
+    }
+  })
+
+  test('the review and review-comment fixtures are read whole, with translation deferred to #18', () => {
+    const review = reviews[0] as Record<string, unknown>
+    const reviewUser = review.user as Record<string, unknown>
+    assert.equal(reviews.length, 1)
+    assert.equal(reviewUser.login, (reviewsExpected.review as Record<string, unknown>).actor)
+    assert.equal(review.state, (reviewsExpected.review as Record<string, unknown>).state)
+    assert.equal(review.submitted_at, (reviewsExpected.review as Record<string, unknown>).submittedAt)
+    assert.deepEqual(reviewsExpected.read?.args, [
+      'api',
+      'repos/acme/widgets/pulls/45/reviews',
+      '--paginate',
+      '--method',
+      'GET',
+      '-f',
+      'per_page=100'
+    ])
+    const comment = reviewComments[0] as Record<string, unknown>
+    assert.equal(reviewComments.length, 1)
+    // 评审评论带着 diff 上下文（diff_hunk/path/line）：解析器不能只取 id 与正文。
+    assert.equal(typeof comment.diff_hunk, 'string')
+    assert.equal(comment.path, (reviewCommentsExpected.comment as Record<string, unknown>).path)
+    assert.deepEqual(reviewCommentsExpected.read?.args, [
+      'api',
+      'repos/acme/widgets/pulls/45/comments',
+      '--paginate',
+      '--method',
+      'GET',
+      '-f',
+      'per_page=100'
+    ])
   })
 })
 

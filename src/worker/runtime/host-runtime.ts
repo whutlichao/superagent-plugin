@@ -198,9 +198,15 @@ export function createHostRuntime(orca: OrcaWorkerApi, options: HostRuntimeOptio
           ],
           { timeoutMs: 120_000, ...(signal === undefined ? {} : { signal }) }
         )
+        // 回执的句柄位置（附录 C S2 的早期记录 + #16 的实测）：1.4.251 上 `orca agent launch
+        // --json` 把 `{kind, handle, paneKey}` 放在 `result.outcome`；早期记录写的是
+        // `result.launch.outcome.handle`，旧宿主另有 `agentTerminalHandle`。三种都认。
         const launch = field(result, 'launch')
         const handle =
-          text(field(launch, 'outcome'), 'handle') ?? text(result, 'agentTerminalHandle') ?? text(result, 'terminalId')
+          text(field(result, 'outcome'), 'handle') ??
+          text(field(launch, 'outcome'), 'handle') ??
+          text(result, 'agentTerminalHandle') ??
+          text(result, 'terminalId')
         if (handle === undefined) throw new OrcaRuntimeError('agent_gone', 'the launch receipt carried no terminal handle')
         return { terminalId: handle, workspaceId: spec.workspace.workspaceId, launchedAt }
       } catch (error) {
@@ -229,8 +235,11 @@ export function createHostRuntime(orca: OrcaWorkerApi, options: HostRuntimeOptio
     },
 
     async findAgent(workspaceId: string): Promise<AgentHandle | null> {
+      // 「活着」的判据只有 `connected`（#16 的附录 C 实测）：`agent launch --surface terminal`
+      // 起在没打开的 worktree 里的终端是 `orphaned: true, connected: true`——它只是没有挂载到
+      // 可见 pane，进程与 TUI 都活着。把 orphaned 当死亡就永远反查不到自己刚起的会话。
       const matches = (await terminals()).filter(
-        (row) => row.worktreeId === workspaceId && row.connected && !row.orphaned
+        (row) => row.worktreeId === workspaceId && row.connected
       )
       return matches.length === 1
         ? { terminalId: matches[0]!.handle, workspaceId, launchedAt: Date.now() }

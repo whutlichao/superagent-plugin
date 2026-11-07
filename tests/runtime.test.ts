@@ -30,7 +30,7 @@ test('a mention becomes a ticket, an agent, a comment and a panel row', async ()
   const h = await openBoot()
   try {
     const first = await h.handle.pollOnce()
-    assert.deepEqual(first, { notifications: 1, triggers: 1 })
+    assert.deepEqual(first, { notifications: 1, triggers: 1, skipped: 0 })
     await h.handle.passOnce()
     // 第二轮 pass：accept 的决定（pass 里排空评估器）→ launch effect → worktree + agent。
     await h.handle.passOnce()
@@ -40,7 +40,10 @@ test('a mention becomes a ticket, an agent, a comment and a panel row', async ()
     assert.equal(h.runtime.calls.ensureWorkspace.length >= 1, true, 'a worktree was created')
     assert.equal(h.runtime.calls.launchAgent.length >= 1, true, 'an agent was launched')
     assert.equal(h.runtime.calls.sent.length >= 1, true, 'the assignment was delivered')
-    const spec = h.runtime.calls.launchAgent[0]!
+    // 组合根同时起一个常驻 Router（#16）；这条用例关心的是 Ticket 的 worker。
+    const spec = h.runtime.calls.launchAgent.find(
+      (candidate) => !candidate.workspace.path.endsWith('/superagent-router')
+    )!
     assert.equal(spec.surface, 'terminal')
     assert.equal(spec.workspace.path.startsWith(h.worktrees), true)
 
@@ -106,7 +109,11 @@ test('a message that is not for the agent leaves a filtered record and no ticket
   try {
     await h.handle.pollOnce()
     await h.handle.passOnce()
-    assert.equal(h.runtime.calls.ensureWorkspace.length, 0)
+    // Router 的专用 worktree 是组合根启动时建的；这里断言的是「没有为消息建 Ticket worktree」。
+    assert.deepEqual(
+      h.runtime.calls.ensureWorkspace.filter((spec) => spec.name !== 'superagent-router'),
+      []
+    )
     assert.equal(h.handle.snapshot().tickets?.length, 0)
   } finally {
     await h.cleanup()

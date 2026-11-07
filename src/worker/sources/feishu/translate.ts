@@ -249,8 +249,16 @@ function versionOf(message: FeishuMessage): string | undefined {
 }
 
 /**
+ * 寻址方式（§I.3 Trigger 行）：私聊一律 `direct`；群消息点名了机器人才是 `mention`，
+ * 没点名就不带（是否监听由 kind 的 `scope` 判）。
+ */
+function addressedOf(direct: boolean, mentioned: boolean): { addressed?: 'direct' | 'mention' } {
+  if (direct) return { addressed: 'direct' }
+  return mentioned ? { addressed: 'mention' } : {}
+}
+
+/**
  * 一条归一化消息 → Trigger；机器人自己的消息返回 `undefined`（§I.3：自身消息丢弃）。
- * 群消息的点名与私聊的寻址都由这里落成 `addressed`，是否监听由 kind 的 `scope` 判。
  */
 export function feishuTrigger(message: FeishuMessage, bot: FeishuBot): Trigger | undefined {
   if (message.senderId === bot.botId || message.senderId === bot.appId) return undefined
@@ -265,11 +273,7 @@ export function feishuTrigger(message: FeishuMessage, bot: FeishuBot): Trigger |
     threads: [threadRef(thread)],
     actor: { source: FEISHU_SOURCE, id: message.senderId },
     human: message.senderType === 'user',
-    ...(direct
-      ? { addressed: 'direct' as const }
-      : mentioned
-        ? { addressed: 'mention' as const }
-        : {}),
+    ...addressedOf(direct, mentioned),
     at: feishuTime(message.createTime),
     text: withMentionNames(message.text, message.mentions),
     ...(message.link === undefined ? {} : { url: message.link }),

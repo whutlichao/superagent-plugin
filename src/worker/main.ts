@@ -102,7 +102,10 @@ export default function activate(orca: OrcaWorkerApi): void {
     eventually((booted) => booted.setPaused(false), (message) => host.log(message))
     return 'Superagent: processing resumed.'
   })
-  host.register(COMMANDS.restartRouter, () => 'Superagent: the router is not wired up yet.')
+  host.register(COMMANDS.restartRouter, () => {
+    eventually((booted) => booted.restartRouter(), (message) => host.log(message))
+    return 'Superagent: restarting the router.'
+  })
   host.register(COMMANDS.checkSetup, () => {
     eventually((booted) => booted.refresh(), (message) => host.log(message))
     return 'Superagent: setup check is not wired up yet.'
