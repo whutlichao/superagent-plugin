@@ -10,12 +10,12 @@
 // 可用」是可以逐格断言的。
 import { describe, test } from 'node:test'
 import assert from 'node:assert/strict'
-import { Engine, MemoryRepositories, STRENGTHS } from '../src/worker/core/index.ts'
+import { Engine, MemoryRepositories, STRENGTHS, UserError } from '../src/worker/core/index.ts'
 import { createRepositories } from '../src/worker/app/repositories.ts'
 import { createPolicySettingsPort, createSettings } from '../src/worker/app/settings.ts'
 import type { SettingsOrigin, SettingsSaveResult } from '../src/worker/app/settings.ts'
 import { settingsVersionKey } from '../src/worker/app/kv.ts'
-import { openTempStore } from './support/state.ts'
+import { openTempStore, isoAfter } from './support/state.ts'
 import type {
   AcceptMode,
   Candidate,
@@ -43,6 +43,7 @@ import type {
   PolicyKindView
 } from '../src/worker/policy/index.ts'
 import { array, object, string } from '../src/worker/infra/schema.ts'
+import { readEvalsHealth, readUnavailableProblems } from '../src/worker/app/views/attention.ts'
 
 /** 固定的测试时刻。 */
 const AT = '2026-11-07T00:00:00.000Z'
@@ -115,6 +116,8 @@ interface FixtureInput {
   readonly disabledRules?: readonly string[]
   /** 夹具唯一那条规则的写法（影响面的测试要改它的名字或说明）。 */
   readonly rule?: { readonly name?: string; readonly en?: string; readonly zh?: string }
+  /** `eval.timeoutSeconds`（§K.1 的评估预算；缺省 300，超时测试改小它）。 */
+  readonly timeoutSeconds?: number
 }
 
 /** 夹具 kind 的 Policy 部分 schema：`allowed` / `bots` 之外再认一个 kind 自有的监听键。 */
@@ -152,7 +155,7 @@ function fixture(input: FixtureInput = {}) {
         admission: input.admission ?? {}
       }
     },
-    eval: { timeoutSeconds: 300 }
+    eval: { timeoutSeconds: input.timeoutSeconds ?? 300 }
   }
   const kinds = (source: string): PolicyKindView | undefined =>
     source === 'chat' ? fixtureKind(observe) : undefined
@@ -1279,11 +1282,15 @@ function policySaveHarness(initial: FixtureInput = {}) {
   const stopped: string[] = []
   const delivered: string[] = []
   let sequence = 0
+  /** 注入的虚拟时钟：超时与暂停顺延断言的是具体时刻，不 sleep（§P.1 第 4 条）。 */
+  let clock = AT
+  /** 处理是否暂停（§K.6；与 Policy 版本无关，因此不写进块）。 */
+  let paused = false
   let engine: Engine
 
   const settings = createSettings({
     store: opened.store,
-    now: () => AT,
+    now: () => clock,
     policy: createPolicySettingsPort({
       kinds: (source) => (source === 'chat' ? fixtureKind(observe) : undefined),
       rows,
@@ -1306,7 +1313,7 @@ function policySaveHarness(initial: FixtureInput = {}) {
   engine = new Engine({
     repo,
     scope,
-    policy: () => createPolicy({ block: liveBlock, sources: scope, rows }),
+    policy: () => createPolicy({ block: liveBlock, sources: scope, rows, paused: () => paused }),
     assessor: { request: (candidate: Candidate) => void requests.push(candidate) },
     executor: {
       start: () => undefined,
@@ -1314,7 +1321,7 @@ function policySaveHarness(initial: FixtureInput = {}) {
       stop: (_ticket, _assignment, reason) => void stopped.push(reason)
     },
     outbox: { send: () => undefined, status: () => undefined, withdraw: () => undefined },
-    now: () => AT
+    now: () => clock
   })
 
   /** 一条名单内的人在团队群里写的、没点名的消息（每条一个新 id）。 */
@@ -1364,6 +1371,18 @@ function policySaveHarness(initial: FixtureInput = {}) {
     accept,
     save,
     liveBlock,
+    /** 当前虚拟时刻（ISO）。 */
+    now: (): string => clock,
+    /** 推时钟（毫秒）：过期与暂停顺延只靠它，不 sleep（§P.1）。 */
+    advance: (milliseconds: number): void => {
+      clock = new Date(Date.parse(clock) + milliseconds).toISOString()
+    },
+    /** 暂停/恢复处理（§K.6）：不写 Policy 块、不改版本。 */
+    setPaused: (next: boolean): void => {
+      paused = next
+    },
+    /** 一个 Thread 的当前行（`pending` / `evaluating` / `expired`）。 */
+    thread: (key: string) => repo.threads.get(key),
     cleanup: opened.cleanup
   }
 }
@@ -1524,6 +1543,302 @@ describe('a policy change and the work in flight (§K.5)', () => {
       // 可以走成一张新 Ticket，而不是被那张复验失败的 Ticket 吞掉（§K.2 第 3 条、§K.3）。
       assert.equal(candidate?.strength, 'explicit')
       assert.equal(candidate?.triggers.length, 1)
+    } finally {
+      h.cleanup()
+    }
+  })
+})
+
+// ---------------------------------------------------------------- Eval 超时与 unavailable（§K.7）
+
+/** 把最新一条候选标记为「送达 assessor 会话」：截止时间从此刻起算（§K.7 起算行）。 */
+function deliverLatest(h: ReturnType<typeof policySaveHarness>): string {
+  const candidate = h.requests.at(-1)
+  assert.notEqual(candidate, undefined, 'an eval is waiting for its candidate')
+  h.engine.candidateDelivered(candidate!.evalId)
+  return candidate!.evalId
+}
+
+describe('the Eval deadline (§K.7)', () => {
+  test('starts at delivery, never passes before it, and the third expiry is unavailable with its attempt count', () => {
+    const h = policySaveHarness({ acceptMode: 'observe', timeoutSeconds: 30 })
+    try {
+      h.engine.receive(h.incoming())
+      h.engine.evaluateDue()
+      assert.deepEqual(
+        h.requests.map((item) => item.triggers.map((trigger) => trigger.id)),
+        [['trigger-1']]
+      )
+      // 还没送达：推过三倍超时也不过期，也不记 Decision。
+      h.advance(120_000)
+      h.engine.evaluateDue()
+      assert.equal(h.requests.length, 1, 'an undelivered candidate never expires')
+      assert.deepEqual(h.repo.decisions.byThread('chat:room'), [])
+      // 送达当刻起算 timeoutSeconds（断言具体时刻）。
+      const deliveredAt = h.now()
+      deliverLatest(h)
+      assert.equal(h.thread('chat:room')?.evaluating?.delivered, deliveredAt)
+      assert.equal(h.thread('chat:room')?.evaluating?.deadline, isoAfter(deliveredAt, 30_000))
+      // 到点前不过期；到点那一秒过期并把 Trigger 重新入队，不记 Decision。
+      h.advance(29_000)
+      h.engine.evaluateDue()
+      assert.equal(h.requests.length, 1)
+      h.advance(2_000)
+      h.engine.evaluateDue()
+      assert.equal(h.requests.length, 2, 'the trigger is queued again for a new eval')
+      assert.deepEqual(h.repo.decisions.byThread('chat:room'), [], 'an expiry is not a Decision')
+      // 第二次到期再排一次；第三次到期记 unavailable（带尝试次数），不再重试。
+      deliverLatest(h)
+      h.advance(31_000)
+      h.engine.evaluateDue()
+      assert.equal(h.requests.length, 3)
+      assert.deepEqual(h.repo.decisions.byThread('chat:room'), [])
+      deliverLatest(h)
+      h.advance(31_000)
+      h.engine.evaluateDue()
+      assert.equal(h.requests.length, 3, 'retries are bounded: no fourth attempt')
+      const [decision] = h.repo.decisions.byThread('chat:room')
+      assert.equal(decision?.kind, 'unavailable', 'a timeout is never an accept or an ignore')
+      assert.deepEqual(decision?.reason, [{ code: 'timeout', values: { attempts: '3' } }])
+      assert.equal(decision?.ticketId, undefined)
+      assert.deepEqual(h.repo.tickets.list(), [], 'a failed assessment never creates a ticket')
+      // 后续新 Trigger 照样开新 Eval（失败的评估不阻塞 Thread）。
+      h.engine.receive(h.incoming())
+      h.engine.evaluateDue()
+      assert.equal(h.requests.length, 4)
+    } finally {
+      h.cleanup()
+    }
+  })
+
+  test('pausing stops the deadline and resuming moves it by exactly the paused time', () => {
+    const h = policySaveHarness({ acceptMode: 'observe', timeoutSeconds: 30 })
+    try {
+      h.engine.receive(h.incoming())
+      h.engine.evaluateDue()
+      const deliveredAt = h.now()
+      deliverLatest(h)
+      assert.equal(h.thread('chat:room')?.evaluating?.deadline, isoAfter(deliveredAt, 30_000))
+      // 15 秒后暂停：pass 记下暂停开始的时刻；暂停不计超时（§K.6）。
+      h.advance(15_000)
+      h.setPaused(true)
+      h.engine.evaluateDue()
+      assert.equal(h.thread('chat:room')?.evaluating?.pausedAt, isoAfter(deliveredAt, 15_000))
+      h.advance(1_000_000)
+      h.engine.evaluateDue()
+      assert.equal(h.requests.length, 1, 'a paused assessment does not expire')
+      assert.deepEqual(h.repo.decisions.byThread('chat:room'), [])
+      // 恢复：截止时间后移「暂停时长」（1_000_000 ms），恢复那一刻不算过期。
+      h.setPaused(false)
+      h.engine.evaluateDue()
+      assert.equal(h.thread('chat:room')?.evaluating?.deadline, isoAfter(deliveredAt, 1_030_000))
+      assert.equal(h.thread('chat:room')?.evaluating?.pausedAt, undefined)
+      // 顺延后的到点前 1 ms 仍不过期，到点才过期。
+      h.advance(14_999)
+      h.engine.evaluateDue()
+      assert.equal(h.requests.length, 1)
+      h.advance(2)
+      h.engine.evaluateDue()
+      assert.equal(h.requests.length, 2)
+    } finally {
+      h.cleanup()
+    }
+  })
+
+  test('pause starts no new assessment, and the one in flight can still be decided', () => {
+    const h = policySaveHarness({ acceptMode: 'observe', timeoutSeconds: 30 })
+    try {
+      h.engine.receive(h.incoming())
+      h.engine.evaluateDue()
+      const evalId = deliverLatest(h)
+      h.setPaused(true)
+      h.engine.evaluateDue()
+      // 暂停期间到来的新 Trigger 只排队，不开始评估。
+      h.engine.receive(h.incoming())
+      h.engine.evaluateDue()
+      assert.equal(h.requests.length, 1, 'pause starts no new evaluation')
+      assert.deepEqual(h.thread('chat:room')?.pending, ['trigger-2'])
+      // 在跑的那次评估照样能被决定：暂停不打断已经开始的评估。
+      const decision = h.engine.decide('trigger-1', { kind: 'ignore', reason: 'chatter', evalId })
+      assert.equal(decision.kind, 'ignore')
+      // 恢复后排队的那条才开评估。
+      h.setPaused(false)
+      h.engine.evaluateDue()
+      assert.equal(h.requests.length, 2)
+      assert.deepEqual(
+        h.requests.at(-1)?.triggers.map((trigger) => trigger.id),
+        ['trigger-2']
+      )
+    } finally {
+      h.cleanup()
+    }
+  })
+
+  test('an assessment that fails records unavailable and opens no ticket', () => {
+    const h = policySaveHarness({ acceptMode: 'auto' })
+    try {
+      h.engine.receive(h.incoming())
+      h.engine.evaluateDue()
+      const candidate = h.requests.at(-1)!
+      const decision = h.engine.decide('trigger-1', {
+        kind: 'unavailable',
+        reason: 'the tool read failed',
+        evalId: candidate.evalId
+      })
+      assert.equal(decision.kind, 'unavailable')
+      assert.deepEqual(decision.reason, [{ code: 'said', values: { text: 'the tool read failed' } }])
+      assert.equal(decision.ticketId, undefined)
+      assert.deepEqual(h.repo.tickets.list(), [])
+      // 后续新 Trigger 可开新 Eval。
+      h.engine.receive(h.incoming())
+      h.engine.evaluateDue()
+      assert.equal(h.requests.length, 2)
+    } finally {
+      h.cleanup()
+    }
+  })
+})
+
+// ---------------------------------------------------------------- 待人工与 evals 健康项（§K.7、§N.4）
+
+describe('the panel\'s pending-human rule and the evals health count (§K.7)', () => {
+  /** 跑一次评估并让它失败（`unavailable`，§K.7 的「评估失败」行），返回那条 Decision。 */
+  function failedAssessment(h: ReturnType<typeof policySaveHarness>) {
+    const trigger = h.incoming()
+    h.engine.receive(trigger)
+    h.engine.evaluateDue()
+    const candidate = h.requests.at(-1)
+    assert.notEqual(candidate, undefined)
+    return h.engine.decide(trigger.id, {
+      kind: 'unavailable',
+      reason: 'the tool read failed',
+      evalId: candidate!.evalId
+    })
+  }
+
+  /** 读模型看到的问题（真库 + 注入的「现在」）。 */
+  const problems = (h: ReturnType<typeof policySaveHarness>) =>
+    readUnavailableProblems({ sql: h.store.sql }, { now: h.now() })
+
+  /** 健康项 `evals` 的读数（1 h 内未解决的 unavailable，§N.4）。 */
+  const health = (h: ReturnType<typeof policySaveHarness>) => readEvalsHealth({ sql: h.store.sql }, h.now())
+
+  test('an unresolved unavailable on an idle thread is one problem, with the thread and the reason', () => {
+    const h = policySaveHarness({ acceptMode: 'observe' })
+    try {
+      const decision = failedAssessment(h)
+      const found = problems(h)
+      assert.deepEqual(found, [
+        {
+          decisionId: decision.id,
+          evalId: decision.evalId,
+          threadKey: 'chat:room',
+          at: h.now(),
+          reason: 'the tool read failed',
+          triggerIds: ['trigger-1']
+        }
+      ])
+    } finally {
+      h.cleanup()
+    }
+  })
+
+  test('dismissing a problem removes it for good and creates no ticket', () => {
+    const h = policySaveHarness({ acceptMode: 'observe' })
+    try {
+      const decision = failedAssessment(h)
+      assert.equal(problems(h).length, 1)
+      const dismissed = h.engine.dismiss(decision.id)
+      assert.equal(dismissed.dismissed, true)
+      assert.deepEqual(problems(h), [], 'a dismissed decision is not a pending problem')
+      assert.deepEqual(problems(h), [], 'dismiss is permanent for that decision')
+      assert.deepEqual(h.repo.tickets.list(), [], 'dismissing creates no ticket')
+      // 同一条再 dismiss 是幂等的，不会变成别的状态。
+      assert.equal(h.engine.dismiss(decision.id).dismissed, true)
+      // 非 unavailable 的 Decision 不能被 dismiss（固定拒绝 `unknownProblem`）。
+      assert.throws(
+        () => h.engine.dismiss('decision-nope'),
+        (error: unknown) => error instanceof UserError && error.code === 'unknownProblem'
+      )
+    } finally {
+      h.cleanup()
+    }
+  })
+
+  test('a decision that is no longer the thread\'s latest is not pending-human', () => {
+    const h = policySaveHarness({ acceptMode: 'observe' })
+    try {
+      failedAssessment(h)
+      assert.equal(problems(h).length, 1)
+      h.advance(1_000)
+      const later = h.incoming()
+      h.engine.receive(later)
+      h.engine.evaluateDue()
+      h.engine.decide(later.id, { kind: 'ignore', reason: 'chatter' })
+      assert.deepEqual(problems(h), [])
+    } finally {
+      h.cleanup()
+    }
+  })
+
+  test('a thread that is queued or evaluating is not pending-human', () => {
+    const h = policySaveHarness({ acceptMode: 'observe' })
+    try {
+      failedAssessment(h)
+      assert.equal(problems(h).length, 1)
+      // 新 Trigger 排队等评估（queued）。
+      h.advance(1_000)
+      h.engine.receive(h.incoming())
+      assert.deepEqual(h.thread('chat:room')?.pending.length, 1)
+      assert.deepEqual(problems(h), [], 'a queued thread hides the old problem')
+      // 评估真的开始（evaluating）。
+      h.engine.evaluateDue()
+      assert.notEqual(h.thread('chat:room')?.evaluating, undefined)
+      assert.deepEqual(problems(h), [], 'an evaluating thread hides the old problem')
+    } finally {
+      h.cleanup()
+    }
+  })
+
+  test('a problem older than 24 hours is not pending-human, and the evals count covers only the last hour', () => {
+    const h = policySaveHarness({ acceptMode: 'observe' })
+    try {
+      failedAssessment(h)
+      assert.equal(health(h).detail, 'unavailable 1 in the last hour')
+      // 59 分钟后仍然算数；超过一小时不再计入健康项。
+      h.advance(59 * 60 * 1000)
+      assert.equal(health(h).detail, 'unavailable 1 in the last hour')
+      h.advance(2 * 60 * 1000)
+      assert.equal(health(h).detail, 'unavailable 0 in the last hour')
+      assert.equal(problems(h).length, 1, 'still within the 24 h panel window')
+      // 超过 24 小时：面板也不再把它算进待人工（但健康项早已为 0）。
+      h.advance(24 * 60 * 60 * 1000)
+      assert.deepEqual(problems(h), [])
+      assert.equal(health(h).state, 'ready')
+    } finally {
+      h.cleanup()
+    }
+  })
+
+  test('dismissing and a superseding decision also leave the evals health count at zero', () => {
+    const h = policySaveHarness({ acceptMode: 'observe' })
+    try {
+      const decision = failedAssessment(h)
+      assert.equal(health(h).detail, 'unavailable 1 in the last hour')
+      h.engine.dismiss(decision.id)
+      assert.equal(health(h).detail, 'unavailable 0 in the last hour')
+
+      // 同一 Thread 上的下一次失败是新的一条决定（换一个时刻，读序才确定）。
+      h.advance(1_000)
+      const second = failedAssessment(h)
+      assert.equal(health(h).detail, 'unavailable 1 in the last hour')
+      h.advance(1_000)
+      const later = h.incoming()
+      h.engine.receive(later)
+      h.engine.evaluateDue()
+      h.engine.decide(later.id, { kind: 'ignore', reason: 'chatter' })
+      assert.equal(second.kind, 'unavailable')
+      assert.equal(health(h).detail, 'unavailable 0 in the last hour')
     } finally {
       h.cleanup()
     }

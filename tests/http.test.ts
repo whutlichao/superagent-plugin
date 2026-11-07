@@ -55,6 +55,8 @@ import type { HttpHost } from '../src/worker/http/state'
 import { openStore } from '../src/worker/app/store'
 import { SCHEMA_VERSION } from '../src/worker/app/schema'
 import { runIdempotent } from '../src/worker/http/idempotency'
+import { createDecisionHandlers, withDecisionHandlers } from '../src/worker/http/decisions'
+import type { Decision } from '../src/worker/core/model'
 import { tempStateDir } from './support/state'
 import { holdPortBlock } from './support/ports'
 
@@ -1200,5 +1202,62 @@ test('twenty occupied increments fall back to an ephemeral port', async () => {
   } finally {
     harness.close()
     blocked.release()
+  }
+})
+
+// ---------------------------------------------------------------- 面板的 dismiss（§K.7）
+
+test('dismissing an unavailable decision answers it; an unknown one is a missing problem', async () => {
+  const dismissed: string[] = []
+  const harness = await startHarness({
+    routes: withDecisionHandlers(
+      ROUTE_TABLE,
+      createDecisionHandlers({
+        dismiss: (id): Decision => {
+          // 领域只允许 dismiss 一条 unavailable；别的给固定拒绝 `unknownProblem`（→ `missing`）。
+          if (id !== 'decision-1') throw new UserError('unknownProblem')
+          dismissed.push(id)
+          return {
+            id,
+            evalId: 'eval-1',
+            threadKey: 'github:acme/widgets#42',
+            triggerIds: ['trigger-1'],
+            policyVersion: 'v1',
+            at: STARTED_AT,
+            kind: 'unavailable',
+            reason: [{ code: 'timeout', values: { attempts: '3' } }],
+            strength: 'explicit',
+            dismissed: true
+          }
+        }
+      })
+    )
+  })
+  try {
+    const ok = await harness.call('/superagent/api/decisions/decision-1/dismiss', { method: 'POST' })
+    assert.equal(ok.status, 200)
+    assert.deepEqual(resultOf(ok), {
+      decision: {
+        id: 'decision-1',
+        kind: 'unavailable',
+        thread_key: 'github:acme/widgets#42',
+        at: STARTED_AT,
+        dismissed: true
+      }
+    })
+    assert.deepEqual(dismissed, ['decision-1'])
+    // 未知（或不是 unavailable）：固定的 `missing`，不是 500，也不写任何东西。
+    const missing = await harness.call('/superagent/api/decisions/decision-9/dismiss', { method: 'POST' })
+    assert.equal(missing.status, 404)
+    assert.equal(failureOf(missing).code, 'missing')
+    // 写方法仍要求显式请求头（§G.3 第 5 条），这条路由不例外。
+    const noHeader = await harness.call('/superagent/api/decisions/decision-1/dismiss', {
+      method: 'POST',
+      headers: { 'x-superagent-request': '' }
+    })
+    assert.equal(noHeader.status, 403)
+    assert.equal(failureOf(noHeader).code, 'origin_forbidden')
+  } finally {
+    harness.close()
   }
 })

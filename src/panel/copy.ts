@@ -351,7 +351,7 @@ export const COPY = {
 
   // --- 原因码（`core/reasons.ts` 的 REASONS；`said` 显示原话） ---
   'reason.said': { zh: '{text}', en: '{text}' },
-  'reason.timeout': { zh: '评估超时未决定', en: 'Assessment timed out' },
+  'reason.timeout': { zh: '评估超时未决定（{attempts} 次尝试）', en: 'Assessment timed out after {attempts} attempts' },
   'reason.policyChanged': { zh: '评估期间策略已变更', en: 'Policy changed during assessment' },
   'reason.noAdmissible': { zh: '没有可准入的触发', en: 'No admissible trigger' },
   'reason.startedTicket': { zh: '已经开过工单 {ticket}', en: 'Already started ticket {ticket}' },
