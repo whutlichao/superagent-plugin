@@ -13,6 +13,7 @@ import {
   UserError
 } from '../src/worker/core/index.ts'
 import { assessmentOutcome } from '../src/worker/policy/index.ts'
+import { reviewCommentTrigger } from '../src/worker/sources/github/translate.ts'
 import type {
   Assignment,
   Candidate,
@@ -254,6 +255,47 @@ describe('intake', () => {
     // Correlation 只加语境不改路由：Eval 只跑在 primary thread 上。
     h.pump()
     assert.deepEqual(h.requests.map((candidate) => candidate.thread.key), ['gh:pr-7'])
+  })
+
+  test('a review comment fans out on its PR thread and lends its review thread only context', () => {
+    const h = harness({
+      gate: () => ({ admissible: true, strength: 'explicit', basis: { via: 'addressed', addressed: 'mention' } })
+    })
+    // 一个 Ticket 只把评审线程当语境跟随；主 Thread 上没有订阅者。
+    const follower = accepted(h).ticketId!
+    assert.equal(h.engine.followForContext(follower, { source: 'github', id: '45/rt/7000' }), true)
+    const trigger = reviewCommentTrigger({
+      repository: 'acme/widgets',
+      pull: 45,
+      login: 'acme-agent',
+      comment: {
+        id: 8001,
+        login: 'carol',
+        bot: false,
+        body: 'Keep the `next` parameter.',
+        createdAt: '2026-09-23T00:00:05Z',
+        updatedAt: '2026-09-23T00:00:05Z',
+        url: 'https://github.com/acme/widgets/pull/45#discussion_r8001',
+        inReplyTo: 7000,
+        path: 'src/app/login.go',
+        line: 54
+      }
+    })
+    h.engine.receive(trigger)
+    // 相关 Thread 只加语境：止于从此到达的 Input 标 context，不产生候选/Decision/所有权。
+    assert.deepEqual(h.opened.triggers.disposition(trigger.id)?.context, [follower])
+    assertMatches(h.opened.tickets.get(follower)!.inputs.at(-1), {
+      kind: 'trigger',
+      triggerId: trigger.id,
+      context: true
+    })
+    h.pump()
+    // Eval 只跑在 primary Thread（PR 会话）上；评审 Thread 没有额外的候选。
+    assert.equal(h.requests.at(-1)?.thread.key, 'github:45')
+    assert.deepEqual(h.opened.threads.get('github:45/rt/7000')?.pending, [])
+    assert.equal(h.opened.decisions.byThread('github:45/rt/7000').length, 0)
+    // 候选属于 PR 会话，不属于评审 Thread；语境到达不产生额外候选。
+    assert.equal(h.engine.candidate(trigger.id)?.thread.key, 'github:45')
   })
 
   test('normalizes source timestamps so text comparison is time comparison', () => {

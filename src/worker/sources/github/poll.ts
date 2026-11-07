@@ -14,7 +14,15 @@ import type { HealthEntry, Thread, Ticket, Trigger } from '../../core/index.ts'
 import type { SourceContext } from '../kind.ts'
 import type { GithubNotification } from './api.ts'
 import { issueNumberOf, type GithubApi } from './api.ts'
-import { commentTrigger, isSelf } from './translate.ts'
+import type { GithubBodySource } from './translate.ts'
+import {
+  bodyFingerprint,
+  commentTrigger,
+  isSelf,
+  issueBodyTrigger,
+  reviewCommentTrigger,
+  reviewTrigger
+} from './translate.ts'
 import type { GithubConfig } from './config.ts'
 
 /** 连续多少轮失败把 `github` 条目标成 error（§I.2：连续 3 轮）。 */
@@ -53,6 +61,11 @@ export interface GithubPollerOptions {
   readonly cursorKey: (notificationId: string) => string
   /** 有 Ticket 订阅的 Thread；缺省（或没有它）时不读订阅。 */
   readonly subscribed?: () => readonly GithubSubscribedThread[]
+  /**
+   * Issue/PR 正文指纹的键（`githubBodyKey(number)`）：键名只活在 `app/kv.ts`，
+   * 由组合根注入。缺省时不翻译正文版本（#36 的 receive-all 复用同一个键）。
+   */
+  readonly bodyKey?: (issue: number) => string
   /** 时钟（毫秒，水位线判定用）；缺省 `Date.now`。 */
   readonly now?: () => number
   readonly log?: (message: string) => void
@@ -206,20 +219,43 @@ export function createGithubPoller(options: GithubPollerOptions): GithubPoller {
     const { repository, issue, since, skip } = input
     let isPull = input.knownPull === true
     let url: string | undefined
+    let body: GithubBodySource | undefined
     if (input.knownPull === undefined) {
       const read = await options.api.issue(repository, issue)
       skip(read.skipped)
-      isPull = read.items[0]?.isPull === true
-      url = read.items[0]?.url
+      const found = read.items[0]
+      isPull = found?.isPull === true
+      url = found?.url
+      if (found) body = found
     }
     if (isPull) {
       const pull = await options.api.pull(repository, issue)
       skip(pull.skipped)
-      url = pull.items[0]?.url ?? url
+      const found = pull.items[0]
+      url = found?.url ?? url
+      if (found) body = found
+    }
+    let received = 0
+    // 正文版本（§I.2「issue-body 编辑」）：第一次读只当基线；之后只在正文指纹变化时
+    // 产 Trigger。评论/评审活动会改 `updated_at` 但不改正文，因此不会制造正文 Trigger。
+    if (options.bodyKey !== undefined && body !== undefined) {
+      const fingerprint = bodyFingerprint(body.body)
+      const stateKey = options.bodyKey(issue)
+      const seen = options.host.state.get(stateKey)
+      if (!isSelf(body, options.login) && typeof seen === 'string' && seen !== fingerprint) {
+        const trigger = issueBodyTrigger({
+          repository,
+          number: issue,
+          isPull,
+          source: body,
+          login: options.login
+        })
+        if (trigger.text.length > 0 && options.host.receive(trigger) !== 'duplicate') received += 1
+      }
+      options.host.state.set(stateKey, fingerprint)
     }
     const comments = await options.api.issueComments(repository, issue, since)
     skip(comments.skipped)
-    let received = 0
     for (const comment of comments.items) {
       if (isSelf(comment, options.login)) continue
       if (!fresh(comment.updatedAt, comment.createdAt, since)) continue
@@ -234,9 +270,31 @@ export function createGithubPoller(options: GithubPollerOptions): GithubPoller {
       if (options.host.receive(trigger) !== 'duplicate') received += 1
     }
     if (isPull) {
-      // 评审与评审评论本票只读（每轮都读，失败记在 Thread 上）；翻译与回复归 #18。
-      skip((await options.api.pullReviews(repository, issue)).skipped)
-      skip((await options.api.pullComments(repository, issue)).skipped)
+      // 评审（review）与评审评论（review-comment）都翻成 Trigger（§I.2 Trigger 翻译行）。
+      const reviews = await options.api.pullReviews(repository, issue)
+      skip(reviews.skipped)
+      for (const review of reviews.items) {
+        if (isSelf(review, options.login)) continue
+        if (!fresh(review.submittedAt, review.submittedAt, since)) continue
+        const trigger = reviewTrigger({ repository, pull: issue, review, login: options.login })
+        // 空的 COMMENTED 评审没有可读内容；有状态的决定仍有正文（`reviewText`）。
+        if (trigger.text.length === 0) continue
+        if (options.host.receive(trigger) !== 'duplicate') received += 1
+      }
+      const reviewComments = await options.api.pullComments(repository, issue)
+      skip(reviewComments.skipped)
+      for (const comment of reviewComments.items) {
+        if (isSelf(comment, options.login)) continue
+        if (!fresh(comment.updatedAt, comment.createdAt, since)) continue
+        const trigger = reviewCommentTrigger({
+          repository,
+          pull: issue,
+          comment,
+          login: options.login
+        })
+        if (trigger.text.length === 0) continue
+        if (options.host.receive(trigger) !== 'duplicate') received += 1
+      }
     }
     recordSuccess(issue, url)
     return received

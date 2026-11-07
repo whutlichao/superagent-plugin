@@ -51,6 +51,7 @@ import {
   feishuChatsKey,
   feishuCursorKey,
   feishuTopicsKey,
+  githubBodyKey,
   githubCursorKey,
   sourceLabelsKey,
   threadSeenKey
@@ -947,6 +948,8 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
           now: nowMs,
           // 游标键的命名留在 `app/kv.ts`（§D.3）：Source 只拿到构造函数。
           cursorKey: githubCursorKey,
+          // Issue/PR 正文指纹也在这里命名（#18；#36 的 receive-all 复用同一个键）。
+          bodyKey: githubBodyKey,
           host: createSourceContext({
             engine,
             store,

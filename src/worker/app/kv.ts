@@ -21,6 +21,7 @@ export const KV_KEY_LITERALS = {
   tokenHashPrefix: 'token-hash:',
   requestIdPrefix: 'request-id:',
   githubCursorPrefix: 'github-cursor:',
+  githubBodyPrefix: 'github-body:',
   githubCiPrefix: 'github-ci:',
   feishuCursorPrefix: 'feishu-cursor:',
   feishuChats: 'feishu-chats',
@@ -74,6 +75,12 @@ export const REQUEST_ID_PREFIX = KV_KEY_LITERALS.requestIdPrefix
 /** Source 状态族（§D.3「Source 状态」行）。 */
 export const githubCursorKey = (notificationId: string): string =>
   `${KV_KEY_LITERALS.githubCursorPrefix}${notificationId}`
+/**
+ * Issue/PR 正文指纹（§I.2 的 issue-body 编辑、票 #18）：键按编号，值只有正文指纹。
+ * #36 的 receive-all 复用同一个键名，不要再起一套。
+ */
+export const githubBodyKey = (issue: number | string): string =>
+  `${KV_KEY_LITERALS.githubBodyPrefix}${issue}`
 export const githubCiKey = (pull: string, headSha: string): string =>
   `${KV_KEY_LITERALS.githubCiPrefix}${pull}#${headSha}`
 export const feishuCursorKey = (chat: string): string => `${KV_KEY_LITERALS.feishuCursorPrefix}${chat}`
