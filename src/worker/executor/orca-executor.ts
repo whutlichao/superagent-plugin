@@ -253,10 +253,12 @@ function workerLaunchPrompt(
     readonly stateDir: string
   }
 ): LaunchPrompt {
+  const maxChars = options.prompts?.maxChars?.()
   return assembleLaunchPrompt({
     role: 'worker',
     revision: options.prompts?.revision() ?? 0,
     config: options.prompts?.config() ?? {},
+    ...(maxChars === undefined ? {} : { maxChars }),
     environment: {
       // 变量名就是这份 env.sh 实际写进去的那些（§E.11）：模型读到的清单不会与文件不符。
       variables: Object.keys(input.environment),

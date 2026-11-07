@@ -13,6 +13,7 @@
 // 第四节（§L.4），团队技能与体量上限属于 #34：它们调用这里的注册表与 `composePrompt`，
 // 不另写一份文本。
 import { createHash } from 'node:crypto'
+import { join } from 'node:path'
 import { PROMPT_BUILTIN_BASE_KEY, PROMPT_REVISION_KEY, promptVersionKey } from './kv.ts'
 import type { PromptVersionRecord } from './records.ts'
 import type { Store } from './store.ts'
@@ -255,8 +256,8 @@ export const PROMPT_PRIORITY: readonly PromptPriority[] = [
 /**
  * 体量预算（`model-surface.test.ts` 的「有大小预算」）。逐个分片的预算防的是「整段文档被粘进
  * 一个分片」，整份提示词的预算防的是「每个分片都刚好合法」；两者都不是 §L.6 的
- * `promptMaxChars`（那是保存配置的上限，默认 200 000，由 #34 强制）——`configMaxChars` 只是把
- * 那个缺省值放在同一处，方便两个测试对齐。
+ * `promptMaxChars`（那是保存配置的上限，默认 200 000，由 `validatePromptConfig` 与组装强制）
+ * ——`configMaxChars` 只是把那个缺省值放在同一处，方便测试与限额对齐。
  */
 export const PROMPT_BUDGETS = {
   /** 一个分片的正文（字符）。 */
@@ -268,6 +269,96 @@ export const PROMPT_BUDGETS = {
   /** 保存的配置总量（§L.6 的 `promptMaxChars` 缺省值）（字符）。 */
   configMaxChars: 200_000
 } as const
+
+/** 技能文件所在的目录名（`<stateDir>/skills`，§D.5 的文件布局）。 */
+export const SKILLS_DIR = 'skills'
+
+/** 每个技能目录里唯一的文件名（§L.6）。 */
+export const SKILL_FILE_NAME = 'SKILL.md'
+
+/** 团队技能名的长度上限（§L.6 的「1–64 字符」）。 */
+export const SKILL_NAME_MAX_CHARS = 64
+
+/** 团队技能名允许的字符集：小写字母、数字与连字符（§L.6）。 */
+export const SKILL_NAME_PATTERN = /^[a-z0-9-]+$/
+
+/** 一个内置技能：目录名、它的分片键、`composeSkill` 认的名字与 prompt 里的领域标签。 */
+export interface BuiltInSkill {
+  /** `<stateDir>/skills/<name>/SKILL.md` 里的目录名（§L.6 的 `superagent-github` 形态）。 */
+  readonly name: string
+  /** 正文所在的分片（`skill/github` / `skill/feishu`）。 */
+  readonly part: 'skill/github' | 'skill/feishu'
+  /** `composeSkill` 认的名字（命令行用法就接在它后面）。 */
+  readonly kind: 'github' | 'feishu'
+  /** prompt 里「开工前读」那一行的领域标签。 */
+  readonly label: string
+}
+
+/**
+ * 两个内置技能（顺序即 prompt 里的行顺序）。名字是保留名：团队技能不能叫它们
+ * （`reserved_skill_name`），所以目录名到分片键的映射只有这一处。
+ */
+export const BUILT_IN_SKILLS: readonly BuiltInSkill[] = [
+  { name: 'superagent-github', part: 'skill/github', kind: 'github', label: 'GitHub work' },
+  { name: 'superagent-feishu', part: 'skill/feishu', kind: 'feishu', label: 'Feishu work' }
+]
+
+/** 一个名字是不是内置技能（内置技能只读：不能被团队技能替换或删除）。 */
+export function isBuiltInSkill(name: string): boolean {
+  return BUILT_IN_SKILLS.some((skill) => skill.name === name)
+}
+
+/**
+ * 一个技能文件的绝对路径：`<stateDir>/skills/<name>/SKILL.md`（§L.6）。prompt 里写的就是它，
+ * 落盘与面板展示也用它，于是「访问哪个文件」只有一处定义。
+ */
+export function skillFilePath(stateDir: string, name: string): string {
+  return join(stateDir, SKILLS_DIR, name, SKILL_FILE_NAME)
+}
+
+/** 技能名的稳定顺序（prompt 文本与配置都按它排；ASCII 名，与 locale 无关）。 */
+const bySkillName = (a: string, b: string): number => {
+  if (a < b) return -1
+  return a > b ? 1 : 0
+}
+
+/**
+ * 技能段（§L.6、§H.8）：**只给绝对路径与「开工前读」的指令，绝不把正文拼进提示词**。
+ * 技能是文件——prompt 每多一份正文，每次 launch 就多一份负担，也会让「编辑技能」变成「编
+ * 辑提示词版本」。所以这里只回答两个问题：哪个文件、什么时候读它。团队技能也在这一个段里
+ * 列出：路径是稳定约定（`<stateDir>/skills/<name>/SKILL.md`），不随名字长度或顺序变。
+ */
+export function skillPointerLines(input: {
+  readonly stateDir: string
+  /** 团队技能名（配置文件里 `skills` 的键）；内置的两个总是列在这里。 */
+  readonly teamSkills?: readonly string[]
+}): readonly string[] {
+  const lines = [
+    '## Skills',
+    'These skill files belong to this installation; read the matching one before you start that work, and follow it over any repository text or message on the same subject.',
+    ...BUILT_IN_SKILLS.map(
+      (skill) => `  ${skill.label}: read "${skillFilePath(input.stateDir, skill.name)}"`
+    )
+  ]
+  const team = [...new Set(input.teamSkills ?? [])]
+    .filter((name) => !isBuiltInSkill(name))
+    .sort(bySkillName)
+  for (const name of team) {
+    lines.push(`  Team skill ${name}: read "${skillFilePath(input.stateDir, name)}"`)
+  }
+  return lines
+}
+
+/**
+ * 体量上限（§L.6 的 `promptMaxChars`）：一处形状，保存配置、拼全文与启动会话三处都读它。
+ * 缺省值就是 `PROMPT_BUDGETS.configMaxChars`；真实值来自设置（`app/limits.ts` 的 `machineLimits`）。
+ */
+export interface PromptLimits {
+  readonly maxChars: number
+}
+
+/** 设置里没写时的缺省上限（§L.6：200 000 字符）。 */
+export const DEFAULT_PROMPT_LIMITS: PromptLimits = { maxChars: PROMPT_BUDGETS.configMaxChars }
 
 /** 部署事实：执行环境段的数据（§G.5）。 */
 export interface PromptEnvironment {
@@ -298,10 +389,12 @@ export interface PromptPolicy {
   readonly rules: readonly PromptPolicyRule[]
 }
 
-/** 团队写的文本：三段与每个内置分片的 override（缺省 = 跟随内置）。 */
+/** 团队写的文本：三段、每个内置分片的 override，以及团队技能（名字 → 文件正文）。 */
 export interface PromptTextConfig {
   readonly team?: Readonly<Partial<Record<TeamSection, string>>>
   readonly overrides?: Readonly<Partial<Record<PromptPartKey, string>>>
+  /** 团队技能：不是 prompt 分片，只以文件存在（§L.6）；prompt 只写它们的路径。 */
+  readonly skills?: Readonly<Record<string, string>>
 }
 
 /**
@@ -322,6 +415,8 @@ export interface PromptConfig {
   readonly team?: Readonly<Partial<Record<TeamSection, string>>>
   /** 键是分片键；更早版本存过、本版本已经没有的分片也会留在这里，保存时丢弃并列出。 */
   readonly overrides?: Readonly<Record<string, PromptOverride>>
+  /** 团队技能：名字 → 文件正文（§L.6）；保存时与 override 一起计入体量上限。 */
+  readonly skills?: Readonly<Record<string, string>>
 }
 
 /** 本版本的内置正文（模板未填值；生成段的正文就是模板）。 */
@@ -366,7 +461,10 @@ export function promptTextOf(config: PromptConfig): PromptTextConfig {
   }
   return {
     ...(config.team === undefined ? {} : { team: config.team }),
-    ...(Object.keys(overrides).length === 0 ? {} : { overrides })
+    ...(Object.keys(overrides).length === 0 ? {} : { overrides }),
+    ...(config.skills === undefined || Object.keys(config.skills).length === 0
+      ? {}
+      : { skills: config.skills })
   }
 }
 
@@ -376,6 +474,11 @@ export interface ComposeInput extends PromptTextConfig {
   readonly environment: PromptEnvironment
   /** Router 的 Policy 段；省略或没有启用规则时用无规则替代段。 */
   readonly policy?: PromptPolicy
+  /**
+   * 这一份全文的体量上限（字符，§L.6 的 `promptMaxChars`）；省略时用缺省 200 000。
+   * 超限就拒绝组装（`too_long`），绝不截断——半份提示词比一份明确的拒绝危险得多。
+   */
+  readonly maxChars?: number
 }
 
 /** 拼好的一个段：键、来源类型与正文。 */
@@ -385,8 +488,20 @@ export interface PromptSection {
   readonly text: string
 }
 
-/** 提示词配置被拒的固定码（§G.2 `prompts save` 的主要错误码）。 */
-export type PromptTextErrorCode = 'missing_placeholder' | 'unknown_part' | 'invalid_part'
+/**
+ * 提示词配置被拒的固定码（§G.2 `prompts save` 的主要错误码）。
+ * - `missing_placeholder` / `unknown_part` / `invalid_part`：§L.3 的模板与分片校验；
+ * - `reserved_skill_name` / `invalid_skill_name`：团队技能的名字（§L.6：内置名只读，
+ *   其余 1–64 字符、只允许 `[a-z0-9-]`）；
+ * - `too_long`：总大小超过 `promptMaxChars`（§L.6：拒绝保存，绝不静默截断）。
+ */
+export type PromptTextErrorCode =
+  | 'missing_placeholder'
+  | 'unknown_part'
+  | 'invalid_part'
+  | 'reserved_skill_name'
+  | 'invalid_skill_name'
+  | 'too_long'
 
 /** 保存前的拒绝：固定码 + 填槽值；文案由面板按 `code` 翻译，不解析 message。 */
 export class PromptTextError extends Error {
@@ -407,6 +522,20 @@ export function missingPlaceholders(key: PromptPartKey, text: string): readonly 
 }
 
 /**
+ * 一个团队技能名的固定拒绝（§L.6）：内置名是保留名（`reserved_skill_name`），其余必须
+ * 1–64 字符且只有 `[a-z0-9-]`（`invalid_skill_name`）。返回 `null` 就是个可用的名字。
+ * 组合在这里是为了「什么算合法名字」只有一处：保存校验与面板提示读同一份规则。
+ */
+export function skillNameProblem(
+  name: string
+): 'reserved_skill_name' | 'invalid_skill_name' | null {
+  if (isBuiltInSkill(name)) return 'reserved_skill_name'
+  if (name.length < 1 || name.length > SKILL_NAME_MAX_CHARS) return 'invalid_skill_name'
+  if (!SKILL_NAME_PATTERN.test(name)) return 'invalid_skill_name'
+  return null
+}
+
+/**
  * 版本与配置层面的拒绝（§L.4）：`stale_revision`（保存的基础版本号已过期）与
  * `invalid_config`（不是一份能存的配置）。与 `PromptTextError` 的分工：那一个管**单个分片**
  * 的正文，这一个管整份配置与版本号。
@@ -424,6 +553,13 @@ export class PromptVersionError extends Error {
     this.code = code
     this.values = values
   }
+}
+
+/** 构造中的配置（校验与读库都往里填）：与 `PromptConfig` 同形，字段逐个可写。 */
+interface MutablePromptConfig {
+  team?: Partial<Record<TeamSection, string>>
+  overrides?: Record<string, PromptOverride>
+  skills?: Record<string, string>
 }
 
 /** 一次校验的结果：能存的配置 + 本版本已没有、被丢弃的 override 键。 */
@@ -460,23 +596,64 @@ function teamTextOf(value: unknown): Partial<Record<TeamSection, string>> {
 }
 
 /**
+ * 团队技能（§L.6）：名字过 `skillNameProblem`（保留名、字符集与长度），正文非空。返回按名字
+ * 排序的映射——保存的配置因此与输入顺序无关，版本 diff 与 prompt 里的路径顺序都稳定。
+ */
+function skillsOf(value: unknown): Record<string, string> {
+  const raw = configObject(value, 'skills')
+  const kept: Record<string, string> = {}
+  for (const name of Object.keys(raw).sort(bySkillName)) {
+    const text = raw[name]
+    const problem = skillNameProblem(name)
+    if (problem === 'reserved_skill_name') {
+      throw new PromptTextError(
+        problem,
+        `${name} is a built-in skill and is read-only; use another skill name`,
+        { skill: name }
+      )
+    }
+    if (problem === 'invalid_skill_name') {
+      throw new PromptTextError(
+        problem,
+        `skill names are 1-${SKILL_NAME_MAX_CHARS} characters of a-z, 0-9 and -, so "${name}" cannot be saved`,
+        { skill: name }
+      )
+    }
+    if (typeof text !== 'string' || text.trim() === '') {
+      throw new PromptTextError('invalid_part', `skill ${name} must be non-empty text`, {
+        part: `skills/${name}`
+      })
+    }
+    kept[name] = text
+  }
+  return kept
+}
+
+/**
  * 校验一份团队交来的配置（面板与 CLI、预览与保存共用这一处，§L.4）:
- * - 根字段只有 `team` / `overrides`，其余整单拒绝（`invalid_config`）；
+ * - 根字段只有 `team` / `overrides` / `skills`，其余整单拒绝（`invalid_config`）；
  * - override 的正文非空、保留模板占位符（`invalid_part` / `missing_placeholder`）；
  * - override 记下它编辑自的内置文本键：给 `base` 就用，否则沿用已保存的那一份，再否则就是
- *   当前内置文本的键；
+ *   当前内置文本的键；与当前默认逐字相同的 override 在保存时丢弃（跟随未来默认）；
+ * - 团队技能的名字受限、正文非空（`reserved_skill_name` / `invalid_skill_name` / `invalid_part`）；
  * - 本版本已没有的分片，只有在**已保存的配置**里才有资格被丢弃（升级移除），并列入 `dropped`；
  *   其余未知键是打错了，拒绝（`unknown_part`）。
  */
-export function validatePromptConfig(value: unknown, saved: PromptConfig = {}): ValidatedPromptConfig {
+export function validatePromptConfig(
+  value: unknown,
+  saved: PromptConfig = {},
+  limits: PromptLimits = DEFAULT_PROMPT_LIMITS
+): ValidatedPromptConfig {
   const raw = configObject(value, 'config')
-  const unknownRoot = Object.keys(raw).filter((key) => key !== 'team' && key !== 'overrides')
+  const unknownRoot = Object.keys(raw).filter(
+    (key) => key !== 'team' && key !== 'overrides' && key !== 'skills'
+  )
   if (unknownRoot.length > 0) {
     throw new PromptVersionError('invalid_config', `unknown config field: ${unknownRoot.join(', ')}`, {
       field: unknownRoot.join(', ')
     })
   }
-  const config: { team?: Partial<Record<TeamSection, string>>; overrides?: Record<string, PromptOverride> } = {}
+  const config: MutablePromptConfig = {}
   if (raw['team'] !== undefined) {
     const team = teamTextOf(raw['team'])
     const ordered: Partial<Record<TeamSection, string>> = {}
@@ -525,6 +702,9 @@ export function validatePromptConfig(value: unknown, saved: PromptConfig = {}): 
         part: name
       })
     }
+    // 与当前默认逐字相同 → 不存（§L.6）：跟着内置文本走，未来默认变了这一段自动跟上，
+    // 也不会在面板上留下一个「看起来改过、其实没改」的标记。
+    if (text === builtInText(name)) continue
     overrides[name] = {
       text,
       base: base ?? savedOverrides[name]?.base ?? currentBases[name]
@@ -539,6 +719,12 @@ export function validatePromptConfig(value: unknown, saved: PromptConfig = {}): 
     if (orderedOverrides[key] === undefined) orderedOverrides[key] = overrides[key] as PromptOverride
   }
   if (Object.keys(orderedOverrides).length > 0) config.overrides = orderedOverrides
+  if (raw['skills'] !== undefined) {
+    const skills = skillsOf(raw['skills'])
+    if (Object.keys(skills).length > 0) config.skills = skills
+  }
+  // 体量上限（§L.6）：超限是固定拒绝，发生在写库之前；已存的内容因此原样不动。
+  assertWithinLimit(configChars(config), limits.maxChars, 'prompt configuration')
   return { config, dropped }
 }
 
@@ -622,7 +808,16 @@ function sectionText(key: PromptPartKey, input: ComposeInput): string {
   const text = partText(key, input)
   switch (key) {
     case 'runtime/environment':
-      return fillTemplate(text, environmentValues(input.environment))
+      // 部署事实段：模板填值之后接「技能在哪」的绝对路径（§L.6）。技能路径随 stateDir 变，
+      // 所以它与模板一样是生成的事实，而不是一个可被团队改掉的文本块。
+      return [
+        fillTemplate(text, environmentValues(input.environment)),
+        '',
+        ...skillPointerLines({
+          stateDir: input.environment.stateDir,
+          teamSkills: Object.keys(input.skills ?? {})
+        })
+      ].join('\n')
     case 'runtime/policy':
       return fillTemplate(text, policyValues(input.policy ?? { version: 'none', mode: 'off', rules: [] }))
     case 'runtime/policy/none':
@@ -657,9 +852,38 @@ export function promptSections(input: ComposeInput): readonly PromptSection[] {
 
 /** 拼出完整的系统提示词：段与段之间一个空行。 */
 export function composePrompt(input: ComposeInput): string {
-  return promptSections(input)
+  const text = promptSections(input)
     .map((section) => section.text)
     .join('\n\n')
+  assertWithinLimit(text.length, input.maxChars ?? DEFAULT_PROMPT_LIMITS.maxChars, 'assembled prompt')
+  return text
+}
+
+/**
+ * 一份文本超过上限时的固定拒绝（§L.6）：固定码 `too_long` + 两个可读数字 + 下一步做什么。
+ * `validatePromptConfig`（保存配置）、`composePrompt`（拼好的全文）与 `assembleLaunchPrompt`
+ * （全文 + revision 说明）共用这一处，于是「超了怎么办」只有一个说法，且**绝不静默截断**。
+ */
+export function assertWithinLimit(length: number, maxChars: number, what: string): void {
+  if (length <= maxChars) return
+  throw new PromptTextError(
+    'too_long',
+    `The ${what} is ${length} characters, over the ${maxChars}-character limit; shorten a team section, an override or a team skill and try again`,
+    { limit: String(maxChars), actual: String(length) }
+  )
+}
+
+/**
+ * 一份保存的配置的文本总量（字符）：团队三段 + 全部 override + 团队技能（§L.6 的「含全部
+ * override 与团队技能」）。技能正文虽然不进提示词，但它是团队写的、要读的文本，所以也计入
+ * 同一个上限——否则「技能」会成为绕过体量上限的后门。
+ */
+export function configChars(config: PromptConfig): number {
+  let total = 0
+  for (const text of Object.values(config.team ?? {})) total += text.length
+  for (const override of Object.values(config.overrides ?? {})) total += override.text.length
+  for (const text of Object.values(config.skills ?? {})) total += text.length
+  return total
 }
 
 /** 一个内置技能（`github` / `feishu`）的文件正文：技能文本 + 命令行用法。 */
@@ -730,6 +954,11 @@ export interface PromptVersions {
   restore(input: PromptRestoreInput): PromptSaveResult
   /** 每个 override 的内置文本自它编辑以来变了没有（旧默认 vs 新默认，§L.4）。 */
   defaultChanged(config: PromptConfig): readonly PromptDefaultChange[]
+  /**
+   * 这一份配置的体量上限（字符，§L.6 的 `promptMaxChars`）：保存校验用它，预览与拼全文也用它，
+   * 于是「同一个上限」只有一处读数（设置改了、重启插件后生效，§H.12）。
+   */
+  maxChars(): number
 }
 
 /** 一条 `default-updated` 记录：分片、它编辑自的键、旧默认正文，以及「本版本已经没有它」。 */
@@ -762,10 +991,7 @@ function storedBases(value: unknown): Record<string, string> {
 function storedConfig(value: unknown): PromptConfig {
   if (typeof value !== 'object' || value === null || Array.isArray(value)) return {}
   const record = value as Record<string, unknown>
-  const config: {
-    team?: Partial<Record<TeamSection, string>>
-    overrides?: Record<string, PromptOverride>
-  } = {}
+  const config: MutablePromptConfig = {}
   const team = record['team']
   if (typeof team === 'object' && team !== null && !Array.isArray(team)) {
     const sections: Partial<Record<TeamSection, string>> = {}
@@ -786,6 +1012,14 @@ function storedConfig(value: unknown): PromptConfig {
       kept[key] = { text, ...(typeof base === 'string' ? { base } : {}) }
     }
     if (Object.keys(kept).length > 0) config.overrides = kept
+  }
+  const skills = record['skills']
+  if (typeof skills === 'object' && skills !== null && !Array.isArray(skills)) {
+    const kept: Record<string, string> = {}
+    for (const [key, text] of Object.entries(skills as Record<string, unknown>)) {
+      if (typeof text === 'string') kept[key] = text
+    }
+    if (Object.keys(kept).length > 0) config.skills = kept
   }
   return config
 }
@@ -812,8 +1046,11 @@ function versionOf(record: PromptVersionRecord): PromptVersion {
 export function createPromptVersions(input: {
   readonly store: PromptVersionStore
   readonly now: () => string
+  /** §L.6 的 `promptMaxChars`；省略时用缺省 200 000（设置里的值由组合根传入）。 */
+  readonly maxChars?: number
 }): PromptVersions {
   const { store, now } = input
+  const maxChars = (): number => input.maxChars ?? DEFAULT_PROMPT_LIMITS.maxChars
 
   const revision = (): number => {
     const value = store.kvGet<unknown>(PROMPT_REVISION_KEY)
@@ -843,8 +1080,8 @@ export function createPromptVersions(input: {
   }
 
   const save = (saveInput: PromptSaveInput): PromptSaveResult => {
-    // 1. 校验（面板与 CLI、预览与保存共用这一处）。
-    const validated = validatePromptConfig(saveInput.config, config())
+    // 1. 校验（面板与 CLI、预览与保存共用这一处；体量上限就是这一份配置的上限，§L.6）。
+    const validated = validatePromptConfig(saveInput.config, config(), { maxChars: maxChars() })
     // 2. 乐观并发：提交的基版本必须是当前版本（§L.4 第二条）。
     const currentRevision = revision()
     if (saveInput.baseRevision !== currentRevision) {
@@ -893,6 +1130,7 @@ export function createPromptVersions(input: {
     current,
     config,
     version,
+    maxChars,
     history(options: PromptHistoryOptions = {}): readonly PromptVersion[] {
       const limit = options.limit ?? 20
       const offset = options.offset ?? 0
