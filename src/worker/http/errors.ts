@@ -87,6 +87,11 @@ export const ERROR_CODES = {
   setupFailed: 'setup_failed',
   /** 并发冲突（同名资源已存在等）。 */
   conflict: 'conflict',
+  /**
+   * `report --pr-number` 的固定拒绝（§G.2 的 `report` 行）：这条 PR 不属于本 Ticket（不是它的
+   * 来源 PR，也不是 agent 从它的分支开的），或已经属于另一个活 Ticket。
+   */
+  prMismatch: 'pr_mismatch',
   /** body 超过 1 MiB（§G.3 第 6 条）。 */
   tooLarge: 'too_large',
   /** 超出 60/min + burst 20（§G.3 第 7 条）。 */
@@ -156,6 +161,8 @@ export function statusForErrorCode(code: string): number {
     case ERROR_CODES.alreadyHandedBack:
     case ERROR_CODES.alreadyEnded:
     case ERROR_CODES.notRetryable:
+    // `report --pr-number` 的 `pr_mismatch`：PR 不属于本 Ticket（§I.2 的「PR 规则」行）。
+    case ERROR_CODES.prMismatch:
     // 本票接线的命令级固定拒绝（§G.2 的 trigger requeue / thread * / policy sync / settings save）。
     case ERROR_CODES.notRequeueable:
     case ERROR_CODES.ownThread:

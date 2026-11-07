@@ -12,7 +12,7 @@
 import { liveTicket } from '../../core/index.ts'
 import type { HealthEntry, Thread, Ticket, Trigger } from '../../core/index.ts'
 import type { SourceContext } from '../kind.ts'
-import type { GithubChecks, GithubNotification, GithubRead } from './api.ts'
+import type { GithubChecks, GithubNotification, GithubPull, GithubRead } from './api.ts'
 import { issueNumberOf, rateLimited, type GithubApi } from './api.ts'
 import type { GithubBodySource } from './translate.ts'
 import {
@@ -90,6 +90,11 @@ export interface GithubPollerOptions {
    * `app/kv.ts`，由组合根注入。缺省时不轮询 CI（与 `bodyKey` 同一条约定）。
    */
   readonly ciKey?: (pull: number, headSha: string) => string
+  /**
+   * 读到一条 PR 时先对账（§I.2「PR 规则」行的 `observePull`）：绑给分支唯一匹配的活 Ticket、
+   * 把已合并/已关闭的交给 `threadClosed`。缺省只读不对账（纯读取的测试与没有 PR 规则的接线）。
+   */
+  readonly observePull?: (pull: GithubPull) => void
   /** 时钟（毫秒，水位线判定用）；缺省 `Date.now`。 */
   readonly now?: () => number
   readonly log?: (message: string) => void
@@ -305,6 +310,9 @@ export function createGithubPoller(options: GithubPollerOptions): GithubPoller {
       url = found?.url ?? url
       if (found) {
         body = found
+        // 先对账（§I.2「PR 规则」行）：开着的 PR 绑给分支唯一匹配的活 Ticket，已合并/已关闭的
+        // 交给 `threadClosed`——结束的判定仍在领域里（§I.5）。
+        options.observePull?.(found)
         // CI 读 head 提交的检查与状态；已关闭/已合并的 PR 不再读（§I.5、§I.2 CI 行）。
         pull = {
           number: issue,

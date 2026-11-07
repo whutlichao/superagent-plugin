@@ -32,6 +32,18 @@ export type {
   GithubReview
 } from './api.ts'
 export { githubConfigSchema, githubSetupProblem, type GithubConfig } from './config.ts'
+// PR 规则与结束通知（§I.2「PR 规则」「结束通知」两行、§I.5）：组合根接「读一条 PR 再绑」与
+// 「轮询对账」，规则本身在 `pull.ts` 里。
+export {
+  agentPull,
+  claimPull,
+  claimReportedPull,
+  observePull,
+  pullEndNotices,
+  pullThread,
+  ticketBranch
+} from './pull.ts'
+export type { GithubPullHost } from './pull.ts'
 export {
   bodyFingerprint,
   ciFingerprint,
