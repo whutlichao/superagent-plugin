@@ -623,3 +623,164 @@ test('gives a human wake the human slot when the normal slots are full, and keep
     await h.cleanup()
   }
 })
+
+// ---- 停止 / 重试（§E.5、§G.2、§O）：命令行与面板走同一份 handler -----------------------
+
+/** 最近一条发往 Issue 会话的正文（Channel 的 `gh api … -f body=…`）。 */
+function lastWrittenBody(commands: FakeCommands): string {
+  const call = commands.calls.filter((item) => item.args[2] === '-f').at(-1)
+  assert.ok(call, 'a message was written to the thread')
+  return call.args[3] ?? ''
+}
+
+test('stops a ticket: withdraws the mandate, writes the closing notice, closes the terminal and keeps the worktree', async () => {
+  const h = await openFollowup()
+  try {
+    await settle(h)
+    const [ticket] = h.handle.snapshot().tickets ?? []
+    assert.ok(ticket)
+    const token = readApiToken(h.stateDir)
+    const view = await ticketOf(h, ticket.id, token)
+    const assignment = view['assignment'] as { readonly id: string; readonly terminalId?: string }
+    const worktree = view['worktree'] as { readonly name: string; readonly directory: string }
+    assert.ok(assignment.terminalId !== undefined, 'the worker runs in a terminal')
+    assert.ok(worktree.directory.length > 0, 'the assignment recorded its worktree')
+
+    // 破坏性动作要显式确认（§O）：没有 `--yes` 的停止是固定拒绝，什么都不改。
+    const unconfirmed = await cli(h.stateDir, portOf(h), ['ticket', 'stop', ticket.id], token)
+    assert.equal(unconfirmed.exit, 2)
+    assert.equal((unconfirmed.envelope as { error?: { code?: string } }).error?.code, 'refused')
+    assert.deepEqual(h.runtime.calls.closeTerminal, [])
+    assert.equal((await ticketOf(h, ticket.id, token))['ended'], undefined)
+
+    const writesBefore = writes(h.commands)
+    const launchesBefore = h.runtime.calls.launchAgent.length
+    const stopped = await cli(
+      h.stateDir,
+      portOf(h),
+      ['ticket', 'stop', ticket.id, '--yes', '--reason=Not needed any more.'],
+      token
+    )
+    assert.equal(stopped.exit, 0, JSON.stringify(stopped.envelope))
+    assert.equal(resultOf(stopped.envelope)['stopped'], true)
+    await h.handle.passOnce()
+
+    // 撤回 Mandate：Ticket 结束在人手里，Assignment 以 `stopped` 结束，终端关闭、目录保留。
+    const ended = await ticketOf(h, ticket.id, token)
+    const ending = ended['ended'] as { readonly by: string; readonly outcome: string; readonly reason?: string }
+    assert.equal(ending.by, 'human')
+    assert.equal(ending.outcome, 'stopped')
+    assert.equal(ending.reason, 'Not needed any more.')
+    assert.equal((ended['assignment'] as { state: string }).state, 'ended')
+    assert.deepEqual(h.runtime.calls.closeTerminal, [assignment.terminalId], 'the terminal is closed')
+    assert.deepEqual(ended['worktree'], worktree, 'the worktree is kept')
+    assert.equal(existsSync(worktree.directory), true, 'the directory is still on disk')
+
+    // 收尾消息：恰好一条，回到这张 Ticket 的会话。
+    assert.equal(writes(h.commands), writesBefore + 1, 'exactly one closing message')
+    const closing = lastWrittenBody(h.commands)
+    assert.equal(closing.includes('Stopped by a person'), true, closing)
+    assert.equal(closing.includes(ticket.id), true, closing)
+
+    // 此后不接任何 Input：人又在 Thread 上说话，Ticket 保持结束、不新起 worker、消息回到 Eval。
+    h.comments.push(FOLLOWUP)
+    const round = await h.handle.pollOnce()
+    assert.equal(round.triggers, 1)
+    assert.equal(
+      h.handle.routerStatus().undecidedCandidates,
+      1,
+      'no ticket owns it, so it queues for the Router'
+    )
+    await h.handle.passOnce()
+    await h.handle.passOnce()
+    const after = await ticketOf(h, ticket.id, token)
+    assert.equal((after['ended'] as { outcome: string }).outcome, 'stopped')
+    assert.equal(h.runtime.calls.launchAgent.length, launchesBefore, 'no new worker was launched')
+    assert.deepEqual(inboxFiles(h.stateDir, ticket.id), ['0.md'], 'nothing was delivered')
+
+    // 固定的拒绝码：已经结束是 `already_ended`，未知是 `missing`；重试也救不回一张停掉的 Ticket。
+    const again = await cli(h.stateDir, portOf(h), ['ticket', 'stop', ticket.id, '--yes'], token)
+    assert.equal(again.exit, 2)
+    assert.equal((again.envelope as { error?: { code?: string } }).error?.code, 'already_ended')
+    const missing = await cli(h.stateDir, portOf(h), ['ticket', 'stop', 'nope', '--yes'], token)
+    assert.equal(missing.exit, 2)
+    assert.equal((missing.envelope as { error?: { code?: string } }).error?.code, 'missing')
+    const revived = await cli(h.stateDir, portOf(h), ['ticket', 'retry', ticket.id], token)
+    assert.equal(revived.exit, 2)
+    assert.equal((revived.envelope as { error?: { code?: string } }).error?.code, 'not_retryable')
+  } finally {
+    await h.cleanup()
+  }
+})
+
+test('retries a failed ticket on the same worktree with the recovery note, and refuses one that cannot be retried', async () => {
+  const h = await openFollowup()
+  try {
+    await settle(h)
+    const [ticket] = h.handle.snapshot().tickets ?? []
+    assert.ok(ticket)
+    const token = readApiToken(h.stateDir)
+    const before = await ticketOf(h, ticket.id, token)
+    const first = before['assignment'] as { readonly id: string; readonly terminalId?: string }
+    const worktree = before['worktree'] as { readonly name: string; readonly directory: string }
+    const worker = assignmentToken(h.stateDir, first.id)
+    const launchesBefore = h.runtime.calls.launchAgent.length
+    const workspacesBefore = h.runtime.calls.ensureWorkspace.length
+
+    // 还在跑的 Ticket 没有卡住的状态：固定 `not_retryable`，什么都不改。
+    const early = await cli(h.stateDir, portOf(h), ['ticket', 'retry', ticket.id], token)
+    assert.equal(early.exit, 2)
+    assert.equal((early.envelope as { error?: { code?: string } }).error?.code, 'not_retryable')
+    assert.deepEqual(h.runtime.calls.closeTerminal, [])
+    assert.equal(h.runtime.calls.launchAgent.length, launchesBefore)
+
+    // worker 报 failed：这张 Ticket 变成可重试。
+    const reported = await cli(
+      h.stateDir,
+      portOf(h),
+      ['report', '--state', 'failed', '--summary=The build is broken.'],
+      worker
+    )
+    assert.equal(reported.exit, 0)
+
+    const retried = await cli(h.stateDir, portOf(h), ['ticket', 'retry', ticket.id], token)
+    assert.equal(retried.exit, 0, JSON.stringify(retried.envelope))
+    const result = resultOf(retried.envelope)
+    assert.equal(result['retried'], true)
+    const next = result['assignment'] as { readonly id: string; readonly state: string }
+    assert.notEqual(next.id, first.id, 'a new assignment, not the replaced one')
+    await h.handle.passOnce()
+    await h.handle.passOnce()
+
+    // 同一个 worktree、同一条分支、同一张 Ticket：不产生第二个 Ticket，也不重新建目录。
+    const after = await ticketOf(h, ticket.id, token)
+    assert.deepEqual(after['worktree'], worktree, 'the same worktree and branch')
+    assert.equal(h.runtime.calls.ensureWorkspace.length, workspacesBefore, 'the worktree is reused')
+    assert.deepEqual(h.handle.snapshot().tickets?.map((item) => item.id), [ticket.id], 'one ticket')
+    assert.deepEqual(h.runtime.calls.closeTerminal, [first.terminalId], 'the replaced terminal is closed')
+    assert.equal(h.runtime.calls.launchAgent.length, launchesBefore + 1, 'one new worker')
+    const running = after['assignment'] as { readonly id: string; readonly state: string; readonly terminalId?: string }
+    assert.equal(running.id, next.id)
+    assert.equal(running.state, 'running')
+    assert.notEqual(running.terminalId, first.terminalId, 'the new assignment got a new terminal')
+    // 恢复说明随第一条投递交给新 worker：先看目录、git 历史与 GitHub，别重复已做的外部动作。
+    const note = readFileSync(join(h.stateDir, 'inbox', ticket.id, '1.md'), 'utf8')
+    assert.equal(note.includes('git history and GitHub'), true, note)
+    assert.equal(
+      h.runtime.calls.sent.some(
+        (call) => call.terminalId === running.terminalId && call.text.includes('git history and GitHub')
+      ),
+      true,
+      'the new worker is told to check the worktree, git history and GitHub'
+    )
+    // 授权面一字不改：重试在同一份 Mandate 下继续。
+    assert.deepEqual([after['strength'], after['actor']], [before['strength'], before['actor']])
+
+    // 未知 Ticket 是 `missing`，不是 `not_retryable`。
+    const missing = await cli(h.stateDir, portOf(h), ['ticket', 'retry', 'nope'], token)
+    assert.equal(missing.exit, 2)
+    assert.equal((missing.envelope as { error?: { code?: string } }).error?.code, 'missing')
+  } finally {
+    await h.cleanup()
+  }
+})

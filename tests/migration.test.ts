@@ -531,7 +531,12 @@ test('a plugin-version upgrade treats running assignments as interrupted and han
         deliver: () => undefined,
         stop: () => undefined
       },
-      outbox: { send: () => undefined, status: () => undefined, withdraw: () => undefined },
+      outbox: {
+      send: () => undefined,
+      status: () => undefined,
+      withdraw: () => undefined,
+      withdrawTicket: () => undefined
+    },
       now: () => AT
     })
     const ticket: Ticket = {

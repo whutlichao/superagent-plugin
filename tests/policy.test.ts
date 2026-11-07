@@ -805,7 +805,8 @@ function engineHarness(initial: FixtureInput = {}) {
     outbox: {
       send: () => undefined,
       status: () => undefined,
-      withdraw: () => undefined
+      withdraw: () => undefined,
+      withdrawTicket: () => undefined
     },
     now: () => AT
   })
@@ -1320,7 +1321,13 @@ function policySaveHarness(initial: FixtureInput = {}) {
       deliver: (ticket: Ticket) => void delivered.push(ticket.id),
       stop: (_ticket, _assignment, reason) => void stopped.push(reason)
     },
-    outbox: { send: () => undefined, status: () => undefined, withdraw: () => undefined },
+    outbox: {
+      send: () => undefined,
+      status: () => undefined,
+      withdraw: () => undefined,
+      withdrawTicket: () => undefined
+    },
+    // 虚拟时钟：超时与暂停顺延断言的是具体时刻（缺省就是夹具的 AT，不 sleep）。
     now: () => clock
   })
 

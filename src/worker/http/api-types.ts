@@ -9,6 +9,7 @@
 // 所有时间字段是 ISO-8601 文本（与库一致，§D.2 要点 1）。
 import type { HealthEntry, LoadView, SetupProblem, StateView } from './state.ts'
 import type { SetupIssue } from '../app/setup-types.ts'
+import type { PromptConfig } from '../app/prompts.ts'
 export type {
   DoctorCheck,
   DoctorCheckName,
@@ -62,6 +63,95 @@ export interface RotateTokenResult {
   readonly tokenFile: string
   /** 旧 token 立刻失效（主 token 由文件持有，重写文件即轮换）。 */
   readonly rotated: true
+}
+
+// ---------------------------------------------------------------- prompts（§L.4、§L.5）
+
+/**
+ * 一份保存下来的提示词配置的读/写形状（= `app/prompts.ts` 的 `PromptConfig`）：
+ * 团队三段按字段给，override 按分片键给，每个 override 记着它编辑自的内置文本键 `base`。
+ */
+export type PromptConfigView = PromptConfig
+
+/** 一个内置分片的读面：正文、读它的角色、必保留占位符，以及它当前正文的键。 */
+export interface PromptPartView {
+  readonly key: string
+  readonly roles: readonly string[]
+  readonly text: string
+  readonly placeholders: readonly string[]
+  /** 当前内置正文的键：override 的 `base` 等于它，表示已按当前默认审过（面板的 re-base）。 */
+  readonly base: string
+}
+
+/** 一条 `default-updated`：旧默认与新默认都在这里，面板不需要自己拼。 */
+export interface PromptDefaultChangeView {
+  readonly part: string
+  /** override 编辑自的内置文本键；没有记录时 `null`。 */
+  readonly base: string | null
+  /** 旧默认正文（本安装留下了它时）。 */
+  readonly previous: string | null
+  /** 新默认正文；本版本已没有这个分片时 `null`。 */
+  readonly next: string | null
+  /** 本版本已经没有这个分片：保存时丢弃并列出。 */
+  readonly removed: boolean
+}
+
+/** 版本历史的一条（§L.4 的 `{revision, predecessor, at, origin}`）。 */
+export interface PromptVersionSummary {
+  readonly revision: number
+  readonly predecessor: number | null
+  readonly at: string
+  readonly origin: 'panel' | 'tool'
+}
+
+/** `GET prompts` 的读数（`prompts get` 与面板 Prompts 页共用）。 */
+export interface PromptConfigResult {
+  /** 读到的配置的版本号；`--defaults` 与还没存过时是 0（= 内置默认）。 */
+  readonly revision: number
+  /** 这个版本保存的时刻与来源；版本 0 时 `null`。 */
+  readonly saved: PromptVersionSummary | null
+  readonly config: PromptConfigView
+  /** 团队三段的名字（面板按它分组；正文在 `parts` 里）。 */
+  readonly sections: readonly string[]
+  /** 每个内置分片**当前**的正文（含团队三段的默认）与它正文的键。 */
+  readonly parts: readonly PromptPartView[]
+  /** 内置文本自编辑以来变过的分片键（等价上游 `default_changed`）。 */
+  readonly default_changed: readonly string[]
+  /** 本版本已没有、保存时会丢弃的分片键。 */
+  readonly removed_parts: readonly string[]
+  /** `default_changed` 的详情：旧默认 vs 新默认。 */
+  readonly changes: readonly PromptDefaultChangeView[]
+  /** 版本历史，新→旧。 */
+  readonly history: readonly PromptVersionSummary[]
+  readonly next_offset: number | null
+}
+
+/** 一个角色的拼装结果（`prompts get --text` 与预览共用）。 */
+export interface PromptTexts {
+  readonly orchestrator: string
+  readonly worker: string
+}
+
+/** `prompts get --text` 的读数。 */
+export interface PromptTextResult {
+  readonly revision: number
+  readonly texts: PromptTexts
+}
+
+/** `prompts save --preview`（`POST prompts/preview`）的读数：不写库。 */
+export interface PromptPreviewResult extends PromptTextResult {
+  /** 保存时会被丢弃的分片键（本版本已没有的 override）。 */
+  readonly dropped: readonly string[]
+  /** 校验后的配置（与保存会存下去的形状相同）。 */
+  readonly config: PromptConfigView
+}
+
+/** 一次保存的读数（`prompts save`、`PUT prompts`）。 */
+export interface PromptSaveView extends PromptVersionSummary {
+  /** 内容与当前版本相同 → 没有写新版本。 */
+  readonly changed: boolean
+  /** 保存时被丢弃的 override 键（本版本已没有的分片）。 */
+  readonly dropped: readonly string[]
 }
 
 /** `read <resource>` 的分页默认与上限（§G.2 的 read 行：默认 20、上限 50）。 */

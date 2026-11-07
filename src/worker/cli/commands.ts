@@ -263,19 +263,23 @@ export const CLI_COMMANDS: readonly CommandDefinition[] = [
   // ---- Ticket / Trigger / Thread（#28/#29/#27）
   {
     name: ['ticket', 'retry'],
-    summary: 'retry a failed or blocked ticket',
+    summary: 'retry a ticket whose worker reported failed or blocked, on the same worktree',
     flags: [REQUEST_ID_FLAG],
     positionals: [{ name: 'ticket_id', required: true }],
     write: true,
-    available: false
+    available: true
   },
   {
     name: ['ticket', 'stop'],
-    summary: 'stop a ticket (a person can still resume it)',
-    flags: [{ name: 'reason', kind: 'value', hint: 'one sentence for the record' }, REQUEST_ID_FLAG],
+    summary: 'stop a ticket for good (destructive; needs --yes): a person can never resume it',
+    flags: [
+      { name: 'reason', kind: 'value', hint: 'one sentence for the record' },
+      { name: 'yes', kind: 'switch', hint: 'confirm that this ticket stays ended' },
+      REQUEST_ID_FLAG
+    ],
     positionals: [{ name: 'ticket_id', required: true }],
     write: true,
-    available: false
+    available: true
   },
   {
     name: ['ticket', 'note'],
@@ -435,7 +439,7 @@ export const CLI_COMMANDS: readonly CommandDefinition[] = [
     ],
     positionals: [],
     write: false,
-    available: false
+    available: true
   },
   {
     name: ['prompts', 'save'],
@@ -448,7 +452,7 @@ export const CLI_COMMANDS: readonly CommandDefinition[] = [
     ],
     positionals: [],
     write: true,
-    available: false
+    available: true
   }
 ]
 
@@ -806,6 +810,19 @@ async function run(
         method: 'POST',
         body: { text: valueArgs(args.flags, 'text') ?? '' }
       })
+    case 'ticket stop': {
+      // `--yes` 就是 body 里的 `confirm`：同一个含义只有一个名字（与 `admin rotate-token` 同）。
+      const reason = valueArgs(args.flags, 'reason')
+      return call(`tickets/${encodePathSegment(args.positionals[0] ?? '')}/stop`, {
+        method: 'POST',
+        body: { confirm: switched(args, 'yes'), ...(reason === undefined ? {} : { reason }) }
+      })
+    }
+    case 'ticket retry':
+      return call(`tickets/${encodePathSegment(args.positionals[0] ?? '')}/retry`, {
+        method: 'POST',
+        body: {}
+      })
     case 'ticket request-status':
       return call(`tickets/${encodePathSegment(args.positionals[0] ?? '')}/request-status`, {
         method: 'POST',
@@ -835,6 +852,46 @@ async function run(
         method: 'GET',
         query: readQuery(resource, args)
       })
+    }
+    // ---- prompts（§L.4、§L.5）：读配置/默认/全文，保存（存的是 `origin: 'tool'` 的新版本）与预览。
+    case 'prompts get': {
+      const query: Record<string, string> = {}
+      const revision = valueArgs(args.flags, 'revision')
+      if (revision !== undefined) {
+        if (!Number.isInteger(Number(revision)) || Number(revision) < 0) {
+          throw new ApiError(ERROR_CODES.invalidValue, '--revision must be a non-negative integer', {
+            flag: 'revision'
+          })
+        }
+        query['revision'] = revision
+      }
+      if (switched(args, 'defaults')) query['defaults'] = 'true'
+      if (switched(args, 'text')) query['text'] = 'true'
+      return call('prompts', { method: 'GET', query })
+    }
+    case 'prompts save': {
+      const preview = switched(args, 'preview')
+      const config = await jsonFlag(args, input, 'config')
+      if (config === undefined) {
+        throw new ApiError(ERROR_CODES.invalidParams, 'prompts save needs --config', { flag: 'config' })
+      }
+      // 预览不写库，也就不需要基础版本号；保存必须带上它（§L.4 第二条）。
+      if (preview) {
+        return call('prompts/preview', { method: 'POST', body: { config } })
+      }
+      const base = valueArgs(args.flags, 'base-revision')
+      if (base === undefined) {
+        throw new ApiError(ERROR_CODES.invalidParams, 'prompts save needs --base-revision', {
+          flag: 'base-revision'
+        })
+      }
+      const baseRevision = Number(base)
+      if (!Number.isInteger(baseRevision) || baseRevision < 0) {
+        throw new ApiError(ERROR_CODES.invalidValue, '--base-revision must be a non-negative integer', {
+          flag: 'base-revision'
+        })
+      }
+      return call('prompts', { method: 'PUT', body: { config, baseRevision, origin: 'tool' } })
     }
     case 'route':
       return call('route', { method: 'POST', body: { decisions: await routeDecisions(args, input) } })

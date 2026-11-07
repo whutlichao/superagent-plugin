@@ -19,7 +19,14 @@ import { acquireLock } from './infra/lock.ts'
 import { createLogger, type Logger } from './infra/log.ts'
 import { HealthBoard, claimModelsEntry } from './infra/health.ts'
 import { defaultStateDir, resolveStateDir, writeStateDirPointer } from './infra/paths.ts'
-import { ensureApiToken, issueAssignmentToken, issueRouterToken } from './infra/tokens.ts'
+import {
+  API_TOKEN_FILE,
+  ROUTER_TOKEN_FILE,
+  TOKENS_DIR,
+  ensureApiToken,
+  issueAssignmentToken,
+  issueRouterToken
+} from './infra/tokens.ts'
 import { createRepositories } from './app/repositories.ts'
 import {
   createPolicy,
@@ -80,11 +87,16 @@ import {
 import type { Deployment } from './sources/kind.ts'
 import { OrcaExecutor, registerExecutorEffects, registerExecutorLifecycle, resolveExecutorSettings } from './executor/orca-executor.ts'
 import { launchCapacity } from './executor/slots.ts'
+import { retryTicket } from './executor/retry.ts'
 import { resumeAfterUpgrade, type ResumeReport } from './executor/resume.ts'
 import { DEFAULT_MAX_WORKERS } from './http/state.ts'
 import { createDomainHandlers, withDomainHandlers } from './http/domain.ts'
 import { createAssessmentHandlers, withAssessmentHandlers } from './http/assessment.ts'
 import { createDecisionHandlers, withDecisionHandlers } from './http/decisions.ts'
+import { createPromptHandlers, withPromptHandlers } from './http/prompts.ts'
+import { createPromptVersions } from './app/prompts.ts'
+import { ENVIRONMENT_VARIABLES } from './executor/environment.ts'
+import type { RouteCaller } from './http/routes.ts'
 import { ROUTE_TABLE, type RouteDefinition } from './http/routes.ts'
 import type { LoopEntry } from './http/state.ts'
 import { startHttpServer, type HttpServerHandle } from './http/server.ts'
@@ -400,7 +412,9 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
     paused: () => paused.paused(),
     // §E.6：`launch` 的取行上限 = 普通槽空位 + 「有人的唤醒在等」时那一个人人类槽。
     // 人/自动的精确判定仍在执行器里（拿不到槽抛 `Later`，不算失败）。
-    slots: () => launchCapacity(repo.tickets.list(), executorSettings.maxWorkers)
+    slots: () => launchCapacity(repo.tickets.list(), executorSettings.maxWorkers),
+    // §J.3：单条 dropped 不算错误、只计数；撤回是人的动作，不计入 drop 计数。
+    dropped: (kind) => (kind === 'reply' ? store.outbox.countDropped() : 0)
   })
   const outbox = createOutbox({ store, effects, now })
   // ---- Policy（§K.1、§K.2）：块从宿主设置里解析；Source 的 Policy 部分与准入行由 kind 认领。
@@ -559,6 +573,9 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
     effects,
     outbox,
     channel: {
+      // Source 关闭（或未安装）时等待（§J.1 暂停行）；不再监听该地址时 drop（§J.1 原因 a）。
+      enabled: (source) => registry.instance(source)?.enabled ?? false,
+      allowed: (message) => registry.channelAllowed(message.channel),
       send: (message) => registry.send(message, (options.commands ?? new Commands()).withSignal())
     },
     now,
@@ -631,6 +648,10 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
     note: (ticketId, text) => engine.note(ticketId, text),
     requestStatus: (ticketId) => engine.requestStatus(ticketId),
     handback: (ticketId, triggerId, reason) => engine.handback(ticketId, triggerId, reason),
+    // 停止与重试是三条改变 Mandate 的操作里的两条（§E.5、§K.3）。重试的恢复说明由执行器
+    // 拼一次（`executor/retry.ts`），这里只把 Ticket 交给它——避免第二个说法。
+    stop: (ticketId, reason) => engine.stopTicket(ticketId, reason),
+    retry: (ticketId) => retryTicket(engine, ticketId),
     ticketOf: (id) => repo.tickets.get(id),
     tickets: () => repo.tickets.list(),
     // 读模型里的「已投递到该 Ticket」：归属判定与扇出/交回同一份记录（`followupOwners`）。
@@ -653,15 +674,49 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
     ticketOf: (id) => repo.tickets.get(id),
     log: (message) => logger.warn(message)
   })
-  const routes: readonly RouteDefinition[] = withDecisionHandlers(
-    withAssessmentHandlers(
-      withDomainHandlers(ROUTE_TABLE, domain),
-      createAssessmentHandlers({
-        tools: routerTools,
-        afterWrite: () => {
-          refresh()
+  // Prompt 配置的读/写面（§L.4、§L.5）：版本库、部署事实与「保存后通知 Router」都在这里接线。
+  // 部署事实给的是**路径**（CLI 的绝对路径、调用者自己的 token 文件），绝不写 token 值（§D.6）；
+  // 保存产生新版本时，Router 保活器把 revision 换成一条短消息排队——不重启会话（§F.4）。
+  const promptVersions = createPromptVersions({ store, now })
+  const prompts = createPromptHandlers({
+    versions: promptVersions,
+    deployment: {
+      environment: ({ caller }) => ({
+        variables: [...ENVIRONMENT_VARIABLES],
+        cliPath: options.cliPath ?? defaultCliPath(),
+        tokenFile: callerTokenFile(caller, resolved),
+        stateDir: resolved,
+        repository: deploymentFacts.repository
+      }),
+      // Policy 段跟着**生效**的块走（保存过的设置优先，§K.5），与 Gate、复验同一个真相源。
+      policy: () => {
+        const block = effectivePolicy()
+        return {
+          version: policy.version,
+          mode: block.acceptMode,
+          rules: block.rules
+            .filter((rule) => rule.enabled)
+            .map((rule) => ({ id: rule.id, name: rule.name, instruction: rule.instruction.en }))
         }
-      })
+      }
+    },
+    onSaved: (revision) => routerSupervision.notifyPromptRevision(revision),
+    afterWrite: () => {
+      refresh()
+    }
+  })
+  const routes: readonly RouteDefinition[] = withDecisionHandlers(
+    withPromptHandlers(
+      withAssessmentHandlers(
+        withDomainHandlers(ROUTE_TABLE, domain),
+        createAssessmentHandlers({
+          tools: routerTools,
+          afterWrite: () => {
+            refresh()
+          }
+        })
+      ),
+      prompts
     ),
     createDecisionHandlers({
       // 面板的 dismiss（§K.7）：领域只接受 unavailable 的 Decision，其余给固定拒绝。
@@ -1038,6 +1093,18 @@ function routerStateStore(store: Store): RouterStateStore {
     restarts: () => store.kvGet<RouterRestartState>(ROUTER_RESTARTS_KEY),
     saveRestarts: (value) => store.kvSet(ROUTER_RESTARTS_KEY, value)
   }
+}
+
+/**
+ * 调用者的 token **文件**路径（写进 prompt 的部署环境段，§G.5）：operator 用主 token 文件，
+ * router 用 `tokens/router`，assignment 用 `tokens/<assignmentId>`。只写路径，不写值（§D.6）。
+ */
+function callerTokenFile(caller: RouteCaller, stateDir: string): string {
+  if (caller.role === 'router') return join(stateDir, TOKENS_DIR, ROUTER_TOKEN_FILE)
+  if (caller.role === 'assignment' && caller.assignmentId !== undefined) {
+    return join(stateDir, TOKENS_DIR, caller.assignmentId)
+  }
+  return join(stateDir, API_TOKEN_FILE)
 }
 
 /** `policy.acceptMode` 的三档；缺省 observe（§K.4、规格 000 的缺省）。 */
