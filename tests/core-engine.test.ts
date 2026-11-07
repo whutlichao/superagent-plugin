@@ -991,6 +991,120 @@ describe('resume and stop', () => {
     )
   })
 
+  test('withdraws the mandate on a person\'s stop and ends the running assignment, keeping the worktree', () => {
+    const h = harness()
+    const ticketId = accepted(h).ticketId!
+    const assignment = h.opened.tickets.get(ticketId)!.assignments[0]!
+    h.engine.assignmentStarted(ticketId, assignment.id, {
+      terminalId: 'term_1',
+      workspace: { short: 'fix-the-typo', directory: '/w/superagent-fix-the-typo', assignment: 'the brief' }
+    })
+    const execution = h.opened.tickets.get(ticketId)!.execution
+    assert.ok(execution, 'the launch recorded the worktree')
+
+    h.engine.stopTicket(ticketId, 'Not needed any more')
+
+    // 撤回 Mandate 是 stop 自己的事实：Policy 仍立得住（`revalidate` 只答「今天的 Policy 还
+    // 认不认这份授权」），但人的停止让这张 Ticket 再也不接东西（§K.3 末段）。
+    const stopped = h.opened.tickets.get(ticketId)!
+    assert.equal(stopped.ended?.by, 'human')
+    assert.equal(stopped.ended?.outcome, 'stopped')
+    assert.equal(stopped.mandate.policyVersion, 'v1', 'the mandate itself is immutable')
+    assert.deepEqual(
+      stopped.assignments.map((item) => [item.state, item.endedReason]),
+      [['ended', 'stopped']],
+      'the running assignment ends as stopped'
+    )
+    assert.deepEqual(h.stopped, [assignment.id], 'the executor is told to close its terminal')
+    assert.deepEqual(stopped.execution, execution, 'the worktree is kept, never removed')
+    assert.equal(
+      h.messages.some((message) => message.id === key('stopped', ticketId)),
+      true,
+      'the closing message is queued with the ending'
+    )
+
+    // 此后什么都不接：人的消息不唤醒它，也 attach 不回来，Assignment 一个都不新起。
+    h.engine.receive(trigger('2'))
+    h.pump()
+    assert.equal(h.opened.tickets.get(ticketId)!.ended?.outcome, 'stopped')
+    assert.deepEqual(h.opened.tickets.get(ticketId)!.inputs, [])
+    assert.equal(h.starts, 1)
+    assert.throws(
+      () => h.engine.attach(ticketId, '2'),
+      (error: unknown) => error instanceof UserError && error.code === 'ticketStopped'
+    )
+  })
+
+  test('retries onto the same ticket, worktree and pull request, with the mandate unchanged and a recovery note', () => {
+    const h = harness()
+    const ticketId = accepted(h).ticketId!
+    h.engine.bindThread(ticketId, { source: 'gh', id: 'pr-9' }, true)
+    const assignment = h.opened.tickets.get(ticketId)!.assignments[0]!
+    h.engine.assignmentStarted(ticketId, assignment.id, {
+      terminalId: 'term_1',
+      workspace: { short: 'fix-the-typo', directory: '/w/superagent-fix-the-typo', assignment: 'the brief' }
+    })
+    const before = h.opened.tickets.get(ticketId)!
+    h.engine.report(ticketId, { state: 'failed', summary: 'the build is broken' })
+
+    h.engine.retryTicket(ticketId, 'Check the worktree, git history and GitHub first.')
+
+    const retried = h.opened.tickets.get(ticketId)!
+    assert.deepEqual(
+      retried.assignments.map((item) => item.state),
+      ['ended', 'pending'],
+      'the stuck assignment ends and a new one is queued'
+    )
+    assert.equal(retried.assignments[0]?.endedReason, 'retried')
+    assert.deepEqual(h.stopped, [assignment.id], 'the replaced terminal is closed')
+    assert.deepEqual(retried.execution, before.execution, 'the same worktree and branch')
+    assert.deepEqual(retried.follows, before.follows, 'the same pull request stays followed')
+    assert.deepEqual(retried.mandate, before.mandate, 'the same mandate: no new authorization')
+    assert.deepEqual(
+      h.opened.tickets.list().map((ticket) => ticket.id),
+      [ticketId],
+      'a retry never opens a second ticket'
+    )
+    assert.equal(
+      retried.inputs.some(
+        (input) => input.kind === 'text' && input.text.includes('git history and GitHub')
+      ),
+      true,
+      'the recovery note is an input of the new assignment'
+    )
+  })
+
+  test('resumes the same work under the same mandate when a person comments after its pull request merged', () => {
+    const h = harness()
+    const ticketId = accepted(h).ticketId!
+    h.engine.bindThread(ticketId, { source: 'gh', id: 'pr-9' }, true)
+    h.engine.report(ticketId, { state: 'ready', summary: 'the redirect is fixed' })
+    h.engine.threadClosed({ source: 'gh', id: 'pr-9' }, 'merged', '2026-09-23T00:01:00Z')
+    const ended = h.opened.tickets.get(ticketId)!
+    assert.equal(ended.ended?.outcome, 'merged')
+    assert.deepEqual(
+      h.opened.threads.get('gh:pr-9')?.subscriptions,
+      [ticketId],
+      'the subscription is kept, so a later comment can resume the ticket (§I.5 item 5)'
+    )
+    const mandate = ended.mandate
+
+    // 人在合并后的 PR 上再说一句：同一个 Mandate，没有新的 Eval、没有新 Decision、没有新 Ticket。
+    h.engine.receive(trigger('2', { threads: [{ source: 'gh', id: 'pr-9' }] }))
+    const resumed = h.opened.tickets.get(ticketId)!
+    assert.equal(resumed.ended, undefined, 'the ticket is open again')
+    assert.deepEqual(resumed.mandate, mandate, 'the same authorization: no new mandate')
+    assert.equal(resumed.assignments.length, 2, 'a new assignment on the same ticket')
+    assert.deepEqual(resumed.inputs.map((input) => input.kind), ['trigger', 'resumed'])
+    assert.equal(h.starts, 2, 'one new worker for the resumed work')
+    assert.deepEqual(h.opened.decisions.byThread('gh:pr-9'), [], 'no accept reopened it')
+    assert.deepEqual(h.opened.tickets.list().map((ticket) => ticket.id), [ticketId])
+
+    // 恢复不改变 PR 的结束规则：下一次 ready 仍按那次合并结束。
+    h.engine.report(ticketId, { state: 'ready', summary: 'the follow-up is in' })
+    assert.equal(h.opened.tickets.get(ticketId)!.ended?.outcome, 'merged')
+  })
+
   test('stops a live ticket only on an explicit instruction and ends it by the human', () => {
     const h = harness()
     const decision = accepted(h)

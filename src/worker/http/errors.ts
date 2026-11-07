@@ -47,6 +47,12 @@ export const ERROR_CODES = {
    */
   notOwned: 'not_owned',
   alreadyHandedBack: 'already_handed_back',
+  /**
+   * `ticket stop` / `ticket retry` 的固定拒绝（§G.2）：停止只能对未结束的 Ticket 发起，
+   * 重试只对卡在 failed/blocked（或投递失败）的 Ticket 成立。
+   */
+  alreadyEnded: 'already_ended',
+  notRetryable: 'not_retryable',
   /** 并发冲突（同名资源已存在等）。 */
   conflict: 'conflict',
   /** body 超过 1 MiB（§G.3 第 6 条）。 */
@@ -76,11 +82,13 @@ export type ApiEnvelope =
 
 /**
  * 核心的用户可见码 → 命令在 §G.2 里写明的固定码（只映有分行的那几条）：领域语义不变，
- * 信封里落成调用方（面板与 agent）按码处理的那个名字。目前只有 `trigger handback`。
+ * 信封里落成调用方（面板与 agent）按码处理的那个名字。目前是 `trigger handback` 与
+ * `ticket retry`。
  */
 export const COMMAND_ERROR_CODES: Readonly<Record<string, string>> = {
   notReached: ERROR_CODES.notOwned,
-  handedBack: ERROR_CODES.alreadyHandedBack
+  handedBack: ERROR_CODES.alreadyHandedBack,
+  notRetryable: ERROR_CODES.notRetryable
 }
 
 /** 错误码 → HTTP 状态码（§G.3 第 8 条 + 三条边界码）。未知码一律 500。 */
@@ -94,9 +102,12 @@ export function statusForErrorCode(code: string): number {
     case ERROR_CODES.incompleteRules:
     case ERROR_CODES.policyChanged:
     case ERROR_CODES.tooLate:
-    // 命令级的固定拒绝（§G.2）：`trigger handback` 的 `not_owned`/`already_handed_back`。
+    // 命令级的固定拒绝（§G.2）：`trigger handback` 的 `not_owned`/`already_handed_back`、
+    // `ticket stop` 的 `already_ended` 与 `ticket retry` 的 `not_retryable`。
     case ERROR_CODES.notOwned:
     case ERROR_CODES.alreadyHandedBack:
+    case ERROR_CODES.alreadyEnded:
+    case ERROR_CODES.notRetryable:
       return 400
     case ERROR_CODES.unauthorized:
       return 401

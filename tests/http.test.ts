@@ -76,6 +76,8 @@ test('every error-code family maps to the status §G.3 item 8 fixes', () => {
     // 命令级的固定拒绝（§G.2 的「主要错误码」）与 `refused` 同为 400。
     ['not_owned', 400],
     ['already_handed_back', 400],
+    ['already_ended', 400],
+    ['not_retryable', 400],
     ['unauthorized', 401],
     ['not_permitted_role', 403],
     ['origin_forbidden', 403],
@@ -101,6 +103,8 @@ test('a command-level refusal keeps the code §G.2 names for it', () => {
   const again = toApiError(new UserError('handedBack'))
   assert.equal(again.code, 'already_handed_back')
   assert.equal(again.status, 400)
+  // `ticket retry` 同理：领域只说不可重试，信封里落成那一行写明的码。
+  assert.equal(toApiError(new UserError('notRetryable')).code, 'not_retryable')
   // 其余核心拒绝照旧是 `refused`：只有 §G.2 写明了码的那几条转名。
   assert.equal(toApiError(new UserError('ticketEnded')).code, 'refused')
 })

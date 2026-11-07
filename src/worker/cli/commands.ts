@@ -263,19 +263,23 @@ export const CLI_COMMANDS: readonly CommandDefinition[] = [
   // ---- Ticket / Trigger / Thread（#28/#29/#27）
   {
     name: ['ticket', 'retry'],
-    summary: 'retry a failed or blocked ticket',
+    summary: 'retry a ticket whose worker reported failed or blocked, on the same worktree',
     flags: [REQUEST_ID_FLAG],
     positionals: [{ name: 'ticket_id', required: true }],
     write: true,
-    available: false
+    available: true
   },
   {
     name: ['ticket', 'stop'],
-    summary: 'stop a ticket (a person can still resume it)',
-    flags: [{ name: 'reason', kind: 'value', hint: 'one sentence for the record' }, REQUEST_ID_FLAG],
+    summary: 'stop a ticket for good (destructive; needs --yes): a person can never resume it',
+    flags: [
+      { name: 'reason', kind: 'value', hint: 'one sentence for the record' },
+      { name: 'yes', kind: 'switch', hint: 'confirm that this ticket stays ended' },
+      REQUEST_ID_FLAG
+    ],
     positionals: [{ name: 'ticket_id', required: true }],
     write: true,
-    available: false
+    available: true
   },
   {
     name: ['ticket', 'note'],
@@ -805,6 +809,19 @@ async function run(
       return call(`tickets/${encodePathSegment(args.positionals[0] ?? '')}/note`, {
         method: 'POST',
         body: { text: valueArgs(args.flags, 'text') ?? '' }
+      })
+    case 'ticket stop': {
+      // `--yes` 就是 body 里的 `confirm`：同一个含义只有一个名字（与 `admin rotate-token` 同）。
+      const reason = valueArgs(args.flags, 'reason')
+      return call(`tickets/${encodePathSegment(args.positionals[0] ?? '')}/stop`, {
+        method: 'POST',
+        body: { confirm: switched(args, 'yes'), ...(reason === undefined ? {} : { reason }) }
+      })
+    }
+    case 'ticket retry':
+      return call(`tickets/${encodePathSegment(args.positionals[0] ?? '')}/retry`, {
+        method: 'POST',
+        body: {}
       })
     case 'ticket request-status':
       return call(`tickets/${encodePathSegment(args.positionals[0] ?? '')}/request-status`, {
