@@ -117,6 +117,28 @@ export interface TestPanel {
   type(target: TestQuery, text: string, options?: { replace?: boolean; submit?: boolean }): Promise<void>
   submit(target: TestQuery): Promise<void>
   toggle(target: TestQuery): Promise<void>
+  /** A Table header click (`onSortChange`). */
+  sort(target: TestQuery, column: string): Promise<void>
+  /** Replaces a Table's selection with exactly these rows. */
+  selectRows(target: TestQuery, keys: readonly string[]): Promise<void>
+  /** Enter or a double click on a Table row (its `onRowAction`). */
+  activateRow(target: TestQuery, key: string): Promise<void>
+  /** Scrolls a Table to the end of its loaded rows (`hasMore` + `onLoadMore`). */
+  loadMore(target: TestQuery): Promise<void>
+  /** Expands a Tree item (one with children). */
+  expand(target: TestQuery, key: string): Promise<void>
+  /** Collapses a Tree item. */
+  collapse(target: TestQuery, key: string): Promise<void>
+  /** Selects a Tree item (`onSelect`). */
+  selectItem(target: TestQuery, key: string): Promise<void>
+  /** A Tree item's own action (`onAction`). */
+  activateItem(target: TestQuery, key: string): Promise<void>
+  /** The keys of a Tree's expanded items. */
+  expandedOf(target: TestQuery): readonly string[]
+  /** The keys of a Table's columns Orca shows at `width` px (wide when omitted). */
+  columnsOf(target: TestQuery, view?: { readonly width?: number }): readonly string[]
+  /** The keys of a Table's rows, in the order Orca draws them. */
+  rowsOf(target: TestQuery): readonly string[]
   select(target: TestQuery, value: string): Promise<void>
   slide(target: TestQuery, value: number): Promise<void>
   valueOf(target: TestQuery): JsonValue

@@ -11,7 +11,14 @@
 // `OrcaRuntime` 与端口进入。
 import { mkdirSync } from 'node:fs'
 import { join } from 'node:path'
-import type { DeploymentView, PanelState } from '../panel/protocol'
+import type {
+  DeploymentView,
+  PanelState,
+  PanelTerminal,
+  TicketDetailView,
+  TicketListInput,
+  TicketListPage
+} from '../panel/protocol'
 import { Engine } from './core/index.ts'
 import type { Store } from './app/store.ts'
 import { openStore } from './app/store.ts'
@@ -63,9 +70,19 @@ import {
   sourceLabelsKey,
   threadSeenKey
 } from './app/kv.ts'
-import { createRefreshableStateSource, type RefreshableStateSource } from './app/state-source.ts'
-import { deliveredFollowups } from './app/views.ts'
-import { followupOwners } from './core/index.ts'
+import {
+  createRefreshableStateSource,
+  panelTicketPage,
+  type RefreshableStateSource
+} from './app/state-source.ts'
+import { deliveredFollowups, ticketDetail } from './app/views.ts'
+import {
+  followupOwners,
+  latestAssignment,
+  runningAssignment,
+  UserError,
+  type Ticket
+} from './core/index.ts'
 import { readEvalsHealth, readUnavailableProblems } from './app/views/attention.ts'
 import { readSystemProblems, replyTarget } from './app/views/problems.ts'
 import { statusBarView } from './app/status-bar.ts'
@@ -104,6 +121,7 @@ import type { Deployment } from './sources/kind.ts'
 import { OrcaExecutor, registerExecutorEffects, registerExecutorLifecycle, resolveExecutorSettings } from './executor/orca-executor.ts'
 import { launchCapacity, loadReadout } from './executor/slots.ts'
 import { retryTicket } from './executor/retry.ts'
+import { WORKTREE_PREFIX } from './executor/workspace.ts'
 import { resumeAfterUpgrade, type ResumeReport } from './executor/resume.ts'
 import { DEFAULT_MAX_WORKERS } from './http/state.ts'
 import { createDomainHandlers, withDomainHandlers } from './http/domain.ts'
@@ -124,7 +142,7 @@ import type { RouteCaller } from './http/routes.ts'
 import { ROUTE_TABLE, type RouteDefinition } from './http/routes.ts'
 import type { LoopEntry } from './http/state.ts'
 import { startHttpServer, type HttpServerHandle } from './http/server.ts'
-import type { AgentStatusEvent, OrcaRuntime } from './runtime/orca-runtime.ts'
+import { OrcaRuntimeError, type AgentStatusEvent, type OrcaRuntime, type WorkspaceInfo } from './runtime/orca-runtime.ts'
 import { createRouterRelay } from './router/relay.ts'
 import {
   createRouterSupervision,
@@ -138,6 +156,9 @@ import { routerPrompt } from './router/prompt.ts'
 
 /** worker 侧一轮 pass 的周期（§N.1 的 2 s 巡检）。 */
 export const PASS_INTERVAL_MS = 2000
+
+/** 详情页的终端摘要读最后几行（§E.7 的取证口径：面板预览 3 行、完整摘要这一档）。 */
+export const TERMINAL_SUMMARY_LINES = 20
 
 /** 历史回填、话题轮询与群名刷新的周期（§I.3：群名一分钟内刷新）。 */
 export const FEISHU_ROUND_MS = 60_000
@@ -212,6 +233,23 @@ export interface BootHandle {
   retryTicket(ticketId: string): PanelState
   /** 聚焦一台终端（§M.2：面板没有这个宿主能力，由 worker 代跑 CLI）。 */
   focusTerminal(terminalId: string): Promise<void>
+  /** Execution 列表的一页（§M.2 的筛选 + §M.4 的分页）；档位 → 领域筛选只有一处映射。 */
+  tickets(input: TicketListInput): TicketListPage
+  /**
+   * 一张工单的详情（§M.2 的七块）。终端摘要是现读的一次 `terminal.read`；读不到就省略，
+   * 不让整个详情失败。未知工单抛 `unknownTicket`。
+   */
+  ticketDetail(ticketId: string): Promise<TicketDetailView>
+  /** 人的停止（§E.5、§K.3：撤回 Mandate）；面板先做行内二次确认。 */
+  stopTicket(ticketId: string): PanelState
+  /** 发一条 fact note（§G.2 的 `ticket note`）：只加语境，不授权任何事。 */
+  noteTicket(ticketId: string, text: string): PanelState
+  /** 请求状态（§G.2 的 `ticket request-status`）：返回是否真的问了一条。 */
+  requestStatus(ticketId: string): boolean
+  /** 打开一张工单的 worktree（§M.2：面板没有 `workspace.open` 这个宿主方法）。 */
+  openTicketWorkspace(ticketId: string): Promise<void>
+  /** 移除一张工单的 worktree（§E.1「清理」，破坏性；面板先要人确认）。 */
+  removeTicketWorkspace(ticketId: string): Promise<void>
   /**
    * `superagent setup check`（§G.2）：重跑探针、把结论应用到各部分并重新武装挂起的循环，
    * **不重启 Orca**。`checked: false` 表示检查时本来就没有问题——没有可检查的东西。
@@ -342,6 +380,38 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
       },
       // 聚焦终端不读写库，只是宿主的一句调用：follower 也能做。
       focusTerminal: (terminalId: string): Promise<void> => options.runtime.focusTerminal(terminalId),
+      // follower 不读库：Execution 的读数与写入都属于拥有者（固定拒绝，不假装成功）。
+      tickets: () => ({ items: [], nextOffset: null }),
+      ticketDetail: async () => {
+        throw Object.assign(new Error('another Superagent instance owns this state directory'), {
+          code: 'unavailable'
+        })
+      },
+      stopTicket: () => {
+        throw Object.assign(new Error('another Superagent instance owns this state directory'), {
+          code: 'action_failed'
+        })
+      },
+      noteTicket: () => {
+        throw Object.assign(new Error('another Superagent instance owns this state directory'), {
+          code: 'action_failed'
+        })
+      },
+      requestStatus: () => {
+        throw Object.assign(new Error('another Superagent instance owns this state directory'), {
+          code: 'action_failed'
+        })
+      },
+      openTicketWorkspace: async () => {
+        throw Object.assign(new Error('another Superagent instance owns this state directory'), {
+          code: 'unavailable'
+        })
+      },
+      removeTicketWorkspace: async () => {
+        throw Object.assign(new Error('another Superagent instance owns this state directory'), {
+          code: 'action_failed'
+        })
+      },
       // follower 不读库、不跑探针：它没有可以做检查的东西。
       checkSetup: async () => ({ checked: false, problem: null, issues: [], restarted: false }),
       // 部署页读到的是「这一进程只跟着另一个实例」：没有自己的 health，也不假装在跑。
@@ -789,6 +859,45 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
         unavailable: readUnavailableProblems({ sql: store.sql }, { now: now() })
       })
   })
+
+  /**
+   * 一张工单当前（或最近一次）派工终端的最后若干行（§E.7 的取证读数）。读不到就省略：
+   * 终端可能已经关了，摘要不该因此让整个详情失败。
+   */
+  const terminalSummary = async (ticket: Ticket): Promise<PanelTerminal | undefined> => {
+    const assignment = runningAssignment(ticket) ?? latestAssignment(ticket)
+    const terminalId = assignment?.terminalId
+    if (terminalId === undefined) return undefined
+    try {
+      const read = await options.runtime.readTerminal(terminalId, { maxLines: TERMINAL_SUMMARY_LINES })
+      return { terminalId, lines: read.lines, truncated: read.truncated }
+    } catch {
+      return undefined
+    }
+  }
+
+  /** 一张工单的 worktree（§E.1：`ticket.execution.directory` 是唯一复用键）；找不到就是固定拒绝。 */
+  const ticketWorkspaceOf = async (ticketId: string): Promise<WorkspaceInfo> => {
+    const ticket = repo.tickets.get(ticketId)
+    if (ticket === undefined) throw new UserError('unknownTicket', { ticket: ticketId })
+    if (ticket.execution === undefined) {
+      throw new OrcaRuntimeError('workspace_missing', 'the ticket has no worktree yet', {
+        values: { ticket: ticketId }
+      })
+    }
+    const workspaces = await options.runtime.listWorkspaces()
+    const found = workspaces.find(
+      (workspace) =>
+        workspace.path === ticket.execution?.directory ||
+        workspace.name === `${WORKTREE_PREFIX}${ticket.execution?.name ?? ''}`
+    )
+    if (found === undefined) {
+      throw new OrcaRuntimeError('workspace_missing', 'the ticket worktree is not in Orca', {
+        values: { ticket: ticketId, path: ticket.execution.directory }
+      })
+    }
+    return found
+  }
 
   function refresh(): PanelState {
     const next = stateSource.refresh()
@@ -1389,6 +1498,45 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
     },
     // 面板不能直接聚焦终端（§M.2）：worker 跑 `orca terminal focus --terminal <handle>`。
     focusTerminal: (terminalId: string): Promise<void> => options.runtime.focusTerminal(terminalId),
+    // Execution 页（§M.2）：列表与详情都是同一个读模型（`app/views.ts`），面板不自己筛。
+    tickets: (input: TicketListInput): TicketListPage => panelTicketPage(repo.tickets.list(), input),
+    ticketDetail: async (ticketId: string): Promise<TicketDetailView> => {
+      const ticket = repo.tickets.get(ticketId)
+      if (ticket === undefined) throw new UserError('unknownTicket', { ticket: ticketId })
+      const terminal = await terminalSummary(ticket)
+      return ticketDetail(
+        ticket,
+        { threads: repo.threads, triggers: repo.triggers },
+        terminal === undefined ? {} : { terminal }
+      )
+    },
+    // §E.5、§G.2：停止（撤回 Mandate）与重试是同一个领域写入面；note 只加一条语境，
+    // request-status 只问已经在等的 worker（返回它是否真的发了一条问题）。
+    stopTicket: (ticketId: string): PanelState => {
+      engine.stopTicket(ticketId)
+      return refresh()
+    },
+    noteTicket: (ticketId: string, text: string): PanelState => {
+      engine.note(ticketId, text)
+      return refresh()
+    },
+    requestStatus: (ticketId: string): boolean => {
+      if (repo.tickets.get(ticketId) === undefined) {
+        throw new UserError('unknownTicket', { ticket: ticketId })
+      }
+      const asked = engine.requestStatus(ticketId)
+      refresh()
+      return asked
+    },
+    // §M.2：面板没有打开/移除 worktree 的宿主方法，两者都由 worker 按 Ticket 记录的目录代理。
+    openTicketWorkspace: async (ticketId: string): Promise<void> => {
+      const workspace = await ticketWorkspaceOf(ticketId)
+      await options.runtime.openWorkspace(workspace.workspaceId)
+    },
+    removeTicketWorkspace: async (ticketId: string): Promise<void> => {
+      const workspace = await ticketWorkspaceOf(ticketId)
+      await options.runtime.removeWorkspace(workspace)
+    },
     checkSetup,
     // Deployment 页的三条读数（§M.3）：状态目录与限额只读；health 是健康板；Router 只读快照。
     deployment: () =>

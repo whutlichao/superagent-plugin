@@ -6,10 +6,18 @@
 //   负载与 Execution 页的行都从同一个库来（§M.2 ①③④、§N.7 的计数）。
 //
 // 依赖纪律（§C.2）：这里只依赖面板的协议类型与注入的读口；不 import `orca`、不 host.call。
-import type { AttentionItem, PanelState, PanelTicket, SystemProblem } from '../../panel/protocol'
+import type {
+  AttentionItem,
+  ExecutionFilter,
+  PanelState,
+  PanelTicket,
+  SystemProblem,
+  TicketListInput,
+  TicketListPage
+} from '../../panel/protocol'
 import { ticketStage, type Ticket } from '../core/index.ts'
 import type { LoadReadout } from '../executor/slots.ts'
-import { ticketView } from './views.ts'
+import { matchesFilter, ticketView, type TicketFilter } from './views.ts'
 
 /** 一份快照的来源：读当前值，改暂停状态。每改一次，修订号加一（§M.6 的单调计数）。 */
 export interface PanelStateSource {
@@ -134,13 +142,43 @@ function updatedAt(ticket: Ticket): number {
 }
 
 /** 一条 Ticket → Execution 页的一行。 */
-function panelTicket(ticket: Ticket): PanelTicket {
+export function panelTicketOf(ticket: Ticket): PanelTicket {
   return {
     id: ticket.id,
     title: ticket.title,
     stage: ticketView(ticket).stage,
     ...(ticket.ended === undefined ? {} : { outcome: ticket.ended.outcome }),
     at: updatedAt(ticket)
+  }
+}
+
+/** 面板的五档筛选 → 领域读模型的筛选（`app/views.ts` 的 `TICKET_FILTERS`）。 */
+const TICKET_FILTER_OF: Readonly<Record<ExecutionFilter, TicketFilter>> = {
+  open: 'open',
+  pending: 'person',
+  working: 'working',
+  waiting: 'idle',
+  ended: 'ended'
+}
+
+/** Execution 列表的一页最多几行（§M.4：无虚拟列表，长列表靠分页 50 条）。 */
+export const TICKET_PAGE_MAX = 50
+
+/**
+ * Execution 列表的一页（§M.2 的筛选 + §M.4 的分页）：筛选与分页交给领域读模型的同一个
+ * 判定（`matchesFilter`），面板因此不会自己发明一套「谁在等人」的规则。
+ */
+export function panelTicketPage(
+  tickets: readonly Ticket[],
+  input: TicketListInput = {}
+): TicketListPage {
+  const filter = input.filter === undefined ? undefined : TICKET_FILTER_OF[input.filter]
+  const limit = Math.max(1, Math.min(TICKET_PAGE_MAX, input.limit ?? TICKET_PAGE_MAX))
+  const offset = Math.max(0, input.offset ?? 0)
+  const matched = tickets.filter((ticket) => matchesFilter(ticket, filter))
+  return {
+    items: matched.slice(offset, offset + limit).map(panelTicketOf),
+    nextOffset: offset + limit < matched.length ? offset + limit : null
   }
 }
 
@@ -193,7 +231,7 @@ export function createWorkerStateSource(input: WorkerStateInput): PanelStateSour
         items: items.sort((left, right) => right.at - left.at)
       },
       problems,
-      tickets: tickets.slice(0, pageSize).map(panelTicket)
+      tickets: tickets.slice(0, pageSize).map(panelTicketOf)
     }
   }
 

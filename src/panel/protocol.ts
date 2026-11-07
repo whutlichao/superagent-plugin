@@ -134,6 +134,133 @@ export interface PanelTicket {
 }
 
 /**
+ * Execution 列表的五档筛选（§M.2：开放、待办、工作中、等待、已结束）。取值是面板的语言，
+ * worker 把它映射到领域读模型的筛选（`app/views.ts` 的 `TICKET_FILTERS`），两边只有一个映射。
+ */
+export const EXECUTION_FILTERS = ['open', 'pending', 'working', 'waiting', 'ended'] as const
+export type ExecutionFilter = (typeof EXECUTION_FILTERS)[number]
+
+/** 一个值是否是五档筛选之一（存储里的旧值、面板与 worker 的入参都用这一处判定）。 */
+export function isExecutionFilter(value: unknown): value is ExecutionFilter {
+  return typeof value === 'string' && (EXECUTION_FILTERS as readonly string[]).includes(value)
+}
+
+/** 一次列表请求：筛选 + 分页窗口（与 CLI 的 `ticket list --state/--offset/--limit` 同义）。 */
+export interface TicketListInput {
+  /** 缺省是全部（`open` 的子集：未结束的都在内）。 */
+  readonly filter?: ExecutionFilter
+  /** 从第几行开始（缺省 0）。 */
+  readonly offset?: number
+  /** 一页最多几行（缺省 50，§M.4）。 */
+  readonly limit?: number
+}
+
+/** 一页 Execution 行；`nextOffset` 为 `null` 表示没有下一页。 */
+export interface TicketListPage {
+  readonly items: readonly PanelTicket[]
+  readonly nextOffset: number | null
+}
+
+/** 一份 Report 的面板面（§E.8）：状态 + 摘要 + 时刻。 */
+export interface PanelReport {
+  readonly state: 'progress' | 'waiting' | 'ready' | 'blocked' | 'failed' | 'dropped'
+  readonly summary: string
+  readonly at: number
+}
+
+/** 一条 Assignment 的面板面（§E.3）：详情页的折叠列表用它。 */
+export interface PanelAssignment {
+  readonly id: string
+  readonly state: 'pending' | 'running' | 'ended'
+  readonly createdAt: number
+  readonly startedAt?: number
+  readonly endedAt?: number
+  readonly endedReason?: string
+  readonly terminalId?: string
+  readonly report?: PanelReport
+}
+
+/** 一条等待投递的 Input（§E.4）：面板只给一句摘要，不重放整段原文。 */
+export interface PanelInput {
+  readonly id: string
+  readonly kind: 'trigger' | 'text' | 'note' | 'policy-changed' | 'resumed'
+  readonly at: number
+  /** 一句话摘要：Trigger 的原话（截短）、note 的正文，或固定措辞要用的数据。 */
+  readonly text?: string
+  /** `kind: 'trigger'` / `'resumed'` 指向的那条 Trigger。 */
+  readonly triggerId?: string
+  /** 人写的（Trigger 输入才标）：决定「解除 blocked」与否的是它。 */
+  readonly human?: boolean
+}
+
+/** 一个订阅（§D.1）：该 Ticket 收到的 Thread。 */
+export interface PanelSubscription {
+  readonly key: string
+  /** 人读的名字（Source 给的 label）；没有就是 key。 */
+  readonly title: string
+  readonly lastAt?: number
+  /** 只当语境（§D.1 / §I.5）：这条 Thread 上的消息不路由给该 Ticket。 */
+  readonly context: boolean
+}
+
+/** 授权面（§M.2 的 Mandate 块）：强度、依据、匹配规则与 policy version。 */
+export interface PanelMandate {
+  readonly strength: 'explicit' | 'inferred'
+  /** 发起人（`<source>:<id>`，与读模型同一拼法）。 */
+  readonly actor: string
+  readonly policyVersion: string
+  /** Gate 如何准入它（§K.3 的 `MandateBasis.via`）。 */
+  readonly via: 'addressed' | 'followup' | 'admission' | 'bot'
+  /** 接收行（`admission` / `bot` 才有，§K.1）。 */
+  readonly cell?: 'listedUnaddressed' | 'unlistedAddressed' | 'unlistedUnaddressed'
+  /** 评估匹配到的规则（`MandateBasis.rules` 的 id）。 */
+  readonly rules: readonly string[]
+}
+
+/** 终端摘要（§E.7 的取证）：只给最后若干行，不是整段历史。 */
+export interface PanelTerminal {
+  readonly terminalId: string
+  readonly lines: readonly string[]
+  readonly truncated: boolean
+}
+
+/** 一张工单的详情（§M.2 的 Execution 详情）：授权、等待中的 Input、订阅、派工、报告、待人工与终端。 */
+export interface TicketDetailView {
+  readonly id: string
+  readonly title: string
+  /** §E.8 的七档之一（与列表同一判定，不带 `agentState` 时是表的严格结果）。 */
+  readonly stage: PanelTicket['stage']
+  readonly outcome?: PanelTicket['outcome']
+  /** 最后更新时间（epoch ms）。 */
+  readonly at: number
+  readonly mandate: PanelMandate
+  /** 等投递的 Input，按加入顺序（`ticket.undelivered`）。 */
+  readonly waitingInputs: readonly PanelInput[]
+  readonly subscriptions: readonly PanelSubscription[]
+  readonly assignments: readonly PanelAssignment[]
+  /** 每一份 Report（按派工顺序；详情页单列一块）。 */
+  readonly reports: readonly PanelReport[]
+  /** 现在等人回答的问题（§E.7 的终端来源标 `via: 'terminal'`）。 */
+  readonly attention?: {
+    readonly question: string
+    readonly at: number
+    readonly via: 'terminal' | null
+  }
+  /** 当前派工终端的摘要；终端已不在或没起来时省略。 */
+  readonly terminal?: PanelTerminal
+  /** 该工单的 worktree（§E.1）：有它才给「Open worktree」「Remove worktree」。 */
+  readonly worktree?: { readonly name: string; readonly directory: string }
+  readonly ended?: {
+    readonly at: number
+    readonly by: 'executor' | 'human'
+    readonly outcome: 'completed' | 'merged' | 'closed' | 'dropped' | 'stopped'
+    readonly reason?: string
+  }
+  /** 领域判定它现在可重试（`canRetry`）：不可重试时页面不画这个按钮。 */
+  readonly canRetry: boolean
+}
+
+/**
  * 健康条目的四档状态（§N.4、§J.3）：域内 `HEALTH_STATES` 的面板面，取值逐字相同。
  * 面板不 import worker（§C.2 规则 3），所以这里写一份字符串联合而不是转出领域类型。
  */
@@ -266,6 +393,26 @@ export interface TicketInput {
   readonly ticketId: string
 }
 
+/** 给一张工单发一条 fact note（§G.2 的 `ticket note`）：只加语境，不授权任何事。 */
+export interface TicketNoteInput extends TicketInput {
+  readonly text: string
+}
+
+/** 「请求状态」的结果（§G.2 的 `ticket request-status`）：只有正在等 trigger 的 worker 才被问。 */
+export interface StatusAskOutcome {
+  readonly asked: boolean
+}
+
+/** 打开该工单的 worktree（§M.2：面板没有这个宿主方法，由 worker 调 `workspace.open`）。 */
+export interface WorktreeOpened {
+  readonly opened: boolean
+}
+
+/** 移除该工单的 worktree（§E.1 清理：破坏性，面板先做行内二次确认）。 */
+export interface WorktreeRemoved {
+  readonly removed: boolean
+}
+
 /** 一次动作的对象：一台终端（`terminal.handle` 的 `term_…`）。 */
 export interface TerminalInput {
   readonly terminalId: string
@@ -284,8 +431,15 @@ export const PLUGIN_REQUESTS = [
   'state',
   'pause',
   'check',
+  'tickets',
+  'ticket.detail',
   'ticket.retry',
+  'ticket.stop',
+  'ticket.note',
+  'ticket.requestStatus',
   'terminal.focus',
+  'workspace.open',
+  'workspace.remove',
   'deployment',
   'doctor',
   'setupCheck',
@@ -313,10 +467,39 @@ declare module 'orca' {
      */
     'ticket.retry': { input: TicketInput; output: PanelState }
     /**
+     * Execution 列表的一页（§M.2 的筛选 + §M.4 的分页）：筛选与分页都在 worker 的读模型里，
+     * 面板只画回来的窗口；`nextOffset` 为 `null` 就是没有下一页。
+     */
+    tickets: { input: TicketListInput; output: TicketListPage }
+    /**
+     * 一张工单的详情（§M.2 的 Execution 详情）：授权、等待中的 Input、订阅、派工、报告、
+     * 待人工与终端摘要。终端摘要是一次 `terminal.read`，读不到就省略而不是编造。
+     */
+    'ticket.detail': { input: TicketInput; output: TicketDetailView }
+    /**
+     * 停止一张工单（§E.5、§G.2 的 `ticket stop`）：撤回 Mandate 并结束它。破坏性，面板先做
+     * 行内二次确认；确认本身就是这一次请求（与 CLI 的 `--yes` 同一个意思）。
+     */
+    'ticket.stop': { input: TicketInput; output: PanelState }
+    /** 发一条 fact note（§G.2 的 `ticket note`）：只加语境，不要求也不授权任何事。 */
+    'ticket.note': { input: TicketNoteInput; output: PanelState }
+    /** 请求状态（§G.2 的 `ticket request-status`）：只问正在等 trigger 的 worker。 */
+    'ticket.requestStatus': { input: TicketInput; output: StatusAskOutcome }
+    /**
      * 聚焦一台终端（§M.2「面板不能直接做的两件事」）：面板没有这个宿主能力，
      * 由 worker 跑 `orca terminal focus --terminal <handle>`。
      */
     'terminal.focus': { input: TerminalInput; output: FocusOutcome }
+    /**
+     * 打开该工单的 worktree（§M.2）：面板没有 `workspace.open` 这个宿主方法，
+     * 由 worker 按 Ticket 记录的目录找到工作区再调宿主。
+     */
+    'workspace.open': { input: TicketInput; output: WorktreeOpened }
+    /**
+     * 移除该工单的 worktree（§E.1「清理」，破坏性、需二次确认）：Host API 没有删除方法，
+     * 由 worker 跑 `orca worktree rm`。
+     */
+    'workspace.remove': { input: TicketInput; output: WorktreeRemoved }
     /** Deployment 页的读数（§M.3）：setup 问题、状态目录、机器限额、暂停、health、Router。 */
     deployment: { output: DeploymentView }
     /** doctor 的结果（§G.2）：跑一次八项检查，只报有没有。 */

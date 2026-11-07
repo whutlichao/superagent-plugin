@@ -8,38 +8,55 @@ import {
   Badge,
   Button,
   Callout,
+  CodeView,
+  Collapsible,
   env,
+  Field,
   IconButton,
+  KeyValue,
   List,
   ListItem,
   plugin,
+  RadioGroup,
   read,
   RelativeTime,
   Row,
   set,
+  type KeyValueItem,
   type OrcaElement,
   Stack,
   Tab,
+  Table,
+  type TableRow,
   Tabs,
   Text,
+  Textarea,
   Toolbar,
   type PanelContext
 } from 'orca'
 import { GLOSSARY_GROUPS, translate, type CopyKey } from './copy'
 import { Deployment, loadDeployment, openDeployment, resetDeployment } from './deployment'
-import { markLabel, problemMark, ticketMark, type MarkTone } from './marks'
+import { executionMark, executionRow } from './execution'
+import { markLabel, problemMark, reportMark, ticketMark, type MarkTone } from './marks'
 import { orderWaiting, problemPage } from './overview'
 import {
+  EXECUTION_FILTERS,
+  isExecutionFilter,
   isNavPage,
   NAV_PAGES,
   type AttentionItem,
+  type ExecutionFilter,
   type HumanSlot,
   type NavPage,
+  type PanelMandate,
   type PanelState,
+  type PanelSubscription,
   type PanelTicket,
-  type SystemProblem
+  type SystemProblem,
+  type TicketDetailView,
+  type TicketListPage
 } from './protocol'
-import { TicketRow, type TicketRowData } from './rows'
+import { TicketRow } from './rows'
 import {
   BootingState,
   ConfirmAction,
@@ -94,6 +111,41 @@ const checking = atom(false)
  * 详情页（#38–#41）读它来打开对应的那条；本票负责把它写对并切页。
  */
 const focus = atom<{ readonly page: NavPage; readonly id: string } | null>(null)
+
+/** Execution 列表的筛选（§M.2 的五档）；写进插件存储，重开面板还停在那一档。 */
+const executionFilter = atom<ExecutionFilter>('panel.executionFilter', 'open', { persist: 'storage' })
+
+/** 列表已读到的行与下一页的位置；`null` 表示这一档还没读过。 */
+const executionList = atom<{
+  readonly items: readonly PanelTicket[]
+  readonly nextOffset: number | null
+} | null>(null)
+
+/** 列表在读（首屏给 `Table` 的 loading，再读只靠按钮的状态）。 */
+const executionLoading = atom(false)
+
+/** 列表的读取失败原因。 */
+const executionError = atom('')
+
+/** 详情读数与它的三态（读失败要有原因与重试入口）。 */
+const detail = atom<TicketDetailView | null>(null)
+const detailError = atom('')
+
+/** 「请求状态」的读数：`asked` 是 worker 的如实回答（没有在等的 worker 就是 false）。 */
+const statusAsked = atom<boolean | null>(null)
+
+/** 一条 fact note 的草稿（只活在面板里，发送后清空）。 */
+const noteDraft = atom('')
+
+/** 详情页的动作在飞行中：确认与发送不可重复按。 */
+const acting = atom(false)
+
+/**
+ * 列表请求的代号：只有最后一次请求的答案落地。`set` 是批量生效的（同一个事件里连着
+ * `set` + 读，读到的可能是上一批的值），所以「筛选在飞行中变了」用同步计数器判断，
+ * 不用在 await 之后重读 atom。
+ */
+let listRequest = 0
 
 /** 面板是否已被卸载：晚到的响应不再改状态。 */
 let disposed = false
@@ -159,6 +211,18 @@ export function setup(ctx: PanelContext): () => void {
   disposed = false
   // 导航记忆里的脏值（旧版本留下的页面名）在第一次渲染前改回 Overview。
   if (!isNavPage(read(page))) set(page, 'overview')
+  // Execution 的 atom 是模块级的：上一次挂载留下的列表、详情与草稿不带进这一次。
+  if (!isExecutionFilter(read(executionFilter))) set(executionFilter, 'open')
+  set(executionList, null)
+  set(executionLoading, false)
+  set(executionError, '')
+  set(detail, null)
+  set(detailError, '')
+  set(statusAsked, null)
+  set(noteDraft, '')
+  set(acting, false)
+  // 上一次挂载还在飞行的列表/详情请求作废（它们的答案不该画进这一次）。
+  listRequest += 1
   ctx.subscriptions.push(
     plugin.on('state.changed', (payload) => {
       // 更旧的推送不触发读取；隐藏时也不发请求（下次可见后的第一次推送会补上）。
@@ -168,6 +232,12 @@ export function setup(ctx: PanelContext): () => void {
       // 部署页读的是另一份读数（限额、health、Router）：停留在这页时跟着推送刷新，但不重跑
       // doctor（那是人要的时候才跑的 `gh`/`lark-cli` 诊断）。
       if (read(page) === 'settings') void loadDeployment()
+      // Execution 页读的是自己的那条请求：详情重读那一张，列表重读已经读到的那几页。
+      if (read(page) === 'execution') {
+        const focused = read(focus)
+        if (focused?.page === 'execution') void loadTicketDetail(focused.id)
+        else void refreshExecutionList()
+      }
     })
   )
   const startPage = read(page)
@@ -175,6 +245,8 @@ export function setup(ctx: PanelContext): () => void {
     void load()
     // 重开面板时停在 Deployment 组：这一页的读数也要读一次（渲染里不发请求）。
     if (startPage === 'settings') void openDeployment()
+    // 停在 Execution：焦点指向一张工单就是详情，否则是列表。
+    if (startPage === 'execution') enterExecution()
   } else set(phase, 'starting')
   return () => {
     disposed = true
@@ -224,29 +296,6 @@ function GlossaryOverlay(props: { readonly locale: string; readonly onClose: () 
       </Stack>
     </Callout>
   )
-}
-
-/** 一条 Execution 行（`PanelTicket`）→ 共享的 Ticket 行（§M.2 Execution；详情归 #38）。 */
-function executionRow(ticket: PanelTicket): TicketRowData {
-  if (ticket.stage === 'ended') {
-    return {
-      id: ticket.id,
-      title: ticket.title,
-      at: ticket.at,
-      stage: 'ended',
-      ...(ticket.outcome === undefined ? {} : { outcome: ticket.outcome })
-    }
-  }
-  if (ticket.stage === 'working' || ticket.stage === 'idle') {
-    return { id: ticket.id, title: ticket.title, at: ticket.at, stage: ticket.stage }
-  }
-  if (ticket.stage === 'queued') {
-    return { id: ticket.id, title: ticket.title, at: ticket.at, action: 'queued' }
-  }
-  if (ticket.stage === 'blockedFailed') {
-    return { id: ticket.id, title: ticket.title, at: ticket.at, action: 'failed' }
-  }
-  return { id: ticket.id, title: ticket.title, at: ticket.at, action: ticket.stage }
 }
 
 /**
@@ -480,12 +529,41 @@ function Overview(props: { locale: string; state: PanelState }): OrcaElement {
 }
 
 /**
- * 从 Overview 打开一张工单：记下要看的那一条，再切到 Execution（详情页读 `focus`）。
- * 「回答」「评审」与点行都是这一个动作——人去看的那条东西就在详情页上。
+ * 从 Overview 打开一张工单：记下要看的那一条，再切到 Execution，并读它的详情（`focus` 是
+ * 详情页的入参；请求不在渲染里发）。「回答」「评审」「查看全部」与点行都是这一个动作。
  */
 function openTicket(ticketId: string): void {
-  set(focus, { page: 'execution', id: ticketId })
   set(page, 'execution')
+  openTicketDetail(ticketId)
+}
+
+/** 打开一张工单的详情（§M.2「点行→详情」）：列表的行动作与 Overview 共用它。 */
+function openTicketDetail(ticketId: string): void {
+  set(focus, { page: 'execution', id: ticketId })
+  set(statusAsked, null)
+  set(noteDraft, '')
+  void loadTicketDetail(ticketId)
+}
+
+/**
+ * 进入 Execution 页时读它要的那一份：`focus` 指向一张工单就是详情，否则是当前筛选的列表。
+ * 已经读过的不重读（推送与动作会各自触发它们那一次）。
+ */
+function enterExecution(): void {
+  const focused = read(focus)
+  if (focused?.page === 'execution') {
+    if (read(detail)?.id !== focused.id) void loadTicketDetail(focused.id)
+    return
+  }
+  if (read(executionList) === null) void loadExecutionList()
+}
+
+/** 回到列表（清掉「从别处点进来的那一张」）；还没读过列表就当场读一次。 */
+function backToExecution(): void {
+  set(focus, null)
+  set(detail, null)
+  set(statusAsked, null)
+  if (read(executionList) === null) void loadExecutionList()
 }
 
 /** 从 Overview 打开一条系统问题的归属页（§M.2「点行→对应详情页」）。 */
@@ -528,19 +606,6 @@ async function checkNow(): Promise<void> {
   }
 }
 
-/** 人的重试（§E.5）：结束卡住的 Assignment，在同一个 worktree 上再起一个。 */
-async function retryTicket(ticketId: string): Promise<void> {
-  set(actionError, '')
-  try {
-    const next = await plugin.request('ticket.retry', { ticketId })
-    if (disposed) return
-    adopt(next)
-  } catch (error) {
-    if (disposed) return
-    set(actionError, reasonOf(error))
-  }
-}
-
 /** 聚焦一台终端（§M.2：面板不能直接做，请求交给 worker 跑 `orca terminal focus`）。 */
 async function focusTerminal(terminalId: string): Promise<void> {
   set(actionError, '')
@@ -549,6 +614,165 @@ async function focusTerminal(terminalId: string): Promise<void> {
   } catch (error) {
     if (disposed) return
     set(actionError, reasonOf(error))
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Execution 页的读数与动作（§M.2）：列表、详情、停止/重试/请求状态/note/工作区，全部经
+// worker 的同一批 handler；面板没有聚焦终端与打开工作区的宿主方法（§M.2 末段）。
+// ---------------------------------------------------------------------------
+
+/** 读一页 Execution 列表：`more` 是「加载更多」，否则从第一行重读。 */
+async function loadExecutionList(options: { readonly more?: boolean } = {}): Promise<void> {
+  const filter = read(executionFilter)
+  const current = read(executionList)
+  if (options.more === true && (current === null || current.nextOffset === null)) return
+  const offset = options.more === true && current !== null ? (current.nextOffset ?? 0) : 0
+  const seq = ++listRequest
+  set(executionLoading, true)
+  set(executionError, '')
+  try {
+    const next: TicketListPage = await plugin.request('tickets', { filter, offset, limit: PAGE_ROWS })
+    // 又发了一次请求（换档或再点一次）：这一次的答案作废，否则两档的行会混在一起。
+    if (disposed || seq !== listRequest) return
+    set(executionList, {
+      items: offset === 0 ? next.items : [...(read(executionList)?.items ?? []), ...next.items],
+      nextOffset: next.nextOffset
+    })
+  } catch (error) {
+    if (disposed) return
+    set(executionError, reasonOf(error))
+  } finally {
+    if (!disposed) set(executionLoading, false)
+  }
+}
+
+/**
+ * 推送后重读已经读到的那些页（不轮询：推送本身就是变化的信号）。重读失败不覆盖已读到的行
+ * ——一次读失败不该把页面清空；下一次推送或动作会再试。
+ */
+async function refreshExecutionList(): Promise<void> {
+  const loaded = read(executionList)?.items.length ?? 0
+  if (loaded === 0) return
+  const filter = read(executionFilter)
+  const seq = ++listRequest
+  const items: PanelTicket[] = []
+  let offset: number | null = 0
+  try {
+    while (offset !== null && items.length < loaded) {
+      const next: TicketListPage = await plugin.request('tickets', {
+        filter,
+        offset,
+        limit: PAGE_ROWS
+      })
+      if (disposed || seq !== listRequest) return
+      if (next.items.length === 0) break
+      items.push(...next.items)
+      offset = next.nextOffset
+    }
+    set(executionList, { items, nextOffset: offset })
+  } catch {
+    // 静默：已读到的行仍然是真的，下一次推送会再读。
+  }
+}
+
+/** 读一张工单的详情（§M.2 的七块）。 */
+async function loadTicketDetail(ticketId: string): Promise<void> {
+  set(detailError, '')
+  try {
+    const next = await plugin.request('ticket.detail', { ticketId })
+    if (disposed) return
+    set(detail, next)
+  } catch (error) {
+    if (disposed) return
+    set(detailError, reasonOf(error))
+  }
+}
+
+/** 详情页的动作收尾：采纳写后的快照，再重读详情（同一份读模型，不猜写后的样子）。 */
+async function afterDetailAction(action: () => Promise<PanelState>, ticketId: string): Promise<void> {
+  set(actionError, '')
+  set(acting, true)
+  try {
+    const next = await action()
+    if (disposed) return
+    adopt(next)
+    await loadTicketDetail(ticketId)
+  } catch (error) {
+    if (!disposed) set(actionError, reasonOf(error))
+  } finally {
+    if (!disposed) set(acting, false)
+  }
+}
+
+/** 人的重试（§E.5）：详情页与 Overview 的行都走这一个请求。 */
+async function retryTicket(ticketId: string): Promise<void> {
+  await afterDetailAction(() => plugin.request('ticket.retry', { ticketId }), ticketId)
+}
+
+/** 停止（§E.5、§K.3：撤回 Mandate）：破坏性，已经过行内二次确认才到这里。 */
+async function stopTicket(ticketId: string): Promise<void> {
+  await afterDetailAction(() => plugin.request('ticket.stop', { ticketId }), ticketId)
+}
+
+/** 发一条 fact note（§G.2 的 `ticket note`）：只加语境，不要求也不授权任何事。 */
+async function sendTicketNote(ticketId: string): Promise<void> {
+  const text = read(noteDraft).trim()
+  if (text === '') return
+  set(actionError, '')
+  set(acting, true)
+  try {
+    const next = await plugin.request('ticket.note', { ticketId, text })
+    if (disposed) return
+    set(noteDraft, '')
+    adopt(next)
+    await loadTicketDetail(ticketId)
+  } catch (error) {
+    if (!disposed) set(actionError, reasonOf(error))
+  } finally {
+    if (!disposed) set(acting, false)
+  }
+}
+
+/** 请求状态（§G.2 的 `ticket request-status`）：只问正在等 trigger 的 worker。 */
+async function requestTicketStatus(ticketId: string): Promise<void> {
+  set(actionError, '')
+  set(acting, true)
+  try {
+    const outcome = await plugin.request('ticket.requestStatus', { ticketId })
+    if (disposed) return
+    set(statusAsked, outcome.asked)
+    await loadTicketDetail(ticketId)
+  } catch (error) {
+    if (!disposed) set(actionError, reasonOf(error))
+  } finally {
+    if (!disposed) set(acting, false)
+  }
+}
+
+/** 打开这张工单的 worktree（§M.2：面板没有这个宿主方法，由 worker 代理）。 */
+async function openTicketWorktree(ticketId: string): Promise<void> {
+  set(actionError, '')
+  try {
+    await plugin.request('workspace.open', { ticketId })
+  } catch (error) {
+    if (disposed) return
+    set(actionError, reasonOf(error))
+  }
+}
+
+/** 移除这张工单的 worktree（§E.1 清理）：破坏性，已经过行内二次确认才到这里。 */
+async function removeTicketWorktree(ticketId: string): Promise<void> {
+  set(actionError, '')
+  set(acting, true)
+  try {
+    await plugin.request('workspace.remove', { ticketId })
+    if (disposed) return
+    await loadTicketDetail(ticketId)
+  } catch (error) {
+    if (!disposed) set(actionError, reasonOf(error))
+  } finally {
+    if (!disposed) set(acting, false)
   }
 }
 
@@ -568,42 +792,454 @@ function Stat(props: { readonly label: string; readonly value: string; readonly 
 
 
 /**
- * Execution 页（§M.2 的 Ticket 列表；详情归 #38）：行来自 worker 快照的 `tickets`，
- * 与 Overview 用同一个 `TicketRow`，因此同一张工单在三个页面上的标记与措辞一致。
- * 从 Overview 点过来的那一张标成 `current`：人去的那一行就是看得见的那一行。
+ * 授权面（§M.2 的 Mandate 块）：强度、发起人、policy version、Gate 依据与匹配到的规则。
+ * 规则是 Mandate 记录的 id：面板照抄，不替它编名字。
  */
-function Execution(props: { readonly locale: string; readonly state: PanelState }): OrcaElement {
+function mandateItems(locale: string, mandate: PanelMandate): readonly KeyValueItem[] {
+  const basis = translate(locale, `mandate.via.${mandate.via}` as CopyKey)
+  const cell =
+    mandate.cell === undefined
+      ? ''
+      : ` · ${translate(locale, `mandate.cell.${mandate.cell}` as CopyKey)}`
+  return [
+    {
+      label: translate(locale, 'term.strength' as CopyKey),
+      value: translate(locale, `strength.${mandate.strength}` as CopyKey)
+    },
+    { label: words(locale, 'execution.actor'), value: mandate.actor, code: true },
+    { label: translate(locale, 'term.policyVersion' as CopyKey), value: mandate.policyVersion },
+    { label: words(locale, 'execution.basis'), value: `${basis}${cell}` },
+    {
+      label: words(locale, 'execution.rules'),
+      value:
+        mandate.rules.length === 0 ? words(locale, 'execution.noRules') : mandate.rules.join(', '),
+      ...(mandate.rules.length === 0 ? {} : { code: true })
+    }
+  ]
+}
+
+/** 终端摘要的预览：Attention 里只看最后几行，完整摘要另有终端块。 */
+const TERMINAL_PREVIEW_LINES = 3
+
+/** 一个订阅的行：人读的名字 + 「仅语境」与最后一条的时刻。 */
+function SubscriptionRow(props: {
+  readonly locale: string
+  readonly subscription: PanelSubscription
+}): OrcaElement {
   const locale = props.locale
-  const tickets = props.state.tickets ?? []
-  const focused = read(focus)
+  const subscription = props.subscription
+  return (
+    <ListItem
+      key={subscription.key}
+      title={subscription.title}
+      description={subscription.context ? words(locale, 'execution.contextOnly') : subscription.key}
+      icon={subscription.context ? 'info' : 'layers'}
+    >
+      <Row gap="xs" align="center" wrap>
+        {subscription.context ? (
+          <MarkBadge label={words(locale, 'execution.contextOnly')} tone="neutral" />
+        ) : null}
+        {subscription.lastAt === undefined ? null : (
+          <RelativeTime at={subscription.lastAt} format="short" muted />
+        )}
+      </Row>
+    </ListItem>
+  )
+}
+
+/**
+ * 一张工单的详情（§M.2 的 Execution 详情）：授权、等待中的 Input、订阅、派工（可折叠）、
+ * Report、Attention（带终端摘要预览）、终端摘要与结局；动作在末尾的工具栏里。
+ *
+ * 读数来自 `ticket.detail` 这一条请求；写动作全部经 worker 的 handler，成功后重读详情。
+ */
+function TicketDetailPage(props: { readonly locale: string; readonly ticketId: string }): OrcaElement {
+  const locale = props.locale
+  const ticket = read(detail)
+  const failure = read(detailError)
+  const busy = read(acting)
+  const asked = read(statusAsked)
+  const draft = read(noteDraft)
+  const back = (
+    <Button variant="ghost" size="sm" icon="next" onPress={backToExecution}>
+      {words(locale, 'execution.back')}
+    </Button>
+  )
+  const shown = ticket !== null && ticket.id === props.ticketId ? ticket : null
+  if (shown === null) {
+    return (
+      <Stack gap="md">
+        <PageHeader title={translate(locale, 'nav.execution')} actions={back} />
+        {failure === '' ? (
+          <LoadingState label={words(locale, 'state.loading')} />
+        ) : (
+          <ErrorState
+            title={words(locale, 'state.errorTitle')}
+            reason={failure}
+            locale={locale}
+            onRetry={() => void loadTicketDetail(props.ticketId)}
+          />
+        )}
+      </Stack>
+    )
+  }
+  const mark = executionMark(shown)
+  const terminal = shown.terminal
+  const lines = terminal?.lines ?? []
   return (
     <Stack gap="md">
-      <Section title={translate(locale, 'nav.execution')} count={tickets.length}>
-        {tickets.length === 0 ? (
-          <EmptyStateBlock title={words(locale, 'execution.empty')} icon="layers" />
+      <PageHeader
+        title={shown.title}
+        subtitle={translate(locale, 'nav.execution')}
+        actions={
+          <Row gap="xs" align="center" wrap>
+            <MarkBadge label={markLabel(locale, mark)} tone={mark.tone} />
+            <RelativeTime at={shown.at} format="short" muted />
+            {back}
+          </Row>
+        }
+      />
+      {failure === '' ? null : (
+        <Text tone="danger" size="xs">
+          {failure}
+        </Text>
+      )}
+
+      <KeyValue label={words(locale, 'execution.mandate')} items={mandateItems(locale, shown.mandate)} />
+
+      <Section title={words(locale, 'execution.inputs')} count={shown.waitingInputs.length}>
+        {shown.waitingInputs.length === 0 ? (
+          <Hint text={words(locale, 'execution.noInputs')} />
         ) : (
-          <List label={translate(locale, 'nav.execution')}>
-            {tickets.slice(0, read(rows)).map((ticket) => (
-              <TicketRow
-                key={ticket.id}
-                locale={locale}
-                ticket={{
-                  ...executionRow(ticket),
-                  ...(focused?.page === 'execution' && focused.id === ticket.id ? { current: true } : {})
-                }}
-              />
+          <List label={words(locale, 'execution.inputs')}>
+            {shown.waitingInputs.map((input) => (
+              <ListItem
+                key={input.id}
+                title={translate(locale, `execution.input.${input.kind}` as CopyKey)}
+                description={input.text ?? input.triggerId ?? input.id}
+              >
+                <Row gap="xs" align="center" wrap>
+                  {input.human === true ? (
+                    <MarkBadge label={words(locale, 'execution.human')} tone="accent" />
+                  ) : null}
+                  <RelativeTime at={input.at} format="short" muted />
+                </Row>
+              </ListItem>
             ))}
           </List>
         )}
-        {tickets.length > read(rows) ? (
-          <Row>
-            <Button variant="outline" size="sm" onPress={() => set(rows, read(rows) + PAGE_ROWS)}>
-              {words(locale, 'state.loadMore')}
-            </Button>
-          </Row>
-        ) : null}
       </Section>
+
+      <Section title={words(locale, 'execution.subscriptions')} count={shown.subscriptions.length}>
+        {shown.subscriptions.length === 0 ? (
+          <Hint text={words(locale, 'execution.noSubscriptions')} />
+        ) : (
+          <List label={words(locale, 'execution.subscriptions')}>
+            {shown.subscriptions.map((subscription) => (
+              <SubscriptionRow key={subscription.key} locale={locale} subscription={subscription} />
+            ))}
+          </List>
+        )}
+      </Section>
+
+      <Collapsible
+        title={`${words(locale, 'execution.assignments')} · ${shown.assignments.length}`}
+        defaultOpen={false}
+      >
+        {shown.assignments.length === 0 ? (
+          <Hint text={words(locale, 'execution.noAssignments')} />
+        ) : (
+          <List label={words(locale, 'execution.assignments')}>
+            {shown.assignments.map((assignment) => (
+              <ListItem
+                key={assignment.id}
+                title={translate(locale, `assignment.${assignment.state}` as CopyKey)}
+                description={assignment.report?.summary ?? assignment.terminalId ?? assignment.id}
+                icon="layers"
+              >
+                <Row gap="xs" align="center" wrap>
+                  {assignment.terminalId === undefined ? null : (
+                    <Text muted size="xs">
+                      {assignment.terminalId}
+                    </Text>
+                  )}
+                  <RelativeTime
+                    at={assignment.startedAt ?? assignment.createdAt}
+                    format="short"
+                    muted
+                  />
+                </Row>
+              </ListItem>
+            ))}
+          </List>
+        )}
+      </Collapsible>
+
+      <Section title={words(locale, 'execution.reports')} count={shown.reports.length}>
+        {shown.reports.length === 0 ? (
+          <Hint text={words(locale, 'execution.noReports')} />
+        ) : (
+          <List label={words(locale, 'execution.reports')}>
+            {shown.reports.map((report, index) => (
+              <ListItem
+                key={`${report.at}:${index}`}
+                title={translate(locale, `report.${report.state}` as CopyKey)}
+                description={report.summary}
+                icon="download"
+              >
+                <Row gap="xs" align="center">
+                  <MarkBadge
+                    label={translate(locale, `report.${report.state}` as CopyKey)}
+                    tone={reportMark(report.state).tone}
+                  />
+                  <RelativeTime at={report.at} format="short" muted />
+                </Row>
+              </ListItem>
+            ))}
+          </List>
+        )}
+      </Section>
+
+      <Section title={words(locale, 'execution.attention')}>
+        {shown.attention === undefined ? (
+          <Hint text={words(locale, 'execution.noAttention')} />
+        ) : (
+          <Callout tone="warning" title={words(locale, 'execution.attention')} icon="info">
+            <Stack gap="xs">
+              <Text size="sm">{shown.attention.question}</Text>
+              <Row gap="xs" align="center" wrap>
+                <RelativeTime at={shown.attention.at} format="short" muted />
+                {shown.attention.via === 'terminal' ? (
+                  <Text muted size="xs">
+                    {words(locale, 'attention.fromTerminal')}
+                  </Text>
+                ) : null}
+              </Row>
+              {terminal === undefined ? null : (
+                <Stack gap="xs">
+                  <Text muted size="xs">
+                    {words(locale, 'execution.terminalPreview')}
+                  </Text>
+                  <CodeView
+                    code={lines.slice(-TERMINAL_PREVIEW_LINES).join('\n')}
+                    label={words(locale, 'execution.terminalPreview')}
+                    wrap
+                    maxHeight="sm"
+                  />
+                </Stack>
+              )}
+            </Stack>
+          </Callout>
+        )}
+      </Section>
+
+      <Section title={words(locale, 'execution.terminal')}>
+        {terminal === undefined ? (
+          <Hint text={words(locale, 'execution.noTerminal')} />
+        ) : (
+          <CodeView
+            code={lines.join('\n')}
+            label={words(locale, 'execution.terminal')}
+            wrap
+            maxHeight="md"
+          />
+        )}
+      </Section>
+
+      {shown.ended === undefined ? null : (
+        <Section title={translate(locale, 'term.ended' as CopyKey)}>
+          <Row gap="xs" align="center" wrap>
+            <MarkBadge
+              label={translate(locale, `outcome.${shown.ended.outcome}` as CopyKey)}
+              tone="neutral"
+            />
+            <Text muted size="xs">
+              {translate(locale, `endBy.${shown.ended.by}` as CopyKey)}
+            </Text>
+            <RelativeTime at={shown.ended.at} format="short" muted />
+            {shown.ended.reason === undefined ? null : (
+              <Text size="xs" muted>
+                {shown.ended.reason}
+              </Text>
+            )}
+          </Row>
+        </Section>
+      )}
+
+      <Toolbar label={words(locale, 'execution.actions')}>
+        {shown.canRetry ? (
+          <Button
+            variant="outline"
+            size="sm"
+            icon="refresh"
+            disabled={busy}
+            onPress={() => void retryTicket(shown.id)}
+          >
+            {words(locale, 'action.retry')}
+          </Button>
+        ) : null}
+        <ConfirmAction
+          id={`stop:${shown.id}`}
+          label={words(locale, 'action.stop')}
+          action={words(locale, 'action.stop')}
+          target={shown.title}
+          locale={locale}
+          icon="stop"
+          onConfirm={() => void stopTicket(shown.id)}
+        />
+        <Button
+          variant="outline"
+          size="sm"
+          icon="info"
+          disabled={busy}
+          onPress={() => void requestTicketStatus(shown.id)}
+        >
+          {words(locale, 'execution.requestStatus')}
+        </Button>
+        {terminal === undefined ? null : (
+          <Button
+            variant="outline"
+            size="sm"
+            icon="play"
+            onPress={() => void focusTerminal(terminal.terminalId)}
+          >
+            {words(locale, 'overview.openTerminal')}
+          </Button>
+        )}
+        {shown.worktree === undefined ? null : (
+          <Button
+            variant="outline"
+            size="sm"
+            icon="folder"
+            onPress={() => void openTicketWorktree(shown.id)}
+          >
+            {words(locale, 'execution.openWorktree')}
+          </Button>
+        )}
+        {shown.worktree === undefined ? null : (
+          <ConfirmAction
+            id={`remove:${shown.id}`}
+            label={words(locale, 'execution.removeWorktree')}
+            action={words(locale, 'execution.removeWorktree')}
+            target={shown.worktree.directory}
+            locale={locale}
+            icon="delete"
+            onConfirm={() => void removeTicketWorktree(shown.id)}
+          />
+        )}
+      </Toolbar>
+
+      {asked === null ? null : (
+        <Hint text={words(locale, asked ? 'execution.asked' : 'execution.notAsked')} />
+      )}
+
+      <Field label={words(locale, 'execution.note')}>
+        <Textarea
+          label={words(locale, 'execution.note')}
+          labelHidden
+          value={draft}
+          placeholder={words(locale, 'execution.notePlaceholder')}
+          rows={2}
+          onChange={(next) => set(noteDraft, next)}
+        />
+      </Field>
+      <Row justify="end">
+        <Button
+          variant="outline"
+          size="sm"
+          icon="download"
+          disabled={busy || draft.trim() === ''}
+          onPress={() => void sendTicketNote(shown.id)}
+        >
+          {words(locale, 'execution.noteSend')}
+        </Button>
+      </Row>
     </Stack>
+  )
+}
+
+/**
+ * Execution 的列表（§M.2）：五档筛选 + 分页 50 条（§M.4 的 `Table`）。行、筛选与分页都由
+ * worker 的读模型回答；点行打开详情。
+ */
+function ExecutionListPage(props: { readonly locale: string }): OrcaElement {
+  const locale = props.locale
+  const filter = read(executionFilter)
+  const page = read(executionList)
+  const loading = read(executionLoading)
+  const failure = read(executionError)
+  const items = page?.items ?? []
+  const rows: TableRow[] = items.map((ticket) => ({
+    key: ticket.id,
+    cells: {
+      ticket: ticket.title,
+      stage: markLabel(locale, executionMark(ticket)),
+      at: { type: 'relative', at: ticket.at, format: 'short' }
+    }
+  }))
+  return (
+    <Stack gap="md">
+      <RadioGroup
+        label={words(locale, 'execution.filters')}
+        orientation="horizontal"
+        value={filter}
+        options={EXECUTION_FILTERS.map((value) => ({
+          value,
+          label: translate(locale, `execution.filter.${value}` as CopyKey)
+        }))}
+        onChange={(next) => {
+          if (!isExecutionFilter(next) || next === filter) return
+          set(executionFilter, next)
+          set(executionList, null)
+          void loadExecutionList()
+        }}
+      />
+      {failure === '' ? null : (
+        <Callout tone="danger" title={words(locale, 'state.errorTitle')} icon="error">
+          <Stack gap="sm">
+            <Text size="sm">{failure}</Text>
+            <Row gap="xs">
+              <Button variant="outline" size="sm" icon="refresh" onPress={() => void loadExecutionList()}>
+                {words(locale, 'state.retry')}
+              </Button>
+            </Row>
+          </Stack>
+        </Callout>
+      )}
+      {page !== null && items.length === 0 && failure === '' ? (
+        <EmptyStateBlock title={words(locale, 'execution.empty')} icon="layers" />
+      ) : null}
+      <Table
+        label={translate(locale, 'nav.execution')}
+        columns={[
+          { key: 'ticket', label: words(locale, 'execution.columnTicket') },
+          { key: 'stage', label: words(locale, 'execution.columnStage'), width: 'sm' },
+          {
+            key: 'at',
+            label: words(locale, 'execution.columnUpdated'),
+            align: 'end',
+            width: 'xs',
+            hideBelow: 'sm'
+          }
+        ]}
+        rows={rows}
+        loading={loading && page === null}
+        hasMore={page !== null && page.nextOffset !== null}
+        onRowAction={(row) => openTicketDetail(row.key)}
+        onLoadMore={() => void loadExecutionList({ more: true })}
+        emptyText={words(locale, 'execution.empty')}
+      />
+    </Stack>
+  )
+}
+
+/** Execution 页：`focus` 指向一张工单时是详情，否则是当前筛选的列表（§M.2）。 */
+function ExecutionPage(props: { readonly locale: string }): OrcaElement {
+  const focused = read(focus)
+  return focused?.page === 'execution' ? (
+    <TicketDetailPage locale={props.locale} ticketId={focused.id} />
+  ) : (
+    <ExecutionListPage locale={props.locale} />
   )
 }
 
@@ -632,7 +1268,7 @@ function PageBody(props: { readonly locale: string; readonly current: NavPage })
     return props.current === 'overview' ? (
       <Overview locale={locale} state={state} />
     ) : (
-      <Execution locale={locale} state={state} />
+      <ExecutionPage locale={locale} />
     )
   }
   return (
@@ -714,6 +1350,7 @@ export default function Panel(): OrcaElement {
           set(page, next)
           // Deployment 组打开时才读（隐藏与未打开的页面不发请求，§M.6）。
           if (next === 'settings') void openDeployment()
+          if (next === 'execution') enterExecution()
         }}
       >
         {NAV_PAGES.map((item) => (
