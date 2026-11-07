@@ -16,6 +16,7 @@ import { cliFailure, FakeStream } from './support/fake-commands.ts'
 import { openBoot } from './support/boot.ts'
 import { bootPlugin } from '../src/worker/boot.ts'
 import { feishuConfigSchema } from '../src/worker/sources/feishu/config.ts'
+import { IDEMPOTENCY_KEY_MAX, feishuIdempotencyKey } from '../src/worker/sources/feishu/channel.ts'
 import { createFeishuKind } from '../src/worker/sources/feishu/kind.ts'
 import type { SyncContext } from '../src/worker/sources/kind.ts'
 import { FakeHealthBoard } from './support/health-board.ts'
@@ -1035,11 +1036,12 @@ function replyMessage(text = 'Done', address: Record<string, string> = {}): Outb
   }
 }
 
-test('a reply lands in the topic of its root message with the message id as the idempotency key', async () => {
+test('a reply lands in the topic of its root message, as markdown, with an idempotency key the CLI accepts', async () => {
   const cli = new FakeCommands()
   cli.script(['im', '+messages-reply'], () => JSON.stringify({ code: 0, data: { message_id: 'om_sent' } }))
   const kind = createFeishuKind('lark-cli')
   assert.equal(await kind.channel?.send(cli, replyMessage()), 'sent')
+  // 命令名与每个 flag 都是本机 lark-cli 1.0.96 的实测值（`im +messages-reply --help`）。
   assert.deepEqual(cli.args, [
     [
       'im',
@@ -1048,12 +1050,39 @@ test('a reply lands in the topic of its root message with the message id as the 
       'bot',
       '--message-id',
       'om_root',
-      '--text',
+      '--reply-in-thread',
+      '--markdown',
       'Done',
       '--idempotency-key',
       'reply-0123456789abcdef0123456789abcdef'
     ]
   ])
+  // 两个 flag 必须同时在：话题回复（§I.3「Feishu 用话题回复」）+ 正文按 Markdown 交给 CLI。
+  const [args] = cli.args as [string[]]
+  assert.ok(args.includes('--reply-in-thread'), 'the reply lands in the thread')
+  assert.ok(args.includes('--markdown'), 'the text goes in as markdown')
+  // 正文原样交出去：转义与富文本是 CLI 的职责（§I.3），这里不改一个字。
+  assert.equal(args[args.indexOf('--markdown') + 1], 'Done')
+  assert.ok((args[args.indexOf('--idempotency-key') + 1] ?? '').length <= IDEMPOTENCY_KEY_MAX)
+})
+
+test('a message id longer than the CLI limit is truncated deterministically, never dropped', async () => {
+  const long = `reply-${'a'.repeat(64)}`
+  const truncated = feishuIdempotencyKey(long)
+  assert.equal(truncated.length, IDEMPOTENCY_KEY_MAX)
+  // 同样的 id 永远同样的键（重试仍然幂等）；不同的 id 不会撞。
+  assert.equal(feishuIdempotencyKey(long), truncated)
+  assert.notEqual(feishuIdempotencyKey(`reply-${'b'.repeat(64)}`), truncated)
+  assert.equal(feishuIdempotencyKey('reply-short'), 'reply-short', 'short ids pass through untouched')
+  // 发出去的那一条用的就是它。
+  const cli = new FakeCommands()
+  cli.script(['im', '+messages-reply'], () => '{}')
+  const kind = createFeishuKind('lark-cli')
+  assert.equal(await kind.channel?.send(cli, { ...replyMessage(), id: long }), 'sent')
+  const [args] = cli.args as [string[]]
+  const sent = args[args.indexOf('--idempotency-key') + 1] ?? ''
+  assert.equal(sent, truncated)
+  assert.ok(sent.length <= IDEMPOTENCY_KEY_MAX)
 })
 
 test('a chat replies only where the Source still listens', async () => {

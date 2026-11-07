@@ -42,7 +42,8 @@
         "bot",
         "--message-id",
         "om_dc13264520392913993dd051dba21dcf",
-        "--text",
+        "--reply-in-thread",
+        "--markdown",
         "Done",
         "--idempotency-key",
         "<outbox message id>"
