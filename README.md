@@ -98,7 +98,7 @@ Orca 的 setup 钩子会在插件根（也就是仓库/worktree 根）创建 `.c
 
 ### 4. 四个宿主设置（Orca Settings → Superagent）
 
-只有决定「能不能开工」的四项进宿主设置，其余全在面板的 Settings → Deployment 组（存库即生效）：
+只有决定「能不能开工」的四项进宿主设置，其余全在面板 Settings 的五个组里（Sources / Eval / Execution / Prompts / Deployment），存库即生效（`stateDir` 除外）：
 
 | key | 标题 | 缺省 | 说明 |
 | --- | --- | --- | --- |
@@ -107,7 +107,7 @@ Orca 的 setup 钩子会在插件根（也就是仓库/worktree 根）创建 `.c
 | `routerAgent` | Router agent | `pi` | 常驻 Router 会话用的 Orca agent id |
 | `baseRepo` | Base repository | 空 | 建工单 worktree 的仓库选择器：`path:<路径>` / `name:<名字>` / `id:<id>` |
 
-两个 agent 设置的默认值在清单与 `src/worker/app/agent-defaults.ts` 两处都写 `pi`，必须同值（`agent-defaults.test.ts` 断言）；你在 Orca Settings 里随时可覆盖。其余设置（模型、并发、`prepare`、blocked commands、CLI 路径、端口、保留策略、三个机器限额）在面板里改。
+两个 agent 设置的默认值在清单与 `src/worker/app/agent-defaults.ts` 两处都写 `pi`，必须同值（`agent-defaults.test.ts` 断言）；你在 Orca Settings 里随时可覆盖。其余设置（模型、并发、`prepare`、blocked commands、CLI 路径、端口、保留策略、四个机器限额）在面板里改。
 
 ### 5. 首次运行：最小可用配置走查
 
