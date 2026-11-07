@@ -12,8 +12,9 @@
 // §B），于是命令行与面板的语义、拒绝码与事务边界只有一份（#29）。
 //
 // 依赖纪律（§C.2）：本文件在 `http/`，只 import core 的类型、`app/views` 与同目录的
-// `ApiError`；领域写入经注入的 Engine 端口，存储经注入的读口。
+// `ApiError`/`values.ts`；领域写入经注入的 Engine 端口，存储经注入的读口。
 import { ApiError, ERROR_CODES } from './errors.ts'
+import { bodyObject } from './values.ts'
 import { IM_WORDS, wordCount } from '../infra/text.ts'
 import { REPORT_STATES, threadKey } from '../core/index.ts'
 import type {
@@ -118,14 +119,6 @@ export interface DomainHandlerOptions {
    * 一小时内重试返回首次结果（§G.1）：本票接线的四条写命令都过这一个口。
    */
   readonly idempotent?: WriteIdempotency
-}
-
-/** 一个 body 对象；不是对象就按 `invalid_params` 拒绝。 */
-function bodyObject(body: unknown): Record<string, unknown> {
-  if (typeof body !== 'object' || body === null) {
-    throw new ApiError(ERROR_CODES.invalidParams, 'The request body must be a JSON object')
-  }
-  return body as Record<string, unknown>
 }
 
 /** 可省略的 body：没有 body 就是空对象（只有 `--yes` 这类开关的动作可以不带字段）。 */

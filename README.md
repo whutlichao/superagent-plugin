@@ -176,7 +176,7 @@ Router 与 worker 用的命令（`route`、`eval`、`eval-read`、`eval-decide`�
 ```sh
 scripts/check.sh          # 四道门禁按序执行，全绿才退出 0
 npx tsc -p .              # 自包含类型检查（不依赖任何 Orca 生成文件）
-orca plugin test . --json # 插件内全部 *.test.ts(x)（#49 实测快照：88 个文件、1560 条测试、fail 0）
+orca plugin test . --json # 插件内全部 *.test.ts(x)（截至 #64 合并的实测快照：89 个文件、1576 条测试、fail 0）
 orca plugin check . --json
 orca plugin validate . --json
 ```

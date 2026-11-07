@@ -567,7 +567,8 @@ CREATE TABLE kv (
 | 设置与历史 | `app/settings.ts` |
 | Prompt 版本 | `app/prompts.ts` |
 | effect 行 | `app/effects.ts` |
-| outbox receipt | `app/outbox.ts`（唯一写者） |
+| outbox receipt | `app/outbox.ts`（运行时唯一写者；已结算行的过期删除归下一行的维护 pass，§D.2 第 5 条） |
+| 过期删除：`trigger` / `disposition` / `decision`（默认 90 天，未结束 Ticket 视野里的不删）、已结算 `outbox`（30 天）、非当前版本快照 | `app/retention-sql.ts`（`app/retention.ts` 在维护 pass 的一天一次事务里执行；它只**删**旧行，不创建任何状态，§D.2 第 5 条） |
 | 每个 health 条目 | 在 HealthBoard 上 claim 它的那个部件（重复 claim 直接抛） |
 | router 快照（terminal/workspace/restarts） | `router/supervision.ts` |
 
@@ -664,7 +665,7 @@ pending ──launch 成功──▶ running ──report(ready|dropped) / stop 
 | --- | --- |
 | stop（人） | 撤回 Mandate、`outbox` 发收尾消息、`closeTerminal`（`orca terminal close`）→ Assignment `ended(reason: stopped)`；worktree 保留。Ticket 之后不再接收任何 Input |
 | retry | 结束当前 Assignment（同 stop 的终端关闭），`launch` 一条新 Assignment，同 worktree/分支/PR；带 recovery note（「检查目录、git 历史与 GitHub，别重复已做的外部动作」） |
-| 恢复（进程重启） | 启动时列出 `running` Assignment，用 `listTerminals()`（全机权威）判断终端是否还在，用 `listWorkspaces()` 判断 worktree 是否还在。终端不在枚举里或 `connected===false` → `interrupted`，新建 Assignment 并带 recovery note；终端还在且 `worktreeId` 命中本 Ticket → 认领（`adopt`），投递一条「已恢复，继续」。**不用 `agents.list()` 做枚举**：它只见聚焦 workspace。`orphaned:true` 只表示「没有挂载到可见 pane」（附录 C Router 记录），不是死亡——但**认领**比判活严一格：`resume.ts` 要求 `connected && !orphaned`，于是「后台跑着、UI 里没开」的 worker 终端会被重建而不是认领（宁可重建，也不把看不见的会话当自己的） |
+| 恢复（进程重启） | 启动时列出 `running` Assignment，用 `listTerminals()`（全机权威）判断终端是否还在，用 `listWorkspaces()` 判断 worktree 是否还在。终端不在枚举里或 `connected===false` → `interrupted`，新建 Assignment 并带 recovery note；终端还在且 `worktreeId` 命中本 Ticket → 认领（`adopt`），投递一条「已恢复，继续」。**不用 `agents.list()` 做枚举**：它只见聚焦 workspace。`orphaned:true` 只表示「没有挂载到可见 pane」（附录 C Router 记录），不是死亡——**认领与判活同一条线**：`resume.ts` 只看 `connected`，再用 `belongsToTicket`（worktree 路径或工作区 id 命中 Ticket 记录的目录）决定这是不是自己的会话，于是「后台跑着、UI 里没开」的 worker 终端被认领而不是重建（#62 的修正；判据是 worktree，不是 pane） |
 | 停止整插件 | `deactivate()` 顺序：停 passes → 排空 effects（保留 pending 行）→ 不杀 worker 终端（它们继续跑，重启后被 adopt）→ 关 HTTP → 关库 → 释放锁 |
 
 上游「shutdown 等 10 s worker 后台工作、进程重启直接丢掉」在 Orca 上不适用：**worker 终端是 Orca 的，不随插件停止而结束**。这是改进而非损失，写进 §H.3。
@@ -1094,9 +1095,10 @@ export interface SourceKind<C = unknown> {
 
 `SourceContext`（由 `app/source-context.ts` 构造）给 kind 的只有：`ready`、`configured()`、`problem`、`config<C>(kind)`、`receive(trigger)`、`atomic(fn)`、`state`（typed kv）、`threads.describe/patch`、`tickets.bindThread/threadClosed`、`triggers.read`、`notify`、`report(entry, health)`、`commands.withSignal`。
 
-**新增一个 SourceKind 的十一步**已经成文在 [`docs/adding-a-source.md`](../adding-a-source.md)：kind 协议与
+**新增一个 SourceKind 的十二步**已经成文在 [`docs/adding-a-source.md`](../adding-a-source.md)：kind 协议与
 配置 schema、fields、facts、health 条目、scope、Channel、Thread 上下文、搜索、Policy 部分（准入行 /
-bots / sync）、环境变量、夹具与测试；以及它在 `sources/registry.ts` 与 `boot.ts` 里怎么注册、
+bots / sync）、环境变量、夹具与测试、资源名（`app/read.ts` 的 `ParsedResource` 与
+`READ_SOURCE_RESOURCES`）；以及它在 `sources/registry.ts` 与 `boot.ts` 里怎么注册、
 `SourceContext` 里哪些东西可以用、必须守的接口缝纪律。
 
 图片的 id 是 `threadContext.image` 与 `eval-read --image-id` 之间的唯一契约：**`<message-id>/<image-key>`**。`eval` 窗口在每条消息上列出这样组合出来的 `images[]`（key 由 `threadContext.images(text)` 从正文认出），`eval-read --image-id` 原样把它交回 `threadContext.image`；kind 只接受自己正文里出现过的 key（与上游 `image` 的校验同），绝不下载任意远端 id。
@@ -1730,7 +1732,7 @@ $ orca plugin types <dir> --json
 | CLI 凭证 | 由机器上的 `gh` / `lark-cli` 持有；插件**不存** GitHub token、不存 Feishu app secret；`secrets` 只用于可选的自定义（如私有镜像口令），且有 `protection()==='unavailable'` 时的降级说明 |
 | 破坏性操作 | 面板二次确认（§M.2）；CLI 侧 `ticket stop` / `worktree rm` / `rotate-token` 要求 `--yes`（或 `--request-id` 幂等 + `--confirm`） |
 | 命令注入 | 所有子进程用 **argv 数组** + `shell:false`；程序名白名单（`gh`/`lark-cli`/`git`/`orca`/`sh`），路径必须是设置里给的绝对值；`prepare` 命令里只允许 `${DSH_SUPERAGENT_*}` 白名单变量，替换时逐值单引号转义；**绝不**把消息正文拼进 shell |
-| 超时 | CLI 60 s（`prepare` 10 min，`worktree create` 120 s）；HTTP handler 内不做超过 10 s 的同步等待（长活进 effect） |
+| 超时 | CLI 60 s（`prepare` 10 min，`worktree create` 120 s）；HTTP handler 内不做超过 10 s 的同步等待（长活进 effect）。两条会同步等外部 CLI 的路由因此各有预算：`POST setup/check` 单条探针 2 s、整次 9 s（`src/worker/http/ops.ts` 的 `SETUP_CHECK_BUDGET`），`POST policy-sync/:id` 整次 8 s（`http/settings.ts` 的 `POLICY_SYNC_BUDGET`）；到点先取消（信号进 `execFile`，子进程被 SIGTERM 掐掉）再返回固定码 `unavailable` + 「稍后重试」，半个结论都不落库（`infra/deadline.ts`） |
 | 路径 | `stateDir` 必须是绝对路径且可写；`inbox/relay/skills/backups` 都在其后代内；任何用户提供的路径（`eval-read --path`）必须 realpath 后落在 base repo 或 ticket worktree 之内，否则 `refused` |
 | 审批面 | manifest 的 10 个 capability 就是用户看到并批准的清单；插件不请求 `appearance:write`，也不注册 hook 之外的拦截点（不用 `terminal.send`/`agent.tool.before` 做「安全网关」，避免把可靠性问题变成安全断言） |
 | 供应链 | 零运行时 npm 依赖（只用 Node 内置：`node:sqlite`、`node:fs`、`node:crypto`、`node:child_process`、`node:http`）；若必须引入 zod，以 MIT 单文件内置（`src/worker/infra/schema.ts` 的最小校验器），避免 `node_modules`（插件不允许提交 `node_modules`，也不做打包） |
@@ -1752,7 +1754,7 @@ $ orca plugin types <dir> --json
 
 ### P.2 测试套件（`orca plugin test .` 会跑所有 `*.test.ts(x)`）
 
-快照（本机 Orca 1.4.251、Node 25）：**88 个文件、1560 条测试、169 个 suite、fail 0**。下表按模块
+快照（本机 Orca 1.4.251、Node 25；截至 #64 合并，`scripts/check.sh` 的实测读数）：**89 个文件、1576 条测试、170 个 suite、fail 0**。下表按模块
 分组，每行都是 `tests/` 下的真实文件；「对应上游」写上游同名测试面，合并与改名的地方直接写出
 去向（§R.2 是同一件事的反向对照）。**没有落地的一项**单独列在表末。
 
@@ -1814,13 +1816,13 @@ $ orca plugin types <dir> --json
 | `manifest-budget.test.ts` / `license.test.ts` / `check-script.test.ts` / `shutdown.test.ts` | 清单形态与每类上限；MIT 与署名句；`scripts/check.sh` 的四道门禁与 `types` 缺陷探针；关停屏障 | `bundle-patch.spec.ts`（删除：改由 `plugin validate` 承担） |
 | `source-state.test.ts` / `log.test.ts` / `schema.test.ts` / `status-bar.test.ts` | Source 只经端口写自己的状态；日志滚动、脱敏、`orca.log`；零依赖校验器的 `strict`/`safeParse`/错误路径；状态栏文本、语气与 2 s 节流 | 无（Orca 专有） |
 | `docs.test.ts` | 本地链接、无冲突标记、编号文档、§C.1 模块表覆盖 `src/` 每个目录、§P.2 ↔ §R.2 互相对得上、README 的十一项限制与 attribution | `docs.spec.ts` |
+| `class-docs.test.ts` | 注释纪律：`src/worker/**` 与 `src/panel/**` 的每个导出类、每个导出具名函数上方都有 JSDoc，每个模块首部都有一段说明（`//` 散文或 JSDoc 都算）；规则配灵敏度自测，豁免表为空 | `class-docs.spec.ts` |
 | `src/panel/panel.check.ts`（不在 `tests/`） | `plugin check` 的 17 个情景（§M.7） | 无（Orca 专有） |
 
 #### 没有落地的上游测试面（记为差异，不是笔误）
 
 | 上游测试面 | 现在的状态 | 归属 |
 | --- | --- | --- |
-| `class-docs.spec.ts` | **没有** `class-docs.test.ts`：仓库里没有「每个类前必须有 JSDoc」的自动断言，这条纪律今天靠审阅 | 无票。§H 之外的一处实现差异，#50 在此记明；要补需要一张新票 |
 | `runtime-concurrency` 的独立文件 | 断言并入 `passes.test.ts`（pass 期间到达的请求）与 `core-engine.test.ts`（Thread 串行 Eval + 合并待评估的 Trigger） | #15 T1 |
 | `delivery.spec.ts` | 投递去重（request id）的断言在 `effects.test.ts` 与 `tools.test.ts`（幂等），没有单独文件 | #11 F6A |
 
@@ -2067,7 +2069,7 @@ manifest + types + tsconfig + boot + lock + sqlite(trigger/thread/ticket/decisio
 | `panel-overview` / `panel-source` / `panel-trigger` / `panel-eval` / `panel-execution` / `panel-settings` / `panel-prompts` / `panel-deployment` | `panel-overview` … `panel-deployment`（10 个文件） | 一对一 |
 | `draft` / `prompt-config` / `markdown` / `marks` / `locales` / `styles` | 同名（`prompt-config` → `prompts` + `panel-prompts` + `diff`） | 一对一 / 合并 |
 | `docs` | `docs` | 一对一（「模块表/测试表完整」改为针对本文 §C 与 §P） |
-| `class-docs` | 未落地 | 没有 `class-docs.test.ts`；§P.2 表末记为差异（要补需要一张新票） |
+| `class-docs` | `class-docs` | 一对一（`tests/class-docs.test.ts`：导出类/具名函数的 JSDoc + 模块首部的一段说明 + 灵敏度自测） |
 | （无） | `runtime-seam` / `host-methods` / `types-surface` / `executor-orca` / `router-orca` / `cli-contract` / `host-runtime` / `kind` / `read-surface` / `read-views` / `route` | 新增（Orca 专有） |
 
 **没有遗漏的核对方式**：本表每一行的「Orca 对应」都必须在 §P.2 出现，`docs.test.ts` 断言这一点；
@@ -2119,9 +2121,10 @@ README 的已知限制段读 `limitation.<id>.*` 文案（中英各一份），�
 
 ### B.2 十一项之外的一处实现差异（不属 §H）
 
-`class-docs.test.ts`（上游 `class-docs.spec.ts`，断言「每个类前有 JSDoc」）**没有落地**：仓库里没有
-这条自动断言，纪律靠审阅。它不是行为差异（§H 记的是行为），所以只写在这里与 §P.2 的表末；要补需要
-一张新票。
+今天没有。`class-docs.test.ts`（上游 `class-docs.spec.ts`）已落地（#62）：导出类与导出具名函数
+必须是 JSDoc，模块首部的一段说明 `//` 散文与 JSDoc 都算——理由写在测试头部（187 个文件的既有
+风格是文件顶上一段散文，统一改写成 JSDoc 只带来冲突，不带来信息）。`export const` 上的箭头函数
+不在射程（值不是具名函数声明）。它不是行为差异（§H 记的是行为），所以不占 §H 的一行。
 
 ## 附录 C：spike 台账（不是「待定」，是「已定方向 + 需实测的参数」）
 
@@ -2420,10 +2423,11 @@ superagent-router-spike16 --repo path:<base> --base-branch HEAD --setup skip --n
    保留在解析链里，旧宿主不受影响。
 2. **`orphaned` 只说明「没有 pane」，`connected` 才说明「还连着」**。保活判据因此是
    「不在枚举里 ∨ `connected=false`」；`orphaned` 只作为快照里的一条事实（面板可显示「后台
-   终端」）。`findAgent` 的反查同步放宽（只看 `connected`）。一份例外：**Ticket 的认领更严**
-   —— `executor/resume.ts` 要求 `connected && !orphaned` 才 `adopt`，否则重建 Assignment（§E.5）。
-   这是「宁可重建，也不把看不见的会话当自己的」的姿态，不是判活规则的第二套真源；用户能感知
-   的结果是：一个后台跑着、UI 里没开的 worker 终端，在插件重启后会被重建而不是认领。
+   终端」）。`findAgent` 的反查同步放宽（只看 `connected`）。Ticket 的认领用同一条线（#62 的
+   修正）：`executor/resume.ts` 判活只看 `connected`，`orphaned` 不作判据；「这是不是自己的
+   会话」由 `belongsToTicket` 的 worktree 判据（路径或工作区 id 命中 Ticket 记录的目录）回答，
+   再决定 `adopt` 还是重建 Assignment（§E.5）。用户能感知的结果是：一个后台跑着、UI 里没开的
+   worker 终端，在插件重启后被认领并收到「已恢复，继续」，而不是被重建。
 3. **`done` 是回合结束，不是会话结束**（与 S7 的记录一致）。§F.5 的 `done` 触发留给 DOC2
    对齐；实现不再按 `done` 重启，避免每一轮都换 Router。
 4. **未证实（不写成事实）**：Router 终端的事件到达。它用的是与 #12 相同的一条

@@ -1494,6 +1494,36 @@ test('a policy sync writes the members into the allow list and reports its own h
   assert.deepEqual(schedule.delays(), [], 'success schedules no retry')
 })
 
+test('a caller cancel reaches the CLI read and leaves the retry chain armed', async () => {
+  const board = new FakeHealthBoard()
+  const schedule = manualSchedule()
+  const cli = new FakeCommands()
+  cli.script(['im', '+chat-members-list'], () => membersPage([{ member_id: 'ou_bob' }]))
+  let saves = 0
+  const runner = createPolicySync({
+    current: () => policyWithFeishu({ allowed: [], syncChat: 'oc_sync' }),
+    revision: () => 0,
+    save: () => {
+      saves += 1
+    },
+    syncable: () => ['feishu'],
+    run: (_id, part, signal) => createFeishuKind('lark-cli').policy!.sync!.run(syncHost(cli), part, signal),
+    health: board,
+    now: () => '2026-11-07T00:00:00.000Z',
+    schedule: schedule.schedule,
+    signal: new AbortController().signal
+  })
+
+  // 调用方（HTTP handler 的 §O 预算）已经取消：读取拿到的信号就是取消的（真端口交给 execFile）。
+  const request = new AbortController()
+  request.abort()
+  await assert.rejects(runner.sync('feishu', request.signal))
+  assert.equal(cli.calls[0]?.options.signal?.aborted, true, 'the cancel reaches the CLI read')
+  assert.equal(saves, 0, 'a cancelled read writes no policy version')
+  assert.deepEqual(board.entries['sync:feishu'], { state: 'error', detail: 'The operation was aborted' })
+  assert.deepEqual(schedule.delays(), [SYNC_FIRST_DELAY_MS], 'the retry chain stays armed')
+})
+
 test('a sync that changes nothing saves nothing, and a non-syncable Source is refused', async () => {
   const board = new FakeHealthBoard()
   const cli = new FakeCommands()

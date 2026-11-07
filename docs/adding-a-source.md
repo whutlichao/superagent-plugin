@@ -1,4 +1,4 @@
-# 新增一个 Source：十一步
+# 新增一个 Source：十二步
 
 这份文档回答一件事：**在这个仓库里加一个新的 Source kind，要动哪些文件、写哪些测试、守哪些缝。**
 它是 §R.1 里上游 `docs/008` 的落点，也是 §I.1 那张 `SourceKind` 协议的工程说明——协议本身在
@@ -22,7 +22,7 @@
 
 ---
 
-## 十一步一览
+## 十二步一览
 
 | # | 步骤 | 落在哪 | 谁替你检查 |
 | --- | --- | --- | --- |
@@ -37,6 +37,7 @@
 | 9 | `policy` 部分：准入行、bots、sync | `sources/<kind>/kind.ts` + `policy/admission.ts` | `policy.test.ts`、`settings.test.ts` |
 | 10 | `environment`：执行环境变量 | `sources/<kind>/kind.ts` + `sources/<kind>/environment` 段 | `environment.test.ts`、`model-surface.test.ts` |
 | 11 | 夹具与测试：`FakeCommands` + `.expected.json` | `tests/support/fake-commands.ts`、`tests/fixtures/cli/<kind>/` | `fixtures.test.ts`、`sources-<kind>.test.ts` |
+| 12 | 资源名：`ParsedResource` 联合与 `READ_SOURCE_RESOURCES` | `src/worker/app/read.ts` | `read-surface.test.ts`、`read-views.test.ts`、`cli-contract.test.ts` |
 
 下面逐步说。最后三节讲**注册**（registry + boot）、**`SourceContext` 能用什么**、**必须守的缝**。
 
@@ -257,6 +258,31 @@ assert.deepEqual(cli.programs, ['gh', 'gh'])
 
 ---
 
+## 12. 资源名：`ParsedResource` 联合与 `READ_SOURCE_RESOURCES`
+
+`read <resource>`（以及 `GET read/:resource`）的资源名是**两份**表一起决定的，两个都在
+`src/worker/app/read.ts`——kind 自己的读模块只管「怎么读」，不管「叫什么」：
+
+1. `ParsedResource`（该文件的联合类型）：资源名解析后的形状。GitHub 是 `{kind: 'github',
+   resource, number?, sha?}`，Feishu 多定位一段 `{kind: 'feishu', resource, triggerId, section,
+   cursor?}`。新 kind 要么复用已有分支的形状，要么在这里加一支——**加一支就要同时改**
+   `parseReadResource`（形状判定）、`shapeOf`（文本页 / 列表页 / `checks`）与 `claimsResource`
+   （assignment 角色的越权边界，§O 的角色行）。
+2. `READ_SOURCE_RESOURCES`（同一文件的字符串数组）：**唯一**的「可用写法」清单。未知资源名的
+   `unknown_resource` 拒绝把这份清单原样放进 `values.forms`（§G.2 的 read 行），技能文本与模型
+   照抄的就是它；漏写就是「实现了但教不会模型用」。
+
+两条硬规矩：
+
+- **资源名本身就是契约**：`next`（`github/issues/12/comments/2`、`feishu/<trigger>/thread/<cursor>`）
+  要能原样交回作下一次读，所以游标编码、分隔与大小写都在这里定，kind 的读模块只负责产出。
+- **越权要在这里拦**：assignment token 只读自己 Ticket 相关的资源（`claimsResource`）；
+  新 kind 若带 Ticket 边界，把那条判定加进同一个函数，别在 kind 里另写一套。
+
+测试：`tests/read-surface.test.ts`（未知资源名的 `forms`、分页与外形的拒绝）与
+`tests/read-views.test.ts`（视图路由）会红；`tests/cli-contract.test.ts` 断言命令面仍然只
+经已有路由（§G.2：不新增命令）。
+
 ## 注册：registry 与 boot
 
 一个 kind 只有被注册才算装上。组合根（`src/worker/boot.ts`）做两件事：
@@ -340,4 +366,6 @@ kind 在运行期只拿得到 `SourceContext`（`ctx`）。它能做：
 - [ ] `channel.send` 幂等、只返回 `sent`/`gone`、超限在起子进程前拒。
 - [ ] 夹具是真实输出的脱敏片段、带 `.expected.json`、`source.command` 与可复算的 id。
 - [ ] `environment.variables` 的每个键都在 `values()` 里有值，`environment.test.ts` 断言到。
+- [ ] 新资源名写进了 `src/worker/app/read.ts` 的 `ParsedResource` 与 `READ_SOURCE_RESOURCES`
+      （第 12 步），`unknown_resource` 的 `forms` 里有它。
 - [ ] 没有新增 npm 依赖；没有 `spawn`、没有 `shell: true`、没有裸 `fetch`。

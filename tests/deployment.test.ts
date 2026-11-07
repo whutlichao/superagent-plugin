@@ -11,6 +11,7 @@ import { existsSync, mkdirSync, readFileSync, rmSync, statSync } from 'node:fs'
 import { join } from 'node:path'
 import { runSetupChecks } from '../src/worker/app/setup'
 import type { SetupCheckInput, SetupReport } from '../src/worker/app/setup'
+import { DeadlineError } from '../src/worker/infra/deadline'
 import { runDoctor } from '../src/worker/app/doctor'
 import { GITCONFIG_MODE, workerGitConfigPath } from '../src/worker/infra/gitconfig'
 import { bootPlugin } from '../src/worker/boot'
@@ -392,6 +393,71 @@ describe('the setup probes tell a person one missing thing at a time', () => {
   })
 })
 
+// §O「超时」行：HTTP handler 内不做超过 10 s 的同步等待。一条 setup 探针是一个子进程，
+// 它可能在网络/登录上挂住；预算到点必须取消探针（信号进 `execFile`，子进程被掐掉），
+// 并把「这次检查没做完」如实抛出去——**不**把超时折成「缺什么」那条结论。
+describe('every setup probe has a deadline', () => {
+  test('a hanging CLI probe is cancelled at the probe budget, and nothing is applied', async () => {
+    const stateDir = tempStateDir()
+    try {
+      let seen: { signal?: AbortSignal; timeoutMs?: number } | undefined
+      const started = Date.now()
+      const failure = await runSetupChecks({
+        ...inputOf(stateDir, {
+          // 身份齐全：探针跑得完就会写 `<stateDir>/worker-gitconfig`（断言「没跑完就没写」）。
+          gitConfig: { account: 'acme-agent', email: '1+acme-agent@users.noreply.github.com' },
+          budget: { probeMs: 20 }
+        }),
+        ports: {
+          isAbsolute: (path) => path.startsWith('/'),
+          writable: () => undefined,
+          repos: async () => [{ id: 'repo-1', path: '/repos/widgets', name: 'widgets' }],
+          // `git --version` 永不返回：探针必须到点取消，而不是陪着它挂。
+          run: (_program, _args, options) => {
+            seen = options
+            return new Promise<string>(() => undefined)
+          }
+        }
+      }).then(
+        () => undefined,
+        (error: unknown) => error
+      )
+      const elapsed = Date.now() - started
+      assert.ok(failure instanceof DeadlineError, `expected a deadline error, got ${String(failure)}`)
+      assert.equal(failure.what, 'the git probe')
+      assert.ok(elapsed < 1000, `the probe gave up after ${elapsed} ms`)
+      assert.equal(seen?.signal?.aborted, true, 'the signal handed to the probe is aborted')
+      assert.equal(seen?.timeoutMs, 20, 'the subprocess is given the same cap')
+      assert.equal(existsSync(join(stateDir, 'worker-gitconfig')), false, 'a cancelled check writes nothing')
+    } finally {
+      rmSync(stateDir, { recursive: true, force: true })
+    }
+  })
+
+  test('without a budget a probe keeps waiting: the boot path is unchanged', async () => {
+    const stateDir = tempStateDir()
+    try {
+      let runs = 0
+      const report = await runSetupChecks({
+        ...inputOf(stateDir),
+        ports: {
+          isAbsolute: (path) => path.startsWith('/'),
+          writable: () => undefined,
+          repos: async () => [{ id: 'repo-1', path: '/repos/widgets', name: 'widgets' }],
+          run: async (program) => {
+            runs += 1
+            return program === 'git' ? 'git version 2.39.0' : 'acme-agent\n'
+          }
+        }
+      })
+      assert.equal(runs, 2, 'the git and GitHub probes both ran')
+      assert.deepEqual(report.issues, [])
+    } finally {
+      rmSync(stateDir, { recursive: true, force: true })
+    }
+  })
+})
+
 // 子进程环境（§I.4 的统一命令端口、§O 的命令注入面、票面「剥掉 *_KEY / *_SECRET / *_TOKEN」）。
 // 两条真实断言：`gh`/`git` 走的 `Commands` 与 `orca` 走的 CLI 包装都经同一个纯函数组环境。
 // 这里真的起一次 `sh`（白名单内的程序），否则「剥没剥」只能靠读源码猜。
@@ -542,6 +608,52 @@ describe('the setup check on the composition root', () => {
       const again = await runCli(h.stateDir, port, ['setup', 'check'])
       assert.equal(again.exit, 2)
       assert.equal((again.envelope as { error: { code: string } }).error.code, 'refused')
+    } finally {
+      await h.cleanup()
+    }
+  })
+
+  test('a hanging CLI makes setup check return unavailable inside the budget and apply nothing', async () => {
+    // 一次真的 HTTP 往返（真库、真 loopback）：boot 时 `gh` 读账号失败一次，于是 setup 有待查的
+    // 问题；之后同一条命令挂住（§O 的超时用例）。
+    const h = await openBoot({
+      scripts: (commands) => {
+        commands.fail(
+          'gh',
+          ['api', 'user'],
+          Object.assign(new Error('gh auth status exited with code 1'), { code: 1 }),
+          { once: true }
+        )
+      }
+    })
+    try {
+      const port = h.handle.port() as number
+      const before = h.handle.deployment()
+      assert.equal(before.setup.length > 0, true, 'the boot left a setup problem behind')
+      const written = h.commands.calls.length
+
+      // 从现在起 `gh api user` 永不返回：探针到点必须被取消，而不是陪着它挂。
+      h.commands.hang('gh', ['api', 'user'])
+      const started = Date.now()
+      const check = await runCli(h.stateDir, port, ['setup', 'check'])
+      const elapsed = Date.now() - started
+
+      // 固定码：`unavailable`（exit 3）与「稍后重试」——不折成一条编出来的 setup 结论。
+      assert.equal(check.exit, 3, JSON.stringify(check.envelope))
+      const envelope = check.envelope as { ok: false; error: { code: string; message: string } }
+      assert.equal(envelope.error.code, 'unavailable')
+      assert.ok(envelope.error.message.includes('retry later'), envelope.error.message)
+      // §O 的探针上限是 2 s：整次请求在 9 s 的总预算里返回（这里一定远早于它）。
+      assert.ok(elapsed < 5_000, `the handler returned after ${elapsed} ms`)
+
+      // 取消传到了 CLI：这次调用拿到的信号已经取消，并且它同时带着同一个上限。
+      const hung = h.commands.calls.slice(written).find((call) => call.program === 'gh')
+      assert.equal(hung?.options.signal?.aborted, true, 'the probe signal is aborted')
+      assert.equal(hung?.options.timeoutMs, 2_000, 'the subprocess gets the same cap')
+
+      // 什么都没应用：setup 结论还是启动时那一条（超时的检查一半都没落地）。
+      assert.equal(h.handle.snapshot().health.setupMissing, true)
+      assert.deepEqual(h.handle.deployment().setup, before.setup)
     } finally {
       await h.cleanup()
     }

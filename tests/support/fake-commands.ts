@@ -135,10 +135,13 @@ interface StreamScript {
   readonly stream: FakeStream
 }
 
+/** 「这次调用永不返回」的哨兵：`hang()` 注册的脚本回它（模拟一个挂住的子进程）。 */
+const HANG = Symbol('hang')
+
 /** 一条脚本：匹配程序与参数前缀（或自定义判定），返回标准输出或抛错。 */
 interface Script {
   readonly matches: (program: string, args: readonly string[]) => boolean
-  readonly reply: (call: FakeCall) => string | Error
+  readonly reply: (call: FakeCall) => string | Error | typeof HANG
   /** 一次性脚本在命中后移除；持久脚本一直有效。 */
   readonly once: boolean
 }
@@ -177,6 +180,20 @@ export class FakeCommands implements CommandsHost {
   /** 一次调用的脚本化（成功或失败混用）：按顺序只命中一次。 */
   next(program: string, args: readonly string[], reply: string | Error): this {
     return this.#push({ program, args: [...args] }, () => reply, true)
+  }
+
+  /**
+   * 脚本化一次**永不返回**的调用（一个挂住的子进程，§O 的超时用例）：
+   * 调用与它收到的选项照常记录，测试据此断言「到点之后信号真的取消了」。
+   * 插到最前面：它描述的是「下一步会挂住」，应当压过此前注册的成功/失败脚本。
+   */
+  hang(program: string, args: readonly string[] = []): this {
+    const matches = (candidate: string, received: readonly string[]): boolean =>
+      candidate === program &&
+      received.length >= args.length &&
+      args.every((value, index) => received[index] === value)
+    this.#scripts.unshift({ matches, reply: () => HANG, once: false })
+    return this
   }
 
   /** 记录下来的程序序列（断言调用顺序用）。 */
@@ -244,12 +261,10 @@ export class FakeCommands implements CommandsHost {
     const entry = this.#scripts[index] as Script
     if (entry.once) this.#scripts.splice(index, 1)
     const reply = entry.reply(call)
-    if (reply instanceof Error) {
-      // 与真端口一致的取消语义：信号已取消时抛 AbortError。
-      if (options.signal?.aborted === true) throw abortError()
-      throw reply
-    }
+    // 与真端口一致的取消语义：信号已取消时 `execFile` 立刻拒绝，不等子进程。
     if (options.signal?.aborted === true) throw abortError()
+    if (reply === HANG) return new Promise<string>(() => undefined)
+    if (reply instanceof Error) throw reply
     return reply
   }
 
