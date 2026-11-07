@@ -32,6 +32,10 @@ export interface GithubIssue {
   readonly url: string
   readonly state: string
   readonly updatedAt: string
+  readonly body: string
+  readonly login: string
+  readonly bot: boolean
+  readonly createdAt: string
 }
 
 /** 一个 PR（`/repos/:o/:r/pulls/:n`）；`merged` 供 §I.5 的结束判定。 */
@@ -42,6 +46,10 @@ export interface GithubPull {
   readonly state: string
   readonly merged: boolean
   readonly updatedAt: string
+  readonly body: string
+  readonly login: string
+  readonly bot: boolean
+  readonly createdAt: string
 }
 
 /** 一条 Issue 评论（`/issues/:n/comments`）或评审评论（`/pulls/:n/comments`）的一项。 */
@@ -53,15 +61,24 @@ export interface GithubComment {
   readonly createdAt: string
   readonly updatedAt: string
   readonly url: string
+  /** 评审评论所属评审线程的根评论 id；不是评审评论时为 null。 */
+  readonly inReplyTo: number | null
+  /** 评审评论的文件路径；会话评论为空串。 */
+  readonly path: string
+  /** 评审评论的行号；拿不到时为 null。 */
+  readonly line: number | null
 }
 
-/** 一条评审（`/pulls/:n/reviews` 的一项）；评审的 Trigger 翻译归 #18。 */
+/** 一条评审（`/pulls/:n/reviews` 的一项）。 */
 export interface GithubReview {
   readonly id: number
   readonly state: string
   readonly login: string
+  readonly bot: boolean
   readonly body: string
   readonly submittedAt: string
+  /** 评审针对的提交；决策文本用它说明评的是哪一版。 */
+  readonly commitId: string
   readonly url: string
 }
 
@@ -103,6 +120,19 @@ function count(value: unknown, key: string): number {
 function flag(value: unknown, key: string): boolean {
   if (typeof value !== 'object' || value === null) return false
   return (value as Record<string, unknown>)[key] === true
+}
+
+/** 一个可选数字字段：缺失、非数字或 0 都当没有。 */
+function optionalCount(value: unknown, key: string): number | null {
+  const found = count(value, key)
+  return found > 0 ? found : null
+}
+
+/** 一条记录的作者：login + 是否 bot（`type: 'Bot'` 或 `[bot]` 后缀，§I.2 Actor 行）。 */
+function authorOf(value: Record<string, unknown>): { login: string; bot: boolean } {
+  const user = isRecord(value['user']) ? value['user'] : {}
+  const login = text(user, 'login')
+  return { login, bot: text(user, 'type') === 'Bot' || /\[bot\]$/i.test(login) }
 }
 
 /** 一个对象是否像 `{...}`（null 与数组都不算）。 */
@@ -153,13 +183,18 @@ export function issueOf(value: unknown): GithubIssue | undefined {
   if (number <= 0) return undefined
   // `pull_request` 只在 PR 上出现；它是「这是 PR」的唯一判据（上游同）。
   const isPull = isRecord(value['pull_request'])
+  const author = authorOf(value)
   return {
     number,
     isPull,
     title: text(value, 'title'),
     url: text(value, 'html_url'),
     state: text(value, 'state'),
-    updatedAt: text(value, 'updated_at')
+    updatedAt: text(value, 'updated_at'),
+    body: text(value, 'body'),
+    login: author.login,
+    bot: author.bot,
+    createdAt: text(value, 'created_at')
   }
 }
 
@@ -168,13 +203,18 @@ export function pullOf(value: unknown): GithubPull | undefined {
   if (!isRecord(value)) return undefined
   const number = count(value, 'number')
   if (number <= 0) return undefined
+  const author = authorOf(value)
   return {
     number,
     title: text(value, 'title'),
     url: text(value, 'html_url'),
     state: text(value, 'state'),
     merged: flag(value, 'merged'),
-    updatedAt: text(value, 'updated_at')
+    updatedAt: text(value, 'updated_at'),
+    body: text(value, 'body'),
+    login: author.login,
+    bot: author.bot,
+    createdAt: text(value, 'created_at')
   }
 }
 
@@ -183,17 +223,19 @@ export function commentOf(value: unknown): GithubComment | undefined {
   if (!isRecord(value)) return undefined
   const id = count(value, 'id')
   if (id <= 0) return undefined
-  const user = isRecord(value['user']) ? value['user'] : {}
-  const login = text(user, 'login')
+  const author = authorOf(value)
   const updatedAt = text(value, 'updated_at') || text(value, 'created_at')
   return {
     id,
-    login,
-    bot: text(user, 'type') === 'Bot' || login.endsWith('[bot]'),
+    login: author.login,
+    bot: author.bot,
     body: text(value, 'body'),
     createdAt: text(value, 'created_at'),
     updatedAt,
-    url: text(value, 'html_url')
+    url: text(value, 'html_url'),
+    inReplyTo: optionalCount(value, 'in_reply_to_id'),
+    path: text(value, 'path'),
+    line: optionalCount(value, 'line') ?? optionalCount(value, 'original_line')
   }
 }
 
@@ -202,13 +244,15 @@ export function reviewOf(value: unknown): GithubReview | undefined {
   if (!isRecord(value)) return undefined
   const id = count(value, 'id')
   if (id <= 0) return undefined
-  const user = isRecord(value['user']) ? value['user'] : {}
+  const author = authorOf(value)
   return {
     id,
     state: text(value, 'state'),
-    login: text(user, 'login'),
+    login: author.login,
+    bot: author.bot,
     body: text(value, 'body'),
     submittedAt: text(value, 'submitted_at') || text(value, 'created_at'),
+    commitId: text(value, 'commit_id'),
     url: text(value, 'html_url')
   }
 }

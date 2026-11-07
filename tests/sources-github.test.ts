@@ -12,9 +12,17 @@ import { CliError } from '../src/worker/sources/commands'
 import { SourceRegistry, EMPTY_SOURCE_SETTINGS } from '../src/worker/sources/registry'
 import { githubKind } from '../src/worker/sources/github/kind'
 import { createGithubApi } from '../src/worker/sources/github/api'
+import type { GithubComment, GithubReview } from '../src/worker/sources/github/api'
+import {
+  bodyFingerprint,
+  commentTrigger,
+  issueBodyTrigger,
+  reviewCommentTrigger,
+  reviewTrigger
+} from '../src/worker/sources/github/translate'
 import { createGithubPoller, subscribedThreads, withinHorizon } from '../src/worker/sources/github/poll'
 import { githubSetupProblem } from '../src/worker/sources/github/config'
-import { githubCursorKey } from '../src/worker/app/kv'
+import { githubBodyKey, githubCursorKey } from '../src/worker/app/kv'
 import { FakeCommands } from './support/fake-commands'
 import { FakeHealthBoard } from './support/health-board'
 import { mkdtempSync } from 'node:fs'
@@ -130,7 +138,10 @@ function readableComment() {
     body: '@acme-agent please fix the login redirect before Friday.',
     createdAt: '2026-11-07T05:01:49Z',
     updatedAt: '2026-11-07T05:01:49Z',
-    url: 'https://github.com/acme/widgets/issues/42#issuecomment-6702566216'
+    url: 'https://github.com/acme/widgets/issues/42#issuecomment-6702566216',
+    inReplyTo: null,
+    path: '',
+    line: null
   }
 }
 
@@ -357,7 +368,11 @@ test('an Issue read reports the Issue, and the same endpoint reports a PR as a P
         title: 'Fix the login redirect',
         url: 'https://github.com/acme/widgets/issues/42',
         state: 'closed',
-        updatedAt: '2026-11-07T05:07:26Z'
+        updatedAt: '2026-11-07T05:07:26Z',
+        body: 'On the settings page the login redirect drops the `next` query parameter, so people land on the dashboard instead of the page they asked for.\n\nSteps to reproduce:\n1. Open the settings page while signed out.\n2. Sign in.\n3. The redirect goes to the dashboard.\n\nExpected: it returns to the settings page.',
+        login: 'alice',
+        bot: false,
+        createdAt: '2026-11-07T05:01:09Z'
       }
     ],
     skipped: 0
@@ -387,7 +402,11 @@ test('the PR read keeps the PR state a later ticket needs for the closing rule',
         url: 'https://github.com/acme/widgets/pull/45',
         state: 'closed',
         merged: true,
-        updatedAt: '2026-11-07T03:09:36Z'
+        updatedAt: '2026-11-07T03:09:36Z',
+        body: 'When the agent account is described in the docs, a reader cannot tell whether the worker signs its commits with a token or a dedicated account.\n\nThis change says the agent CLI is signed in to the agent account and that the commit email is the noreply address. No behaviour changes.',
+        login: 'bob',
+        bot: false,
+        createdAt: '2023-11-04T07:30:25Z'
       }
     ],
     skipped: 0
@@ -411,8 +430,10 @@ test('the review and review-comment pages are read with the argv arrays the fixt
         id: 1714394287,
         state: 'COMMENTED',
         login: 'carol',
+        bot: false,
         body: '',
         submittedAt: '2023-11-06T07:14:48Z',
+        commitId: '48ab24d08ec56a03ee76d0ddad470517cdb900bd',
         url: 'https://github.com/acme/widgets/pull/45#pullrequestreview-1714394287'
       }
     ],
@@ -495,7 +516,7 @@ test('every Thread with a live Ticket subscription is read each round, PR endpoi
     now: () => Date.parse('2026-11-07T04:00:00Z')
   })
   const first = await poller.poll()
-  assert.deepEqual(first, { notifications: 0, triggers: 2, skipped: 0 })
+  assert.deepEqual(first, { notifications: 0, triggers: 3, skipped: 0 })
   assert.deepEqual(
     commands.calls.map((call) => call.args.slice(0, 2)),
     [
@@ -511,7 +532,7 @@ test('every Thread with a live Ticket subscription is read each round, PR endpoi
   )
   assert.deepEqual(
     h.received.map((trigger) => trigger.threads[0]?.id),
-    ['42', '45']
+    ['42', '45', '45']
   )
   // 每个 Thread 都读到了自己的页面地址（Thread meta 归 Source 写，§D.2）。
   assert.equal(h.meta.get('github:42')?.url, 'https://github.com/acme/widgets/issues/42')
@@ -561,8 +582,8 @@ test('a single Thread failure stays on its meta while other Threads are read', a
     now: () => Date.parse('2026-11-07T04:00:00Z')
   })
   const first = await poller.poll()
-  // #42 的评论失败只记在它的 Thread 上；#45 照常读、照常收。
-  assert.equal(first.triggers, 1)
+  // #42 的评论失败只记在它的 Thread 上；#45 照常读、照常收（会话评论 + 评审评论）。
+  assert.equal(first.triggers, 2)
   assert.equal(typeof h.meta.get('github:42')?.pollError, 'string')
   assert.equal(h.meta.get('github:45')?.pollError, undefined)
 
@@ -702,7 +723,7 @@ test('a PullRequest notification expands into the PR and its conversation commen
   commands.script(['api', 'repos/acme/widgets/issues/45/comments', '--paginate'], () =>
     fixture('pull-conversation.json')
   )
-  // PR 的订阅读取还有评审与评审评论两页（本票只读，翻译归 #18）。
+  // PR 的订阅读取还有评审与评审评论两页（评审为空、评审评论译为 Trigger）。
   commands.script(['api', 'repos/acme/widgets/pulls/45/reviews', '--paginate'], () =>
     fixture('pull-reviews.json')
   )
@@ -718,7 +739,7 @@ test('a PullRequest notification expands into the PR and its conversation commen
     cursorKey: githubCursorKey,
     now: () => Date.parse('2026-11-07T04:00:00Z')
   }).poll()
-  assert.deepEqual(result, { notifications: 1, triggers: 1, skipped: 0 })
+  assert.deepEqual(result, { notifications: 1, triggers: 2, skipped: 0 })
   // 通知的 subject.type 已经说明是 PR：不再多读一次 issues/<n>（夹具的 expandsTo 记着这一点）。
   assert.deepEqual(
     commands.calls.map((call) => call.args.slice(0, 2)),
@@ -733,7 +754,20 @@ test('a PullRequest notification expands into the PR and its conversation commen
   const { idRecipe: _recipe, ...expected } = expectedOf('pull-conversation').trigger as Trigger & {
     idRecipe: string
   }
-  assert.deepEqual(h.received, [expected])
+  assert.deepEqual(h.received[0], expected)
+  // 评审评论（夹具里的行内讨论）属于同一个 PR 会话，但额外挂一个评审 Thread 与回复根。
+  const inline = h.received[1]!
+  assert.equal(inline.id, key('github', 'review-comment', '1382860676', '2023-11-06T07:14:48Z'))
+  assert.deepEqual(inline.threads, [
+    { source: 'github', id: '45' },
+    { source: 'github', id: '45/rt/1382860676' }
+  ])
+  assert.deepEqual(inline.channel, {
+    source: 'github',
+    thread: 'github:45',
+    address: { repo: 'acme/widgets', issue: '45', root: '1382860676' }
+  })
+  assert.deepEqual(h.received.map((trigger) => trigger.meta['kind']), ['comment', 'review-comment'])
   // 读到的 PR 把页面地址写进 Thread 自己的 meta（§D.2：label/url/facts/pollError 归 Source）。
   assert.equal(h.meta.get('github:45')?.url, 'https://github.com/acme/widgets/pull/45')
   assert.equal(h.meta.get('github:45')?.pollError, undefined)
@@ -877,7 +911,7 @@ test('the result counts malformed entries instead of crashing', async () => {
     cursorKey: githubCursorKey
   }).poll()
   // 一条通知缺 id、一条评审缺 id：都只计数跳过，整轮仍算成功（不是失败）。
-  assert.deepEqual(result, { notifications: 1, triggers: 1, skipped: 2 })
+  assert.deepEqual(result, { notifications: 1, triggers: 2, skipped: 2 })
   assert.equal(h.health.at(-1)?.state, 'ready')
   assert.notEqual(h.state.get(githubCursorKey('26977600684')), undefined)
 })
@@ -1099,4 +1133,573 @@ test('a locked or deleted issue is gone; any other failure is an error the queue
   assert.equal(await attempt(new CliError('gh exited with code 1: HTTP 410', 410, 1)), 'gone')
   assert.equal(await attempt(new CliError('gh exited with code 1: HTTP 404', 404, 1)), 'gone')
   await assert.rejects(attempt(new CliError('gh exited with code 1: HTTP 500', 500, 1)), /gh exited/)
+})
+
+// ---- #18：评审、评审评论与 Issue/PR 正文的翻译（§I.2「Trigger 翻译」行） ----
+
+/** 一条评审（`/pulls/:n/reviews` 的一项），字段与端口同形。 */
+function review(overrides: Partial<GithubReview> = {}): GithubReview {
+  return {
+    id: 7001,
+    state: 'CHANGES_REQUESTED',
+    login: 'carol',
+    bot: false,
+    body: '@acme-agent please keep the `next` parameter.',
+    submittedAt: '2026-11-07T06:00:00Z',
+    commitId: 'abc123',
+    url: 'https://github.com/acme/widgets/pull/45#pullrequestreview-7001',
+    ...overrides
+  }
+}
+
+/** 一条评审评论（`/pulls/:n/comments` 的一项），字段与端口同形。 */
+function reviewComment(overrides: Partial<GithubComment> = {}): GithubComment {
+  return {
+    id: 8001,
+    login: 'carol',
+    bot: false,
+    body: 'Consider keeping `next` here.',
+    createdAt: '2026-11-07T06:01:00Z',
+    updatedAt: '2026-11-07T06:01:00Z',
+    url: 'https://github.com/acme/widgets/pull/45#discussion_r8001',
+    inReplyTo: 7000,
+    path: 'src/app/login.go',
+    line: 54,
+    ...overrides
+  }
+}
+
+/** 端口形状 → GitHub JSON 形状（轮询测试造 CLI 输出用）。 */
+function reviewJson(overrides: Partial<GithubReview> = {}): Record<string, unknown> {
+  const value = review(overrides)
+  return {
+    id: value.id,
+    user: { login: value.login, type: value.bot ? 'Bot' : 'User' },
+    body: value.body,
+    state: value.state,
+    submitted_at: value.submittedAt,
+    commit_id: value.commitId,
+    html_url: value.url
+  }
+}
+
+/** 端口形状 → GitHub JSON 形状（轮询测试造 CLI 输出用）。 */
+function reviewCommentJson(overrides: Partial<GithubComment> = {}): Record<string, unknown> {
+  const value = reviewComment(overrides)
+  return {
+    id: value.id,
+    user: { login: value.login, type: value.bot ? 'Bot' : 'User' },
+    body: value.body,
+    created_at: value.createdAt,
+    updated_at: value.updatedAt,
+    html_url: value.url,
+    in_reply_to_id: value.inReplyTo,
+    path: value.path,
+    line: value.line
+  }
+}
+
+test('a submitted review becomes one Trigger with its actor, state and mention', () => {
+  const trigger = reviewTrigger({
+    repository: 'acme/widgets',
+    pull: 45,
+    review: review(),
+    login: 'acme-agent'
+  })
+  assert.deepEqual(trigger, {
+    id: key('github', 'review', '7001', '2026-11-07T06:00:00Z'),
+    source: 'github',
+    threads: [{ source: 'github', id: '45' }],
+    actor: { source: 'github', id: 'carol' },
+    human: true,
+    addressed: 'mention',
+    at: '2026-11-07T06:00:00Z',
+    text: 'CHANGES_REQUESTED review of commit abc123\n\n@acme-agent please keep the `next` parameter.',
+    url: 'https://github.com/acme/widgets/pull/45#pullrequestreview-7001',
+    channel: {
+      source: 'github',
+      thread: 'github:45',
+      address: { repo: 'acme/widgets', issue: '45' }
+    },
+    meta: {
+      kind: 'review',
+      repository: 'acme/widgets',
+      issue: 45,
+      reviewId: 7001,
+      state: 'CHANGES_REQUESTED',
+      commitId: 'abc123',
+      updatedAt: '2026-11-07T06:00:00Z'
+    }
+  })
+  // 一个只有状态的评审决定仍然可读；空的 COMMENTED 评审没有内容。
+  const approved = reviewTrigger({
+    repository: 'acme/widgets',
+    pull: 45,
+    review: review({ state: 'APPROVED', body: '' }),
+    login: 'acme-agent'
+  })
+  assert.equal(approved.text, 'APPROVED review of commit abc123')
+  assert.equal(approved.addressed, undefined)
+  const commented = reviewTrigger({
+    repository: 'acme/widgets',
+    pull: 45,
+    review: review({ state: 'COMMENTED', body: '' }),
+    login: 'acme-agent'
+  })
+  assert.equal(commented.text, '')
+  // [bot] 不是人，即使 GitHub 没把 type 写成 Bot。
+  assert.equal(
+    reviewTrigger({ repository: 'acme/widgets', pull: 45, review: review({ login: 'ci-bot[bot]' }), login: 'acme-agent' })
+      .human,
+    false
+  )
+})
+
+test('a review comment carries its root id, the review thread and the reply address', () => {
+  const trigger = reviewCommentTrigger({
+    repository: 'acme/widgets',
+    pull: 45,
+    comment: reviewComment(),
+    login: 'acme-agent'
+  })
+  assert.deepEqual(trigger.threads, [
+    { source: 'github', id: '45' },
+    { source: 'github', id: '45/rt/7000' }
+  ])
+  assert.deepEqual(trigger.channel, {
+    source: 'github',
+    thread: 'github:45',
+    address: { repo: 'acme/widgets', issue: '45', root: '7000' }
+  })
+  assert.equal(trigger.id, key('github', 'review-comment', '8001', '2026-11-07T06:01:00Z'))
+  assert.deepEqual(trigger.meta, {
+    kind: 'review-comment',
+    repository: 'acme/widgets',
+    issue: 45,
+    commentId: 8001,
+    rootCommentId: 7000,
+    reviewThread: '45/rt/7000',
+    path: 'src/app/login.go',
+    line: 54,
+    updatedAt: '2026-11-07T06:01:00Z'
+  })
+  assert.equal(trigger.addressed, undefined, 'the body does not mention the agent')
+  // 根评论自己没有 in_reply_to_id：它自己就是根。
+  const root = reviewCommentTrigger({
+    repository: 'acme/widgets',
+    pull: 45,
+    comment: reviewComment({ inReplyTo: null }),
+    login: 'acme-agent'
+  })
+  assert.deepEqual(root.threads[1], { source: 'github', id: '45/rt/8001' })
+  assert.equal(root.channel?.address['root'], '8001')
+  assert.equal(root.addressed, undefined)
+  // 正文点名 agent 时仍是 mention；改写不会改变 root。
+  const mention = reviewCommentTrigger({
+    repository: 'acme/widgets',
+    pull: 45,
+    comment: reviewComment({ body: '@acme-agent this is the same finding.' }),
+    login: 'acme-agent'
+  })
+  assert.equal(mention.addressed, 'mention')
+})
+
+test('an issue body version keys on updated_at: an edit is a new Trigger, the same version repeats', () => {
+  const base = {
+    repository: 'acme/widgets',
+    number: 42,
+    isPull: false,
+    login: 'acme-agent',
+    source: {
+      title: 'Fix the login redirect',
+      body: 'On the settings page the login redirect drops the `next` query parameter.',
+      login: 'alice',
+      bot: false,
+      createdAt: '2026-11-07T05:01:09Z',
+      updatedAt: '2026-11-07T05:07:26Z',
+      url: 'https://github.com/acme/widgets/issues/42'
+    }
+  } as const
+  const first = issueBodyTrigger(base)
+  assert.deepEqual(first, {
+    id: key('github', 'issue', '42', '2026-11-07T05:07:26Z'),
+    source: 'github',
+    threads: [{ source: 'github', id: '42' }],
+    actor: { source: 'github', id: 'alice' },
+    human: true,
+    at: '2026-11-07T05:07:26Z',
+    text:
+      'Fix the login redirect\n\nOn the settings page the login redirect drops the `next` query parameter.',
+    url: 'https://github.com/acme/widgets/issues/42',
+    channel: {
+      source: 'github',
+      thread: 'github:42',
+      address: { repo: 'acme/widgets', issue: '42' }
+    },
+    meta: {
+      kind: 'issue',
+      repository: 'acme/widgets',
+      issue: 42,
+      updatedAt: '2026-11-07T05:07:26Z'
+    }
+  })
+  assert.equal(first.id, issueBodyTrigger(base).id, 'the same version repeats')
+  // 编辑：updated_at 变了就是新事件、新 id。id 里没有正文本身。
+  const edited = issueBodyTrigger({
+    ...base,
+    source: { ...base.source, body: `${base.source.body}\n\nEdit: keep the anchor too.`, updatedAt: '2026-11-07T06:30:00Z' }
+  })
+  assert.notEqual(edited.id, first.id)
+  // 正文 @ 了 agent 才是 mention；actor 用 Issue/PR 的作者，bot 永远不是人。
+  const mentioned = issueBodyTrigger({
+    ...base,
+    source: { ...base.source, body: '@acme-agent please fix this.', updatedAt: '2026-11-07T06:40:00Z' }
+  })
+  assert.equal(mentioned.addressed, 'mention')
+  assert.equal(
+    issueBodyTrigger({ ...base, source: { ...base.source, login: 'ci-bot[bot]', bot: true } }).human,
+    false
+  )
+  // PR 正文走同一个 translator，meta.kind 记 'pull'，scope 才会落到 pulls 行。
+  assert.equal(issueBodyTrigger({ ...base, isPull: true }).meta['kind'], 'pull')
+  // 指纹只认正文：同一正文同一指纹，改了正文才变。
+  assert.equal(bodyFingerprint('same'), bodyFingerprint('same'))
+  assert.notEqual(bodyFingerprint('same'), bodyFingerprint('changed'))
+})
+
+test('a subscribed PR translates its reviews and review comments, dropping the agent and marking bots', async () => {
+  const commands = new FakeCommands()
+  commands.script('gh api notifications', () => JSON.stringify([]))
+  commands.script(['api', 'repos/acme/widgets/issues/45'], () => fixture('pull-as-issue.json'))
+  commands.script(['api', 'repos/acme/widgets/pulls/45'], () => fixture('pull.json'))
+  commands.script(['api', 'repos/acme/widgets/issues/45/comments', '--paginate'], () => JSON.stringify([]))
+  commands.script(['api', 'repos/acme/widgets/pulls/45/reviews', '--paginate'], () =>
+    JSON.stringify([
+      reviewJson({ id: 1, state: 'APPROVED', body: '@acme-agent approve?' }),
+      reviewJson({ id: 2, state: 'COMMENTED', login: 'acme-agent', body: 'my own review' }),
+      reviewJson({ id: 3, state: 'COMMENTED', body: '' }),
+      reviewJson({ id: 4, state: 'COMMENTED', login: 'ci-bot[bot]', bot: true, body: 'automated finding' })
+    ])
+  )
+  commands.script(['api', 'repos/acme/widgets/pulls/45/comments', '--paginate'], () =>
+    JSON.stringify([
+      reviewCommentJson({ id: 10, inReplyTo: 9000, body: 'keep `next`' }),
+      reviewCommentJson({ id: 11, login: 'acme-agent', body: 'self reply' }),
+      reviewCommentJson({ id: 12, login: 'ci-bot[bot]', bot: true, body: 'bot finding' })
+    ])
+  )
+  const h = host()
+  const result = await createGithubPoller({
+    api: api(commands),
+    config: config(),
+    login: 'acme-agent',
+    host: h.port,
+    cursorKey: githubCursorKey,
+    subscribed: () => [{ issue: 45, live: true, lastAt: '2026-11-07T03:00:00Z' }],
+    now: () => Date.parse('2026-11-07T04:00:00Z')
+  }).poll()
+  assert.deepEqual(result, { notifications: 0, triggers: 4, skipped: 0 })
+  assert.deepEqual(
+    h.received.map((trigger) => [
+      trigger.meta['kind'],
+      trigger.actor.id,
+      trigger.human,
+      trigger.addressed ?? null
+    ]),
+    [
+      ['review', 'carol', true, 'mention'],
+      ['review', 'ci-bot[bot]', false, null],
+      ['review-comment', 'carol', true, null],
+      ['review-comment', 'ci-bot[bot]', false, null]
+    ]
+  )
+  // 评审评论带上根评论与相关 Thread；评审本身只属于 PR 会话。
+  const inline = h.received[2]!
+  assert.deepEqual(inline.threads, [
+    { source: 'github', id: '45' },
+    { source: 'github', id: '45/rt/9000' }
+  ])
+  assert.equal(inline.channel?.address['root'], '9000')
+  assert.deepEqual(h.received[0]!.threads, [{ source: 'github', id: '45' }])
+  // 自身消息两条（评审与回复）都没有变成 Trigger。
+  assert.equal(h.received.some((trigger) => trigger.actor.id === 'acme-agent'), false)
+})
+
+test('an issue body edit becomes a Trigger only after the baseline; comment activity alone does not', async () => {
+  const commands = new FakeCommands()
+  commands.script('gh api notifications', () => JSON.stringify([]))
+  const v1 = JSON.parse(fixture('issue.json')) as Record<string, unknown>
+  const sameBodyNewVersion = { ...v1, updated_at: '2026-11-07T06:00:00Z' }
+  const edited: Record<string, unknown> = {
+    ...v1,
+    body: `${String(v1.body)}\n\nEdit: also keep the anchor.`,
+    updated_at: '2026-11-07T06:30:00Z'
+  }
+  // 四轮各读一次 Issue：基线、同正文新 updated_at、正文编辑、同一编辑再读。
+  for (const issue of [v1, sameBodyNewVersion, edited, edited]) {
+    commands.next('gh', ['api', 'repos/acme/widgets/issues/42'], JSON.stringify(issue))
+  }
+  commands.script(['api', 'repos/acme/widgets/issues/42/comments', '--paginate'], () => JSON.stringify([]))
+  const h = host()
+  const poller = createGithubPoller({
+    api: api(commands),
+    config: config(),
+    login: 'acme-agent',
+    host: h.port,
+    cursorKey: githubCursorKey,
+    bodyKey: githubBodyKey,
+    subscribed: () => [{ issue: 42, live: true, lastAt: '2026-11-07T03:00:00Z' }],
+    now: () => Date.parse('2026-11-07T04:00:00Z')
+  })
+  assert.equal((await poller.poll()).triggers, 0, 'the first read only sets the baseline')
+  assert.equal(h.state.get(githubBodyKey(42)), bodyFingerprint(String(v1.body)))
+  assert.equal((await poller.poll()).triggers, 0, 'a new updated_at with the same body is comment activity, not an edit')
+  assert.equal((await poller.poll()).triggers, 1)
+  assert.equal(h.received[0]?.id, key('github', 'issue', '42', '2026-11-07T06:30:00Z'))
+  assert.equal(h.received[0]?.text, `${String(edited.title)}\n\n${String(edited.body)}`)
+  assert.equal(h.state.get(githubBodyKey(42)), bodyFingerprint(String(edited.body)))
+  assert.equal((await poller.poll()).triggers, 0, 'the same version repeats as duplicate')
+})
+
+test('a PR body edit uses the same translator and fingerprint key, with meta kind pull', async () => {
+  const commands = new FakeCommands()
+  commands.script('gh api notifications', () => JSON.stringify([]))
+  commands.script(['api', 'repos/acme/widgets/issues/45'], () => fixture('pull-as-issue.json'))
+  const v1 = JSON.parse(fixture('pull.json')) as Record<string, unknown>
+  const v2 = { ...v1, body: `${String(v1.body)}\n\nEdit: name the account too.`, updated_at: '2026-11-07T07:00:00Z' }
+  commands.next('gh', ['api', 'repos/acme/widgets/pulls/45'], JSON.stringify(v1))
+  commands.next('gh', ['api', 'repos/acme/widgets/pulls/45'], JSON.stringify(v2))
+  commands.script(['api', 'repos/acme/widgets/issues/45/comments', '--paginate'], () => JSON.stringify([]))
+  commands.script(['api', 'repos/acme/widgets/pulls/45/reviews', '--paginate'], () => JSON.stringify([]))
+  commands.script(['api', 'repos/acme/widgets/pulls/45/comments', '--paginate'], () => JSON.stringify([]))
+  const h = host()
+  const poller = createGithubPoller({
+    api: api(commands),
+    config: config(),
+    login: 'acme-agent',
+    host: h.port,
+    cursorKey: githubCursorKey,
+    bodyKey: githubBodyKey,
+    subscribed: () => [{ issue: 45, live: true, lastAt: '2026-11-07T03:00:00Z' }],
+    now: () => Date.parse('2026-11-07T04:00:00Z')
+  })
+  assert.equal((await poller.poll()).triggers, 0)
+  assert.equal(h.state.get(githubBodyKey(45)), bodyFingerprint(String(v1.body)))
+  assert.equal((await poller.poll()).triggers, 1)
+  assert.equal(h.received[0]?.meta['kind'], 'pull')
+  assert.equal(h.received[0]?.id, key('github', 'issue', '45', '2026-11-07T07:00:00Z'))
+})
+
+// ---- #18：评审线程回复、回退与 Channel 幂等（§I.2 Channel 行） ----
+
+/** 一个把 `FakeCommands` 当 `CommandsHost` 用的最小视图。 */
+function channelHost(commands: FakeCommands) {
+  return {
+    run: (program: string, args: readonly string[], options?: Parameters<FakeCommands['run']>[2]) =>
+      commands.run(program, args, options ?? {}),
+    stream: (program: string, args: readonly string[], options: Parameters<FakeCommands['stream']>[2]) =>
+      commands.stream(program, args, options),
+    withSignal: () => commands
+  }
+}
+
+/** 一条发往评审线程的消息。 */
+function reviewReply(id = 'reply-9', root = '7000') {
+  return {
+    id,
+    channel: {
+      source: 'github',
+      thread: 'github:45',
+      address: { repo: 'acme/widgets', issue: '45', root }
+    },
+    text: 'Fixed in abc123.',
+    kind: 'reply' as const
+  }
+}
+
+test('a review-thread reply confirms the root and posts to the replies endpoint', async () => {
+  const commands = new FakeCommands()
+  commands.script(['api', 'repos/acme/widgets/pulls/comments/7000'], () => JSON.stringify({ id: 7000 }))
+  commands.script(['api', 'repos/acme/widgets/pulls/45/comments?per_page=100', '-q'], () => '')
+  commands.script(['api', 'repos/acme/widgets/pulls/45/comments/7000/replies', '-f'], () => '{}')
+  const result = await githubKind.channel?.send(channelHost(commands), reviewReply())
+  assert.equal(result, 'sent')
+  assert.deepEqual(
+    commands.calls.map((call) => call.args),
+    [
+      ['api', 'repos/acme/widgets/pulls/comments/7000'],
+      ['api', 'repos/acme/widgets/pulls/45/comments?per_page=100', '-q', '.[].body'],
+      [
+        'api',
+        'repos/acme/widgets/pulls/45/comments/7000/replies',
+        '-f',
+        'body=Fixed in abc123.\n\n<!-- superagent:reply-9 -->'
+      ]
+    ]
+  )
+  // 绝不把评审线程的回复写成 PR 会话评论，也不替 worker 调 resolve。
+  assert.equal(
+    commands.calls.some((call) => call.args.includes('graphql') || call.args.includes('resolveReviewThread')),
+    false
+  )
+})
+
+test('a missing root comment falls back to the PR conversation', async () => {
+  const commands = new FakeCommands()
+  commands.fail(
+    'gh',
+    ['api', 'repos/acme/widgets/pulls/comments/7000'],
+    new CliError('gh exited with code 1: HTTP 404', 404, 1)
+  )
+  commands.script(['api', 'repos/acme/widgets/issues/45/comments?per_page=100', '-q'], () => '')
+  commands.script(['api', 'repos/acme/widgets/issues/45/comments', '-f'], () => '{}')
+  const result = await githubKind.channel?.send(channelHost(commands), reviewReply())
+  assert.equal(result, 'sent')
+  assert.deepEqual(
+    commands.calls.map((call) => call.args),
+    [
+      ['api', 'repos/acme/widgets/pulls/comments/7000'],
+      ['api', 'repos/acme/widgets/issues/45/comments?per_page=100', '-q', '.[].body'],
+      ['api', 'repos/acme/widgets/issues/45/comments', '-f', 'body=Fixed in abc123.\n\n<!-- superagent:reply-9 -->']
+    ]
+  )
+})
+
+test('two sends of the same review reply produce one comment', async () => {
+  const commands = new FakeCommands()
+  commands.script(['api', 'repos/acme/widgets/pulls/comments/7000'], () => JSON.stringify({ id: 7000 }))
+  let markerPresent = false
+  commands.script(['api', 'repos/acme/widgets/pulls/45/comments?per_page=100', '-q'], () =>
+    markerPresent ? 'Fixed in abc123.\n\n<!-- superagent:reply-9 -->' : ''
+  )
+  commands.script(['api', 'repos/acme/widgets/pulls/45/comments/7000/replies', '-f'], () => {
+    markerPresent = true
+    return '{}'
+  })
+  const host = channelHost(commands)
+  assert.equal(await githubKind.channel?.send(host, reviewReply()), 'sent')
+  assert.equal(await githubKind.channel?.send(host, reviewReply()), 'sent')
+  const posts = commands.calls.filter((call) => call.args.includes('-f'))
+  assert.equal(posts.length, 1, 'the marker stops the second write')
+  assert.equal(markerPresent, true)
+})
+
+test('a locked, deleted or forbidden target is gone; a rate limit is retried', async () => {
+  async function attempt(error: CliError): Promise<'sent' | 'gone'> {
+    const commands = new FakeCommands()
+    commands.script(['api', 'repos/acme/widgets/issues/42/comments?per_page=100', '-q'], () => '')
+    commands.fail('gh', ['api', 'repos/acme/widgets/issues/42/comments', '-f'], error)
+    return (await githubKind.channel?.send(channelHost(commands), {
+      id: 'reply-1',
+      channel: { source: 'github', thread: 'github:42', address: { repo: 'acme/widgets', issue: '42' } },
+      text: 'Done.',
+      kind: 'reply'
+    })) as 'sent' | 'gone'
+  }
+  assert.equal(await attempt(new CliError('gh exited with code 1: issue is locked (HTTP 403)', 403, 1)), 'gone')
+  assert.equal(
+    await attempt(new CliError('gh exited with code 1: Resource not accessible by integration (HTTP 403)', 403, 1)),
+    'gone'
+  )
+  assert.equal(await attempt(new CliError('gh exited with code 1: HTTP 404', 404, 1)), 'gone')
+  assert.equal(await attempt(new CliError('gh exited with code 1: HTTP 410', 410, 1)), 'gone')
+  await assert.rejects(
+    attempt(new CliError('gh exited with code 1: API rate limit exceeded (HTTP 403)', 403, 1)),
+    /rate limit/
+  )
+  await assert.rejects(attempt(new CliError('gh exited with code 1: HTTP 500', 500, 1)), /gh exited/)
+})
+
+test('the channel accepts a review-thread address only when its root is a number', () => {
+  assert.equal(githubKind.channel?.allowed?.({ repo: 'acme/widgets', issue: '45', root: '7000' }, config()), true)
+  assert.equal(githubKind.channel?.allowed?.({ repo: 'acme/widgets', issue: '45' }, config()), true)
+  assert.equal(githubKind.channel?.allowed?.({ repo: 'acme/widgets', issue: '45', root: 'x' }, config()), false)
+  assert.equal(githubKind.channel?.allowed?.({ repo: '', issue: '45' }, config()), false)
+  assert.equal(githubKind.channel?.allowed?.({ repo: 'acme/widgets', issue: 'four' }, config()), false)
+  // 评审线程的链接指向讨论锚点（面板与 outbox 读它）。
+  const link = githubKind.channel?.link?.(
+    {
+      repo: 'acme/widgets',
+      issue: '45',
+      root: '7000'
+    },
+    {}
+  )
+  assert.equal(link?.url, 'https://github.com/acme/widgets/pull/45#discussion_r7000')
+})
+
+test('an issue body the agent itself wrote is dropped like any other self message', async () => {
+  const commands = new FakeCommands()
+  commands.script('gh api notifications', () => JSON.stringify([]))
+  const original = JSON.parse(fixture('issue.json')) as Record<string, unknown>
+  const mine: Record<string, unknown> = {
+    ...original,
+    user: { login: 'acme-agent', type: 'User' },
+    body: 'The agent edited its own description.',
+    updated_at: '2026-11-07T07:30:00Z'
+  }
+  commands.next('gh', ['api', 'repos/acme/widgets/issues/42'], JSON.stringify(original))
+  commands.next('gh', ['api', 'repos/acme/widgets/issues/42'], JSON.stringify(mine))
+  commands.script(['api', 'repos/acme/widgets/issues/42/comments', '--paginate'], () => JSON.stringify([]))
+  const h = host()
+  const poller = createGithubPoller({
+    api: api(commands),
+    config: config(),
+    login: 'acme-agent',
+    host: h.port,
+    cursorKey: githubCursorKey,
+    bodyKey: githubBodyKey,
+    subscribed: () => [{ issue: 42, live: true, lastAt: '2026-11-07T03:00:00Z' }],
+    now: () => Date.parse('2026-11-07T04:00:00Z')
+  })
+  assert.equal((await poller.poll()).triggers, 0, 'the baseline')
+  assert.equal((await poller.poll()).triggers, 0, 'the agent edited its own body')
+  assert.deepEqual(h.received, [])
+  // 即便如此，指纹仍然前进：下一次真正的人编辑才是新事件。
+  assert.equal(h.state.get(githubBodyKey(42)), bodyFingerprint(String(mine.body)))
+})
+
+test('editing a comment, review or review comment is a new Trigger; the same version repeats', () => {
+  const comment = {
+    id: 1,
+    login: 'alice',
+    bot: false,
+    body: 'first version',
+    createdAt: '2026-11-07T05:00:00Z',
+    updatedAt: '2026-11-07T05:00:00Z',
+    url: '',
+    inReplyTo: null,
+    path: '',
+    line: null
+  }
+  const issueComment = (updatedAt: string) =>
+    commentTrigger({
+      repository: 'acme/widgets',
+      issue: 42,
+      comment: { ...comment, updatedAt },
+      login: 'acme-agent',
+      observeComments: false
+    })
+  assert.equal(issueComment('2026-11-07T05:00:00Z').id, issueComment('2026-11-07T05:00:00Z').id)
+  assert.notEqual(issueComment('2026-11-07T05:00:00Z').id, issueComment('2026-11-07T05:10:00Z').id)
+
+  const reviewAt = (submittedAt: string) =>
+    reviewTrigger({
+      repository: 'acme/widgets',
+      pull: 45,
+      review: review({ submittedAt }),
+      login: 'acme-agent'
+    })
+  assert.equal(reviewAt('2026-11-07T06:00:00Z').id, reviewAt('2026-11-07T06:00:00Z').id)
+  assert.notEqual(reviewAt('2026-11-07T06:00:00Z').id, reviewAt('2026-11-07T06:10:00Z').id)
+
+  const inlineAt = (updatedAt: string) =>
+    reviewCommentTrigger({
+      repository: 'acme/widgets',
+      pull: 45,
+      comment: { ...reviewComment(), updatedAt },
+      login: 'acme-agent'
+    })
+  assert.equal(inlineAt('2026-11-07T06:01:00Z').id, inlineAt('2026-11-07T06:01:00Z').id)
+  assert.notEqual(inlineAt('2026-11-07T06:01:00Z').id, inlineAt('2026-11-07T06:11:00Z').id)
 })
