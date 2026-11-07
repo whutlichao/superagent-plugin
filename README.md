@@ -33,3 +33,11 @@ scripts/check.sh        四道门禁，按序执行
 MIT；见 `LICENSE`。
 
 > Ported from `deepseek-ai/dsh-superagent-prototype` (MIT, Copyright DeepSeek), commit `8c32a9dc5d72c033816c6a8110b37f40cf94fba4`. The Orca adaptation changes the host integration; the domain rules, prompts and documents are derived from that prototype.
+
+## 已知限制（摘要）
+
+完整清单见设计文档附录 B；与 worker 执行环境相关的一条：`agent.launch.before` 钩子注入的
+`worker-bin` shim 只挡手滑，**不是安全边界**；`worker-gitconfig` 是一份最小副本（凭据 helper、
+SSH→HTTPS 重写、agent 提交身份），`filter.lfs.*` 等其余全局项只剩系统级配置——LFS 依赖系统
+配置，所以进程环境注入仍是**近似**（§H.11）。`GIT_CONFIG_GLOBAL` 只在文件真的存在时才注入：
+指向不存在的文件会让 git 停止加载用户级配置。

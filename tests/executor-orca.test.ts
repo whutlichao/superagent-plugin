@@ -19,6 +19,7 @@ import {
 import { launchTicketAgent, seedPrompt } from '../src/worker/executor/launch'
 import type { EnvironmentDeployment } from '../src/worker/executor/environment'
 import { createLaunchHook, type LaunchHook } from '../src/worker/executor/launch-hook'
+import { writeWorkerGitConfig, workerGitConfigPath } from '../src/worker/infra/gitconfig'
 import {
   OrcaExecutor,
   registerExecutorEffects,
@@ -1094,6 +1095,15 @@ test('the launch hook injects this launch and leaves every other launch alone', 
   const injected: Record<string, string>[] = []
   const strangers: Record<string, string>[] = []
   const h = harness({ deployment: DEPLOYMENT, blockedCommands: ['personal-gh'], launchHook: hook })
+  // 组合根在启动时写好这份文件（§H.11）；这里显式写一次，费定「文件存在才注入」。
+  assert.equal(
+    writeWorkerGitConfig({
+      stateDir: h.stateDir,
+      account: DEPLOYMENT.githubLogin,
+      email: DEPLOYMENT.githubCommitEmail
+    }).state,
+    'written'
+  )
   // 替身扮演宿主：真正 launch 之前先发一次钩子，把环境交给「启动」这一步。
   h.runtime.script.launchAgent = (spec) => {
     const mine = hook.handle(
@@ -1135,8 +1145,40 @@ test('the launch hook injects this launch and leaves every other launch alone', 
   assert.equal(injected[0]?.['DSH_SUPERAGENT_TICKET'], 'ticket-11')
   assert.equal(injected[0]?.['DSH_SUPERAGENT_NAME'], 'fix-the-login-flow')
   assert.equal(injected[0]?.['PATH'], `${h.stateDir}/bin:/usr/bin:/bin`, 'the shim directory leads PATH')
-  assert.equal(injected[0]?.['GIT_CONFIG_GLOBAL'], `${h.stateDir}/worker-gitconfig`)
+  assert.equal(injected[0]?.['GIT_CONFIG_GLOBAL'], workerGitConfigPath(h.stateDir))
   assert.deepEqual(strangers, [{}], 'another worktree is untouched')
+  await h.cleanup()
+})
+
+test('without the worker git config file nothing is injected, so the operator config still applies', async () => {
+  const hook = createLaunchHook()
+  const injected: Record<string, string>[] = []
+  const h = harness({ deployment: DEPLOYMENT, launchHook: hook })
+  h.runtime.script.launchAgent = (spec) => {
+    hook.handle(
+      {
+        agent: spec.agent,
+        workspaceId: spec.workspace.workspaceId,
+        workspaceKind: 'worktree',
+        command: 'pi',
+        env: {}
+      },
+      (event) => {
+        injected.push({ ...event.env })
+        return { kind: 'continue' as const, event }
+      }
+    )
+    return { terminalId: 'term_1', workspaceId: spec.workspace.workspaceId, launchedAt: 1 }
+  }
+  const pending = ticket({ assignments: [assignment('a-1', 'pending')] })
+  h.seed(pending)
+  h.seedTrigger(trigger())
+  h.executor.start(pending, pending.assignments[0]!)
+  await h.effects.idle('launch')
+
+  assert.equal(injected.length, 1)
+  assert.equal('GIT_CONFIG_GLOBAL' in (injected[0] ?? {}), false, 'a missing file must not sever the operator config')
+  assert.equal(injected[0]?.['DSH_SUPERAGENT_TICKET'], 'ticket-11', 'the rest of the environment is still injected')
   await h.cleanup()
 })
 

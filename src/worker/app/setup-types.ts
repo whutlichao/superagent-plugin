@@ -5,6 +5,7 @@
 // 部分**（Source 停在 setup/starting，不是 error），并给一条修法与「检查一次」的入口。
 //
 // 红线（§O、§N.5）：结论只写「有没有 / 缺什么」，绝不出现 token、密钥或消息正文。
+import type { WorkerGitConfigWrite } from '../infra/gitconfig.ts'
 
 /** setup 问题归属的部件（决定谁被挡住，也决定面板放在哪张卡上）。 */
 export type SetupPlace = 'orca' | 'state' | 'executor' | 'github' | 'feishu'
@@ -34,6 +35,8 @@ export type SetupCode =
   | 'account_unreadable'
   | 'bot_missing'
   | 'user_identity'
+  | 'gitconfig_missing'
+  | 'gitconfig_unwritable'
 
 /** 「检查一次」的入口：面板按钮与 CLI 命令是同一条（§G.2 的 `setup check`）。 */
 export const SETUP_CHECK_AGAIN = 'superagent setup check'
@@ -87,6 +90,25 @@ export interface SetupPorts {
   readonly repos?: () => Promise<readonly RepoRow[]>
   /** `orca repo search-refs` 的命中 ref（base ref 存在性）。 */
   readonly searchRefs?: (selector: RepoSelectorLike, query: string) => Promise<readonly string[]>
+  /**
+   * 写 `<stateDir>/worker-gitconfig`（§H.11）。缺省就是 `infra/gitconfig.ts` 的真实现
+   * （只往 stateDir 里写）；测试可以换成一个只回既定读数的替身。
+   */
+  readonly writeGitConfig?: (options: {
+    readonly stateDir: string
+    readonly account: string
+    readonly email: string
+  }) => WorkerGitConfigWrite
+}
+
+/**
+ * worker 的提交身份来源（§H.11）：agent 账号与它的 noreply 邮箱，与
+ * `DSH_SUPERAGENT_GITHUB_ACCOUNT` / `_COMMIT_EMAIL` 同源。
+ * `account` 是设置里的回落值——探针读到 `gh` 的账号时以探针为准。
+ */
+export interface SetupGitConfigIdentity {
+  readonly account?: string
+  readonly email: string
 }
 
 /** `runSetupChecks` 的输入：一份设置快照 + 注入的外部世界。 */
@@ -105,6 +127,11 @@ export interface SetupCheckInput {
   readonly githubEnabled?: boolean
   /** 配置了 Feishu 时的 CLI；没配就没有这一项（不查 lark-cli）。 */
   readonly feishuCli?: string
+  /**
+   * 写到 worker git 配置里的身份（§H.11）。不给就不管这件事（直接调探针的调用方）；
+   * 组合根总是给——它是 `DSH_SUPERAGENT_GITHUB_COMMIT_EMAIL` 的同源值。
+   */
+  readonly gitConfig?: SetupGitConfigIdentity
   readonly ports?: SetupPorts
 }
 

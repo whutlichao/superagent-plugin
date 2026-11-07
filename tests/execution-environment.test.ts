@@ -399,12 +399,28 @@ describe('the agent.launch.before hook (§H.11)', () => {
         environment: { DSH_SUPERAGENT_TICKET: 'ticket-11' },
         binDirectory: '/state/bin',
         gitConfig: '/state/worker-gitconfig',
+        // 只有文件真的存在才注入（真实存在性的用例在 `gitconfig.test.ts`，用真文件 + 真 git）。
+        gitConfigExists: () => true,
         basePath: '/usr/local/bin:/usr/bin'
       }),
       {
         DSH_SUPERAGENT_TICKET: 'ticket-11',
         PATH: '/state/bin:/usr/local/bin:/usr/bin',
         GIT_CONFIG_GLOBAL: '/state/worker-gitconfig'
+      }
+    )
+    // 文件不在：不注入，回落到操作者环境（指向不存在的文件会把用户配置全部切断）。
+    assert.deepEqual(
+      launchEnvironment({
+        environment: { DSH_SUPERAGENT_TICKET: 'ticket-11' },
+        binDirectory: '/state/bin',
+        gitConfig: '/state/worker-gitconfig',
+        gitConfigExists: () => false,
+        basePath: '/usr/local/bin:/usr/bin'
+      }),
+      {
+        DSH_SUPERAGENT_TICKET: 'ticket-11',
+        PATH: '/state/bin:/usr/local/bin:/usr/bin'
       }
     )
     // 没有既有 PATH 时也不留一个空段（空段等于把当前目录放进 PATH）。

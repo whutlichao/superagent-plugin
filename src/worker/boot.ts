@@ -305,6 +305,11 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
     githubCli: githubInstance.cli,
     githubEnabled: githubInstance.enabled,
     ...(feishuCli === undefined ? {} : { feishuCli }),
+    // worker 的提交身份（§H.11）：账号以探针读到的 `gh` 为准，邮箱来自设置（§E.11 同源）。
+    gitConfig: {
+      email: text(settings['githubCommitEmail']) ?? '',
+      account: text(settings['githubLogin']) ?? ''
+    },
     ports: {
       run: (program, args) => commandPort.run(program, args),
       repos: () => options.runtime.listRepos(),

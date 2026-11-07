@@ -197,7 +197,7 @@ export const CLI_COMMANDS: readonly CommandDefinition[] = [
   },
   {
     name: ['doctor'],
-    summary: 'diagnose token, port, lock, database, CLI paths and logins (presence only; the setup check decides whether to start)',
+    summary: 'diagnose token, port, lock, database, CLI paths, the worker git config and logins (presence only; the setup check decides whether to start)',
     flags: [],
     positionals: [],
     write: false,
