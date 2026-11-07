@@ -920,7 +920,7 @@ Router/Worker 用的命令（等价上游 `orchestrator_*` 工具）：
 | `superagent pause` / `resume` | 处理暂停（`paused=true/false`），写 `settings` 的 `paused`，origin=`operator` |
 | `superagent setup check` | 重跑 setup（会重启 worker 内的 loops，不重启 Orca）；`setup` 已无问题时拒绝 |
 | `superagent source labels <id>` | 刷新显示名（一次外部读取，有 §O 的预算：超预算 → `unavailable` + 「稍后重试」，不写库、不返回半份成功） |
-| `superagent admin backup` | 立即备份（供升级前手工调用）：入队一行 `backup` effect 并回 `{queued:true, path, at}`——VACUUM 不在 HTTP handler 里跑（§O），`path` 就是它将要落到的位置 |
+| `superagent admin backup` | 入队一次备份（供升级前手工调用）：入队一行 `backup` effect 并回 `{queued:true, path, at}`——VACUUM 不在 HTTP handler 里跑（§O），`path` 就是它将要落到的位置；命令返回不等文件写完 |
 | `superagent admin rotate-token` | 轮换主 token（破坏性，需确认） |
 | `superagent doctor` | 本地诊断：token/端口/锁/库迁移/CLI 路径/gh 登录/lark-cli 配置，逐项 `ok\|warn\|timeout\|fail`（`timeout` = 那条探针在自己的预算内没回来，既不是 ok 也不是 fail；见 §O 的超时行） |
 
@@ -1744,7 +1744,7 @@ ENOENT: no such file or directory, open
 | CLI 凭证 | 由机器上的 `gh` / `lark-cli` 持有；插件**不存** GitHub token、不存 Feishu app secret；`secrets` 只用于可选的自定义（如私有镜像口令），且有 `protection()==='unavailable'` 时的降级说明 |
 | 破坏性操作 | 面板二次确认（§M.2）；CLI 侧 `ticket stop` / `worktree rm` / `rotate-token` 要求 `--yes`（或 `--request-id` 幂等 + `--confirm`） |
 | 命令注入 | 所有子进程用 **argv 数组** + `shell:false`；程序名白名单（`gh`/`lark-cli`/`git`/`orca`/`sh`），路径必须是设置里给的绝对值；`prepare` 命令里只允许 `${DSH_SUPERAGENT_*}` 白名单变量，替换时逐值单引号转义；**绝不**把消息正文拼进 shell |
-| 超时 | CLI 60 s（`prepare` 10 min，`worktree create` 120 s）；HTTP handler 内不做超过 10 s 的同步等待（长活进 effect）。**每一条会同步等外部 CLI/探针的路由各有一条预算**（都在 10 s 天花板之下）：`POST setup/check` 单条探针 2 s、整次 9 s（`src/worker/http/ops.ts` 的 `SETUP_CHECK_BUDGET`），`POST policy-sync/:id` 整次 8 s（`http/settings.ts` 的 `POLICY_SYNC_BUDGET`），`POST doctor` 单条 CLI 探针 2 s、整次 9 s（`ops.ts` 的 `DOCTOR_BUDGET`），`POST sources/:id/labels` 单条探针 2 s、整次 5 s（`ops.ts` 的 `SOURCE_LABELS_BUDGET`），`PUT settings/:block` 的账号探针单条 2 s、整次 9 s（`settings.ts` 的 `SETTINGS_SAVE_BUDGET`），`POST report --pr-number` 的 PR 读单条 2 s、整次 5 s（`http/domain.ts` 的 `REPORT_BUDGET`），`GET eval/:id` / `GET eval-read/:id` 与 `GET read/:resource` 整次 9 s（`http/eval.ts` 的 `EVAL_READ_BUDGET`、`http/read.ts` 的 `READ_BUDGET`）。到点先取消（信号进 `execFile`，子进程被 SIGTERM 掐掉）再定结论：`doctor` 是逐项读数，单条探针到点只把**那一项**标成 `timeout`（200，其余项照常；不伪装 ok），整次到点才 `unavailable`；其余是一次**动作**，到点即返回固定码 `unavailable` + 「稍后重试」，半个结论/名单/设置都不落库（`infra/deadline.ts` 的 `withDeadline` / `probeRunner` / `withinBudget`，折码只有 `http/budget.ts` 的 `refuseOnDeadline` 一处）。面板的 host 方法（`checkSetup`/`doctor`/`refreshSourceLabels`/`syncSource`/`settingsSave`）与 HTTP 走**同一份预算**：面板请求同样不能占住 worker。`POST admin/backup` 的 `VACUUM` 是同步的，所以它不进 handler：命令只入队一行 `backup` effect（§J.2）并回 `{queued:true, path}`，由队列在事件循环的下一拍完成（先让响应写出去） |
+| 超时 | CLI 60 s（`prepare` 10 min，`worktree create` 120 s）；HTTP handler 内不做超过 10 s 的同步等待（长活进 effect）。**每一条会同步等外部 CLI/探针的路由各有一条预算**（都在 10 s 天花板之下）：`POST setup/check` 单条探针 2 s、整次 9 s（`src/worker/http/ops.ts` 的 `SETUP_CHECK_BUDGET`），`POST policy-sync/:id` 整次 8 s（`http/settings.ts` 的 `POLICY_SYNC_BUDGET`），`POST doctor` 单条 CLI 探针 2 s、整次 9 s（`ops.ts` 的 `DOCTOR_BUDGET`），`POST sources/:id/labels` 单条探针 2 s、整次 5 s（`ops.ts` 的 `SOURCE_LABELS_BUDGET`），`PUT settings/:block` 的账号探针单条 2 s、整次 9 s（`settings.ts` 的 `SETTINGS_SAVE_BUDGET`），`POST report --pr-number` 的 PR 读单条 2 s、整次 5 s（`http/domain.ts` 的 `REPORT_BUDGET`），`GET eval/:id` / `GET eval-read/:id` 与 `GET read/:resource` 整次 9 s（`http/eval.ts` 的 `EVAL_READ_BUDGET`、`http/read.ts` 的 `READ_BUDGET`）。到点先取消（信号进 `execFile`，子进程被 SIGTERM 掐掉）再定结论：`doctor` 是逐项读数，单条探针到点只把**那一项**标成 `timeout`（200，其余项照常；不伪装 ok），整次到点才 `unavailable`；其余是一次**动作**，到点即返回固定码 `unavailable` + 「稍后重试」，半个结论/名单/设置都不落库（`infra/deadline.ts` 的 `withDeadline` / `probeRunner` / `withinBudget`，折码只有 `http/budget.ts` 的 `refuseOnDeadline` 一处）。面板的 host 方法（`checkSetup`/`doctor`/`refreshSourceLabels`/`syncSource`/`settingsSave`）与 HTTP 走**同一份预算**：面板请求同样不能占住 worker。`POST admin/backup` 的 `VACUUM` 是同步的，所以它不进 handler：命令只入队一行 `backup` effect（§J.2）并回 `{queued:true, path}`；effect 先让出一拍（`setImmediate`）好让那个响应写出去，然后 `VACUUM` **仍然在 worker 自己的事件循环上同步跑完**。诚实边界：这里的保证是「这个 HTTP handler 不阻塞、响应已经先写出去」，**不是**「整个 worker 在备份期间非阻塞」——备份期间同一条事件循环同样被按住，`VACUUM` 的时长就是按住的时长。备份先写同目录的临时文件再原子改名到目标（`VACUUM INTO` 不覆盖已存在的文件，直接写目标会让重试永远失败；目标已存在只是被替换，崩溃留下的临时文件在下次动手前清掉，§N.6） |
 | 路径 | `stateDir` 必须是绝对路径且可写；`inbox/relay/skills/backups` 都在其后代内；任何用户提供的路径（`eval-read --path`）必须 realpath 后落在 base repo 或 ticket worktree 之内，否则 `refused` |
 | 审批面 | manifest 的 10 个 capability 就是用户看到并批准的清单；插件不请求 `appearance:write`，也不注册 hook 之外的拦截点（不用 `terminal.send`/`agent.tool.before` 做「安全网关」，避免把可靠性问题变成安全断言） |
 | 供应链 | 零运行时 npm 依赖（只用 Node 内置：`node:sqlite`、`node:fs`、`node:crypto`、`node:child_process`、`node:http`）；若必须引入 zod，以 MIT 单文件内置（`src/worker/infra/schema.ts` 的最小校验器），避免 `node_modules`（插件不允许提交 `node_modules`，也不做打包） |
@@ -1766,7 +1766,7 @@ ENOENT: no such file or directory, open
 
 ### P.2 测试套件（`orca plugin test .` 会跑所有 `*.test.ts(x)`）
 
-快照（本机 Orca 1.4.251、Node 25；截至 #68 合并，`scripts/check.sh` 的实测读数）：**89 个文件、1602 条测试、173 个 suite、fail 0**。下表按模块
+快照（本机 Orca 1.4.251、Node 25；截至 #68 合并，`scripts/check.sh` 的实测读数）：**89 个文件、1606 条测试、173 个 suite、fail 0**。下表按模块
 分组，每行都是 `tests/` 下的真实文件；「对应上游」写上游同名测试面，合并与改名的地方直接写出
 去向（§R.2 是同一件事的反向对照）。**没有落地的一项**单独列在表末。
 

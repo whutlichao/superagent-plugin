@@ -308,6 +308,8 @@ function noticeOf(block: string, outcome: SettingsSaveOutcome): DraftNotice | nu
     }
   }
   if (outcome.reason === 'conflict') return { kind: 'conflict', revision: outcome.revision }
+  // `failed` 原样保留 worker 的那句话（§O 的「… did not finish within N ms; retry later」也走
+  // 这里）：面板不另编一条超时文案，也不把到点折成第二种 reason。
   return { kind: 'failed', error: outcome.error }
 }
 

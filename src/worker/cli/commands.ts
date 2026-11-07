@@ -192,7 +192,7 @@ export const CLI_COMMANDS: readonly CommandDefinition[] = [
   },
   {
     name: ['admin', 'backup'],
-    summary: 'back up the database now (before an upgrade); the copy is written right after the command returns',
+    summary: 'queue a database backup (before an upgrade); returns queued and the path it will be written to, not a finished copy',
     flags: [REQUEST_ID_FLAG],
     positionals: [],
     write: true,

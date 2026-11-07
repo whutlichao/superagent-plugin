@@ -189,6 +189,8 @@ export function createOpsHandlers(options: {
   // §O「长活进 effect」：VACUUM 是**同步**的，在 handler 里跑会把整个 worker（以及这一个
   // 请求的响应）按在磁盘上。组合根给的 `backup` 端口只入队一行 `backup` effect 并回它将要
   // 落到的路径；没有队列的裸服务器（测试）照旧同步做一次。两种情形都是同一份 `backupNow`。
+  // 诚实边界：handler 本身不跑 VACUUM、响应先写出去，但 VACUUM 仍在 worker 自己的事件循环
+  // 上跑完（§O 超时行），不是「整个 worker 非阻塞」。
   const backup = options.ports?.backup
   handlers.set('POST admin/backup', ({ at, body, token, requestId }) =>
     idempotent(options.store, requestId ?? requestIdFrom(body), at, token, (): BackupResult => {

@@ -463,6 +463,24 @@ test('field-level issues name the field, and the control is marked invalid', asy
   await panel.unmount()
 })
 
+test('a save that missed its deadline shows the worker’s specific retry-later message', async () => {
+  // 与 `deployment.test.ts` 的面板保存用例同一条文案：handler 到点后拿到的是一次 `failed`
+  // （reason 仍是 `failed`，没有第二种 timeout 形状），`error` 原样进保存栏。那条用例里先
+  // 到点的是探针自己的 10 ms，所以点名的是「GitHub CLI probe」。
+  const message = 'The GitHub CLI probe did not finish within 10 ms; retry later'
+  const panel = await openSettings({
+    onSave: (input) => ({ ok: false, reason: 'failed', block: input.block, error: message })
+  })
+  await panel.toggle({ type: 'Switch', label: 'Observe new Issues' })
+  await panel.press({ text: COPY['action.save'].en })
+  const shown = COPY['draft.failed'].en.replace('{error}', message)
+  assert.ok(panel.find({ text: shown }), 'the save bar carries the worker’s exact message')
+  assert.ok(panel.find({ text: /did not finish within 10 ms; retry later/ }), 'including the deadline and retry hint')
+  assert.equal(panel.find({ text: COPY['action.save'].en }) !== null, true, 'the draft is still there')
+  assert.deepEqual(panel.refusals, [])
+  await panel.unmount()
+})
+
 test('a stale revision shows the conflict and Reload takes the server value', async () => {
   let current = settingsView({ observeIssues: false })
   const panel = await openSettings({

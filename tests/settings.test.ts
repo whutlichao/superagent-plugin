@@ -451,6 +451,10 @@ describe('settings save over the command surface (§K.8)', () => {
       assert.equal(failed.code, 'unavailable')
       assert.equal(failed.status, 503)
       assert.ok(failed.message.includes('retry later'), failed.message)
+      // `values.reason` 是面板与脚本可判定的原因（`failed` 仍是面板结果里的那一个）。
+      assert.equal(failed.values?.['reason'], 'timeout')
+      assert.equal(failed.values?.['block'], 'source:github')
+      assert.match(failed.message, /^The source:github account check did not finish within \d+ ms; retry later$/)
       assert.ok(elapsed < 1_000, `the handler returned after ${elapsed} ms`)
       // 预算两条线都交给了端口：探针上限 10 ms、信号已取消（真实现把它交给 `execFile`）。
       assert.equal(handed?.probeMs, 10)

@@ -1083,7 +1083,9 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
   effects.handle('notice', relayHandlers.notice)
   // `backup` effect（§O「长活进 effect」、§G.2 的 `admin backup`）：VACUUM 是同步的，绝不在一
   // 个 HTTP handler 里跑。handler 只入队一行，本 handler 在队列的调度里做；先让出一拍再动手，
-  // 让已经排好的 I/O（那一个响应）先写出去——否则同一条事件循环被 VACUUM 按住的时长一样长。
+  // 让已经排好的 I/O（那一个响应）先写出去。诚实边界（§O 超时行）：让出一拍只是让响应先写
+  // 出去，VACUUM 仍然在这条 worker 事件循环上同步跑完——保证的是「HTTP handler 不阻塞」，
+  // 不是「整个 worker 在备份期间非阻塞」。重试安全由 `backupNow` 的临时文件 + 原子改名保证。
   effects.handle('backup', async (payload) => {
     await new Promise<void>((resolve) => {
       setImmediate(() => {

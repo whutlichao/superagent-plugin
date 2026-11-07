@@ -16,7 +16,7 @@ import { runDoctor } from '../src/worker/app/doctor'
 import { GITCONFIG_MODE, workerGitConfigPath } from '../src/worker/infra/gitconfig'
 import { bootPlugin } from '../src/worker/boot'
 import { dispatch } from '../src/worker/cli/commands'
-import { parseArgs } from '../src/worker/cli/io'
+import { parseArgs, render } from '../src/worker/cli/io'
 import { readApiToken } from '../src/worker/infra/tokens'
 import { openBoot, settingsOf } from './support/boot'
 import { openStore } from '../src/worker/app/store'
@@ -1291,7 +1291,10 @@ describe('the panel host methods carry the same §O budgets as the HTTP routes',
       // 面板拿到的是一次固定拒绝：不是保存成功，也不是「校验不通过」（`invalid`）。
       assert.equal(outcome.ok, false)
       assert.equal(outcome.ok === false ? outcome.reason : 'ok', 'failed')
-      assert.ok(String(outcome.ok === false && 'error' in outcome ? outcome.error : '').includes('retry later'))
+      const failure = outcome.ok === false && 'error' in outcome ? outcome.error : ''
+      // 具体文案原样交给面板：挂住的是哪条探针、多少毫秒、稍后重试（不是泛泛的 failed）。
+      // 探针自己的 10 ms 上限先到，所以消息点名的是那条 CLI 探针，而不是外层的整次检查。
+      assert.match(failure, /^The GitHub CLI probe did not finish within \d+ ms; retry later$/)
       assert.ok(elapsed < 1_000, `the panel call returned after ${elapsed} ms`)
       // 什么都没写：没有设置版本、没有块修订号。
       assert.deepEqual([...store.kvKeys()], before)
@@ -1332,6 +1335,24 @@ describe('admin backup runs the VACUUM off the request', () => {
       const again = await runCli(h.stateDir, port, ['admin', 'backup'])
       assert.equal(again.exit, 0)
       await h.handle.passOnce()
+    } finally {
+      await h.cleanup()
+    }
+  })
+
+  test('the `--text` reply is `queued` plus the path it will land in, never a finished copy', async () => {
+    const h = await openBoot()
+    try {
+      const called = await runCli(h.stateDir, h.handle.port() as number, ['admin', 'backup', '--text'])
+      assert.equal(called.exit, 0, JSON.stringify(called.envelope))
+      const text = render(called.envelope, { text: true })
+      // 人读的三行：先「入队了」，再给它将落到的路径（§O：VACUUM 还没跑）。
+      assert.ok(text.includes('queued: true'), text)
+      assert.ok(text.includes('path: '), text)
+      assert.ok(text.includes('at: '), text)
+      // 文件还没写：不出现 bytes/kept，也不把入队说成完成。
+      assert.equal(text.includes('bytes:'), false, text)
+      assert.equal(text.includes('kept:'), false, text)
     } finally {
       await h.cleanup()
     }

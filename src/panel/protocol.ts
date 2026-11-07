@@ -1312,6 +1312,9 @@ export interface SettingsIssueView {
 /**
  * 一次保存的结果（面板的保存栏只认这一份）：成功带新修订号，失败带字段级 issues、
  * 冲突（409）带服务端现在的修订号，其余固定拒绝给一句原因。
+ *
+ * 没有单独的 timeout 形状：§O 的保存预算到点时 worker 仍回 `failed`，`error` 原样携带
+ * 「… did not finish within N ms; retry later」，面板把它显示在保存栏里。
  */
 export type SettingsSaveOutcome =
   | {

@@ -1,10 +1,10 @@
 // 迁移（§D.2 要点 3–4、§N.6、§P.2 `migration.test.ts`）：逐级一个事务、迁移前备份、
 // 只保留五份、库版本更高时拒绝启动并给出可读日志、失败不带半迁移库启动。
 import { assert, test } from 'orca/testing'
-import { existsSync, mkdirSync, readdirSync, rmSync } from 'node:fs'
+import { existsSync, mkdirSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
-import { backupNow } from '../src/worker/app/backup'
+import { backupNow, backupPath } from '../src/worker/app/backup'
 import { PLUGIN_VERSION_KEY } from '../src/worker/app/kv'
 import { migrate, MigrationError, readSchemaVersion } from '../src/worker/app/migration'
 import { MIGRATIONS, SCHEMA_VERSION, type MigrationStep } from '../src/worker/app/schema'
@@ -449,6 +449,75 @@ test('manual `admin backup` and pre-migration backups share one directory and th
       store.close()
     }
   } finally {
+    rmSync(stateDir, { recursive: true, force: true })
+  }
+})
+
+test('a failed backup attempt leaves no target and the retry at the same moment succeeds', () => {
+  // `backup` effect 会按退避重跑同一行（同一个 `at`）：第一次没做成不能把第二次的路堵死。
+  const stateDir = tempStateDir()
+  const store = openStore({ stateDir })
+  try {
+    const at = isoDaysAfter(AT, 1)
+    const path = backupPath(store, at)
+    const temp = `${path}.tmp`
+    // 让这一次 VACUUM 失败：只读连接在写输出文件那一步报错，与「目录写不进去」同一条路径。
+    store.sql.run('PRAGMA query_only = ON')
+    assert.throws(() => backupNow(store, at), undefined, 'the first attempt fails')
+    assert.equal(existsSync(path), false, 'a failed attempt writes no target')
+    assert.equal(existsSync(temp), false, 'and leaves no half-written temp file behind')
+    store.sql.run('PRAGMA query_only = OFF')
+    // 重试：同一个 `at`（同一个目标文件名）也能成——目标从未被创建，临时文件也已经清掉。
+    const saved = backupNow(store, at)
+    assert.equal(saved.path, path)
+    assert.ok(saved.bytes > 0, 'the retry wrote a backup')
+    assert.equal(existsSync(temp), false, 'the temp file is gone after the rename')
+    // 备份是真的库（不是空文件）：schema 版本与源库一致。
+    const copy = new DatabaseSync(path)
+    try {
+      assert.equal(readSchemaVersion(copy), SCHEMA_VERSION)
+    } finally {
+      copy.close()
+    }
+  } finally {
+    store.close()
+    rmSync(stateDir, { recursive: true, force: true })
+  }
+})
+
+test('a retry whose target already exists replaces it instead of getting stuck', () => {
+  // 第一次已经落盘（目标存在），上一次中止还留下一个同名临时文件：旧实现把目标直接交给
+  // `VACUUM INTO`，第二次会永远报 `output file already exists`，effect 的退避链永远追不上。
+  const stateDir = tempStateDir()
+  const store = openStore({ stateDir })
+  try {
+    const at = isoDaysAfter(AT, 2)
+    const path = backupPath(store, at)
+    const temp = `${path}.tmp`
+    const first = backupNow(store, at)
+    assert.equal(first.path, path)
+    assert.ok(existsSync(path), 'the first attempt landed')
+    // 旧写法在这里就卡住：目标已存在是 `VACUUM INTO` 的固定失败面，不是这次要的结论。
+    assert.throws(
+      () => store.sql.run('VACUUM INTO ?', [path]),
+      undefined,
+      'the raw VACUUM cannot write over an existing target'
+    )
+    // 中止留下的临时文件（内容无所谓：它不该被当成备份，也不该挡住重试）。
+    writeFileSync(temp, 'half-written by an interrupted attempt')
+    const again = backupNow(store, at)
+    assert.equal(again.path, path, 'the retry lands on the same documented path')
+    assert.equal(existsSync(temp), false, 'the stale temp file is cleaned up')
+    assert.ok(again.bytes > 0, 'the retry wrote a new copy')
+    assert.equal(readdirSync(store.backupDir).filter((name) => name.endsWith('.tmp')).length, 0)
+    const copy = new DatabaseSync(path)
+    try {
+      assert.equal(readSchemaVersion(copy), SCHEMA_VERSION, 'the replacement is a complete database')
+    } finally {
+      copy.close()
+    }
+  } finally {
+    store.close()
     rmSync(stateDir, { recursive: true, force: true })
   }
 })
