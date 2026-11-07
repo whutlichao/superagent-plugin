@@ -84,7 +84,7 @@ test('numbered documents are consecutive from 000 and only link to earlier ones'
   // 生效：一旦有人引入 `NNN-name.md`，编号必须从 000 连号，且只能链接更早的编号文档
   //（链接检查已在上一支里覆盖可解析性；这一支只禁「指向未来」的依赖）。
   const numbered = listFiles('docs', '.md')
-    .map((path) => relative('docs', path).replace(/\\/g, '/'))
+    .map((path) => path.slice('docs/'.length))
     .filter((name) => /^\d{3}-[a-z0-9-]+\.md$/.test(name))
     .sort()
   assert.deepEqual(
