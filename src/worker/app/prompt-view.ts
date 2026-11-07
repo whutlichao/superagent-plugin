@@ -251,8 +251,3 @@ export function restorePromptVersion(
   if (result.changed) options.onSaved?.(result.revision)
   return promptPanelView(options)
 }
-
-/** 这一份配置的体量上限（面板显示「上限 N 字符」时读它，与保存同一个数）。 */
-export function promptCharLimit(options: PromptPanelOptions): number {
-  return options.versions.maxChars()
-}

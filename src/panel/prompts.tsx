@@ -51,7 +51,6 @@ import {
   errorValues,
   issueTexts,
   partText,
-  refusedIssues,
   removeSkill,
   sameConfig,
   setOverride,

@@ -29,11 +29,6 @@ export function skillPath(stateDir: string, name: string): string {
   return `${stateDir}/${SKILLS_DIR}/${name}/${SKILL_FILE_NAME}`
 }
 
-/** 团队段的分片键（`team/<name>`）。 */
-export function teamPartKey(section: PromptTeamSection): string {
-  return `team/${section}`
-}
-
 /** 一个分片当前的正文：override 优先，团队段其次，否则跟随内置正文。 */
 export function partText(config: PanelPromptConfig, part: PanelPromptPart): string {
   const override = config.overrides?.[part.key]
@@ -242,17 +237,6 @@ export function errorValues(error: unknown): Readonly<Record<string, string>> {
       .filter(([, value]) => typeof value === 'string')
       .map(([key, value]) => [key, value as string])
   )
-}
-
-/**
- * 一次抛出的拒绝 → `issues[]`：宿主把 `values` 折掉时，至少码对应的那句话还在；`part` 与
- * 填槽值读得到就一起用（与预览返回的 `issues[]` 同一形状，渲染只有一处）。
- */
-export function refusedIssues(locale: string, error: unknown): readonly PromptIssueText[] {
-  const code = errorCode(error)
-  const values = errorValues(error)
-  const part = values['part'] ?? values['skill'] ?? null
-  return issueTexts(locale, [{ code, part, values }])
 }
 
 /** 一个角色的全文：草稿预览优先，否则已保存的那份（Full prompt 页唯一的取值处）。 */
