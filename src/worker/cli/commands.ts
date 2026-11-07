@@ -12,6 +12,7 @@
 // 依赖纪律（§C.2 `cli → http/handlers`）：本文件只 import 类型、固定错误码与 HTTP 客户端，
 // 不 import `orca`、不 import `app/`（CLI 是独立进程，只能经 HTTP 碰数据）。
 
+import { readFileSync } from 'node:fs'
 import { ApiError, ERROR_CODES, type ErrorCode, type ErrorPayload } from '../http/errors.ts'
 import { statusCode } from '../http/state.ts'
 import { REQUEST_ID_HEADER } from '../http/idempotency.ts'
@@ -356,7 +357,7 @@ export const CLI_COMMANDS: readonly CommandDefinition[] = [
     ],
     positionals: [],
     write: true,
-    available: false
+    available: true
   },
   {
     name: ['ack'],
@@ -368,7 +369,7 @@ export const CLI_COMMANDS: readonly CommandDefinition[] = [
     ],
     positionals: [],
     write: true,
-    available: false
+    available: true
   },
   {
     name: ['report'],
@@ -386,7 +387,7 @@ export const CLI_COMMANDS: readonly CommandDefinition[] = [
     ],
     positionals: [],
     write: true,
-    available: false
+    available: true
   },
 
   // ---- 设置、Policy 与 Prompts（#25/#33/#34/#42）
@@ -618,6 +619,22 @@ function valueArgs(flags: ParsedArgs['flags'], name: string): string | undefined
   return typeof flag === 'string' ? flag : undefined
 }
 
+/** 去掉 undefined 的 body 字段（HTTP body 只带真正给出的参数）。 */
+function compact(fields: Readonly<Record<string, string | undefined>>): Record<string, string> {
+  const body: Record<string, string> = {}
+  for (const [key, value] of Object.entries(fields)) {
+    if (value !== undefined && value.length > 0) body[key] = value
+  }
+  return body
+}
+
+/** `--summary-file`：从文件读长摘要（§G.2 的 report 行）；读不到就按固定拒绝。 */
+function summaryFile(args: CommandArgs): string | undefined {
+  const path = valueArgs(args.flags, 'summary-file')
+  if (path === undefined) return undefined
+  return readFileSync(path, 'utf8')
+}
+
 /** 写命令的 request id（读命令忽略它：`--request-id` 只对写有意义）。 */
 function requestIdOf(parsed: ParsedArgs): string | null {
   const raw = valueArgs(parsed.flags, REQUEST_ID_FLAG_NAME)
@@ -664,6 +681,38 @@ async function run(
       })
     case 'doctor':
       return call('doctor', { method: 'POST', body: {} })
+    case 'reply':
+      return call('reply', {
+        method: 'POST',
+        body: compact({
+          purpose: valueArgs(args.flags, 'purpose'),
+          ticketId: valueArgs(args.flags, 'ticket'),
+          triggerId: valueArgs(args.flags, 'trigger'),
+          text: valueArgs(args.flags, 'text'),
+          question: valueArgs(args.flags, 'human-action')
+        })
+      })
+    case 'ack':
+      return call('ack', {
+        method: 'POST',
+        body: compact({
+          trigger: valueArgs(args.flags, 'trigger'),
+          text: valueArgs(args.flags, 'text')
+        })
+      })
+    case 'report':
+      return call('report', {
+        method: 'POST',
+        body: compact({
+          state: valueArgs(args.flags, 'state'),
+          summary: valueArgs(args.flags, 'summary') ?? summaryFile(args),
+          prNumber: valueArgs(args.flags, 'pr-number'),
+          prUrl: valueArgs(args.flags, 'pr-url'),
+          humanAction: valueArgs(args.flags, 'human-action'),
+          replyToTrigger: valueArgs(args.flags, 'reply-to-trigger'),
+          questionForTrigger: valueArgs(args.flags, 'question-for-trigger')
+        })
+      })
     case 'read': {
       const resource = args.positionals[0] ?? ''
       return call(readPath(resource, args.positionals[1]), {
