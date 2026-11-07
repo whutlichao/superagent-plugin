@@ -1209,26 +1209,27 @@ function ExecutionListPage(props: { readonly locale: string }): OrcaElement {
       {page !== null && items.length === 0 && failure === '' ? (
         <EmptyStateBlock title={words(locale, 'execution.empty')} icon="layers" />
       ) : null}
-      <Table
-        label={translate(locale, 'nav.execution')}
-        columns={[
-          { key: 'ticket', label: words(locale, 'execution.columnTicket') },
-          { key: 'stage', label: words(locale, 'execution.columnStage'), width: 'sm' },
-          {
-            key: 'at',
-            label: words(locale, 'execution.columnUpdated'),
-            align: 'end',
-            width: 'xs',
-            hideBelow: 'sm'
-          }
-        ]}
-        rows={rows}
-        loading={loading && page === null}
-        hasMore={page !== null && page.nextOffset !== null}
-        onRowAction={(row) => openTicketDetail(row.key)}
-        onLoadMore={() => void loadExecutionList({ more: true })}
-        emptyText={words(locale, 'execution.empty')}
-      />
+      {page === null && failure !== '' ? null : (
+        <Table
+          label={translate(locale, 'nav.execution')}
+          columns={[
+            { key: 'ticket', label: words(locale, 'execution.columnTicket') },
+            { key: 'stage', label: words(locale, 'execution.columnStage'), width: 'sm' },
+            {
+              key: 'at',
+              label: words(locale, 'execution.columnUpdated'),
+              align: 'end',
+              width: 'xs',
+              hideBelow: 'sm'
+            }
+          ]}
+          rows={rows}
+          loading={loading && page === null}
+          hasMore={page !== null && page.nextOffset !== null}
+          onRowAction={(row) => openTicketDetail(row.key)}
+          onLoadMore={() => void loadExecutionList({ more: true })}
+        />
+      )}
     </Stack>
   )
 }
