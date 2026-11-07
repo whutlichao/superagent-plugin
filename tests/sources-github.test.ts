@@ -900,7 +900,12 @@ test('a missing repository or CLI leaves the Source in setup and starts no polli
       // 组合根不造轮询器：`pollOnce` 返回空读数，且一个 gh 调用都没有（连账号探针都不跑）。
       assert.deepEqual(await h.handle.pollOnce(), { notifications: 0, triggers: 0, skipped: 0 })
       assert.equal(h.handle.snapshot().health.setupMissing, true, 'the panel sees a setup problem')
-      assert.deepEqual(h.commands.calls, [], 'no gh call happens before setup completes')
+      // 一个 `gh` 调用都没有：setup 没完成之前连账号探针都不跑（git 探针与本例无关）。
+      assert.deepEqual(
+        h.commands.calls.filter((call) => call.program === 'gh'),
+        [],
+        'no gh call happens before setup completes'
+      )
     } finally {
       await h.cleanup()
     }

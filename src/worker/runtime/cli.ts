@@ -6,6 +6,7 @@
 // `gh`/`lark-cli` 出口，两者互不替代（§I.4）。
 import { execFile, type ExecFileError } from 'node:child_process'
 import { basename } from 'node:path'
+import { withoutSecretEnvironment } from '../infra/env.ts'
 import { OrcaRuntimeError, type JsonValue } from './orca-runtime.ts'
 
 /** 默认超时（§E.1：worktree create 的 120 s 是调用方传的；这里给通用 60 s）。 */
@@ -70,7 +71,8 @@ export function createOrcaCli(program = 'orca'): OrcaCli {
             encoding: 'utf8',
             shell: false,
             ...(options.signal === undefined ? {} : { signal: options.signal }),
-            env: { ...process.env, GH_PROMPT_DISABLED: '1' }
+            // `orca` 也是子进程：同样不继承 `*_KEY` / `*_SECRET` / `*_TOKEN`（§O）。
+            env: withoutSecretEnvironment({ ...process.env, GH_PROMPT_DISABLED: '1' })
           },
           (error, stdout, stderr) => {
             if (error) {

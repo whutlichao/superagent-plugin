@@ -64,6 +64,11 @@ export async function openBoot(options: {
   readonly stateDir?: string
   readonly scriptComment?: boolean
   readonly settings?: Record<string, unknown>
+  /**
+   * 在缺省脚本**之前**注册自己的脚本（`FakeCommands` 先注册者优先）：用来模拟
+   * 「第一次调用失败、之后成功」（例如人刚做完 `gh auth login`）。
+   */
+  readonly scripts?: (commands: FakeCommands) => void
   readonly boot?: (stateDir: string, runtime: FakeOrcaRuntime, commands: FakeCommands) => Promise<BootHandle>
 } = {}): Promise<BootHarness> {
   const stateDir = options.stateDir ?? mkdtempSync(join(tmpdir(), 'superagent-boot-'))
@@ -71,6 +76,9 @@ export async function openBoot(options: {
   const runtime = new FakeOrcaRuntime()
   runtime.worktreeRoot = worktrees
   const commands = new FakeCommands()
+  options.scripts?.(commands)
+  // setup 探针会问 `git --version`（§I.4：worker 需要 git）；不脚本化就等于「没装」。
+  commands.script('git --version', () => 'git version 2.39.0\n')
   commands.script('gh api user', () => 'acme-agent\n')
   commands.script('gh api notifications', () => JSON.stringify([NOTIFICATION]))
   // 通知的 subject 先展开成 Issue 读取（§I.2「通知轮询」行），再读评论。

@@ -14,6 +14,8 @@ import type {
   CommandSpec,
   JsonValue,
   OrcaRuntime,
+  RepoRow,
+  RepoSelector,
   RuntimeStorage,
   StatusBarUpdate,
   TerminalRow,
@@ -70,6 +72,17 @@ function hostError(method: string, error: unknown): OrcaRuntimeError {
   const code = typeof raw?.code === 'string' && HOST_ERROR_CODES.has(raw.code) ? raw.code : 'action_failed'
   const message = typeof raw?.message === 'string' && raw.message.length > 0 ? raw.message : `${method} failed`
   return new OrcaRuntimeError(code as OrcaRuntimeError['code'], message.slice(0, 300))
+}
+
+/**
+ * 仓库选择器 → CLI 的 `--repo` 值（`path:` / `id:` / `name:`，§E.1）。
+ * `ensureWorkspace` 与 `searchRefs` 共用这一份，两处不会各写一套前缀。
+ */
+function repoArg(selector: RepoSelector): string | undefined {
+  if (selector.path !== undefined) return `path:${selector.path}`
+  if (selector.id !== undefined) return `id:${selector.id}`
+  if (selector.name !== undefined) return `name:${selector.name}`
+  return undefined
 }
 
 /** 一遍 `terminal list --json` 的行 → seam 的终端行。 */
@@ -133,13 +146,13 @@ export function createHostRuntime(orca: OrcaWorkerApi, options: HostRuntimeOptio
       if (existing !== undefined) {
         return { workspaceId: existing.workspaceId, path: existing.path, branch: existing.branch, created: false }
       }
-      const selector = spec.repo?.path ?? spec.repo?.id ?? spec.repo?.name
+      const selector = spec.repo === undefined ? undefined : repoArg(spec.repo)
       const args = [
         'worktree',
         'create',
         '--name',
         spec.name,
-        ...(selector === undefined ? [] : ['--repo', spec.repo?.path !== undefined ? `path:${selector}` : spec.repo?.id !== undefined ? `id:${selector}` : `name:${selector}`]),
+        ...(selector === undefined ? [] : ['--repo', selector]),
         ...(spec.baseBranch === undefined ? [] : ['--base-branch', spec.baseBranch]),
         ...(spec.branch === undefined ? [] : ['--branch', spec.branch]),
         '--setup',
@@ -155,6 +168,27 @@ export function createHostRuntime(orca: OrcaWorkerApi, options: HostRuntimeOptio
         throw new OrcaRuntimeError('cli_failed', 'orca worktree create returned no path')
       }
       return { workspaceId, path, branch: text(worktree, 'branch') ?? null, created: true }
+    },
+
+    async listRepos(): Promise<readonly RepoRow[]> {
+      const result = await cli.run(['repo', 'list'])
+      return listOf(result, 'repos').flatMap((row) => {
+        const id = text(row, 'id')
+        const path = text(row, 'path')
+        if (id === undefined || path === undefined) return []
+        // `displayName` 是人在 Orca 里看到的短名；缺它就回落到路径的最后一段（不猜别的字段）。
+        const name = text(row, 'displayName') ?? path.slice(path.lastIndexOf('/') + 1)
+        return [{ id, path, name }]
+      })
+    },
+
+    async searchRefs(selector: RepoSelector, query: string): Promise<readonly string[]> {
+      const repo = repoArg(selector)
+      if (repo === undefined) {
+        throw new OrcaRuntimeError('invalid_request', 'a repo selector needs a path, a name or an id')
+      }
+      const result = await cli.run(['repo', 'search-refs', '--repo', repo, '--query', query])
+      return listOf(result, 'refs').filter((ref): ref is string => typeof ref === 'string')
     },
 
     async listWorkspaces(): Promise<readonly WorkspaceInfo[]> {

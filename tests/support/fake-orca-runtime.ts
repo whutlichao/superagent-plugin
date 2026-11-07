@@ -17,6 +17,8 @@ import type {
   CommandSpec,
   JsonValue,
   OrcaRuntime,
+  RepoRow,
+  RepoSelector,
   StatusBarUpdate,
   TerminalRow,
   WorkspaceHandle,
@@ -51,6 +53,8 @@ export interface FakeOrcaScript {
   closeTerminal?: (terminalId: string) => void | Promise<void>
   runCommand?: (spec: CommandSpec) => CommandHandle | Promise<CommandHandle>
   listTerminals?: () => readonly TerminalRow[] | Promise<readonly TerminalRow[]>
+  listRepos?: () => readonly RepoRow[] | Promise<readonly RepoRow[]>
+  searchRefs?: (selector: RepoSelector, query: string) => readonly string[] | Promise<readonly string[]>
 }
 
 /** 逐次调用的记录；测试按它断言顺序、次数与参数。 */
@@ -65,6 +69,8 @@ export interface FakeOrcaCalls {
   readonly listWorkspaces: number[]
   readonly listAgents: number[]
   readonly listTerminals: number[]
+  readonly listRepos: number[]
+  readonly searchRefs: { readonly selector: RepoSelector; readonly query: string }[]
 }
 
 /** 终端在替身里的内容：按行存，`sendText` 追加，`readTerminal` 截取尾部。 */
@@ -91,7 +97,9 @@ export class FakeOrcaRuntime implements OrcaRuntime {
     runCommand: [],
     listWorkspaces: [],
     listAgents: [],
-    listTerminals: []
+    listTerminals: [],
+    listRepos: [],
+    searchRefs: []
   }
 
   /** 下一次 `ensureWorkspace` 返回 `created: true` 时用的路径（确定性，测试可断言）。 */
@@ -100,6 +108,13 @@ export class FakeOrcaRuntime implements OrcaRuntime {
   readonly script: FakeOrcaScript = {}
   /** `listWorkspaces()` 的回答；测试直接改它来模拟「已有 worktree」。 */
   workspaces: WorkspaceInfo[] = []
+  /**
+   * `listRepos()` 的回答。缺省带一个与 `tests/support/boot.ts` 的设置相符的仓库
+   * （`baseRepo: '/repos/widgets'`），于是「什么都没改」的 boot 场景 setup 通过。
+   */
+  repos: RepoRow[] = [{ id: 'repo-widgets', path: '/repos/widgets', name: 'widgets' }]
+  /** `searchRefs()` 能命中的 ref（缺省 `main`：fixture 设置的 base ref 没配，用不到它）。 */
+  refs: string[] = ['main']
   /**
    * 新建 worktree 的路径根（缺省即 `WORKTREE_ROOT`）。执行器会往这个目录里写 `.superagent/`，
    * 所以需要真文件系统的用例把它换成临时目录，避免在 `/tmp` 固定位置留垃圾。
@@ -136,6 +151,18 @@ export class FakeOrcaRuntime implements OrcaRuntime {
       }
     ]
     return handle
+  }
+
+  async listRepos(): Promise<readonly RepoRow[]> {
+    this.calls.listRepos.push(this.repos.length)
+    if (this.script.listRepos) return await this.script.listRepos()
+    return this.repos
+  }
+
+  async searchRefs(selector: RepoSelector, query: string): Promise<readonly string[]> {
+    this.calls.searchRefs.push({ selector, query })
+    if (this.script.searchRefs) return await this.script.searchRefs(selector, query)
+    return this.refs.filter((ref) => ref.includes(query))
   }
 
   async listWorkspaces(): Promise<readonly WorkspaceInfo[]> {

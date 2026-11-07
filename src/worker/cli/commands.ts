@@ -165,7 +165,7 @@ export const CLI_COMMANDS: readonly CommandDefinition[] = [
   },
   {
     name: ['setup', 'check'],
-    summary: 're-run the setup probes (stub until #44 lands)',
+    summary: 're-run the setup probes and re-arm the loops; refuses when nothing is missing',
     flags: [REQUEST_ID_FLAG],
     positionals: [],
     write: true,
@@ -197,7 +197,7 @@ export const CLI_COMMANDS: readonly CommandDefinition[] = [
   },
   {
     name: ['doctor'],
-    summary: 'check token, port, lock, database, CLI path, gh login and lark-cli config',
+    summary: 'diagnose token, port, lock, database, CLI paths and logins (presence only; the setup check decides whether to start)',
     flags: [],
     positionals: [],
     write: false,

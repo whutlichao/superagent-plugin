@@ -8,8 +8,8 @@
 //   POST admin/rotate-token     admin rotate-token（破坏性：body `{confirm:true}`）
 //   POST doctor                 doctor（逐项 ok/warn/fail）
 //
-// 尚未接线的仍是 `stub()`：`setup/check`（#44 的探针）、`router/restart`、`workspace open`、
-// 面板专属视图与所有 Router/Worker 命令（各自的票接上时只改 handler 字段）。
+// 尚未接线的仍是 `stub()`：`router/restart`、`workspace open`、面板专属视图与所有
+// Router/Worker 命令（各自的票接上时只改 handler 字段）。
 //
 // 依赖纪律（§C.2）：本文件在 `http/` 里，只 import `app/`、`infra/` 与同目录的兄弟模块；
 // 不 import `sources/`（Source 端口由组合根注入），也不起子进程（doctor 的 runner 同样注入）。
@@ -25,6 +25,7 @@ import type {
   DoctorResult,
   PauseResult,
   RotateTokenResult,
+  SetupCheckResult,
   SourceLabelsResult
 } from './api-types.ts'
 import type { Store } from '../app/store.ts'
@@ -49,7 +50,20 @@ export interface OpsPorts {
   readonly now?: () => string
   /** doctor 的端口探测（测试注入；缺省真连 127.0.0.1:<port>）。 */
   readonly portOpen?: (port: number) => Promise<boolean>
+  /**
+   * `setup check`（§G.2 的运维行）：组合根给的重跑探针。缺省保持 `stub()`——
+   * 一个没有组合根的测试服务器不能假装「检查过了」。
+   */
+  readonly setupCheck?: SetupCheckPort
 }
+
+/** `setup check` 的端口：返回组合根的重跑结论（`BootHandle.checkSetup`）。 */
+export type SetupCheckPort = () => Promise<{
+  readonly checked: boolean
+  readonly problem: SetupCheckResult['problem']
+  readonly issues: SetupCheckResult['issues']
+  readonly restarted: boolean
+}>
 
 /** 一条被接线的路由：`<METHOD> <path>` → handler。 */
 export type OpsHandlers = ReadonlyMap<string, RouteHandler>
@@ -129,6 +143,30 @@ export function createOpsHandlers(options: {
       return result
     })
   })
+
+  // ---- setup check（§G.2、§N.1）：重跑探针并重新武装挂起的循环；本来没问题就固定拒绝。
+  const setupCheck = options.ports?.setupCheck
+  if (setupCheck !== undefined) {
+    handlers.set('POST setup/check', async ({ token, requestId, body, at }) =>
+      idempotent(options.store, token === undefined ? 'unknown' : callerKey(token), requestId ?? requestIdFrom(body), at, async () => {
+        const outcome = await setupCheck()
+        if (!outcome.checked) {
+          throw new ApiError(
+            ERROR_CODES.refused,
+            'setup has no problems left; there is nothing to check again',
+            { reason: 'nothing_to_check' }
+          )
+        }
+        const result: SetupCheckResult = {
+          checked: true,
+          restarted: outcome.restarted,
+          problem: outcome.problem,
+          issues: outcome.issues
+        }
+        return result
+      })
+    )
+  }
 
   // ---- doctor（§G.2、§N.4）：本地诊断；只报有没有，不报是什么。
   const doctorOptions: DoctorOptions = {

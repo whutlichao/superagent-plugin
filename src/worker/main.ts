@@ -106,9 +106,22 @@ export default function activate(orca: OrcaWorkerApi): void {
     eventually((booted) => booted.restartRouter(), (message) => host.log(message))
     return 'Superagent: restarting the router.'
   })
+  // §N.2：贡献命令的 string 结果原样显示在 Orca 里；重跑探针是异步的，结果用通知/日志补上。
   host.register(COMMANDS.checkSetup, () => {
-    eventually((booted) => booted.refresh(), (message) => host.log(message))
-    return 'Superagent: setup check is not wired up yet.'
+    eventually(async (booted) => {
+      const outcome = await booted.checkSetup()
+      if (!outcome.checked) {
+        host.log('Superagent: setup has no problems left; nothing to check again.')
+        return
+      }
+      const first = outcome.problem
+      host.log(
+        first === null
+          ? 'Superagent: setup check passed; the worker loops were re-armed.'
+          : `Superagent: setup still needs ${first.place} (${first.code}): ${first.fix ?? ''}`.trim()
+      )
+    }, (message) => host.log(message))
+    return 'Superagent: re-running the setup probes.'
   })
 
   for (const event of EVENTS) host.subscribe(event)

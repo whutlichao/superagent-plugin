@@ -105,6 +105,16 @@ export interface WorkspaceHandle {
   readonly created: boolean
 }
 
+/**
+ * Orca 已登记的仓库（`orca repo list --json` 的一行，§E.1 base repo 行）。
+ * 只取 setup 探针校验存在性要用的三项：id、路径与显示名。
+ */
+export interface RepoRow {
+  readonly id: string
+  readonly path: string
+  readonly name: string
+}
+
 /** 宿主侧工作区行（`workspace.list` 的投影）。 */
 export interface WorkspaceInfo {
   readonly workspaceId: string
@@ -218,6 +228,17 @@ export interface RuntimeSecrets {
 export interface OrcaRuntime {
   readonly api: { readonly major: number; readonly minor: number; readonly locale: string }
   supports(method: string): boolean
+
+  /**
+   * `orca repo list --json`：Orca 已登记的仓库（§E.1：base repo 必须在其中，setup 检查用它）。
+   * 只读；CLI 缺失按 `cli_missing` 抛错，不返回空表（空表会被误读成「一个仓库都没有」）。
+   */
+  listRepos(): Promise<readonly RepoRow[]>
+  /**
+   * `orca repo search-refs --repo <selector> --query <ref> --json`：命中该查询的 ref 名。
+   * 配了 base ref 时用它校验存在性；没配时调用方显式传 `HEAD`，不假装读得到 Orca 的默认值。
+   */
+  searchRefs(selector: RepoSelector, query: string): Promise<readonly string[]>
 
   // 1. 工作区
   ensureWorkspace(spec: WorkspaceSpec, signal?: AbortSignal): Promise<WorkspaceHandle>

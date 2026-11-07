@@ -137,6 +137,10 @@ declare module 'node:fs' {
   export function closeSync(fd: number): void
   export function writeSync(fd: number, data: string, encoding: 'utf8'): number
   export function fsyncSync(fd: number): void
+  /** `node:fs` 的常量面：writable 探针只需要 `W_OK`（setup 检查，§O 路径行）。 */
+  export const constants: { readonly W_OK: number }
+  /** 访问性检查：命中即通过，否则抛错（`mode` 缺省即「存在」）。 */
+  export function accessSync(path: string, mode?: number): void
 }
 
 /** `node:os`：临时目录与家目录（§D.5 的 stateDir 默认值）。 */

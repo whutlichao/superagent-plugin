@@ -33,7 +33,16 @@ export interface DoctorResult {
   readonly summary: { readonly ok: number; readonly warn: number; readonly fail: number }
   readonly stateDir: string
   readonly at: string
+  /**
+   * 一句分工说明：doctor 是**诊断**（「没配置」与「坏了」逐项分开、只报有没有）；
+   * 决定插件能不能开工的是 setup 检查（`superagent setup check`）。两件事不要混看。
+   */
+  readonly note: string
 }
+
+/** `doctor` 结果里的那句分工说明（CLI 的 `--text`、面板 Deployment 页与测试共用一处）。 */
+export const DOCTOR_NOTE =
+  'doctor diagnoses this machine (present or missing, never a value); the setup check decides whether the plugin may start: superagent setup check'
 
 /** 三档的固定顺序（`--text` 输出把 fail 排最前，便于一眼看到要修什么）。 */
 export const DOCTOR_STATES: readonly DoctorState[] = ['fail', 'warn', 'ok']
@@ -72,7 +81,13 @@ export function summarize(checks: readonly DoctorCheck[]): DoctorResult['summary
  */
 export function doctorResult(checks: readonly DoctorCheck[], input: { readonly stateDir: string; readonly at: string }): DoctorResult {
   const ordered = orderChecks(checks)
-  return { checks: ordered, summary: summarize(ordered), stateDir: input.stateDir, at: input.at }
+  return {
+    checks: ordered,
+    summary: summarize(ordered),
+    stateDir: input.stateDir,
+    at: input.at,
+    note: DOCTOR_NOTE
+  }
 }
 
 /** doctor 的退出码：有 fail → 1；否则 0。 */
