@@ -6,7 +6,11 @@
 import { describe, test } from 'node:test'
 import assert from 'node:assert/strict'
 import {
+  ADMISSION_PAGE_LIMIT,
   admissionContext,
+  admissionSettingsOf,
+  DEFAULT_ADMISSION_PAGES,
+  DEFAULT_ADMISSION_TIMEOUT_MS,
   PaginationError,
   threadWindow
 } from '../src/worker/sources/admission-context.ts'
@@ -278,5 +282,31 @@ describe('FakeCommands', () => {
     cli.next('sh', ['-c', 'exit 1'], 'ok')
     await assert.rejects(cli.run('sh', ['-c', 'exit 1']), /exited with code 1/)
     assert.equal(await cli.run('sh', ['-c', 'exit 1']), 'ok')
+  })
+})
+
+// 部署设置的两个键（§H.22）：缺省值、边界与「读不懂就回落」——评估因此不会因为一条坏设置停摆。
+describe('admission settings come from the deployment settings', () => {
+  test('the defaults are five pages and thirty seconds', () => {
+    assert.deepEqual(admissionSettingsOf({}), {
+      maxPages: DEFAULT_ADMISSION_PAGES,
+      timeoutMs: DEFAULT_ADMISSION_TIMEOUT_MS
+    })
+  })
+
+  test('the documented keys are read, and a bounded value is accepted as given', () => {
+    assert.deepEqual(
+      admissionSettingsOf({ admissionContextMaxPages: 2, admissionContextTimeoutMs: 1_500 }),
+      { maxPages: 2, timeoutMs: 1_500 }
+    )
+  })
+
+  test('out-of-range or non-integer values fall back to the defaults', () => {
+    for (const value of [0, -1, ADMISSION_PAGE_LIMIT + 1, 1.5, '3', null]) {
+      assert.equal(admissionSettingsOf({ admissionContextMaxPages: value }).maxPages, DEFAULT_ADMISSION_PAGES, String(value))
+    }
+    for (const value of [0, 999, 120_001, '30000', undefined]) {
+      assert.equal(admissionSettingsOf({ admissionContextTimeoutMs: value }).timeoutMs, DEFAULT_ADMISSION_TIMEOUT_MS, String(value))
+    }
   })
 })

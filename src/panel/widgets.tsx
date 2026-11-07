@@ -7,6 +7,7 @@ import {
   Button,
   Callout,
   EmptyState,
+  Progress,
   read,
   RelativeTime,
   Row,
@@ -50,9 +51,19 @@ export function PageHeader(props: {
   )
 }
 
-/** 加载态：三行骨架（§M.2 每页的 Skeleton + Progress）。 */
-export function LoadingState(props: { readonly label: string }) {
-  return <Skeleton lines={3} label={props.label} />
+/**
+ * 加载态（§M.2 每页的 Skeleton×3 + Progress）：三个骨架块加一条进度条，
+ * 让人知道「正在读」而不是「没有东西」。
+ */
+export function LoadingState(props: { readonly label: string }): OrcaElement {
+  return (
+    <Stack gap="sm">
+      <Skeleton lines={1} label={props.label} />
+      <Skeleton lines={1} />
+      <Skeleton lines={1} />
+      <Progress label={props.label} labelHidden />
+    </Stack>
+  )
 }
 
 /** 空态：一句「没什么」加可选的下一步。 */

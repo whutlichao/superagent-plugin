@@ -17,7 +17,7 @@ import type { Store } from './app/store.ts'
 import { openStore } from './app/store.ts'
 import { acquireLock } from './infra/lock.ts'
 import { createLogger, type Logger } from './infra/log.ts'
-import { HealthBoard, claimModelsEntry } from './infra/health.ts'
+import { HealthBoard, claimModelsEntry, FAILURES_BEFORE_ERROR } from './infra/health.ts'
 import { defaultStateDir, resolveStateDir, writeStateDirPointer } from './infra/paths.ts'
 import {
   API_TOKEN_FILE,
@@ -64,6 +64,7 @@ import {
 import { createRefreshableStateSource, type RefreshableStateSource } from './app/state-source.ts'
 import { deliveredFollowups } from './app/views.ts'
 import { readEvalsHealth, readUnavailableProblems } from './app/views/attention.ts'
+import { readSystemProblems, replyTarget } from './app/views/problems.ts'
 import { statusBarView } from './app/status-bar.ts'
 import type { StatusBarView } from './app/status-bar.ts'
 import { Effects, ROUTER_EFFECT_KEY } from './app/effects.ts'
@@ -98,12 +99,15 @@ import {
 } from './sources/feishu/index.ts'
 import type { Deployment } from './sources/kind.ts'
 import { OrcaExecutor, registerExecutorEffects, registerExecutorLifecycle, resolveExecutorSettings } from './executor/orca-executor.ts'
-import { launchCapacity } from './executor/slots.ts'
+import { launchCapacity, loadReadout } from './executor/slots.ts'
 import { retryTicket } from './executor/retry.ts'
 import { resumeAfterUpgrade, type ResumeReport } from './executor/resume.ts'
 import { DEFAULT_MAX_WORKERS } from './http/state.ts'
 import { createDomainHandlers, withDomainHandlers } from './http/domain.ts'
 import { createAssessmentHandlers, withAssessmentHandlers } from './http/assessment.ts'
+import { createEvalHandlers, withEvalHandlers } from './http/eval.ts'
+import { createEvalTools } from './app/eval.ts'
+import { admissionSettingsOf } from './sources/admission-context.ts'
 import { createDecisionHandlers, withDecisionHandlers } from './http/decisions.ts'
 import { createPromptHandlers, withPromptHandlers } from './http/prompts.ts'
 import { createPromptVersions } from './app/prompts.ts'
@@ -195,6 +199,13 @@ export interface BootHandle {
   refresh(): PanelState
   /** 写暂停状态（唯一写者是 `app/pause.ts`）并刷新快照。 */
   setPaused(paused: boolean): PanelState
+  /**
+   * 人的重试（§E.5，面板 `ticket.retry` 请求用）：结束卡住的 Assignment，在同一个 worktree、
+   * 分支与 PR 上再起一个，带恢复说明；返回写后的快照。不可重试时抛领域的 `notRetryable`。
+   */
+  retryTicket(ticketId: string): PanelState
+  /** 聚焦一台终端（§M.2：面板没有这个宿主能力，由 worker 代跑 CLI）。 */
+  focusTerminal(terminalId: string): Promise<void>
   /**
    * `superagent setup check`（§G.2）：重跑探针、把结论应用到各部分并重新武装挂起的循环，
    * **不重启 Orca**。`checked: false` 表示检查时本来就没有问题——没有可检查的东西。
@@ -317,6 +328,14 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
       notifyPromptRevision: () => undefined,
       refresh: () => emptySnapshot(),
       setPaused: () => emptySnapshot(),
+      // follower 不写库：重试属于拥有者，跟着它去面板里做（固定拒绝，不假装成功）。
+      retryTicket: () => {
+        throw Object.assign(new Error('another Superagent instance owns this state directory'), {
+          code: 'action_failed'
+        })
+      },
+      // 聚焦终端不读写库，只是宿主的一句调用：follower 也能做。
+      focusTerminal: (terminalId: string): Promise<void> => options.runtime.focusTerminal(terminalId),
       // follower 不读库、不跑探针：它没有可以做检查的东西。
       checkSetup: async () => ({ checked: false, problem: null, issues: [], restarted: false }),
       // 部署页读到的是「这一进程只跟着另一个实例」：没有自己的 health，也不假装在跑。
@@ -732,20 +751,34 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
   /** health 里报 error 的条目数（面板的 `health.error` 与 §J.3 的系统问题共用这一条读法）。 */
   const healthErrors = (): number =>
     Object.values(board.all()).filter((entry) => entry.state === 'error').length
+  /** Source 概况（Overview 空态那一行）：与 Source 页、`sources` 健康条目同一份读数。 */
+  const sourceSummary = (): { enabled: number; problems: number } => {
+    const rows = registry.overview().filter((row) => row.installed)
+    return {
+      enabled: rows.filter((row) => row.enabled).length,
+      problems: rows.filter((row) => row.state === 'error').length
+    }
+  }
   const stateSource: RefreshableStateSource = createRefreshableStateSource({
     tickets: () => repo.tickets.list(),
     activity: () => activityCounts(store, nowMs()),
-    load: () => {
-      const counts = store.assignmentCounts()
-      return { running: counts.running, maxWorkers: executorSettings.maxWorkers }
-    },
+    // §E.6 的槽读数：运行数/上限 + 单列的人类槽（执行器自己判定占用，面板不重算一遍）。
+    load: () => loadReadout(repo.tickets.list(), executorSettings.maxWorkers),
     hasError: () => healthErrors() > 0,
     setupMissing: () => setup.missing(),
     paused: () => paused.paused(),
-    // §J.3 的系统问题 = health error 条目 + §K.7 判过四条件的 unavailable（窗口、最新决定、
-    // dismiss 与 Thread 是否在忙都在读模型里判）。回复连续失败那一项由 outbox 的计数补。
+    sources: sourceSummary,
+    // §J.3 的系统问题 = health error 条目 + 连续失败 3 次的回复（outbox）+ §K.7 判过四条件的
+    // unavailable（窗口、最新决定、dismiss 与 Thread 是否在忙都在读模型里判）。
     problems: () =>
-      healthErrors() + readUnavailableProblems({ sql: store.sql }, { now: now() }).length
+      readSystemProblems({
+        health: board.all(),
+        replies: outbox.failing(FAILURES_BEFORE_ERROR).map((entry) => ({
+          id: entry.record.id,
+          target: replyTarget(entry.message.channel)
+        })),
+        unavailable: readUnavailableProblems({ sql: store.sql }, { now: now() })
+      })
   })
 
   function refresh(): PanelState {
@@ -820,6 +853,28 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
     ticketOf: (id) => repo.tickets.get(id),
     log: (message) => logger.warn(message)
   })
+  // Router 的两条评估读命令（§G.2 的 `eval` / `eval-read`）：窗口页数与超时来自部署设置
+  // （§H.22），语境经 kind 的 `threadContext`（§I.1），`--path` 只允许 base repo 与 Ticket
+  // worktree（§O）。候选、Trigger 与 worktree 都现读，重启后不必重建。
+  const evalAdmission = admissionSettingsOf(settings)
+  // base repo 的选择器可能只给了 name/id（§E.1）：能解析成路径就解析一次，解析不了就只认
+  // Ticket worktree——`--path` 因此仍然 fail closed（§O），而不是猜一个目录。
+  const baseRepoPath = await baseRepoPathOf(options.runtime, executorSettings.baseRepo)
+  const evalRoots = (): readonly string[] => [
+    ...(baseRepoPath === undefined ? [] : [baseRepoPath]),
+    ...repo.tickets
+      .list()
+      .flatMap((ticket) => (ticket.execution === undefined ? [] : [ticket.execution.directory]))
+  ]
+  const evalTools = createEvalTools({
+    candidate: (triggerId) => engine.candidate(triggerId),
+    trigger: (triggerId) => repo.triggers.get(triggerId),
+    threadContext: (trigger) => registry.threadContext(trigger, sourceSettings),
+    commands: commandPort,
+    admission: () => evalAdmission,
+    roots: evalRoots,
+    log: (message) => logger.info(message)
+  })
   // Prompt 配置的读/写面（§L.4、§L.5）：版本库、部署事实与「保存后通知 Router」都在这里接线。
   // 部署事实给的是**路径**（CLI 的绝对路径、调用者自己的 token 文件），绝不写 token 值（§D.6）；
   // 保存产生新版本时，Router 保活器把 revision 换成一条短消息排队——不重启会话（§F.4）。
@@ -837,14 +892,17 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
   })
   const routes: readonly RouteDefinition[] = withDecisionHandlers(
     withPromptHandlers(
-      withAssessmentHandlers(
-        withDomainHandlers(ROUTE_TABLE, domain),
-        createAssessmentHandlers({
-          tools: routerTools,
-          afterWrite: () => {
-            refresh()
-          }
-        })
+      withEvalHandlers(
+        withAssessmentHandlers(
+          withDomainHandlers(ROUTE_TABLE, domain),
+          createAssessmentHandlers({
+            tools: routerTools,
+            afterWrite: () => {
+              refresh()
+            }
+          })
+        ),
+        createEvalHandlers({ tools: evalTools })
       ),
       prompts
     ),
@@ -1224,6 +1282,14 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
       paused.setPaused(value, now(), 'operator')
       return refresh()
     },
+    // 面板的「Retry」（§E.5）：同一个 handler 也是 `ticket retry` 的语义（§G.2），
+    // 可重试与否由领域判定（不可重试时抛 `notRetryable`，main 把它折成固定拒绝）。
+    retryTicket: (ticketId: string): PanelState => {
+      retryTicket(engine, ticketId)
+      return refresh()
+    },
+    // 面板不能直接聚焦终端（§M.2）：worker 跑 `orca terminal focus --terminal <handle>`。
+    focusTerminal: (terminalId: string): Promise<void> => options.runtime.focusTerminal(terminalId),
     checkSetup,
     // Deployment 页的三条读数（§M.3）：状态目录与限额只读；health 是健康板；Router 只读快照。
     deployment: () =>
@@ -1254,10 +1320,12 @@ function emptySnapshot(): PanelState {
       error: false,
       paused: false,
       setupMissing: true,
+      sources: { enabled: 0, problems: 0 },
       activity: { received: 0, evaluated: 0, accepted: 0, ignored: 0, ended: 0 },
-      executor: { running: 0, maxWorkers: DEFAULT_MAX_WORKERS }
+      executor: { running: 0, maxWorkers: DEFAULT_MAX_WORKERS, humanSlot: 'free' }
     },
     attention: { answer: 0, review: 0, problems: 0, items: [] },
+    problems: [],
     tickets: []
   }
 }
@@ -1443,6 +1511,29 @@ interface FeishuSetup {
   readonly botId: string
   readonly appId: string
   readonly problem?: { readonly place: string; readonly code: string; readonly detail?: string }
+}
+
+/**
+ * `executor.baseRepo` 的本地路径（`eval-read --path` 的根，§O）：`path:` 选择器直接用；
+ * `name:`/`id:` 去 `orca repo list` 里找一次。找不到或 CLI 不可用就返回 undefined——
+ * 根的缺失只会让 `--path` 拒绝，不会让 worker 启动失败。
+ */
+async function baseRepoPathOf(
+  runtime: Pick<OrcaRuntime, 'listRepos'>,
+  selector: { readonly path?: string; readonly name?: string; readonly id?: string } | undefined
+): Promise<string | undefined> {
+  if (selector === undefined) return undefined
+  if (selector.path !== undefined) return selector.path
+  try {
+    const repos = await runtime.listRepos()
+    return repos.find(
+      (repo) =>
+        (selector.id !== undefined && repo.id === selector.id) ||
+        (selector.name !== undefined && repo.name === selector.name)
+    )?.path
+  } catch {
+    return undefined
+  }
 }
 
 /** 部署派生的事实（§E.11 的变量源）：仓库与账号来自设置与 setup 探针。 */

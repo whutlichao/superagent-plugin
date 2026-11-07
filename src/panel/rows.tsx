@@ -36,6 +36,8 @@ export interface TicketRowData {
   readonly at: number
   /** 行上直接可做的动作；缺省表示只读。 */
   readonly onOpen?: () => void
+  /** 从别的页面点进来的那一行（§M.2「点行→对应详情页」）：高亮以示“就是它”。 */
+  readonly current?: boolean
 }
 
 /** Ticket 行的标记：有 `action` 时按「等谁/做什么」措辞，否则按阶段/结局。 */
@@ -62,6 +64,7 @@ export function TicketRow(props: { readonly locale: string; readonly ticket: Tic
       description={label}
       icon={mark.icon}
       {...(ticket.onOpen === undefined ? {} : { onPress: ticket.onOpen })}
+      {...(ticket.current === undefined ? {} : { current: ticket.current })}
     >
       <Row gap="xs" align="center">
         <MarkBadge label={label} tone={mark.tone} />

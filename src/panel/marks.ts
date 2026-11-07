@@ -97,6 +97,18 @@ export function ticketMark(ticket: {
   return { labelKey: 'stage.idle', tone: 'neutral', icon: 'bell' }
 }
 
+/** 系统问题的标记（§J.3 的三个来源）：部件报错最重，发不出去的消息次之，等人看的评估最轻。 */
+export function problemMark(kind: 'health' | 'reply' | 'unavailable'): Mark {
+  switch (kind) {
+    case 'reply':
+      return { labelKey: 'overview.problemKind.reply', tone: 'warning', icon: 'download' }
+    case 'unavailable':
+      return { labelKey: 'overview.problemKind.unavailable', tone: 'warning', icon: 'info' }
+    default:
+      return { labelKey: 'overview.problemKind.health', tone: 'danger', icon: 'error' }
+  }
+}
+
 /** Thread 的阶段标记；`queued` 的文案带 `{count}`（排队数）。 */
 export function threadMark(thread: { readonly stage: ThreadStage; readonly pending: number }): Mark {
   switch (thread.stage) {

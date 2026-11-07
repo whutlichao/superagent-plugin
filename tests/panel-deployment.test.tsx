@@ -30,10 +30,12 @@ function snapshot(paused = false): PanelState {
       error: false,
       paused,
       setupMissing: false,
+      sources: { enabled: 1, problems: 0 },
       activity: { received: 2, evaluated: 1, accepted: 1, ignored: 0, ended: 0 },
-      executor: { running: 0, maxWorkers: 4 }
+      executor: { running: 0, maxWorkers: 4, humanSlot: 'free' }
     },
     attention: { answer: 0, review: 0, problems: 0, items: [] },
+    problems: [],
     tickets: []
   }
 }

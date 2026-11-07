@@ -101,6 +101,27 @@ test('pausing through the panel contract bumps the revision and pushes state.cha
   await cleanup()
 })
 
+test('check reads the read model again and pushes the new revision', async () => {
+  const { worker, cleanup } = await mounted()
+  const before = (await worker.request('state')) as { revision: number }
+  const seen = worker.posts.length
+  const next = (await worker.request('check')) as { revision: number }
+  assert.equal(next.revision, before.revision + 1, 'the check really re-read the model')
+  assert.deepEqual(worker.posts.slice(seen), [
+    { event: 'state.changed', payload: { revision: next.revision } }
+  ])
+  await cleanup()
+})
+
+test('the retry and terminal actions refuse malformed input instead of guessing', async () => {
+  const { worker, cleanup } = await mounted()
+  await assert.rejects(worker.request('ticket.retry', {}), /ticketId/)
+  await assert.rejects(worker.request('terminal.focus', {}), /terminalId/)
+  // 未知工单由领域拒绝（不假装重试成功，也不吞掉原因）。
+  await assert.rejects(worker.request('ticket.retry', { ticketId: 'ticket-unknown' }), /.+/)
+  await cleanup()
+})
+
 test('the pause command answers a string Orca shows as-is, and moves the same state', async () => {
   const { worker, cleanup } = await mounted()
   const before = (await worker.request('state')) as { revision: number }
