@@ -94,17 +94,22 @@ export class FakeOrcaRuntime implements OrcaRuntime {
     listTerminals: []
   }
 
+  /** 下一次 `ensureWorkspace` 返回 `created: true` 时用的路径（确定性，测试可断言）。 */
+  static readonly WORKTREE_ROOT = '/tmp/superagent-worktrees'
+
   readonly script: FakeOrcaScript = {}
   /** `listWorkspaces()` 的回答；测试直接改它来模拟「已有 worktree」。 */
   workspaces: WorkspaceInfo[] = []
+  /**
+   * 新建 worktree 的路径根（缺省即 `WORKTREE_ROOT`）。执行器会往这个目录里写 `.superagent/`，
+   * 所以需要真文件系统的用例把它换成临时目录，避免在 `/tmp` 固定位置留垃圾。
+   */
+  worktreeRoot: string = FakeOrcaRuntime.WORKTREE_ROOT
   /** 反查表：`workspaceId → agent 句柄`；`launchAgent` 默认往这里登记。 */
   readonly agentsByWorkspace = new Map<string, AgentHandle>()
   /** 终端表：句柄 → 内容。 */
   readonly terminals = new Map<string, FakeTerminal>()
   #sequence = 0
-
-  /** 下一次 `ensureWorkspace` 返回 `created: true` 时用的路径（确定性，测试可断言）。 */
-  static readonly WORKTREE_ROOT = '/tmp/superagent-worktrees'
 
   supports(): boolean {
     return true
@@ -113,7 +118,7 @@ export class FakeOrcaRuntime implements OrcaRuntime {
   async ensureWorkspace(spec: WorkspaceSpec): Promise<WorkspaceHandle> {
     this.calls.ensureWorkspace.push(spec)
     if (this.script.ensureWorkspace) return await this.script.ensureWorkspace(spec)
-    const path = `${FakeOrcaRuntime.WORKTREE_ROOT}/${spec.name}`
+    const path = `${this.worktreeRoot}/${spec.name}`
     const handle: WorkspaceHandle = {
       workspaceId: `ws:${spec.name}`,
       path,

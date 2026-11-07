@@ -8,6 +8,16 @@
 import type { OrcaWorkerApi } from './worker-api'
 import type { StatusBarUpdate } from './orca-runtime'
 
+/**
+ * 钩子的返回值：宿主只区分「继续」与「拒绝」，而「继续」就是把 `next` 的结果原样交回——
+ * 真实宿主给回的是改过的事件对象，`orca/testing` 的挂载器给回 `{ kind: 'continue', event }`。
+ * 插件永远选「继续」，所以这里只要求「一个对象或者什么都不返回」，不伪造其中一种形状。
+ */
+export type HookVerdict = object | undefined
+
+/** 一个钩子处理器：拿到载荷与 `next`，返回裁决。 */
+export type HookHandler<Event> = (event: Event, next: (event: Event) => HookVerdict) => HookVerdict
+
 /** worker 侧需要的宿主动作；`main.ts` 与领域模块只看到这一组。 */
 export interface WorkerHost {
   /** 更新清单里的状态栏项。 */
@@ -19,7 +29,8 @@ export interface WorkerHost {
   /** 注册贡献命令；返回的字符串原样显示在 Orca 里。 */
   register(commandId: string, handler: () => string): void
   subscribe(event: 'agent.status.changed' | 'workspace.created' | 'workspace.removed'): void
-  hook(event: 'agent.launch.before'): void
+  /** 注册一个钩子处理器（目前只有一个钩子：`agent.launch.before`，§H.11）。 */
+  hook<Event>(event: 'agent.launch.before', handler: HookHandler<Event>): void
   log(message: string): void
 }
 
@@ -47,8 +58,12 @@ export function createWorkerHost(orca: OrcaWorkerApi): WorkerHost {
     subscribe(event: 'agent.status.changed' | 'workspace.created' | 'workspace.removed'): void {
       orca.events.on(event, () => undefined)
     },
-    hook(event: 'agent.launch.before'): void {
-      orca.hooks.on(event, () => undefined)
+    hook<Event>(event: 'agent.launch.before', handler: HookHandler<Event>): void {
+      // 宿主给的是 `AgentLaunchBeforeEvent` 与一个返回 `unknown` 的 `next`；端口把它们收敛成
+      // `HookHandler`，真假转换只发生在这一处（运行缝边界，§B.1）。
+      orca.hooks.on(event, (payload, next) =>
+        handler(payload as Event, (changed) => next(changed as typeof payload) as HookVerdict)
+      )
     },
     log(message: string): void {
       orca.log(message)

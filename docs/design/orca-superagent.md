@@ -695,6 +695,23 @@ Report 状态映射：
 
 同时写 `<ticketDir>/.superagent/env.sh`（`export K='v'`，全部单引号转义），并把它列入 `.git/info/exclude`（在 worktree 内写，不影响 base repo 的 index）。worker prompt 里既有变量的值也有「不要把这些写进提交」的说明。
 
+**实测补充（#13，2026-11-07）**：Orca 建的是 **linked worktree**，`.git` 是一个文本文件
+（`gitdir: <repo>/.git/worktrees/<name>`），而 git 只读 **common dir** 的 `info/exclude`；
+`<worktreeGitDir>/info/exclude` 即使存在也不会被读取（git 2.56，开 `extensions.worktreeConfig`
+也一样，`git status` 仍报 `?? .superagent/`）。因此实现按 `git rev-parse --git-path info/exclude`
+的同一口径解析 `.git` → `commondir`，把 `.superagent/` 加到**该仓库共用的** `info/exclude`：
+只多一行忽略规则，不碰索引、不碰工作树（`tests/execution-environment.test.ts` 断言 base repo 的
+`git ls-files -s` 与索引文件大小/mtime 都不变）。同一 repo 的其它 worktree 也会忽略
+`.superagent/`——那正是本插件在每个 Ticket worktree 里都写的东西。code:
+`src/worker/executor/env-file.ts`。
+
+**变量与失败姿态（#13）**：变量值只来自 Ticket、部署（`Deployment`）与 Source 配置（起始
+Trigger 的 `meta`），不由 agent 发现；`${DSH_SUPERAGENT_*}` 的替换只发生在 `prepare` 的命令
+文本里，按变量表白名单逐值单引号转义（`environment.ts` 的 `substituteVariables`），未知变量
+原样留给 shell。`executor.blockedCommands` 的 shim 与 `GIT_CONFIG_GLOBAL` 由 launch 钩子注入
+（§H.11）；shim 只让被禁命令非零退出，**不是安全边界**——这句同时写在 shim 的 stderr、设计
+§H.11 与面板 Settings/Deployment 的文案里（#42/#47 的落点）。
+
 ---
 
 ## F. Router
@@ -1383,7 +1400,7 @@ interface AdmissionCells {
 | --- | --- |
 | Sources | 每个 Source 一张卡：开关、`repository`/`cli`、`observeIssues/Pulls/Comments/Ci`；Feishu 的 chats 行编辑（chatId/name/listen）、`directMessages`、`otherChats`；「Sync now」（Feishu 允许名单纯）、Advanced（`pollSeconds`、`readLimit`） |
 | Eval | Policy version、rules 列表（增删改、启用开关）、`acceptMode`（RadioGroup: off/observe/auto）、`timeoutSeconds`、`model`；**On each Source** 子页：allowed 行编辑、bots、admission 表（每行的三个 cell，按 `rows()` 是否 observe 决定 cell 是否可用）、Feishu 的 `syncChat` |
-| Execution | `agent`、`model`、`effort`、`maxWorkers`、`baseRepo`（Select，来自 `GET models`/`orca repo list` 的 worker 镜像）、`baseBranch`、`branchPrefix`、`prepare`（Textarea + 「插入变量」菜单，点一下把 `${DSH_SUPERAGENT_…}` 插到光标处）、`blockedCommands`、`inlineLimit`、`worktreeRetention` |
+| Execution | `agent`、`model`、`effort`、`maxWorkers`、`baseRepo`（Select，来自 `GET models`/`orca repo list` 的 worker 镜像）、`baseBranch`、`branchPrefix`、`prepare`（Textarea + 「插入变量」菜单，点一下把 `${DSH_SUPERAGENT_…}` 插到光标处）、`blockedCommands`（提示语照抄 §H.11：shim 只挡手滑，**不是安全边界**）、`inlineLimit`、`worktreeRetention` |
 | Prompts | 子 tab：**Edit**（三段团队文本 + 每个内置分片的 override，被改的标 `changed`，模板显示必保留占位符）、**Full prompt**（`CodeView` 全文 + 与「已保存」或「默认」的 `diff.ts` 行级对比）、**History**（版本列表 + 恢复到某版本）、**Skills**（内置只读 + 团队技能增删改） |
 | Deployment | setup 问题 + 「Check again」、`stateDir`（只读 + 复制路径）、机器限额（`promptMaxChars`、`admissionContextMaxPages/TimeoutMs`、`retention.days`）、`paused` 开关、health 明细、`router` 状态（terminal/since/restarts + Restart）、`doctor` 结果、「Rotate token」、Limitations 段（§H 里标「是」的条目摘要） |
 
@@ -2060,6 +2077,63 @@ Orca 应用重启后端口文件是否过期。**影响**：§N.1 的端口选�
 --base-branch <ref> --branch <b> --setup skip --no-parent --json` 用 `hrtime` 计时，
 `git -C <path> rev-parse HEAD` 对比 base tip，`ls <path>/.codegraph` 判断 setup 是否跑了。
 
+### S4 实测记录（#13，2026-11-07）
+
+**测什么**：`agent.launch.before` 钩子注入的 `env` 是否真的进入 agent 进程，以及钩子在 2 s 内
+的稳定率。**影响**：§H.11 的 shim 与 `GIT_CONFIG_GLOBAL` 注入是否有效。**回落**：若无效，改为
+「prompt 强制绝对路径 + setup 检查 git config」，并把 H.11 升级为更强限制。
+
+实测环境：arm64 macOS 27.0.1，Node 25.0.0，Orca 1.4.251。
+
+**1. 宿主确实把钩子返回的 `env` 并进这次 PTY 启动的环境**（只读取 `app.asar`，安装包内函数
+`vWe`，调用点在同一次 launch 的 `planAgentLaunch` 之后）：
+
+```js
+a = await Nt.pn('agent.launch.before', /* payload schema */, {
+  agent, workspaceId, workspaceKind, terminalId?, command: r, env: {}   // ← 钩子收到的 env 恒为空
+})
+let o = Object.keys(a.env), s = o.length > 0 ? { ...e.env, ...a.env } : void 0
+return { ...e, command: a.command, ...s ? { env: s } : {} }             // ← 并回 launch 的 env
+```
+
+- `{ ...e.env, ...a.env }`：注入变量覆盖同名宿主变量，并随 `spawnOptions.env` 一起交给 PTY
+  spawn（同一函数后面把它放进 `spawnOptions`）。
+- 钩子收到的 `env` 是空对象：PATH 的底座只能取**插件进程自己的** PATH（`launchEnvironment`
+  的 `basePath`）。
+- 不发钩子的情形（同一函数的前置条件）：没有 `launchAgent`、没有 `command`、结构化 spawn
+  intent、`resumeOrigin` / `resumeProviderSession`（恢复已存会话）。因此执行器在 launch 之前
+  登记环境、launch 结束（无论成败）就释放（`launch.ts` 的 `attempt`），避免把一次没发生的
+  launch 的环境留给下一台终端。
+
+**2. 预算与失败姿态**：宿主按插件逐个跑钩子，每个 2 s；抛错/超时/崩溃按清单条目的 `onError`
+处理，本插件声明 `"onError": "pass"`——最坏结果是「不注入」，不是「launch 被拒」。插件实现
+同口径：处理体超过 2 s 就放行并记一行日志（`launch-hook.ts`）。
+
+**3. 本机耗时（插件侧，2 000 次采样）**：`hook.handle`（纯字典合并）中位 0.0012 ms、p95
+0.0019 ms、p99 0.0078 ms、最大 1.10 ms；`environmentOf`（变量表求值）中位 0.0010 ms、p95
+0.0025 ms、最大 3.9 ms。两者比 2 s 低三个数量级——插件侧不构成超时风险，剩余风险只在宿主把
+请求投递给插件进程的那段 IPC。
+
+**4. 未证实（不写成事实）**：一次真实 `orca agent launch` 里 agent 进程拿到的环境。这需要安装
+并启用本插件、由人批准 `trusted-worker` 的能力（`orca plugin list --json` 里没有 dev 条目；
+同 S5 的口径，worker 不代按批准）。因此「钩子注入已端到端生效」不是本票的结论。
+
+**5. 回落（不依赖 S4 的结论，已同时实现）**：
+
+- 开播语与 `inbox/0.md` 一律给 CLI 的绝对路径与 token 文件路径；
+- `prepare` 的变量替换在插件内完成，不依赖注入；
+- `<ticketDir>/.superagent/env.sh` 让 worker 自己 `source`（值在插件内算好、转义正确）；
+- setup 检查（#44）继续要求 agent 账号的 CLI 包装脚本与 `git config`，即上游 `worker-bin` /
+  `worker-gitconfig` 的等价面。
+
+**结论**：「钩子的 `env` 进入 spawn 的 `env`」是宿主实现里读到的事实；「本机 2 s 内稳定」由
+插件侧 µs 级测量支持，宿主 IPC 那一段未实测。§H.11 因此保持**近似**（已知限制为「是」），shim
+**不是安全边界**——文档、shim 的 stderr 与设置文案都这么写。
+
+**复现方式（脚本未入库）**：只读地取 `app.asar` 里的 `agent.launch.before` 调用点
+（`node -e` 读 `/Applications/Orca.app/Contents/Resources/app.asar` 后按字符串定位
+`agent.launch.before`，上下文里能看到 `env: {}` 与 `{ ...e.env, ...a.env }`）；耗时用
+`process.hrtime.bigint()` 对 `createLaunchHook().handle` 与 `environmentOf` 各采 2 000 次取分位。
 ### S7/S9 实测记录（#12，2026-11-07）
 
 **实测环境**：arm64 macOS 27.0.1，Node 25.0.0，Orca CLI 1.4.251。两条证据并用：
