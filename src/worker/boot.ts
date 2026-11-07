@@ -1557,24 +1557,39 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
   // ---- 定时器（§N.1 的 2 s pass 与 pollSeconds 轮询）：关停时一并清掉
   let closing = false
   const timers: ReturnType<typeof setInterval>[] = []
+  /**
+   * 定时器驱动的轮（pass / poll / Feishu / 名单同步）。`shutdown()` 是关停屏障（#60）：
+   * 它返回时这些轮必须已经结束，否则它们的写（inbox、日志、库）会落在关停之后。
+   */
+  const rounds = new Set<Promise<void>>()
+  const trackRound = (work: Promise<unknown>): void => {
+    const settled: Promise<void> = work.then(
+      () => undefined,
+      (error: unknown) => {
+        logger.warn('a background round ended with an error', { error: stringOf(error) })
+      }
+    )
+    rounds.add(settled)
+    void settled.then(() => rounds.delete(settled))
+  }
   if (options.disableTimers !== true) {
     const passTimer = setInterval(() => {
-      void passOnce()
+      trackRound(passOnce())
     }, options.passIntervalMs ?? PASS_INTERVAL_MS)
     timers.push(passTimer)
     const pollMs =
       options.pollIntervalMs ?? Math.max(10_000, Number(githubSetup.config['pollSeconds'] ?? 60) * 1000)
     if (poller !== null) {
       const pollTimer = setInterval(() => {
-        void pollOnce()
+        trackRound(pollOnce())
       }, pollMs)
       timers.push(pollTimer)
     }
     if (feishuBackfill !== null) {
       // 第一轮立刻跑一次（安装完就能补上安装前一刻之后的），之后每分钟一轮。
-      void feishuOnce()
+      trackRound(feishuOnce())
       const feishuTimer = setInterval(() => {
-        void feishuOnce()
+        trackRound(feishuOnce())
       }, FEISHU_ROUND_MS)
       timers.push(feishuTimer)
     }
@@ -1584,6 +1599,7 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
   const streaming = feishuStream === null ? null : feishuStream.run()
   // 名单同步的「启动时一次」：不等它（一次 CLI 读最多 60 s，不该挡住首屏），失败只写健康与日志。
   const startupSync = policySync.start()
+  trackRound(startupSync)
   refresh()
 
   let closed = false
@@ -1591,8 +1607,9 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
     if (closed) return
     closed = true
     closing = true
-    // 监督先停：关停期间不再发现「终端没了」并去 launch 新会话。
-    routerSupervision.stop()
+    // 监督先停：关停期间不再发现「终端没了」并去 launch 新会话；还在跑的那一次 tick/restart
+    // 先收尾（它会轮换 token、launch 会话），之后才拆后面的部件。
+    await routerSupervision.stop()
     for (const timer of timers) clearInterval(timer)
     // 名单同步的待重试先取消；再关事件流（看门狗与 abort 都会停子进程）。
     lifetimeAbort.abort()
@@ -1602,7 +1619,10 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
     options.statusBar?.dispose()
     await passes.stop()
     await effects.drain()
-    http.close()
+    // 定时器驱动的轮（poll / Feishu / 名单同步）也在写状态目录与库：等它们结束再拆 HTTP 与库。
+    while (rounds.size > 0) await Promise.allSettled([...rounds])
+    // 已经进到 handler 的请求同样要跑完（它们会写设置、技能文件与 token），再关库与日志。
+    await http.close()
     store.close()
     lock.release()
     logger.key('superagent worker stopped')
