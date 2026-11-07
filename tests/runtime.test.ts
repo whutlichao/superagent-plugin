@@ -30,7 +30,7 @@ test('a mention becomes a ticket, an agent, a comment and a panel row', async ()
   const h = await openBoot()
   try {
     const first = await h.handle.pollOnce()
-    assert.deepEqual(first, { notifications: 1, triggers: 1 })
+    assert.deepEqual(first, { notifications: 1, triggers: 1, skipped: 0 })
     await h.handle.passOnce()
     // 第二轮 pass：accept 的决定（pass 里排空评估器）→ launch effect → worktree + agent。
     await h.handle.passOnce()

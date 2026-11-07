@@ -1,0 +1,31 @@
+{
+  "source": {
+    "command": "gh api 'repos/cli/cli/pulls/8294/comments?per_page=1'",
+    "note": "真实输出（28 个字段的评审评论，含 diff_hunk/path/line 与 _links）；仓库、账号、正文、代码路径与 diff 替换成中性值。"
+  },
+  "read": {
+    "program": "gh",
+    "args": [
+      "api",
+      "repos/acme/widgets/pulls/45/comments",
+      "--paginate",
+      "--method",
+      "GET",
+      "-f",
+      "per_page=100"
+    ],
+    "why": "订阅的 PR Thread 每轮读评审评论页（行内讨论）"
+  },
+  "pull": 45,
+  "comment": {
+    "id": 1382860676,
+    "actor": "carol",
+    "path": "src/app/login.go",
+    "updatedAt": "2023-11-06T07:14:48Z"
+  },
+  "translatedBy": "#18（评审线程 Trigger 与回复不在本票）",
+  "tally": {
+    "skipped": 0
+  },
+  "fixture": "tests/fixtures/cli/github/pull-review-comments.json"
+}
