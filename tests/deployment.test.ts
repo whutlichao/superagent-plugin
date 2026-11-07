@@ -11,6 +11,7 @@ import { existsSync, mkdirSync, readFileSync, rmSync, statSync } from 'node:fs'
 import { join } from 'node:path'
 import { runSetupChecks } from '../src/worker/app/setup'
 import type { SetupCheckInput, SetupReport } from '../src/worker/app/setup'
+import { DeadlineError } from '../src/worker/infra/deadline'
 import { runDoctor } from '../src/worker/app/doctor'
 import { GITCONFIG_MODE, workerGitConfigPath } from '../src/worker/infra/gitconfig'
 import { bootPlugin } from '../src/worker/boot'
@@ -386,6 +387,71 @@ describe('the setup probes tell a person one missing thing at a time', () => {
       for (const forbidden of ['ghp_', 'token=', 'Bearer', 'secret']) {
         assert.equal(text.includes(forbidden), false, `the report does not contain ${forbidden}`)
       }
+    } finally {
+      rmSync(stateDir, { recursive: true, force: true })
+    }
+  })
+})
+
+// §O「超时」行：HTTP handler 内不做超过 10 s 的同步等待。一条 setup 探针是一个子进程，
+// 它可能在网络/登录上挂住；预算到点必须取消探针（信号进 `execFile`，子进程被掐掉），
+// 并把「这次检查没做完」如实抛出去——**不**把超时折成「缺什么」那条结论。
+describe('every setup probe has a deadline', () => {
+  test('a hanging CLI probe is cancelled at the probe budget, and nothing is applied', async () => {
+    const stateDir = tempStateDir()
+    try {
+      let seen: { signal?: AbortSignal; timeoutMs?: number } | undefined
+      const started = Date.now()
+      const failure = await runSetupChecks({
+        ...inputOf(stateDir, {
+          // 身份齐全：探针跑得完就会写 `<stateDir>/worker-gitconfig`（断言「没跑完就没写」）。
+          gitConfig: { account: 'acme-agent', email: '1+acme-agent@users.noreply.github.com' },
+          budget: { probeMs: 20 }
+        }),
+        ports: {
+          isAbsolute: (path) => path.startsWith('/'),
+          writable: () => undefined,
+          repos: async () => [{ id: 'repo-1', path: '/repos/widgets', name: 'widgets' }],
+          // `git --version` 永不返回：探针必须到点取消，而不是陪着它挂。
+          run: (_program, _args, options) => {
+            seen = options
+            return new Promise<string>(() => undefined)
+          }
+        }
+      }).then(
+        () => undefined,
+        (error: unknown) => error
+      )
+      const elapsed = Date.now() - started
+      assert.ok(failure instanceof DeadlineError, `expected a deadline error, got ${String(failure)}`)
+      assert.equal(failure.what, 'the git probe')
+      assert.ok(elapsed < 1000, `the probe gave up after ${elapsed} ms`)
+      assert.equal(seen?.signal?.aborted, true, 'the signal handed to the probe is aborted')
+      assert.equal(seen?.timeoutMs, 20, 'the subprocess is given the same cap')
+      assert.equal(existsSync(join(stateDir, 'worker-gitconfig')), false, 'a cancelled check writes nothing')
+    } finally {
+      rmSync(stateDir, { recursive: true, force: true })
+    }
+  })
+
+  test('without a budget a probe keeps waiting: the boot path is unchanged', async () => {
+    const stateDir = tempStateDir()
+    try {
+      let runs = 0
+      const report = await runSetupChecks({
+        ...inputOf(stateDir),
+        ports: {
+          isAbsolute: (path) => path.startsWith('/'),
+          writable: () => undefined,
+          repos: async () => [{ id: 'repo-1', path: '/repos/widgets', name: 'widgets' }],
+          run: async (program) => {
+            runs += 1
+            return program === 'git' ? 'git version 2.39.0' : 'acme-agent\n'
+          }
+        }
+      })
+      assert.equal(runs, 2, 'the git and GitHub probes both ran')
+      assert.deepEqual(report.issues, [])
     } finally {
       rmSync(stateDir, { recursive: true, force: true })
     }

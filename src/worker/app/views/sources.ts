@@ -19,6 +19,8 @@ import type { Fact, Field, Localized, SourceKind } from '../../sources/kind.ts'
 import type { SourceOverview } from '../../sources/registry.ts'
 import type { ReadParam } from '../store-read.ts'
 import type { SetupIssue } from '../setup-types.ts'
+// 容错读取与预览只有 `views/values.ts` 一份（#64）：本文件只引用，不再各写一遍。
+import { jsonObject, previewOf, textOf } from './values.ts'
 import type { OutboxEntry, OutboxDropReason } from '../outbox.ts'
 import type {
   DeploymentSetupIssue,
@@ -42,6 +44,9 @@ export const FILTERED_PREVIEW = 5
 
 /** 每张卡最多列几条被 drop 的消息（§M.4：长列表靠一页 50 条，面板给「只列了最近几条」）。 */
 export const DROPPED_PREVIEW = 50
+
+/** 一行摘要的字符上限（被过滤的 Trigger 与被 drop 的消息共用；超出截断并加省略号）。 */
+export const SOURCE_PREVIEW_CHARS = 160
 
 /** 读模型需要的受控 SQL 出口（`Store.sql` 结构上满足它；与 `views/attention.ts` 同一条）。 */
 export interface SourceReader {
@@ -133,30 +138,11 @@ export function windowStart(now: string): string {
   return new Date(nowMs - SOURCE_WINDOW_MS).toISOString()
 }
 
-/** 一行里的一个文本列（取不到就是空串：坏行不抛）。 */
-function textOf(row: unknown, column: string): string {
-  if (typeof row !== 'object' || row === null) return ''
-  const value = (row as Record<string, unknown>)[column]
-  return typeof value === 'string' ? value : ''
-}
-
 /** 一行里的一个数字列（取不到或解不开就是 0）。 */
 function numberOf(row: unknown, column: string): number {
   if (typeof row !== 'object' || row === null) return 0
   const value = (row as Record<string, unknown>)[column]
   return typeof value === 'number' && Number.isFinite(value) ? value : Number(value ?? 0) || 0
-}
-
-/** 库里的 JSON 文本 → 普通对象；解不开就不是对象（坏行不抛）。 */
-function jsonObject(value: unknown): Record<string, unknown> | undefined {
-  if (typeof value === 'object' && value !== null) return value as Record<string, unknown>
-  if (typeof value !== 'string') return undefined
-  try {
-    const parsed: unknown = JSON.parse(value)
-    return typeof parsed === 'object' && parsed !== null ? (parsed as Record<string, unknown>) : undefined
-  } catch {
-    return undefined
-  }
 }
 
 /** 按来源分组的 24 h 计数。 */
@@ -191,26 +177,25 @@ function filteredOf(
       typeof row === 'object' && row !== null ? (row as Record<string, unknown>)['actor'] : undefined
     )
     const threadKey = textOf(row, 'thread_key')
-    const text = textOf(row, 'text').replace(/\s+/g, ' ').trim()
+    // 一行摘要：折叠空白、超出就截断并加省略号（面板只放得下一行）。
+    const preview = previewOf(textOf(row, 'text'), {
+      limit: SOURCE_PREVIEW_CHARS,
+      flatten: true,
+      ellipsis: true
+    })
     return [
       {
         id,
         at: epoch(textOf(row, 'at')),
         actor: typeof actor?.['id'] === 'string' ? actor['id'] : '',
         code: textOf(row, 'code'),
-        ...(text === '' ? {} : { text: previewOf(text) }),
+        ...(preview.text === '' ? {} : { text: preview.text }),
         ...(threadKey === '' ? {} : { threadKey })
       }
     ]
   })
   const total = rows.length === 0 ? 0 : Math.max(numberOf(rows[0], 'total'), items.length)
   return { total, items }
-}
-
-/** 一段正文的预览：空白折成一个空格，过长截断（详情只给摘要，不重放整段原文）。 */
-function previewOf(text: string): string {
-  const flat = text.replace(/\s+/g, ' ').trim()
-  return flat.length > 160 ? `${flat.slice(0, 159)}…` : flat
 }
 
 /** 一条 Thread 给人看的名字（Source 给的 `meta.label`）；没有就是 key。 */
@@ -245,13 +230,18 @@ function droppedMessageOf(host: SourceViewHost, entry: OutboxEntry): PanelDroppe
   if (at === null) return undefined
   const ticket = entry.message.ticketId === undefined ? undefined : host.ticket(entry.message.ticketId)
   const thread = droppedThread(host, entry.message)
-  const text = previewOf(entry.message.text)
+  // 与「被过滤的 Trigger」同一条摘要规则：折叠空白、超出截断（详情不重放整段原文）。
+  const preview = previewOf(entry.message.text, {
+    limit: SOURCE_PREVIEW_CHARS,
+    flatten: true,
+    ellipsis: true
+  })
   return {
     id: entry.record.id,
     at: epoch(at),
     reason: reason as OutboxDropReason,
     kind: entry.message.kind,
-    ...(text === '' ? {} : { text }),
+    ...(preview.text === '' ? {} : { text: preview.text }),
     ...(ticket === undefined ? {} : { ticket: { id: ticket.id, title: ticket.title } }),
     ...(thread === undefined ? {} : { thread: { key: thread.key, title: threadTitle(thread, thread.key) } })
   }

@@ -14,6 +14,7 @@
 // 依赖纪律（§C.2）：app 可以 import policy 与 sources 的端口类型；Infra 只给条目名。
 import type { PolicyBlock, SourcePolicySection } from '../policy/index.ts'
 import type { HealthClaim, HealthClaims } from '../sources/registry.ts'
+import { combineSignals } from '../infra/deadline.ts'
 import { syncHealthEntry } from '../infra/health.ts'
 
 /** 第一次失败之后的等待（1 分钟，§I.3 同步行）。 */
@@ -52,8 +53,12 @@ export interface PolicySyncOptions {
 export interface PolicySync {
   /** 现在能同步的 Source（面板据此显示「立即同步」是否可用）。 */
   syncable(): readonly string[]
-  /** 同步一个 Source（手动「立即同步」）；不能同步时抛错。 */
-  sync(id: string): Promise<Record<string, unknown>>
+  /**
+   * 同步一个 Source（手动「立即同步」）；不能同步时抛错。
+   * `signal` 是这次请求自己的取消线（HTTP handler 的总预算，§O）：它与驱动器的停机信号取并集
+   * 传进 kind 的读取。取消之后待重试照旧按退避排着——长活由那条链接着做，不占着 handler。
+   */
+  sync(id: string, signal?: AbortSignal): Promise<Record<string, unknown>>
   /** 启动时一次：每个可同步的 Source 各跑一次，失败只记健康与日志，不抛给启动。 */
   start(): Promise<void>
   /** 停机：取消所有待重试（已经排好的读取不会再发生）。 */
@@ -114,7 +119,15 @@ export function createPolicySync(options: PolicySyncOptions): PolicySync {
     retries.set(id, { cancel, wait })
   }
 
-  const sync = async (id: string): Promise<Record<string, unknown>> => {
+  /** 这一次同步的取消线：请求自己的信号与停机信号取并集（都没有就是一个永不取消的线）。 */
+  const signalOf = (extra: AbortSignal | undefined): AbortSignal => {
+    const signals = [options.signal, extra].filter(
+      (candidate): candidate is AbortSignal => candidate !== undefined
+    )
+    return signals.length === 0 ? new AbortController().signal : combineSignals(signals)
+  }
+
+  const sync = async (id: string, signal?: AbortSignal): Promise<Record<string, unknown>> => {
     if (!options.syncable().includes(id)) {
       throw new Error(`The ${id} Source cannot sync now: it names no sync target or is not running`)
     }
@@ -122,7 +135,7 @@ export function createPolicySync(options: PolicySyncOptions): PolicySync {
     const revision = options.revision()
     const part = options.current().sources[id] ?? {}
     try {
-      const next = await options.run(id, part, options.signal ?? new AbortController().signal)
+      const next = await options.run(id, part, signalOf(signal))
       // 同步是一次网络读；期间有人保存了 Policy 就放弃这次结果（下次按新配置重读）。
       if (options.revision() !== revision) {
         throw new Error('The policy changed while syncing; retry with the current settings')

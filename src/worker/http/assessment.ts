@@ -5,9 +5,10 @@
 // 拒绝换成 `ApiError`（状态码由 `errors.ts` 的一张表决定）、成功后的刷新钩子、以及给响应信封
 // 的形状。业务判断全部在 `app/assessment.ts`。
 //
-// 依赖纪律（§C.2）：本文件在 `http/`，只 import 同目录的 `ApiError` 与 `app/assessment.ts`
-// 的类型；不读存储、不做 I/O、不 spawn。
+// 依赖纪律（§C.2）：本文件在 `http/`，只 import 同目录的 `ApiError`/`values.ts` 与
+// `app/assessment.ts` 的类型；不读存储、不做 I/O、不 spawn。
 import { ApiError, ERROR_CODES } from './errors.ts'
+import { bodyObject } from './values.ts'
 import type { RouteDefinition, RouteHandler } from './routes.ts'
 import type { RouterTools } from '../app/assessment.ts'
 
@@ -15,14 +16,6 @@ import type { RouterTools } from '../app/assessment.ts'
 export interface AssessmentHandlerOptions {
   readonly tools: Pick<RouterTools, 'decide' | 'route'>
   readonly afterWrite?: () => void
-}
-
-/** 一个 body 对象；不是对象就按 `invalid_params` 拒绝。 */
-function bodyObject(body: unknown): Record<string, unknown> {
-  if (typeof body !== 'object' || body === null || Array.isArray(body)) {
-    throw new ApiError(ERROR_CODES.invalidParams, 'The request body must be a JSON object')
-  }
-  return body as Record<string, unknown>
 }
 
 /** 把一条固定拒绝换成 `ApiError`（状态码由错误码族决定，调用点不自己挑）。 */

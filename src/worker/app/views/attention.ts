@@ -11,10 +11,12 @@
 // 依赖纪律（§C.2）：app → core 是允许的方向；这里只经 `Store.sql.all` 这条受控出口读库，
 // 不 import runtime / sources / executor。
 import type { HealthEntry, JsonValue } from '../../core/ports.ts'
-import { reasonText, type Reason } from '../../core/reasons.ts'
+import { reasonText } from '../../core/reasons.ts'
 import type { Ticket } from '../../core/model.ts'
 import { ticketStage } from '../../core/stage.ts'
 import type { ReadParam } from '../store-read.ts'
+// 容错读取只有 `views/values.ts` 一份（#64）：本文件只引用，不再各写一遍。
+import { bodyOf, jsonObject, reasonsOf, stringsOf, textOf } from './values.ts'
 
 /** 读模型需要的最小 SQL 出口（`Store.sql.all` 结构上满足它）。 */
 export interface AttentionReader {
@@ -52,12 +54,6 @@ export function readAttentionCounts(reader: AttentionReader): AttentionCounts {
     else if (stage.action === 'review') review += 1
   }
   return { answer, review }
-}
-
-/** 一行里的 `body` 列（null 原型对象；取不到就是 undefined）。 */
-function bodyOf(row: unknown): JsonValue {
-  if (typeof row !== 'object' || row === null) return undefined
-  return (row as Record<string, JsonValue>)['body']
 }
 
 /** 库里的 `body` 是 JSON 文本；解不开就当没有（读模型不因为一行坏数据抛错）。 */
@@ -168,40 +164,3 @@ function threadIsBusy(reader: AttentionReader, threadKey: string): boolean {
   return false
 }
 
-/** 一行里的一个文本列（取不到就是空串：坏行不抛）。 */
-function textOf(row: unknown, column: string): string {
-  if (typeof row !== 'object' || row === null) return ''
-  const value = (row as Record<string, unknown>)[column]
-  return typeof value === 'string' ? value : ''
-}
-
-/** 库里的 JSON 文本 → 普通对象；解不开就不是对象（坏行不抛）。 */
-function jsonObject(value: JsonValue): Record<string, unknown> | undefined {
-  if (typeof value === 'object' && value !== null) return value as Record<string, unknown>
-  if (typeof value !== 'string') return undefined
-  try {
-    const parsed: unknown = JSON.parse(value)
-    return typeof parsed === 'object' && parsed !== null ? (parsed as Record<string, unknown>) : undefined
-  } catch {
-    return undefined
-  }
-}
-
-/** 一条结构化原因（`{code, values?, triggerId?}`）；只认带 code 的对象。 */
-function isReason(value: unknown): value is Reason {
-  return (
-    typeof value === 'object' &&
-    value !== null &&
-    typeof (value as { code?: unknown }).code === 'string'
-  )
-}
-
-/** 一个 Decision 的原因：数组就逐条保留；不是数组就是没有。 */
-function reasonsOf(value: unknown): readonly Reason[] {
-  return Array.isArray(value) ? value.filter(isReason) : []
-}
-
-/** 一个字符串数组（取不到就是空数组）。 */
-function stringsOf(value: unknown): readonly string[] {
-  return Array.isArray(value) ? value.filter((item): item is string => typeof item === 'string') : []
-}

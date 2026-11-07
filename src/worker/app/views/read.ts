@@ -20,8 +20,7 @@
 // 依赖纪律（§C.2）：本文件在 `app/`，import 领域类型、既有读模型与注入的读口；不 import
 // `http/`、不 import `cli/`、不读存储、不 spawn、不读时钟（`now` 由宿主给）。
 import type { Decision, Thread, Ticket, Trigger, TriggerDisposition } from '../../core/index.ts'
-import type { Reason } from '../../core/reasons.ts'
-import { reasonText } from '../../core/reasons.ts'
+import { reasonText, type Reason } from '../../core/reasons.ts'
 import type { PanelState, SystemProblem, WorkerHealth } from '../../../panel/protocol'
 import type { SourceOverview } from '../../sources/registry.ts'
 import {
@@ -34,6 +33,8 @@ import type { Roles } from '../roles.ts'
 import type { TimelineCursor, TimelineItem } from '../records.ts'
 import { ticketView, type TicketView } from '../views.ts'
 import type { ReadParam } from '../store-read.ts'
+// 容错读取与预览的实现只有 `views/values.ts` 一份（#64）：本文件只引用，不再各写一遍。
+import { jsonObject, previewOf, reasonsOf, stringsOf, textOf } from './values.ts'
 
 /** Thread 列表的筛选（§M.1 的 Trigger 页：Subscribed / Evaluating / New in 24 h / All）。 */
 export const THREAD_FILTERS = ['all', 'subscribed', 'evaluating', 'new'] as const
@@ -358,51 +359,6 @@ export function parseCursor(value: string): TimelineCursor | undefined {
   return { at, triggerId }
 }
 
-/** 一段正文的预览（列表页的条数不是字符数：正文按固定上限截断并说明全文长度）。 */
-function previewOf(text: string): { text: string; chars?: number; truncated?: true } {
-  return text.length <= THREAD_PREVIEW_CHARS
-    ? { text }
-    : { text: text.slice(0, THREAD_PREVIEW_CHARS), chars: text.length, truncated: true }
-}
-
-/** 一行里的一个文本列（取不到就是空串：坏行不抛）。 */
-function textOf(row: unknown, column: string): string {
-  if (typeof row !== 'object' || row === null) return ''
-  const value = (row as Record<string, unknown>)[column]
-  return typeof value === 'string' ? value : ''
-}
-
-/** 库里的 JSON 文本 → 普通对象；解不开就不是对象（坏行不抛）。 */
-function jsonObject(value: unknown): Record<string, unknown> | undefined {
-  if (typeof value === 'object' && value !== null) return value as Record<string, unknown>
-  if (typeof value !== 'string') return undefined
-  try {
-    const parsed: unknown = JSON.parse(value)
-    return typeof parsed === 'object' && parsed !== null ? (parsed as Record<string, unknown>) : undefined
-  } catch {
-    return undefined
-  }
-}
-
-/** 一条结构化原因（`{code, values?, triggerId?}`）；只认带 code 的对象。 */
-function isReason(value: unknown): value is Reason {
-  return (
-    typeof value === 'object' &&
-    value !== null &&
-    typeof (value as { code?: unknown }).code === 'string'
-  )
-}
-
-/** 一个 Decision 的原因：数组就逐条保留；不是数组就是没有。 */
-function reasonsOf(value: unknown): readonly Reason[] {
-  return Array.isArray(value) ? value.filter(isReason) : []
-}
-
-/** 一个字符串数组（取不到就是空数组）。 */
-function stringsOf(value: unknown): readonly string[] {
-  return Array.isArray(value) ? value.filter((item): item is string => typeof item === 'string') : []
-}
-
 /** 评估匹配到的规则（`audit.matches` 的 `{rule_id, reason}`），没有就是空数组。 */
 function rulesOf(audit: unknown): readonly { readonly rule_id: string; readonly reason: string }[] {
   const matches = jsonObject(audit)?.['matches']
@@ -508,7 +464,8 @@ function headerOf(thread: Thread): ThreadHeader {
 function entryOf(host: ViewReadHost, item: TimelineItem): TimelineEntry {
   const trigger = host.trigger(item.triggerId)
   const disposition = host.disposition(item.triggerId)
-  const preview = previewOf(trigger?.text ?? '')
+  // 时间线保留原文的换行（`flatten` 不开），截断时把全文长度交给面板。
+  const preview = previewOf(trigger?.text ?? '', { limit: THREAD_PREVIEW_CHARS })
   return {
     id: item.triggerId,
     at: item.at,
@@ -599,7 +556,7 @@ function searchTriggers(
   const items = rows.slice(0, limit).flatMap((row): SearchTriggerView[] => {
     const id = textOf(row, 'id')
     if (id.length === 0) return []
-    const preview = previewOf(textOf(row, 'text'))
+    const preview = previewOf(textOf(row, 'text'), { limit: THREAD_PREVIEW_CHARS })
     const actor = jsonObject(
       typeof row === 'object' && row !== null ? (row as Record<string, unknown>)['actor'] : undefined
     )

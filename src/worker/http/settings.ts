@@ -11,11 +11,13 @@
 //   的记账都由驱动器负责，本文件只做参数、拒绝码与 `{policy, allowed, added, removed}` 的读数。
 //
 // 依赖纪律（§C.2）：本文件在 `http/`，只 import `app/`（settings、settings-blocks、setup 的
-// 类型）、同目录的 `ApiError` 与 `api-types`；不读存储、不跑子进程——账号探针与同步驱动器
+// 类型）、同目录的 `ApiError`/`values.ts` 与 `api-types`；不读存储、不跑子进程——账号探针与同步驱动器
 // 都由组合根以端口注入，缺哪个端口该路由就固定 `unavailable`。
 import { ApiError, ERROR_CODES, type ErrorIssue } from './errors.ts'
+import { bodyObject } from './values.ts'
 import type { RouteDefinition, RouteHandler } from './routes.ts'
 import type { WriteIdempotency } from './domain.ts'
+import { DeadlineError, withDeadline, type HandlerBudget } from '../infra/deadline.ts'
 import {
   accountCandidatesIn,
   RESTART_SETUP_FIELDS,
@@ -50,13 +52,27 @@ export type AccountCheckPort = (candidate: AccountCandidates) => Promise<readonl
 export interface PolicySyncPort {
   /** 现在能同步的 Source（驱动器的 `syncable()`）。 */
   syncable(): readonly string[]
-  /** 同步一个 Source（手动「立即同步」）；失败时抛错。 */
-  sync(id: string): Promise<Record<string, unknown>>
+  /**
+   * 同步一个 Source（手动「立即同步」）；失败时抛错。`signal` 是这次请求的取消线（§O）：
+   * 到点之后 kind 的读取被取消，驱动器的退避链接着把长活做完。
+   */
+  sync(id: string, signal?: AbortSignal): Promise<Record<string, unknown>>
   /** 该 Source 当前的允许名单（同步前：用来算 `added` / `removed`）。 */
   allowed(id: string): readonly unknown[]
   /** 同步之后的 Policy 块读数。 */
   policy(): { readonly revision: number; readonly version: string | null }
 }
+
+/**
+ * `POST policy-sync/:id` 的时间预算（§O「超时」行）：整次 8 s。
+ *
+ * 名单同步是**一次**多页网络读（`lark-cli +chat-members-list --page-all`）：读取本身不按页
+ * 交给 handler，所以这里只有一个总预算，没有 2 s 的逐页上限——给一次正常的同步 2 s 会让它
+ * 必然失败。设计给 `policy sync` 的返回形状只有 `{policy, allowed, added, removed}`（§G.2），
+ * 没有 `{queued:true}` 这一形，也没有「名单同步」的 effect kind（§J.2 的七种），所以超预算
+ * 不能改成入队：如实返回 `unavailable` + 「稍后重试」，长活由驱动器的退避链接手（§I.3）。
+ */
+export const POLICY_SYNC_BUDGET: HandlerBudget = { totalMs: 8_000 }
 
 /** handler 的接线：设置写入器（#20）+ 端口（账号检查 #44、名单同步 #23）。 */
 export interface SettingsHandlerOptions {
@@ -74,6 +90,8 @@ export interface SettingsHandlerOptions {
   readonly checkAccount?: AccountCheckPort
   /** 名单同步驱动器；缺省时 `POST policy-sync/:id` 保持 `unavailable`。 */
   readonly policySync?: PolicySyncPort
+  /** `POST policy-sync/:id` 的时间预算（§O）；缺省 `POLICY_SYNC_BUDGET`，测试注入小预算。 */
+  readonly policySyncBudget?: HandlerBudget
   /** 写成功后的刷新钩子（面板 `state.changed`）。 */
   readonly afterWrite?: () => void
   /**
@@ -81,14 +99,6 @@ export interface SettingsHandlerOptions {
    * 实现 `runWrite`；缺省直接执行一次。
    */
   readonly idempotent?: WriteIdempotency
-}
-
-/** 一个 body 对象；不是对象就按 `invalid_params` 拒绝。 */
-function bodyObject(body: unknown): Record<string, unknown> {
-  if (typeof body !== 'object' || body === null || Array.isArray(body)) {
-    throw new ApiError(ERROR_CODES.invalidParams, 'The request body must be a JSON object')
-  }
-  return body as Record<string, unknown>
 }
 
 /** 一个非负整数 body 字段。 */
@@ -319,7 +329,10 @@ export function createSettingsHandlers(
   )
 
   // ---- POST policy-sync/:id：走 #23 的驱动器；健康与 origin=sync 的记账在驱动器里。
+  // §O 的预算：一次多页读取有总上限，到点取消读取并返回 `unavailable`（不是 `sync_failed`：
+  // 这次没有失败，只是没做完；驱动器的退避链会接着做）。
   const policySync = options.policySync
+  const syncBudget = options.policySyncBudget ?? POLICY_SYNC_BUDGET
   if (policySync !== undefined) {
     handlers.set('POST policy-sync/:id', (input) =>
       write(input, async () => {
@@ -335,8 +348,18 @@ export function createSettingsHandlers(
         const before = policySync.allowed(id)
         let part: Record<string, unknown>
         try {
-          part = await policySync.sync(id)
-        } catch {
+          part = await withDeadline((signal) => policySync.sync(id, signal), {
+            ms: syncBudget.totalMs,
+            what: `the ${id} policy sync`
+          })
+        } catch (error) {
+          if (error instanceof DeadlineError) {
+            throw new ApiError(
+              ERROR_CODES.unavailable,
+              `The ${id} policy sync did not finish within ${syncBudget.totalMs} ms; retry later`,
+              { source: id, reason: 'timeout' }
+            )
+          }
           // 驱动器的错误原文只进日志与健康条目（§N.5）：信封里只给固定码与 Source。
           throw new ApiError(ERROR_CODES.syncFailed, `The ${id} policy sync failed`, { source: id })
         }

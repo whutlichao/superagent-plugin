@@ -125,7 +125,7 @@ import { createPasses } from './app/passes.ts'
 import { notePluginVersion } from './app/upgrade.ts'
 import { createSourceContext } from './app/source-context.ts'
 import { createSetupState, issuesOf, runSetupChecks } from './app/setup.ts'
-import type { SetupCheckInput, SetupIssue, SetupProblem, SetupReport } from './app/setup.ts'
+import type { SetupBudget, SetupCheckInput, SetupIssue, SetupProblem, SetupReport } from './app/setup.ts'
 import {
   SourceRegistry,
   type ResolvedSourceInstance,
@@ -327,8 +327,11 @@ export interface BootHandle {
   /**
    * `superagent setup check`（§G.2）：重跑探针、把结论应用到各部分并重新武装挂起的循环，
    * **不重启 Orca**。`checked: false` 表示检查时本来就没有问题——没有可检查的东西。
+   *
+   * `budget` 只在 HTTP handler 里给（§O 的时间预算）：探针到点被取消、整次检查随之放弃，
+   * 半份结论**不**会被 `apply`。
    */
-  checkSetup(): Promise<SetupCheckOutcome>
+  checkSetup(budget?: SetupBudget): Promise<SetupCheckOutcome>
   /** Deployment 页的读数（§M.3）：setup 问题、状态目录、机器限额、暂停、health 与 Router。 */
   deployment(): DeploymentView
   /**
@@ -1241,13 +1244,15 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
    * 用的是本进程启动时读到的设置：Orca Settings 里的改动仍要重启 worker 才生效（§N.2 只对
    * 面板里的设置承诺即时生效）；人修好的外部条件（`gh auth login`、在 Orca 里加仓库）当场可见。
    */
-  const checkSetup = async (): Promise<SetupCheckOutcome> => {
+  const checkSetup = async (budget?: SetupBudget): Promise<SetupCheckOutcome> => {
     if (!setup.missing()) {
       return { checked: false, problem: null, issues: [], restarted: false }
     }
     const githubWasBlocked = githubBlocked()
     const routerWasEnabled = routerEnabled()
-    const report = await runSetupChecks(setupInput())
+    const input = setupInput()
+    // §O：handler 给的预算（探针上限 + 取消信号）只加在这次重跑上；启动路径没有预算。
+    const report = await runSetupChecks(budget === undefined ? input : { ...input, budget })
     applySetup(report)
     refresh()
     // 刚解锁的循环从现在开始干活：Source 轮询下一轮就发请求，Router 监督真的建会话。
@@ -1470,11 +1475,11 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
     idempotent,
     policySync: {
       syncable: () => policySyncDriver?.syncable() ?? [],
-      sync: (id) => {
+      sync: (id, signal) => {
         if (policySyncDriver === null) {
           throw new Error('the policy sync driver is not wired yet')
         }
-        return policySyncDriver.sync(id)
+        return policySyncDriver.sync(id, signal)
       },
       // 同步前的名单：影响面从「现在生效的那份 Policy」算起（保存过就以存下来的为准）。
       allowed: (id) => effectivePolicy().sources[id]?.allowed ?? [],
@@ -1546,7 +1551,7 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
     ops: {
       run: (program, args) => commandPort.run(program, args),
       cliPath: options.cliPath ?? defaultCliPath(),
-      setupCheck: () => checkSetup(),
+      setupCheck: (budget) => checkSetup(budget),
       doctor: doctorNow,
       // `source labels`（§G.2）：与面板的「刷新显示名」同一次读取（`refreshedLabels`），
       // 拒绝码用命令面的 `missing`/`not_syncable`（§G.2 的固定拒绝）。

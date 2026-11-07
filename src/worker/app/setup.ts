@@ -12,14 +12,17 @@
 import { accessSync, constants } from 'node:fs'
 import { isAbsolute } from 'node:path'
 import { writeWorkerGitConfig, type WorkerGitConfigWrite } from '../infra/gitconfig.ts'
+import { rethrowIfDeadline, withDeadline } from '../infra/deadline.ts'
 import type {
   RepoRow,
   RepoSelectorLike,
+  SetupBudget,
   SetupCheckInput,
   SetupGitConfigIdentity,
   SetupIssue,
   SetupPlace,
   SetupPorts,
+  SetupProbeOptions,
   SetupReport,
   SetupState
 } from './setup-types.ts'
@@ -28,6 +31,7 @@ import { SETUP_CHECK_AGAIN, issuesOf, setupProblemOf } from './setup-types.ts'
 export type {
   RepoRow,
   RepoSelectorLike,
+  SetupBudget,
   SetupCheckInput,
   SetupCode,
   SetupGitConfigIdentity,
@@ -35,6 +39,7 @@ export type {
   SetupKind,
   SetupPlace,
   SetupPorts,
+  SetupProbeOptions,
   SetupProblem,
   SetupReport,
   SetupState
@@ -76,6 +81,30 @@ function isMissingProgram(error: unknown): boolean {
 function messageOf(error: unknown): string {
   const text = error instanceof Error ? error.message : String(error)
   return text.length > 200 ? `${text.slice(0, 200)}…` : text
+}
+
+/**
+ * 一次探针的出口：有预算时套上截止期（到点先取消再拒绝，§O），没预算时原样跑。
+ * `what` 是人读的名字，**不是** argv（错误文案可能进日志与面板，§O 的命令注入面）。
+ */
+type Probe = <T>(what: string, work: (options: SetupProbeOptions) => Promise<T>) => Promise<T>
+
+/**
+ * 按预算造一个 `Probe`。探针的上限同时交给实现（`timeoutMs`）：信号掐不掉的子进程靠它兜。
+ * 外部取消（handler 的总预算）与探针上限走同一个 `DeadlineError`。
+ */
+function probeOf(budget: SetupBudget | undefined): Probe {
+  const ms = budget?.probeMs
+  const outer = budget?.signal
+  return <T>(what: string, work: (options: SetupProbeOptions) => Promise<T>): Promise<T> => {
+    if (ms === undefined) return work({})
+    const options: SetupProbeOptions = { timeoutMs: ms }
+    return withDeadline((signal) => work({ ...options, signal }), {
+      ms,
+      what,
+      ...(outer === undefined ? {} : { signal: outer })
+    })
+  }
 }
 
 /** 缺省的子进程出口：一切都按「程序不在」处理，而不是去碰操作者的机器。 */
@@ -141,12 +170,15 @@ function probeModel(model: string | undefined): SetupIssue | undefined {
 
 /** `git` 可用：只影响 worker，不影响插件自己（§I.4）。 */
 async function probeGit(
-  run: (program: string, args: readonly string[]) => Promise<string>
+  probe: Probe,
+  run: (program: string, args: readonly string[], options?: SetupProbeOptions) => Promise<string>
 ): Promise<SetupIssue | undefined> {
   try {
-    await run('git', ['--version'])
+    await probe('the git probe', (options) => run('git', ['--version'], options))
     return undefined
   } catch (error) {
+    // 截止期不是「缺什么」：它意味着这次检查没做完（§O），原样交给调用方折成 `unavailable`。
+    rethrowIfDeadline(error)
     const missing = isMissingProgram(error)
     return issue({
       place: 'executor',
@@ -184,6 +216,7 @@ interface BaseRepoInput {
  */
 async function probeBaseRepo(
   input: BaseRepoInput,
+  probe: Probe,
   ports: { readonly repos: () => Promise<readonly RepoRow[]>; readonly searchRefs: NonNullable<SetupPorts['searchRefs']> }
 ): Promise<readonly SetupIssue[]> {
   const selector = input.baseRepo
@@ -200,8 +233,10 @@ async function probeBaseRepo(
   }
   let repos: readonly RepoRow[]
   try {
-    repos = await ports.repos()
+    // `orca repo list` 是宿主调用（没有 signal 参数）：截止期至少让 handler 立刻拿到拒绝。
+    repos = await probe('the orca repository probe', () => ports.repos())
   } catch (error) {
+    rethrowIfDeadline(error)
     const missing = isMissingProgram(error)
     return [
       issue({
@@ -230,8 +265,9 @@ async function probeBaseRepo(
   if (ref === undefined) return []
   let refs: readonly string[]
   try {
-    refs = await ports.searchRefs(selector, ref)
+    refs = await probe('the base ref probe', () => ports.searchRefs(selector, ref))
   } catch (error) {
+    rethrowIfDeadline(error)
     return [
       issue({
         place: 'executor',
@@ -257,7 +293,8 @@ async function probeBaseRepo(
 /** GitHub：配置两项 + agent 账号能读（§I.4；被禁用的实例只查配置）。 */
 async function probeGithub(
   input: SetupCheckInput,
-  run: (program: string, args: readonly string[]) => Promise<string>
+  probe: Probe,
+  run: (program: string, args: readonly string[], options?: SetupProbeOptions) => Promise<string>
 ): Promise<{ readonly issues: readonly SetupIssue[]; readonly login: string }> {
   const issues: SetupIssue[] = []
   if (input.repository.trim() === '') {
@@ -285,7 +322,9 @@ async function probeGithub(
   if (issues.length > 0) return { issues, login: '' }
   if (input.githubEnabled === false) return { issues, login: '' }
   try {
-    const output = await run(input.githubCli, ['api', 'user', '--jq', '.login'])
+    const output = await probe('the GitHub CLI probe', (options) =>
+      run(input.githubCli, ['api', 'user', '--jq', '.login'], options)
+    )
     const login = output.trim()
     if (login !== '') return { issues, login }
     return {
@@ -301,6 +340,7 @@ async function probeGithub(
       login: ''
     }
   } catch (error) {
+    rethrowIfDeadline(error)
     const missing = isMissingProgram(error)
     return {
       issues: [
@@ -399,7 +439,8 @@ export function larkIdentities(text: string): LarkIdentities {
  */
 async function probeFeishu(
   input: SetupCheckInput,
-  run: (program: string, args: readonly string[]) => Promise<string>
+  probe: Probe,
+  run: (program: string, args: readonly string[], options?: SetupProbeOptions) => Promise<string>
 ): Promise<readonly SetupIssue[]> {
   const cli = input.feishuCli
   // `undefined`：这个 Source 没配置（不查）。空串：配置了但没填 CLI——一条 setup 问题。
@@ -417,8 +458,9 @@ async function probeFeishu(
   }
   let text: string
   try {
-    text = await run(cli, ['auth', 'status'])
+    text = await probe('the Feishu CLI probe', (options) => run(cli, ['auth', 'status'], options))
   } catch (error) {
+    rethrowIfDeadline(error)
     const missing = isMissingProgram(error)
     return [
       issue({
@@ -479,6 +521,7 @@ export async function runSetupChecks(input: SetupCheckInput): Promise<SetupRepor
   const absolute = ports.isAbsolute ?? isAbsolute
   const writable = ports.writable ?? ((path: string) => accessSync(path, constants.W_OK))
   const run = ports.run ?? missingRunner
+  const probe = probeOf(input.budget)
   const repos = ports.repos ?? (async () => [])
   const searchRefs: NonNullable<SetupPorts['searchRefs']> =
     ports.searchRefs ??
@@ -493,13 +536,13 @@ export async function runSetupChecks(input: SetupCheckInput): Promise<SetupRepor
   if (agent !== undefined) issues.push(agent)
   const model = probeModel(input.model)
   if (model !== undefined) issues.push(model)
-  const git = await probeGit(run)
+  const git = await probeGit(probe, run)
   if (git !== undefined) issues.push(git)
   const baseInput: { baseRepo?: RepoSelectorLike; baseRef?: string } = {}
   if (input.baseRepo !== undefined) baseInput.baseRepo = input.baseRepo
   if (input.baseRef !== undefined) baseInput.baseRef = input.baseRef
-  issues.push(...(await probeBaseRepo(baseInput, { repos, searchRefs })))
-  const github = await probeGithub(input, run)
+  issues.push(...(await probeBaseRepo(baseInput, probe, { repos, searchRefs })))
+  const github = await probeGithub(input, probe, run)
   issues.push(...github.issues)
   if (input.gitConfig !== undefined) {
     const written = probeGitConfig(
@@ -510,7 +553,7 @@ export async function runSetupChecks(input: SetupCheckInput): Promise<SetupRepor
     )
     if (written !== undefined) issues.push(written)
   }
-  issues.push(...(await probeFeishu(input, run)))
+  issues.push(...(await probeFeishu(input, probe, run)))
 
   return { issues, githubLogin: github.login }
 }

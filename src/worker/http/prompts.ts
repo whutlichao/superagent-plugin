@@ -8,11 +8,12 @@
 // 3. 预览：**同一个** `validatePromptConfig`，只是不写库（票面：面板与 CLI 同一份校验）；
 // 4. 保存成功后通知活着的 Router（§F.4：一条短消息，不重启；角色层要新会话才换）。
 //
-// 依赖纪律（§C.2）：本文件在 `http/`，只 import 同目录的 `ApiError`、`app/prompts.ts` 与
+// 依赖纪律（§C.2）：本文件在 `http/`，只 import 同目录的 `ApiError`/`values.ts`、`app/prompts.ts` 与
 // `app/` 的类型；不读存储、不 spawn、不 import `runtime/`。部署事实（CLI 路径、token 文件、
 // Policy）由组合根以 `PromptDeployment` 注入——缺省时 `--text` 与预览是明说的 `unavailable`，
 // 绝不拼一份缺值的全文。
 import { ApiError, ERROR_CODES } from './errors.ts'
+import { bodyObject } from './values.ts'
 import type { RouteCaller, RouteDefinition, RouteHandler } from './routes.ts'
 import {
   builtInBases,
@@ -67,14 +68,6 @@ export interface PromptHandlerOptions {
   readonly onSaved?: (revision: number) => void
   /** 写成功后的刷新钩子（面板 `state.changed`）。 */
   readonly afterWrite?: () => void
-}
-
-/** 一个 body 对象；不是对象就按 `invalid_params` 拒绝。 */
-function bodyObject(body: unknown): Record<string, unknown> {
-  if (typeof body !== 'object' || body === null || Array.isArray(body)) {
-    throw new ApiError(ERROR_CODES.invalidParams, 'The request body must be a JSON object')
-  }
-  return body as Record<string, unknown>
 }
 
 /** 一个非负整数 body 字段。 */

@@ -264,6 +264,7 @@ function surface(
   options: {
     readonly checkAccount?: Parameters<typeof createSettingsHandlers>[0]['checkAccount']
     readonly policySync?: Parameters<typeof createSettingsHandlers>[0]['policySync']
+    readonly policySyncBudget?: Parameters<typeof createSettingsHandlers>[0]['policySyncBudget']
   } = {}
 ) {
   const { store, cleanup } = openTempStore()
@@ -583,6 +584,39 @@ describe('settings save over the command surface (§K.8)', () => {
 })
 
 describe('policy sync over the command surface (§I.3)', () => {
+  test('a hanging read returns unavailable inside the budget, cancels the read, and writes nothing', async () => {
+    let handed: { readonly signal?: AbortSignal } | undefined
+    const h = surface({
+      // §O：8 s 是缺省线；用例把总预算压到 40 ms，断言的是「到点就返回」而不是等 8 s。
+      policySyncBudget: { totalMs: 40 },
+      policySync: {
+        syncable: () => ['github'],
+        sync: (_id, signal) => {
+          handed = { ...(signal === undefined ? {} : { signal }) }
+          return new Promise(() => undefined)
+        },
+        allowed: () => [],
+        policy: () => ({ revision: 0, version: null })
+      }
+    })
+    try {
+      const before = [...h.store.kvKeys()]
+      const started = Date.now()
+      const failed = await apiRefusal(h.call('POST policy-sync/:id', { params: { id: 'github' } }))
+      const elapsed = Date.now() - started
+      assert.equal(failed.code, 'unavailable')
+      assert.equal(failed.status, 503)
+      assert.ok(failed.message.includes('retry later'), failed.message)
+      assert.ok(elapsed < 1_000, `the handler returned after ${elapsed} ms`)
+      // 取消传进驱动器：kind 的读取拿到已取消的信号（真实现把它交给 `CommandsHost`）。
+      assert.equal(handed?.signal?.aborted, true)
+      // 超时的同步什么都不写：库里的键一个字都没变（没有幂等记录，也没有 origin=sync 的保存）。
+      assert.deepEqual(h.store.kvKeys(), before)
+    } finally {
+      h.cleanup()
+    }
+  })
+
   test('syncs through the driver and reports the allow-list diff', async () => {
     let synced = 0
     const h = surface({

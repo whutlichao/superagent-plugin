@@ -567,7 +567,8 @@ CREATE TABLE kv (
 | 设置与历史 | `app/settings.ts` |
 | Prompt 版本 | `app/prompts.ts` |
 | effect 行 | `app/effects.ts` |
-| outbox receipt | `app/outbox.ts`（唯一写者） |
+| outbox receipt | `app/outbox.ts`（运行时唯一写者；已结算行的过期删除归下一行的维护 pass，§D.2 第 5 条） |
+| 过期删除：`trigger` / `disposition` / `decision`（默认 90 天）、已结算 `outbox`（30 天）、非当前版本快照 | `app/retention-sql.ts`（`app/retention.ts` 在维护 pass 的一天一次事务里执行；它只**删**旧行，不创建任何状态，§D.2 第 5 条） |
 | 每个 health 条目 | 在 HealthBoard 上 claim 它的那个部件（重复 claim 直接抛） |
 | router 快照（terminal/workspace/restarts） | `router/supervision.ts` |
 
@@ -664,7 +665,7 @@ pending ──launch 成功──▶ running ──report(ready|dropped) / stop 
 | --- | --- |
 | stop（人） | 撤回 Mandate、`outbox` 发收尾消息、`closeTerminal`（`orca terminal close`）→ Assignment `ended(reason: stopped)`；worktree 保留。Ticket 之后不再接收任何 Input |
 | retry | 结束当前 Assignment（同 stop 的终端关闭），`launch` 一条新 Assignment，同 worktree/分支/PR；带 recovery note（「检查目录、git 历史与 GitHub，别重复已做的外部动作」） |
-| 恢复（进程重启） | 启动时列出 `running` Assignment，用 `listTerminals()`（全机权威）判断终端是否还在，用 `listWorkspaces()` 判断 worktree 是否还在。终端不在枚举里或 `connected===false` → `interrupted`，新建 Assignment 并带 recovery note；终端还在且 `worktreeId` 命中本 Ticket → 认领（`adopt`），投递一条「已恢复，继续」。**不用 `agents.list()` 做枚举**：它只见聚焦 workspace。`orphaned:true` 只表示「没有挂载到可见 pane」（附录 C Router 记录），不是死亡——但**认领**比判活严一格：`resume.ts` 要求 `connected && !orphaned`，于是「后台跑着、UI 里没开」的 worker 终端会被重建而不是认领（宁可重建，也不把看不见的会话当自己的） |
+| 恢复（进程重启） | 启动时列出 `running` Assignment，用 `listTerminals()`（全机权威）判断终端是否还在，用 `listWorkspaces()` 判断 worktree 是否还在。终端不在枚举里或 `connected===false` → `interrupted`，新建 Assignment 并带 recovery note；终端还在且 `worktreeId` 命中本 Ticket → 认领（`adopt`），投递一条「已恢复，继续」。**不用 `agents.list()` 做枚举**：它只见聚焦 workspace。`orphaned:true` 只表示「没有挂载到可见 pane」（附录 C Router 记录），不是死亡——**认领与判活同一条线**：`resume.ts` 只看 `connected`，再用 `belongsToTicket`（worktree 路径或工作区 id 命中 Ticket 记录的目录）决定这是不是自己的会话，于是「后台跑着、UI 里没开」的 worker 终端被认领而不是重建（#62 的修正；判据是 worktree，不是 pane） |
 | 停止整插件 | `deactivate()` 顺序：停 passes → 排空 effects（保留 pending 行）→ 不杀 worker 终端（它们继续跑，重启后被 adopt）→ 关 HTTP → 关库 → 释放锁 |
 
 上游「shutdown 等 10 s worker 后台工作、进程重启直接丢掉」在 Orca 上不适用：**worker 终端是 Orca 的，不随插件停止而结束**。这是改进而非损失，写进 §H.3。
@@ -1094,9 +1095,10 @@ export interface SourceKind<C = unknown> {
 
 `SourceContext`（由 `app/source-context.ts` 构造）给 kind 的只有：`ready`、`configured()`、`problem`、`config<C>(kind)`、`receive(trigger)`、`atomic(fn)`、`state`（typed kv）、`threads.describe/patch`、`tickets.bindThread/threadClosed`、`triggers.read`、`notify`、`report(entry, health)`、`commands.withSignal`。
 
-**新增一个 SourceKind 的十一步**已经成文在 [`docs/adding-a-source.md`](../adding-a-source.md)：kind 协议与
+**新增一个 SourceKind 的十二步**已经成文在 [`docs/adding-a-source.md`](../adding-a-source.md)：kind 协议与
 配置 schema、fields、facts、health 条目、scope、Channel、Thread 上下文、搜索、Policy 部分（准入行 /
-bots / sync）、环境变量、夹具与测试；以及它在 `sources/registry.ts` 与 `boot.ts` 里怎么注册、
+bots / sync）、环境变量、夹具与测试、资源名（`app/read.ts` 的 `ParsedResource` 与
+`READ_SOURCE_RESOURCES`）；以及它在 `sources/registry.ts` 与 `boot.ts` 里怎么注册、
 `SourceContext` 里哪些东西可以用、必须守的接口缝纪律。
 
 图片的 id 是 `threadContext.image` 与 `eval-read --image-id` 之间的唯一契约：**`<message-id>/<image-key>`**。`eval` 窗口在每条消息上列出这样组合出来的 `images[]`（key 由 `threadContext.images(text)` 从正文认出），`eval-read --image-id` 原样把它交回 `threadContext.image`；kind 只接受自己正文里出现过的 key（与上游 `image` 的校验同），绝不下载任意远端 id。
@@ -2420,10 +2422,11 @@ superagent-router-spike16 --repo path:<base> --base-branch HEAD --setup skip --n
    保留在解析链里，旧宿主不受影响。
 2. **`orphaned` 只说明「没有 pane」，`connected` 才说明「还连着」**。保活判据因此是
    「不在枚举里 ∨ `connected=false`」；`orphaned` 只作为快照里的一条事实（面板可显示「后台
-   终端」）。`findAgent` 的反查同步放宽（只看 `connected`）。一份例外：**Ticket 的认领更严**
-   —— `executor/resume.ts` 要求 `connected && !orphaned` 才 `adopt`，否则重建 Assignment（§E.5）。
-   这是「宁可重建，也不把看不见的会话当自己的」的姿态，不是判活规则的第二套真源；用户能感知
-   的结果是：一个后台跑着、UI 里没开的 worker 终端，在插件重启后会被重建而不是认领。
+   终端」）。`findAgent` 的反查同步放宽（只看 `connected`）。Ticket 的认领用同一条线（#62 的
+   修正）：`executor/resume.ts` 判活只看 `connected`，`orphaned` 不作判据；「这是不是自己的
+   会话」由 `belongsToTicket` 的 worktree 判据（路径或工作区 id 命中 Ticket 记录的目录）回答，
+   再决定 `adopt` 还是重建 Assignment（§E.5）。用户能感知的结果是：一个后台跑着、UI 里没开的
+   worker 终端，在插件重启后被认领并收到「已恢复，继续」，而不是被重建。
 3. **`done` 是回合结束，不是会话结束**（与 S7 的记录一致）。§F.5 的 `done` 触发留给 DOC2
    对齐；实现不再按 `done` 重启，避免每一轮都换 Router。
 4. **未证实（不写成事实）**：Router 终端的事件到达。它用的是与 #12 相同的一条

@@ -16,6 +16,8 @@
 import { ApiError, ERROR_CODES } from './errors.ts'
 import { runWrite } from './idempotency.ts'
 import type { RouteDefinition, RouteHandler } from './routes.ts'
+import { DeadlineError, withDeadline, type HandlerBudget } from '../infra/deadline.ts'
+import type { SetupBudget } from '../app/setup-types.ts'
 import { rotateApiToken } from '../infra/tokens.ts'
 import { backupNow } from '../app/backup.ts'
 import { createPausedState, type PausedState } from '../app/pause.ts'
@@ -60,15 +62,32 @@ export interface OpsPorts {
    * 缺省时 handler 用本文件拼的那份选项（`store.inspect()` + 注入的 runner）。
    */
   readonly doctor?: () => Promise<DoctorResult>
+  /** `setup check` 的时间预算（§O）；缺省 `SETUP_CHECK_BUDGET`，测试注入小预算。 */
+  readonly setupCheckBudget?: HandlerBudget
 }
 
-/** `setup check` 的端口：返回组合根的重跑结论（`BootHandle.checkSetup`）。 */
-export type SetupCheckPort = () => Promise<{
+/**
+ * `setup check` 的端口：返回组合根的重跑结论（`BootHandle.checkSetup`）。
+ *
+ * `budget` 是 §O 的时间预算：handler 定总预算（`withDeadline`），把探针上限与取消信号交给
+ * 组合根；组合根再交给 `runSetupChecks`。忽略它的实现顶多让 handler 到点返回 `unavailable`。
+ */
+export type SetupCheckPort = (budget?: SetupBudget) => Promise<{
   readonly checked: boolean
   readonly problem: SetupCheckResult['problem']
   readonly issues: SetupCheckResult['issues']
   readonly restarted: boolean
 }>
+
+/**
+ * `POST setup/check` 的时间预算（§O「超时」行）。
+ *
+ * 一条探针是一个子进程（`git`、`gh`、`orca`、`lark-cli`），可能在登录/网络上挂住：单条 2 s
+ * 到点就取消，取消进 `execFile`，子进程被杀。整次 9 s：串行的四条探针最坏 8 s，还留 1 s 给
+ * HTTP 与组合根的收尾——都在 §O 的 10 s 天花板之下。预算到点返回固定码 `unavailable`，
+ * 并写明「稍后重试」；**不**把超时折成一条「缺什么」的 setup 结论。
+ */
+export const SETUP_CHECK_BUDGET: HandlerBudget = { probeMs: 2_000, totalMs: 9_000 }
 
 /** 一条被接线的路由：`<METHOD> <path>` → handler。 */
 export type OpsHandlers = ReadonlyMap<string, RouteHandler>
@@ -145,11 +164,13 @@ export function createOpsHandlers(options: {
   })
 
   // ---- setup check（§G.2、§N.1）：重跑探针并重新武装挂起的循环；本来没问题就固定拒绝。
+  // §O 的预算在这里落地：总预算到点先取消探针（信号进子进程）再返回 `unavailable`。
   const setupCheck = options.ports?.setupCheck
+  const setupBudget = options.ports?.setupCheckBudget ?? SETUP_CHECK_BUDGET
   if (setupCheck !== undefined) {
     handlers.set('POST setup/check', async ({ token, requestId, body, at }) =>
       idempotent(options.store, requestId ?? requestIdFrom(body), at, token, async () => {
-        const outcome = await setupCheck()
+        const outcome = await setupCheckWithin(setupCheck, setupBudget)
         if (!outcome.checked) {
           throw new ApiError(
             ERROR_CODES.refused,
@@ -200,6 +221,37 @@ export function withOpsHandlers(
     if (route.method === 'GET' && route.path === 'state') return route
     const handler = handlers.get(routeKey(route))
     return handler === undefined ? route : { ...route, handler }
+  })
+}
+
+/**
+ * 在预算内跑一次 setup 检查：到点取消探针，把 `DeadlineError` 折成固定码 `unavailable` +
+ * 「稍后重试」。`probeMs` 与 `signal` 一起交给端口——组合根据此给每条探针装截止期。
+ *
+ * 「不吞」在这里是两条：超时**不**折成 setup 结论（那会把「没查完」说成「缺什么」），
+ * 也不留下半份状态（组合根只在 `runSetupChecks` 返回后才 `apply` 结论）。
+ */
+function setupCheckWithin(
+  port: SetupCheckPort,
+  budget: HandlerBudget
+): ReturnType<SetupCheckPort> {
+  const probeMs = budget.probeMs
+  return withDeadline(
+    (signal) =>
+      port({
+        signal,
+        ...(probeMs === undefined ? {} : { probeMs })
+      }),
+    { ms: budget.totalMs, what: 'the setup check' }
+  ).catch((error: unknown) => {
+    if (error instanceof DeadlineError) {
+      throw new ApiError(
+        ERROR_CODES.unavailable,
+        `The setup check did not finish within ${budget.totalMs} ms; retry later`,
+        { reason: 'timeout' }
+      )
+    }
+    throw error
   })
 }
 

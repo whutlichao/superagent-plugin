@@ -78,6 +78,25 @@ export interface RepoSelectorLike {
   readonly id?: string
 }
 
+/**
+ * 一次外部探针的取消信息（§O「超时」行）：截止期到点时 handler 先取消再拒绝，
+ * 取消了还得让子进程知道——`Commands.run` 把 `signal` 交给 `execFile`，子进程被 SIGTERM 掐掉。
+ */
+export interface SetupProbeOptions {
+  readonly signal?: AbortSignal
+  /** 探针的上限（毫秒）：实现该把它交给子进程（`execFile` 的 `timeout`）。 */
+  readonly timeoutMs?: number
+}
+
+/**
+ * 一次 setup 检查的时间预算：`probeMs` 是单条探针的上限，`signal` 是外部取消（HTTP handler
+ * 的总预算）。两条都省略就是启动路径：探针不限时，与 #64 之前逐字一致。
+ */
+export interface SetupBudget {
+  readonly probeMs?: number
+  readonly signal?: AbortSignal
+}
+
 /** 外部世界的注入点；缺省的实现要么安全（不跑子进程）、要么如实失败。 */
 export interface SetupPorts {
   /** 一个路径是否绝对（缺省 `node:path` 的同名判定）。 */
@@ -85,7 +104,11 @@ export interface SetupPorts {
   /** 目录是否可写（缺省 `fs.accessSync(path, W_OK)`；不可写时抛错）。 */
   readonly writable?: (path: string) => void
   /** 跑一个子进程并返回标准输出；缺省「程序不在」（绝不在测试里偷偷跑真 CLI）。 */
-  readonly run?: (program: string, args: readonly string[]) => Promise<string>
+  readonly run?: (
+    program: string,
+    args: readonly string[],
+    options?: SetupProbeOptions
+  ) => Promise<string>
   /** `orca repo list` 的只读行（base repo 存在性）。 */
   readonly repos?: () => Promise<readonly RepoRow[]>
   /** `orca repo search-refs` 的命中 ref（base ref 存在性）。 */
@@ -132,6 +155,8 @@ export interface SetupCheckInput {
    * 组合根总是给——它是 `DSH_SUPERAGENT_GITHUB_COMMIT_EMAIL` 的同源值。
    */
   readonly gitConfig?: SetupGitConfigIdentity
+  /** 探针的时间预算（§O）；只在 HTTP handler 里给，启动路径不给。 */
+  readonly budget?: SetupBudget
   readonly ports?: SetupPorts
 }
 

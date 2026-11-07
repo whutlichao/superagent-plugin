@@ -57,7 +57,10 @@ import { createRepositories } from '../src/worker/app/repositories'
 import { SCHEMA_VERSION } from '../src/worker/app/schema'
 import { runIdempotent } from '../src/worker/http/idempotency'
 import { createDecisionHandlers, withDecisionHandlers } from '../src/worker/http/decisions'
-import { createSettingsHandlers, withSettingsHandlers } from '../src/worker/http/settings'
+import { POLICY_SYNC_BUDGET, createSettingsHandlers, withSettingsHandlers } from '../src/worker/http/settings'
+import { SETUP_CHECK_BUDGET } from '../src/worker/http/ops'
+import type { OpsPorts } from '../src/worker/http/ops'
+import type { SetupBudget } from '../src/worker/app/setup-types'
 import { createSettings } from '../src/worker/app/settings'
 import type { Decision, Thread, Ticket } from '../src/worker/core/model'
 import type { Trigger } from '../src/worker/core/model'
@@ -260,6 +263,8 @@ interface HarnessOptions {
   readonly startedAt?: string
   readonly pid?: number
   readonly clock?: () => Date
+  /** 运维 handler 的接线（§G.2）；`setupCheck` 这类端口由用例注入，不需要组合根。 */
+  readonly ops?: OpsPorts
 }
 
 /** 一个跑着的测试服务器与它的状态目录。 */
@@ -320,7 +325,8 @@ async function startHarness(options: HarnessOptions = {}): Promise<Harness> {
     startedAt: options.startedAt ?? STARTED_AT,
     log: (line) => void logs.push(line),
     rateLimiter: options.rateLimiter ?? GENEROUS_LIMITER(),
-    routes
+    routes,
+    ...(options.ops === undefined ? {} : { ops: options.ops })
   })
   const call: Harness['call'] = (path, callOptions = {}) => {
     const method = callOptions.method ?? 'GET'
@@ -728,6 +734,76 @@ test('a write with the same request id replays the first result', async () => {
     const replay = await harness.call('/superagent/api/test/write-once', { method: 'POST' })
     assert.deepEqual(resultOf(replay), { kind: 'replayed', result: { runs: 1 } })
     assert.equal(runs, 1)
+  } finally {
+    harness.close()
+  }
+})
+
+// ---------------------------------------------------------------- handler 的时间预算（§O）
+
+/**
+ * §O「超时」行：HTTP handler 内不做超过 10 s 的同步等待。两条会同步等外部 CLI 的路由
+ * （`setup check` 的串行探针、`policy sync` 的多页读取）各有一条总预算：到点先取消
+ * （信号进子进程），再返回固定码 `unavailable` + 「稍后重试」，而且**一个字都不写**。
+ */
+test('the handler budgets stay under the §O ten-second ceiling, with a 2 s probe cap', () => {
+  assert.equal(SETUP_CHECK_BUDGET.probeMs, 2_000)
+  assert.ok(SETUP_CHECK_BUDGET.totalMs < 10_000, 'setup check finishes inside ten seconds')
+  assert.ok(POLICY_SYNC_BUDGET.totalMs < 10_000, 'policy sync finishes inside ten seconds')
+  // policy sync 是一次多页读取：没有逐探针上限，总预算就是它的线。
+  assert.equal(POLICY_SYNC_BUDGET.probeMs, undefined)
+})
+
+test('a hanging setup check returns unavailable inside the budget, cancels the probes and writes nothing', async () => {
+  let handed: SetupBudget | undefined
+  const harness = await startHarness({
+    ops: {
+      // 组合根的探针永远不返回（一个挂住的 `gh api user` 就是这个形状）。
+      setupCheck: (budget) => {
+        handed = budget
+        return new Promise(() => undefined)
+      },
+      setupCheckBudget: { probeMs: 10, totalMs: 40 }
+    }
+  })
+  try {
+    const started = Date.now()
+    const observed = await harness.call('/superagent/api/setup/check', {
+      method: 'POST',
+      headers: { 'x-superagent-request-id': 'setup-check-1' }
+    })
+    const elapsed = Date.now() - started
+    assert.equal(observed.status, 503)
+    const error = failureOf(observed)
+    assert.equal(error.code, 'unavailable')
+    assert.ok(error.message.includes('retry later'), error.message)
+    assert.ok(elapsed < 1_000, `the handler returned after ${elapsed} ms`)
+    // 取消传到了组合根：它的探针拿到的信号已经取消（真实现把它交给 `execFile`）。
+    assert.equal(handed?.signal?.aborted, true, 'the budget signal is aborted')
+    assert.equal(handed?.probeMs, 10)
+    // 超时的请求什么都不写：幂等记录也没有（失败不缓存）。
+    const written = harness.store.kvKeys().filter((key) => key.startsWith('request-id:'))
+    assert.deepEqual(written, [])
+  } finally {
+    harness.close()
+  }
+})
+
+test('a failing setup check port is not swallowed: a non-deadline error stays an internal error', async () => {
+  const harness = await startHarness({
+    ops: {
+      setupCheck: async () => {
+        throw new Error('the router supervision could not start')
+      }
+    }
+  })
+  try {
+    const observed = await harness.call('/superagent/api/setup/check', { method: 'POST' })
+    assert.equal(observed.status, 500)
+    const error = failureOf(observed)
+    assert.equal(error.code, 'internal')
+    // 内部错误的原文不回显（§O）：信封里只有固定码。
+    assert.equal(error.message.includes('router supervision'), false)
   } finally {
     harness.close()
   }
