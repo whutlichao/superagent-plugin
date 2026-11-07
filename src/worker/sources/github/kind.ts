@@ -16,7 +16,7 @@ import type {
 } from '../../core/index.ts'
 import type { Localized, SourceContext, SourceKind } from '../kind.ts'
 import type { CommandsHost } from '../commands.ts'
-import { isGone, type GoneRule } from '../commands.ts'
+import { CliError, isGone, type GoneRule } from '../commands.ts'
 import { array, object, string } from '../../infra/schema.ts'
 import type { GithubConfig } from './config.ts'
 import { githubConfigSchema } from './config.ts'
@@ -29,26 +29,76 @@ export const GITHUB_KIND = 'github'
 export const idMarker = (messageId: string): string => `<!-- superagent:${messageId} -->`
 
 /** 判定「这个地址永远收不到」的 GitHub 错误码（§I.2 Channel 失败处理行）。 */
-export const GONE_RULES: readonly GoneRule[] = [
-  { code: 404 },
-  { code: 410 },
-  { code: 403, message: /locked/i }
-]
+export const GONE_RULES: readonly GoneRule[] = [{ code: 404 }, { code: 410 }, { code: 403 }]
+
+/**
+ * 403 也可以是限流（它会自己恢复），所以不能一律当 `gone`：只有非限流的 403
+ * （锁定、无权限）才是永久失败，其余一律抛错重试（§I.2）。
+ */
+const RATE_LIMITED = /rate limit|secondary rate|abuse detection/i
+
+export function githubGone(error: unknown): boolean {
+  if (error instanceof CliError && error.code === 403 && RATE_LIMITED.test(error.message)) return false
+  return isGone(error, GONE_RULES)
+}
+
+/** 根评论不存在（已删/找不到）：评审线程的回复退到 PR 会话，而不是 `gone`。 */
+function missingTarget(error: unknown): boolean {
+  return error instanceof CliError && (error.code === 404 || error.code === 410)
+}
 
 /** 中英双语短句的简写（`Localized` 两种语言都要有值，与 `locales.test` 同一纪律）。 */
 const both = (zh: string, en: string): Localized => ({ zh, en })
 
-/** GitHub 的 Channel 地址字段（`ChannelRef.address`）。 */
-export interface GithubAddress extends Record<string, string> {
+/** GitHub 的 Channel 地址字段（`ChannelRef.address`）。`root` 只在评审线程的地址上出现。 */
+export type GithubAddress = Record<string, string> & {
   readonly repo: string
   readonly issue: string
+  readonly root?: string
 }
 
-/** 一个地址是否够发一条 Issue 评论。 */
-function addressOf(address: Record<string, string>): { repo: string; issue: string } | undefined {
+/** 解析后的地址：`root` 给出时回复走评审线程的 replies 端点。 */
+interface GithubTarget {
+  readonly repo: string
+  readonly issue: string
+  readonly root?: number
+}
+
+/** 一个地址是否够发一条评论（`root` 给出时必须是数字）。 */
+function addressOf(address: Record<string, string>): GithubTarget | undefined {
   const repo = address['repo'] ?? ''
   const issue = address['issue'] ?? ''
-  return repo.length > 0 && /^\d+$/.test(issue) ? { repo, issue } : undefined
+  if (repo.length === 0 || !/^\d+$/.test(issue)) return undefined
+  const root = address['root']
+  if (root === undefined) return { repo, issue }
+  return /^\d+$/.test(root) ? { repo, issue, root: Number(root) } : undefined
+}
+
+/** 发之前先按隐藏标记查重（最多一页，§I.2 Channel 行）。 */
+async function hasMarker(
+  host: CommandsHost,
+  cli: string,
+  path: string,
+  marker: string
+): Promise<boolean> {
+  const output = await host.run(cli, ['api', `${path}?per_page=100`, '-q', '.[].body'])
+  return output.includes(marker)
+}
+
+/** 评审线程的根评论还在不在（404/410 算不在；其余失败原样抛，让外层分别判 gone/重试）。 */
+async function rootExists(
+  host: CommandsHost,
+  cli: string,
+  repo: string,
+  root: number
+): Promise<boolean> {
+  try {
+    await host.run(cli, ['api', `repos/${repo}/pulls/comments/${root}`])
+    return true
+  } catch (error) {
+    if (missingTarget(error)) return false
+    throw error
+  }
 }
 
 /**
@@ -169,33 +219,38 @@ export function createGithubKind(cli: string): SourceKind<GithubConfig> {
         if (target === undefined) return 'gone'
         const marker = idMarker(message.id)
         const body = `${message.text}\n\n${marker}`
-        // 先查重：读已有评论（最多一页）里有没有同一个标记（§I.2 Channel 幂等）。
-        const existing = await host.run(cli, [
-          'api',
-          `repos/${target.repo}/issues/${target.issue}/comments?per_page=100`,
-          '-q',
-          '.[].body'
-        ])
-        if (existing.includes(marker)) return 'sent'
         try {
-          await host.run(cli, [
-            'api',
-            `repos/${target.repo}/issues/${target.issue}/comments`,
-            '-f',
-            `body=${body}`
-          ])
+          // 评审线程：先确认根评论还在；不在就退到 PR 会话（§I.2 Channel 行）。
+          if (target.root !== undefined && (await rootExists(host, cli, target.repo, target.root))) {
+            const path = `repos/${target.repo}/pulls/${target.issue}/comments`
+            if (await hasMarker(host, cli, path, marker)) return 'sent'
+            await host.run(cli, ['api', `${path}/${target.root}/replies`, '-f', `body=${body}`])
+            return 'sent'
+          }
+          const path = `repos/${target.repo}/issues/${target.issue}/comments`
+          // 先查重：读已有评论（最多一页）里有没有同一个标记（§I.2 Channel 幂等）。
+          if (await hasMarker(host, cli, path, marker)) return 'sent'
+          await host.run(cli, ['api', path, '-f', `body=${body}`])
         } catch (error) {
-          if (isGone(error, GONE_RULES)) return 'gone'
+          if (githubGone(error)) return 'gone'
           throw error
         }
         return 'sent'
       },
       link(address) {
         const target = addressOf(address)
+        if (target === undefined) {
+          return { url: '', label: both('Issue', 'Issue') }
+        }
+        if (target.root !== undefined) {
+          return {
+            url: `https://github.com/${target.repo}/pull/${target.issue}#discussion_r${target.root}`,
+            label: both(`#${target.issue} 的 review 讨论`, `Review discussion on #${target.issue}`)
+          }
+        }
         return {
-          url: target === undefined ? '' : `https://github.com/${target.repo}/issues/${target.issue}`,
-          label:
-            target === undefined ? both('Issue', 'Issue') : both(`#${target.issue}`, `#${target.issue}`)
+          url: `https://github.com/${target.repo}/issues/${target.issue}`,
+          label: both(`#${target.issue}`, `#${target.issue}`)
         }
       }
     },

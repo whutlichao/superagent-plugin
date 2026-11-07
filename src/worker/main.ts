@@ -111,6 +111,7 @@ export default function activate(orca: OrcaWorkerApi): void {
     }
     return (await ready()).setPaused(paused)
   })
+  // Overview 的两条动作（#37）：`check` 重读读模型；`ticket.retry` 与 `terminal.focus` 在详情页。
   host.handleRequest('check', async () => {
     const booted = await ready()
     return booted.refresh()
@@ -144,6 +145,19 @@ export default function activate(orca: OrcaWorkerApi): void {
     } catch (error) {
       throw Object.assign(new Error(messageOf(error)), { code: codeOf(error, 'action_failed') })
     }
+  })
+  // Deployment 组（§M.3）：读数一次读完；doctor、重跑探针与两个破坏性动作各一条请求。
+  host.handleRequest('deployment', async () => (await ready()).deployment())
+  host.handleRequest('doctor', async () => (await ready()).doctor())
+  host.handleRequest('setupCheck', async () => {
+    const outcome = await (await ready()).checkSetup()
+    return { checked: outcome.checked, problems: outcome.issues }
+  })
+  host.handleRequest('rotateToken', async () => (await ready()).rotateToken())
+  host.handleRequest('restartRouter', async () => {
+    const booted = await ready()
+    await booted.restartRouter()
+    return booted.deployment().router
   })
 
   host.register(COMMANDS.pause, () => {
