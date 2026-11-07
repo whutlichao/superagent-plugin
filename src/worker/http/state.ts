@@ -14,7 +14,7 @@
 //
 // 本票只有 `store` 是真读数（真库），其余从注入的端口取：进程与 HTTP 由 server 提供，
 // health/setup/paused/loops/load 的写者在后续票（#45、#44、#6、#11），缺省值就是「还没接上」。
-import type { Store } from '../app/store'
+import type { Store } from '../app/store.ts'
 
 /** health 条目的四档状态（§N.4）。 */
 export type HealthState = 'starting' | 'ready' | 'paused' | 'error'
@@ -68,6 +68,11 @@ export interface HttpHost {
   readonly loops?: () => readonly LoopEntry[]
   /** worker slots 上限（§E.6 缺省 2）。 */
   readonly maxWorkers?: () => number
+  /**
+   * CLI 绝对路径（#8 的 doctor「CLI 路径」项用）。缺省 `undefined`：doctor 报 warn，
+   * 不猜一个可能不存在的路径。
+   */
+  readonly cliPath?: string
 }
 
 /** HTTP 段里由 server 自己填的两个读数。 */

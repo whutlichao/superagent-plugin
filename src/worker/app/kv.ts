@@ -27,7 +27,8 @@ export const KV_KEY_LITERALS = {
   lockPid: 'lock-pid',
   lastPrune: 'last-prune',
   apiPort: 'api-port',
-  backupIndex: 'backup-index'
+  backupIndex: 'backup-index',
+  pauseState: 'pause-state'
 } as const
 
 /** schema 版本（唯一版本源，§D.2 要点 3）。 */
@@ -73,11 +74,22 @@ export const feishuCursorKey = (chat: string): string => `${KV_KEY_LITERALS.feis
 export const threadSeenKey = (threadKey: string): string => `${KV_KEY_LITERALS.threadSeenPrefix}${threadKey}`
 export const sourceLabelsKey = (kind: string): string => `${KV_KEY_LITERALS.sourceLabelsPrefix}${kind}`
 
+/**
+ * 状态目录族的文件名（§D.5、§G.4 第 1 条）：这两个名字不是 KV 键，而是 `<stateDir>` 下的
+ * 普通文件；CLI 与 worker 都按同一处字面量找它们（`infra/paths.ts` 从这里再导出）。
+ */
+export const STATE_DIR_NAME = 'orca-superagent'
+export const STATE_DIR_ENV = 'ORCA_SUPERAGENT_STATE_DIR'
+export const STATE_DIR_POINTER = 'state-dir-pointer'
+
 /** 维护族（§D.3「维护」行）。 */
 export const LOCK_PID_KEY = KV_KEY_LITERALS.lockPid
 export const LAST_PRUNE_KEY = KV_KEY_LITERALS.lastPrune
 export const API_PORT_KEY = KV_KEY_LITERALS.apiPort
 export const BACKUP_INDEX_KEY = KV_KEY_LITERALS.backupIndex
+
+/** 暂停状态（§K.6：独立设置，不改变 Policy version；唯一读写处 `app/pause.ts`）。 */
+export const PAUSE_STATE_KEY = KV_KEY_LITERALS.pauseState
 
 /** 保留策略要扫的两个版本族（§D.2 要点 5：删「非当前」的旧快照）。 */
 export const VERSION_SNAPSHOT_PREFIXES = {

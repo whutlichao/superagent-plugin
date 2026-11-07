@@ -6,8 +6,8 @@
 //
 // 纪律：**失败不缓存**——一次拒绝或内部错误在重试时应该有机会成功，否则「重试」这个动作
 // 本身就没有意义（HTTP 层的 429/超时重试尤其如此）。
-import { REQUEST_ID_PREFIX, requestIdKey } from '../app/kv'
-import type { Store } from '../app/store'
+import { REQUEST_ID_PREFIX, requestIdKey } from '../app/kv.ts'
+import type { Store } from '../app/store.ts'
 
 /** 幂等窗口：一小时（§G.1 幂等行）。 */
 export const IDEMPOTENCY_WINDOW_MS = 60 * 60 * 1000
@@ -75,6 +75,33 @@ export function runIdempotent<T>(options: IdempotentOptions<T>): IdempotentRun {
   }
 
   const result = run()
+  store.kvSet(key, { at, result } satisfies IdempotentRecord)
+  pruneExpired(store, at)
+  return { outcome: { kind: 'ran', result }, requestId }
+}
+
+/**
+ * 异步版的同一件事（`source labels` 要读外部、`doctor` 要跑子进程）。
+ *
+ * 语义与同步版逐条一致：命中 → 返回首次结果且不调用 `run`；未命中 → 先 `await run()`，
+ * **成功之后**才写记录（失败不缓存）；没有 id → 直接跑。查记录与写记录都是同步 kv 操作，
+ * 所以两个并发请求不会同时看到「没有记录」再各跑一次（Node 的单线程 + 同步 kv）。
+ */
+export async function runIdempotentAsync<T>(
+  options: IdempotentOptions<T | Promise<T>>
+): Promise<IdempotentRun> {
+  const { store, caller, requestId, at, run } = options
+  if (requestId === null) {
+    return { outcome: { kind: 'ran', result: await run() }, requestId: null }
+  }
+
+  const key = requestIdKey(caller, requestId)
+  const existing = store.kvGet<IdempotentRecord>(key)
+  if (existing !== null && withinWindow(existing.at, at)) {
+    return { outcome: { kind: 'replayed', result: existing.result }, requestId }
+  }
+
+  const result = await run()
   store.kvSet(key, { at, result } satisfies IdempotentRecord)
   pruneExpired(store, at)
   return { outcome: { kind: 'ran', result }, requestId }

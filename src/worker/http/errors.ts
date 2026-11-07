@@ -8,7 +8,7 @@
 // - `rate_limited`（第 7 条）→ 429。
 //
 // 响应体恒为 `{ok:false, error:{code, message, values?}}`；`values` 只给填槽值，不给内部细节。
-import { UserError } from '../core/errors'
+import { UserError } from '../core/errors.ts'
 
 /** 命令与边界共用的固定错误码（面板按 `error.code` 翻译，不解析 message）。 */
 export const ERROR_CODES = {

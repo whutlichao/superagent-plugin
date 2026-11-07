@@ -5,10 +5,10 @@
 // 1. 只认 `Authorization: Bearer <token>`（不认 cookie、不认查询串）；
 // 2. 交给 `verifyToken` 判定有效性与绑定（assignment 的 ticketId / assignmentId / 过期）；
 // 3. 按路由声明的最低角色判阶梯；不足 → `not_permitted_role`（403）。
-import { ApiError, ERROR_CODES } from './errors'
-import { allowsRole, type RouteCaller, type RouteDefinition } from './routes'
-import { verifyToken } from '../infra/tokens'
-import type { Store } from '../app/store'
+import { ApiError, ERROR_CODES } from './errors.ts'
+import { allowsRole, type RouteCaller, type RouteDefinition } from './routes.ts'
+import { verifyToken } from '../infra/tokens.ts'
+import type { Store } from '../app/store.ts'
 
 /**
  * 从 `Authorization` 头里取 Bearer token；方案名大小写不敏感（RFC 6750），

@@ -11,7 +11,7 @@
 // 文件名来自 `app/kv.ts` 的维护族键（§D.3 的上线约束：键字面量只在 kv.ts 与 migration.ts）。
 import { closeSync, readFileSync, unlinkSync, openSync, writeSync } from 'node:fs'
 import { join } from 'node:path'
-import { API_PORT_KEY } from '../app/kv'
+import { API_PORT_KEY } from '../app/kv.ts'
 
 /** 端口文件名（§D.5；值取自 `API_PORT_KEY`，`api-port` 的字面量只活在 `app/kv.ts`）。 */
 export const PORT_FILE = API_PORT_KEY

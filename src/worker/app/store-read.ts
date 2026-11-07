@@ -3,7 +3,7 @@
 // 工作集（活跃 Thread、开放 Ticket、活跃 Ticket、待发 Outbox）一律走生成列 + 部分索引：
 // 非活跃行根本不进索引，所以一次 pass 只扫活行。这里的 SQL 是唯一副本，`store.ts`
 // 负责执行，测试用 `plan()` 断言查询计划（§P.1 的可核验行为）。
-import type { TimelineCursor, TimelinePage, WorkingSet } from './records'
+import type { TimelineCursor, TimelinePage, WorkingSet } from './records.ts'
 
 /** 可绑定到 SQLite 参数的标量（与 `store.ts` 的驱动类型结构相同；type-only 依赖）。 */
 export type ReadParam = null | number | bigint | string | Uint8Array

@@ -14,6 +14,7 @@ declare module 'node:path' {
   export function join(...parts: string[]): string
   export function dirname(path: string): string
   export function resolve(...parts: string[]): string
+  export function relative(from: string, to: string): string
   export function basename(path: string): string
   export function isAbsolute(path: string): boolean
 }
@@ -41,6 +42,12 @@ declare module 'node:child_process' {
     stderr?: string
     stdout?: string
   }
+  /** 同步形态（入口测试用）；失败时 Error 上带 `status`/`stdout`/`stderr`。 */
+  export function execFileSync(
+    file: string,
+    args: readonly string[],
+    options: ExecFileOptions & { readonly stdio?: readonly string[] }
+  ): string
   export function execFile(
     file: string,
     args: readonly string[],
@@ -65,6 +72,14 @@ declare module 'node:fs' {
   }
   export function readFileSync(path: string, encoding: 'utf8'): string
   export function writeFileSync(path: string, data: string, encoding?: 'utf8'): void
+  /** 带选项的写法（`mode` 决定新文件的权限位；已存在文件的权限不变）。 */
+  export function writeFileSync(
+    path: string,
+    data: string,
+    options: { readonly encoding?: 'utf8'; readonly mode?: number }
+  ): void
+  /** 改权限位（`rotate-token` 用例与 doctor 的 0600 判定用）。 */
+  export function chmodSync(path: string, mode: number): void
   export function appendFileSync(path: string, data: string, encoding: 'utf8'): void
   export function readdirSync(
     path: string,
@@ -178,6 +193,10 @@ declare module 'node:http' {
   /** 测试客户端：只有它能发送任意的 `Host`（`fetch` 会覆写成目标地址）。 */
   export interface ClientRequest {
     on(event: 'error', listener: (error: Error) => void): void
+    /** 请求级别的超时（CLI 的 10 s 上限）。 */
+    setTimeout(milliseconds: number, listener?: () => void): void
+    /** 中止这次请求（超时回调里用）。 */
+    destroy(): void
     end(chunk?: string): void
   }
 
@@ -300,6 +319,15 @@ declare const process: {
   readonly platform: string
   kill(pid: number, signal: 0): true
   hrtime: { bigint(): bigint }
+  /** 正在跑这个进程的 node 可执行文件（doctor 的「CLI 路径」项把它当已存在的路径用）。 */
+  readonly execPath: string
+  readonly versions: Readonly<Record<string, string | undefined>>
+}
+
+/** 控制台：`src/worker/cli/main.ts` 的缺省输出通道（其余模块不直接打印）。 */
+declare const console: {
+  log(...values: readonly unknown[]): void
+  error(...values: readonly unknown[]): void
 }
 
 /** 定时器：心跳（§N.1 每 5 s 触碰锁）与保留策略的节流用。 */

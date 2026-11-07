@@ -14,9 +14,9 @@
 // 顺序的理由：先挡「不是本机/不是本站」的请求（最便宜、也最该早拒），再花哈希成本校验
 // token，再判角色（越权请求不该让服务端为它解析大 body），最后才读 body。
 import { createServer, type IncomingMessage, type ServerResponse, type Server } from 'node:http'
-import { createRateLimiter, type RateLimiter } from './rate-limit'
-import { ApiError, ERROR_CODES, toApiError } from './errors'
-import { authenticate, authorize } from './auth'
+import { createRateLimiter, type RateLimiter } from './rate-limit.ts'
+import { ApiError, ERROR_CODES, toApiError } from './errors.ts'
+import { authenticate, authorize } from './auth.ts'
 import {
   DEFAULT_PORT,
   portCandidates,
@@ -24,7 +24,7 @@ import {
   removePortRecord,
   writePortRecord,
   type PortRecord
-} from './port-file'
+} from './port-file.ts'
 import {
   ROUTE_TABLE,
   assertSettingsWriteAllowed,
@@ -33,9 +33,12 @@ import {
   type RouteCaller,
   type RouteDefinition,
   type RouteInput
-} from './routes'
-import { stateView, type HttpHost } from './state'
-import { ensureApiToken } from '../infra/tokens'
+} from './routes.ts'
+import { requestIdOf } from './idempotency.ts'
+import { stateView, type HttpHost } from './state.ts'
+import { createOpsHandlers, withOpsHandlers, type OpsPorts } from './ops.ts'
+import { createPausedState } from '../app/pause.ts'
+import { ensureApiToken } from '../infra/tokens.ts'
 
 /** API 的基址前缀（§G.3：`/superagent/api/`）。 */
 export const API_BASE = '/superagent/api'
@@ -82,6 +85,11 @@ export interface HttpServerOptions {
   readonly rateLimiter?: RateLimiter
   /** 路由表（缺省 `ROUTE_TABLE`；测试可注入额外路由）。 */
   readonly routes?: readonly RouteDefinition[]
+  /**
+   * 运维命令的接线（§G.2）：暂停、source labels、admin backup/rotate-token、doctor。
+   * 缺省用 store + stateDir 构造；组合根可以覆盖 `sourceLabels` / `run` / `cliPath`。
+   */
+  readonly ops?: OpsPorts
 }
 
 /** 起好的服务器句柄。 */
@@ -118,6 +126,8 @@ interface Parsed {
   readonly query: Readonly<Record<string, string>>
   readonly body: unknown
   readonly caller: RouteCaller
+  /** 通过校验的 token 原文（只为幂等键的哈希存在；不写日志、不回显，§O）。 */
+  readonly token: string
 }
 
 /**
@@ -133,7 +143,22 @@ export async function startHttpServer(options: HttpServerOptions): Promise<HttpS
   // 主 token 首启生成（§D.6）：API 起来之前 token 文件必须存在，否则 401 永远无法通过。
   ensureApiToken(options.stateDir)
 
-  const routes = withStateRoute(options.routes ?? ROUTE_TABLE, options.host, () => ({
+  // 暂停状态是同一个读模型的两处出口：`pause`/`resume` 写它，`GET state` 的 `paused` 读它。
+  // 于是 CLI 的 `pause` 之后紧接着 `status` 一定看到 `paused: true`（退出码因此是 3）。
+  const pausedState = options.ops?.paused ?? createPausedState(options.host.store)
+  const host: HttpHost =
+    options.host.paused === undefined
+      ? { ...options.host, paused: () => pausedState.paused() }
+      : options.host
+
+  const opsHandlers = createOpsHandlers({
+    store: options.host.store,
+    stateDir: options.stateDir,
+    ...(options.host.cliPath === undefined ? {} : { cliPath: options.host.cliPath }),
+    ...(options.ops === undefined ? {} : { ports: { ...options.ops, paused: pausedState } })
+  })
+  const routed = withOpsHandlers(options.routes ?? ROUTE_TABLE, opsHandlers)
+  const routes = withStateRoute(routed, host, () => ({
     port: bound.port,
     requests
   }))
@@ -185,7 +210,9 @@ export async function startHttpServer(options: HttpServerOptions): Promise<HttpS
         query: parsed.query,
         body: parsed.body,
         caller: parsed.caller,
-        at: now().toISOString()
+        at: now().toISOString(),
+        token: parsed.token,
+        requestId: requestIdOf(request.headers)
       })
       respond(response, context, 200, { ok: true, result }, null)
     } catch (error) {
@@ -379,7 +406,8 @@ async function parse(
     params: matched.params,
     query: queryOf(url),
     body,
-    caller
+    caller,
+    token
   }
 }
 
