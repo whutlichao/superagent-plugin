@@ -6,6 +6,7 @@ import { assert, test } from 'orca/testing'
 import { dispatch } from '../src/worker/cli/commands'
 import { parseArgs } from '../src/worker/cli/io'
 import { readApiToken } from '../src/worker/infra/tokens'
+import { EFFECT_KINDS } from '../src/worker/app/effects'
 import { assignmentToken, openBoot } from './support/boot'
 
 /** 一个指向 boot 服务器的 CLI 目标。 */
@@ -191,6 +192,32 @@ test('a restart adopts the running assignment instead of opening a second ticket
     }
   } finally {
     await first.cleanup()
+  }
+})
+
+test('the composition root wires a handler for every effect kind, and each reports its counts', async () => {
+  const h = await openBoot()
+  try {
+    const port = h.handle.port()
+    assert.notEqual(port, null)
+    const read = await cli(h.stateDir, port!, ['health'], readApiToken(h.stateDir))
+    assert.equal(read.exit, 0)
+    const health = (
+      read.envelope as { result: { health: Record<string, { state: string; detail?: string }> } }
+    ).result.health
+    // §J.2 的七行各有自己的 handler（注册过就会报告一次，因此不会停在 `starting`），
+    // §J.3 的 detail 写的就是计数——两句合起来证明「每个 kind 接上了真实的 handler」。
+    for (const kind of EFFECT_KINDS) {
+      assert.ok(health[kind] !== undefined, `${kind} has a health entry`)
+      assert.notEqual(health[kind]!.state, 'starting', `${kind} has a handler`)
+      assert.equal(
+        /^waiting \d+, failed \d+$/.test(health[kind]!.detail ?? ''),
+        true,
+        `${kind}: ${health[kind]!.detail ?? ''}`
+      )
+    }
+  } finally {
+    await h.cleanup()
   }
 })
 
