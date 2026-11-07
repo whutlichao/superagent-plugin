@@ -7,9 +7,9 @@
 //
 // 三条纪律（与 `app/read.ts`、`app/eval.ts` 同）：
 // - **复用既有读模型，不做第二套查询**：Overview 取面板快照（`app/state-source.ts`），
-//   Sources 取注册表的 `overview()`，Tickets 取 `app/views.ts` 的 `ticketsPage`，Thread 时间线
-//   取 `store-read.ts` 的 `(at, triggerId)` 游标，Models 取 `app/roles.ts` 的角色解析，
-//   Search 取 Source kind 自己的 `find` 语义；
+//   Tickets 取 `app/views.ts` 的 `ticketsPage`，Decision 取仓储的 `decisions.list()`（面板 Eval
+//   页同一份读），Thread 时间线取 `store-read.ts` 的 `(at, triggerId)` 游标，Models 取
+//   `app/roles.ts` 的角色解析，Search 取 Source kind 自己的 `find` 语义；
 // - **状态是状态**：没有内容时 `items` 为空并把原因写清楚；不知道的行不编（坏行跳过）；
 // - **无权限如实说**：assignment 只读自己 Ticket 相关的 Thread（`mayReadThread`），
 //   角色不满足的整个面由路由表拒绝（§O）。
@@ -236,7 +236,7 @@ export interface ViewPaging {
 
 /** 视图读工具需要的宿主端口（组合根注入真仓储/注册表/状态源；测试用真库或替身）。 */
 export interface ViewReadHost {
-  /** 受控 SQL 出口（Decision 列表与 Search 的 Trigger 匹配在这一层查）。 */
+  /** 受控 SQL 出口（Search 的 Trigger 匹配：正文 / id / 链接 / 存的 JSON）。 */
   readonly reader: ViewReader
   /** 当前时刻（ISO-8601）：`window` 与「New in 24 h」由服务端换算。 */
   readonly now: () => string
@@ -268,7 +268,9 @@ export interface ViewReadHost {
   readonly trigger: (id: string) => Trigger | undefined
   readonly disposition: (id: string) => TriggerDisposition | undefined
   /** 一条 Thread 的 Decision（仓储的 `byThread`，旧的在前）。 */
-  readonly decisions: (threadKey: string) => readonly Decision[]
+  readonly threadDecisions: (threadKey: string) => readonly Decision[]
+  /** 全部 Decision（仓储的 `list()`，最新的在前）：`read decisions` 的同一份读。 */
+  readonly allDecisions: () => readonly Decision[]
   readonly tickets: () => readonly Ticket[]
   readonly ticket: (id: string) => Ticket | undefined
 }
@@ -423,34 +425,6 @@ function decisionView(decision: Decision): DecisionView {
     reason_text: reasonText(decision.reason),
     ...(decision.ticketId === undefined ? {} : { ticketId: decision.ticketId }),
     ...(decision.dismissed === true ? { dismissed: true as const } : {}),
-    ...(rules.length === 0 ? {} : { rules })
-  }
-}
-
-/** 一行 `decision` → 读模型（`body` 是完整记录；列只用来定位坏行）。 */
-function decisionRowOf(row: unknown): DecisionView | undefined {
-  const id = textOf(row, 'id')
-  const threadKey = textOf(row, 'thread_key')
-  const at = textOf(row, 'at')
-  if (id.length === 0 || threadKey.length === 0 || at.length === 0) return undefined
-  const body = jsonObject(
-    typeof row === 'object' && row !== null ? (row as Record<string, unknown>)['body'] : undefined
-  )
-  if (body === undefined) return undefined
-  const reason = reasonsOf(body['reason'])
-  const rules = rulesOf(body['audit'])
-  return {
-    id,
-    at,
-    kind: typeof body['kind'] === 'string' ? body['kind'] : textOf(row, 'kind'),
-    threadKey,
-    triggerIds: stringsOf(body['triggerIds']),
-    policyVersion: typeof body['policyVersion'] === 'string' ? body['policyVersion'] : '',
-    strength: body['strength'] === 'explicit' ? 'explicit' : 'inferred',
-    reason,
-    reason_text: reasonText(reason),
-    ...(typeof body['ticketId'] === 'string' ? { ticketId: body['ticketId'] } : {}),
-    ...(body['dismissed'] === true ? { dismissed: true as const } : {}),
     ...(rules.length === 0 ? {} : { rules })
   }
 }
@@ -706,7 +680,7 @@ export function createViewReadTools(host: ViewReadHost): ViewReadTools {
       const tail = host.timeline.tail(key, limit)
       page = timelinePageOf(host, tail.items, tail.before === null ? null : encodeCursor(tail.before))
     }
-    const decisions = [...host.decisions(key)].reverse().slice(0, limit).map(decisionView)
+    const decisions = [...host.threadDecisions(key)].reverse().slice(0, limit).map(decisionView)
     return { thread: headerOf(thread), ...page, decisions }
   }
 
@@ -732,30 +706,16 @@ export function createViewReadTools(host: ViewReadHost): ViewReadTools {
         })
       }
     }
-    const clauses: string[] = []
-    const params: ReadParam[] = []
-    if (kind !== undefined) {
-      clauses.push('kind = ?')
-      params.push(kind)
-    }
-    if (cutoff !== undefined) {
-      clauses.push('at >= ?')
-      params.push(cutoff)
-    }
-    const where = clauses.length === 0 ? '' : ` WHERE ${clauses.join(' AND ')}`
-    const totalRow = host.reader.sql.all(`SELECT COUNT(*) AS n FROM decision${where}`, params)[0]
-    const total = typeof totalRow === 'object' && totalRow !== null ? Number((totalRow as Record<string, unknown>)['n'] ?? 0) : 0
-    const rows = host.reader.sql.all(
-      `SELECT id, thread_key, at, kind, body FROM decision${where} ORDER BY at DESC, id DESC LIMIT ? OFFSET ?`,
-      [...params, paging.limit, paging.offset]
-    )
-    const items = rows.flatMap((row) => {
-      const view = decisionRowOf(row)
-      return view === undefined ? [] : [view]
-    })
-    // 坏行可能被跳过；推进量按**读到的行**算，否则一条坏数据会让 `next_offset` 原地打转。
-    const end = paging.offset + rows.length
-    return { items, next_offset: end < total ? end : null }
+    // 同一个读模型也服务面板的 Eval 页（`views/decisions.ts` 的 `decisionPage`）：这里只按
+    // kind/window 过滤后走同一条「最新在前」的序，再分页，不另写一条查询。
+    const matched = host
+      .allDecisions()
+      .filter((decision) => kind === undefined || decision.kind === kind)
+      .filter((decision) => cutoff === undefined || decision.at >= cutoff)
+      .sort((left, right) =>
+        left.at === right.at ? right.id.localeCompare(left.id) : right.at.localeCompare(left.at)
+      )
+    return pageOf(matched.map((decision) => decisionView(decision)), paging)
   }
 
   const searchOf = (options: { readonly query: string; readonly limit?: number }): SearchView | ReadRefusal => {

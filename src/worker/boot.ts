@@ -1139,7 +1139,8 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
     },
     trigger: (id) => repo.triggers.get(id),
     disposition: (id) => repo.triggers.disposition(id),
-    decisions: (key) => repo.decisions.byThread(key),
+    threadDecisions: (key) => repo.decisions.byThread(key),
+    allDecisions: () => repo.decisions.list(),
     tickets: () => repo.tickets.list(),
     ticket: (id) => repo.tickets.get(id)
   })
