@@ -296,14 +296,19 @@ function HealthEntries(props: { readonly locale: string; readonly source: PanelS
   )
 }
 
-/** 24 小时计数：收到的、被过滤的与最近一条的时刻（时间交给 `RelativeTime`）。 */
-function Stats(props: { readonly locale: string; readonly source: PanelSource }): OrcaElement {
+/** 24 小时计数（§M.1：只画非零计数）：收到的、被过滤的与最近一条的时刻。 */
+function Stats(props: { readonly locale: string; readonly source: PanelSource }): OrcaElement | null {
   const locale = props.locale
   const stats = props.source.stats
+  if (stats.received === 0 && stats.filtered === 0 && stats.lastAt === undefined) return null
   return (
     <Row gap="md" align="center" wrap>
-      <Text size="xs">{translate(locale, 'source.received', { count: stats.received })}</Text>
-      <Text size="xs">{translate(locale, 'source.filtered', { count: stats.filtered })}</Text>
+      {stats.received === 0 ? null : (
+        <Text size="xs">{translate(locale, 'source.received', { count: stats.received })}</Text>
+      )}
+      {stats.filtered === 0 ? null : (
+        <Text size="xs">{translate(locale, 'source.filtered', { count: stats.filtered })}</Text>
+      )}
       {stats.lastAt === undefined ? null : (
         <Row gap="xs" align="center">
           <Text muted size="xs">

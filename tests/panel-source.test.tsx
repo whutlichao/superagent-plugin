@@ -765,11 +765,18 @@ test('a setup problem sits on its own card and leaves the other card alone', asy
   panel = undefined
 })
 
-test('an empty filtered or dropped list takes no space', async () => {
-  const mounted = await openSourceTab({ sources: () => pageOf([githubCard()]) })
+test('an empty filtered or dropped list takes no space, and zero counts are quiet', async () => {
+  const mounted = await openSourceTab({
+    sources: () => pageOf([githubCard({ stats: { received: 0, filtered: 0 } })])
+  })
   const github = cardText(nodesOfType(mounted, 'Card')[0] as TreeNode)
   assert.equal(github.includes(COPY['source.filteredTitle'].en), false)
   assert.equal(github.includes(COPY['source.droppedTitle'].en), false)
+  assert.equal(
+    github.includes(translate('en', 'source.received', { count: 0 })),
+    false,
+    'a zero count is not printed (§M.1: non-zero counts only)'
+  )
   await mounted.unmount()
   panel = undefined
 })
