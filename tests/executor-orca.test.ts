@@ -14,6 +14,7 @@ import {
   DeliveryError,
   confirmsDelivery,
   inboxPath,
+  renderInputMarkdown,
   type DeliverySettings
 } from '../src/worker/executor/deliver'
 import { launchTicketAgent, seedPrompt } from '../src/worker/executor/launch'
@@ -23,6 +24,7 @@ import {
   OrcaExecutor,
   registerExecutorEffects,
   registerExecutorLifecycle,
+  renderAssignmentBrief,
   resolveExecutorSettings
 } from '../src/worker/executor/orca-executor'
 import {
@@ -809,6 +811,56 @@ test('a launch builds the worktree, writes the brief and starts the worker on a 
     'the seed prompt points at the brief'
   )
   await h.cleanup()
+})
+
+/** 一张主动接受（inferred）的票：Mandate 记着匹配到的规则。 */
+function proactiveTicket(): Ticket {
+  return ticket({
+    title: 'Fix the typo',
+    mandate: {
+      strength: 'inferred',
+      policyVersion: 'policy-1',
+      basis: { via: 'followup', rules: ['copy', 'visual'] },
+      actor: { source: 'github', id: 'royce' },
+      scope: 'one typo'
+    }
+  })
+}
+
+/** 开播正文的固定输入（与真 launch 同一形状）。 */
+const BRIEF = {
+  short: 'fix-the-typo',
+  directory: '/tmp/superagent-worktrees/superagent-fix-the-typo',
+  cliPath: LAUNCH.cliPath,
+  tokenFile: LAUNCH.tokenFile,
+  environment: {}
+} as const
+
+test('a proactive ticket briefs its matched rules and the local-only limit', () => {
+  const brief = renderAssignmentBrief({ ticket: proactiveTicket(), trigger: trigger(), ...BRIEF })
+  assert.ok(brief.includes('Proactively accepted'), brief)
+  for (const rule of ['copy', 'visual']) assert.ok(brief.includes(rule), `the brief names ${rule}`)
+  assert.ok(brief.includes('only the local small change'), brief)
+  // 显式票没有这段限制：它的授权来自那条消息，不需要额外收窄。
+  const explicit = renderAssignmentBrief({ ticket: ticket(), trigger: trigger(), ...BRIEF })
+  assert.equal(explicit.includes('only the local small change'), false)
+})
+
+test('every later input to a proactive ticket repeats the local-only limit', () => {
+  const markdown = renderInputMarkdown(
+    proactiveTicket(),
+    { id: 'input-2', kind: 'text', text: 'a person replied', at: AT },
+    2,
+    undefined
+  )
+  assert.ok(markdown.includes('only the local small change'), markdown)
+  const explicit = renderInputMarkdown(
+    ticket(),
+    { id: 'input-2', kind: 'text', text: 'a person replied', at: AT },
+    2,
+    undefined
+  )
+  assert.equal(explicit.includes('only the local small change'), false)
 })
 
 test('three failed launches mark the ticket failed and put the launch health entry in error', async () => {

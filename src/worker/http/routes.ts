@@ -172,6 +172,8 @@ export const ROUTE_TABLE: readonly RouteDefinition[] = [
   { method: 'POST', path: 'prompts/preview', command: 'prompts save --preview', minimumRole: 'router', handler: stub },
 
   // ---- Router 的动作（§F.6）
+  { method: 'POST', path: 'route', command: 'route', minimumRole: 'router', handler: stub },
+  { method: 'POST', path: 'eval-decide/:id', command: 'eval-decide', minimumRole: 'router', handler: stub },
   { method: 'POST', path: 'policy-sync/:id', command: 'policy sync', minimumRole: 'router', handler: stub },
   { method: 'POST', path: 'triggers/:id/requeue', command: 'trigger requeue', minimumRole: 'router', handler: stub },
   { method: 'POST', path: 'threads/:key/unsubscribe', command: 'thread unsubscribe', minimumRole: 'router', handler: stub },

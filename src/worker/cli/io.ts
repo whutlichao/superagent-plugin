@@ -37,6 +37,8 @@ export interface ParsedArgs {
   readonly words: readonly string[]
   /** `--flag value` 与 `--flag=value` 合并后的记录；开关值为 `true`。 */
   readonly flags: Readonly<Record<string, string | true>>
+  /** 可重复 flag 的全部取值，按出现顺序（`--item` 是唯一的：§G.2 的 route）。 */
+  readonly repeated: Readonly<Record<string, readonly string[]>>
   /** `--text`：人读文本输出；缺省（或 `--json`）是 JSON 信封。 */
   readonly text: boolean
   /**
@@ -77,19 +79,35 @@ export const BOOLEAN_FLAGS: readonly string[] = [
 ]
 
 /**
+ * 可以重复出现的 flag：`route --item '<json>' --item '<json>'`（§G.2 的 route 行）。
+ * 其余 flag 重复一次仍是 `invalid_params`：不允许「最后一个默默胜出」。
+ */
+export const REPEATABLE_FLAGS: readonly string[] = ['item']
+
+/**
  * 解析 argv（不含 `node` 与脚本路径）。
  *
  * 规则：
  * - `--flag=value` 与 `--flag value` 等价；布尔开关不吃下一个词；
  * - `--` 之后的一切都是普通词（以 `-` 开头的路径/长文本）；
- * - 缺值、空 flag 名、重复 flag、以及 `--token` 一律抛 `invalid_params`（退出 2）；
+ * - 缺值、空 flag 名、重复 flag（`REPEATABLE_FLAGS` 除外）、以及 `--token` 一律抛
+ *   `invalid_params`（退出 2）；
  * - 错误消息只提**这一个** flag 的名字：不回显 argv（argv 里可能有消息正文），也不回显值。
  */
 export function parseArgs(argv: readonly string[]): ParsedArgs {
   const flags: Record<string, string | true> = {}
+  const repeated: Record<string, string[]> = {}
   const words: string[] = []
   let textValue: string | undefined
   let index = 0
+
+  const remember = (name: string, value: string): void => {
+    if (REPEATABLE_FLAGS.includes(name)) {
+      repeated[name] = [...(repeated[name] ?? []), value]
+      return
+    }
+    flags[name] = value
+  }
 
   while (index < argv.length) {
     const word = argv[index] as string
@@ -109,11 +127,11 @@ export function parseArgs(argv: readonly string[]): ParsedArgs {
     const equals = body.indexOf('=')
     const name = equals < 0 ? body : body.slice(0, equals)
     if (name.length === 0) throw invalidFlag('an empty flag name')
-    if (Object.prototype.hasOwnProperty.call(flags, name)) {
+    if (Object.prototype.hasOwnProperty.call(flags, name) && !REPEATABLE_FLAGS.includes(name)) {
       throw invalidFlag(`--${name} was given more than once`)
     }
     if (equals >= 0) {
-      flags[name] = body.slice(equals + 1)
+      remember(name, body.slice(equals + 1))
       continue
     }
     if (BOOLEAN_FLAGS.includes(name)) {
@@ -129,10 +147,16 @@ export function parseArgs(argv: readonly string[]): ParsedArgs {
     const value = argv[index]
     if (value === undefined || value.startsWith('--')) throw invalidFlag(`--${name} needs a value`)
     index += 1
-    flags[name] = value
+    remember(name, value)
   }
 
-  return { words, flags, text: flags['text'] === true, ...(textValue === undefined ? {} : { textValue }) }
+  return {
+    words,
+    flags,
+    repeated,
+    text: flags['text'] === true,
+    ...(textValue === undefined ? {} : { textValue })
+  }
 }
 
 /** `invalid_params` 的统一构造：只提 flag 名，不作任何回显。 */
