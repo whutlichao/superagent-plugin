@@ -150,6 +150,27 @@ export const COPY = {
   'mandate.cell.listedUnaddressed': { zh: '名单内、未点名', en: 'Listed, not addressed' },
   'mandate.cell.unlistedAddressed': { zh: '名单外、点名', en: 'Unlisted, addressed' },
   'mandate.cell.unlistedUnaddressed': { zh: '名单外、未点名', en: 'Unlisted, not addressed' },
+  // ---- Eval 页（§M.2 的 Eval 行、§K.7 的四条件）----
+  'eval.empty': { zh: '没有决定。', en: 'No decisions.' },
+  'eval.openThread': { zh: '打开线程', en: 'Open thread' },
+  'eval.openTicket': { zh: '打开工单', en: 'Open ticket' },
+  'eval.dismiss': { zh: '不再提示', en: 'Dismiss' },
+  'eval.dismissed': { zh: '已不再提示', en: 'Dismissed' },
+  'eval.dismissedHint': {
+    zh: '这条问题已经 dismiss，不再计入待人工；记录仍在，可以随时回看。',
+    en: 'This problem was dismissed, so it no longer counts as needing a person; the record stays for review.'
+  },
+  'eval.needsPerson': { zh: '待人工', en: 'Needs a person' },
+  'eval.unresolved': {
+    zh: '24 小时内有 {count} 条未完成的评估仍要人看。',
+    en: '{count} unresolved unavailable decision(s) in the last 24 h still need a person.'
+  },
+  'eval.needsPersonHint': {
+    zh: '它仍是该线程最新的决定、未 dismiss，且线程不在排队或评估中，所以现在算待人工。',
+    en: "It is still its Thread's latest decision, not dismissed, and the Thread is not queued or evaluating, so it counts as needing a person now."
+  },
+  'eval.actions': { zh: '决定动作', en: 'Decision actions' },
+  'eval.noReasons': { zh: '这条决定没有记原因。', en: 'This decision recorded no reason.' },
   'overview.problems': { zh: '系统问题', en: 'System problems' },
   'overview.problemsEmpty': { zh: '没有系统问题。', en: 'No system problems.' },
   'overview.problemKind.health': { zh: '健康错误', en: 'Health error' },
@@ -186,6 +207,7 @@ export const COPY = {
 
   // ---- 页头与通用操作 ----
   'action.refresh': { zh: '重新检查', en: 'Check again' },
+  'action.back': { zh: '返回列表', en: 'Back to the list' },
   'action.open': { zh: '打开', en: 'Open' },
   'action.details': { zh: '查看全部', en: 'See all' },
   'action.save': { zh: '保存', en: 'Save' },
@@ -690,6 +712,7 @@ export const COPY = {
   'userError.unknownTicket': { zh: '未知的工单', en: 'Unknown ticket' },
   'userError.unknownTrigger': { zh: '未知的触发', en: 'Unknown trigger' },
   'userError.unknownAssignment': { zh: '未知的派工', en: 'Unknown assignment' },
+  'userError.unknownDecision': { zh: '未知的决定', en: 'Unknown decision' },
   'userError.unknownProblem': { zh: '找不到这条未完成的评估', en: 'Unavailable Eval not found' },
   'userError.ticketEnded': { zh: '工单已结束', en: 'Ticket has ended' },
   'userError.assignmentEnded': {

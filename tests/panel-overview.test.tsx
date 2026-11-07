@@ -539,7 +539,9 @@ test('the worker read model turns health errors, failing replies and unresolved 
       id: 'unavailable:d1',
       kind: 'unavailable',
       name: 'thread-7',
-      detail: 'The model could not judge this request'
+      detail: 'The model could not judge this request',
+      // #40：Overview 的行把背后的 Decision id 带上，点行时 Eval 页直接打开那一条。
+      decisionId: 'd1'
     }
   ])
   // 没有 detail 的健康条目也有一行：部件报 error 就是事实，不因缺说明而消失。
