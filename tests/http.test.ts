@@ -760,6 +760,8 @@ test('the route table carries every row §G.3 names', () => {
   const rows = ROUTE_TABLE.map((route) => `${route.method} ${route.path}`).sort()
   assert.deepEqual(rows, [
     'GET decisions',
+    'GET eval-read/:id',
+    'GET eval/:id',
     'GET models',
     'GET overview',
     'GET policy/history',
@@ -1041,8 +1043,8 @@ test('every route refuses a role below its minimum with not_permitted_role', asy
         checked += 1
       }
     }
-    // 37 条路由：32 条高于 assignment（5 条是 assignment 档），13 条是 operator → 45 次拒绝。
-    assert.equal(checked, 45, 'every route above assignment refuses it, and every operator route refuses router')
+    // 39 条路由：34 条高于 assignment（5 条是 assignment 档），13 条是 operator → 47 次拒绝。
+    assert.equal(checked, 47, 'every route above assignment refuses it, and every operator route refuses router')
   } finally {
     harness.close()
   }

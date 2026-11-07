@@ -98,6 +98,9 @@ import { resumeAfterUpgrade, type ResumeReport } from './executor/resume.ts'
 import { DEFAULT_MAX_WORKERS } from './http/state.ts'
 import { createDomainHandlers, withDomainHandlers } from './http/domain.ts'
 import { createAssessmentHandlers, withAssessmentHandlers } from './http/assessment.ts'
+import { createEvalHandlers, withEvalHandlers } from './http/eval.ts'
+import { createEvalTools } from './app/eval.ts'
+import { admissionSettingsOf } from './sources/admission-context.ts'
 import { createDecisionHandlers, withDecisionHandlers } from './http/decisions.ts'
 import { createPromptHandlers, withPromptHandlers } from './http/prompts.ts'
 import { createPromptVersions } from './app/prompts.ts'
@@ -773,6 +776,25 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
     ticketOf: (id) => repo.tickets.get(id),
     log: (message) => logger.warn(message)
   })
+  // Router 的两条评估读命令（§G.2 的 `eval` / `eval-read`）：窗口页数与超时来自部署设置
+  // （§H.22），语境经 kind 的 `threadContext`（§I.1），`--path` 只允许 base repo 与 Ticket
+  // worktree（§O）。候选、Trigger 与 worktree 都现读，重启后不必重建。
+  const evalAdmission = admissionSettingsOf(settings)
+  const evalRoots = (): readonly string[] => [
+    ...(executorSettings.baseRepo?.path === undefined ? [] : [executorSettings.baseRepo.path]),
+    ...repo.tickets
+      .list()
+      .flatMap((ticket) => (ticket.execution === undefined ? [] : [ticket.execution.directory]))
+  ]
+  const evalTools = createEvalTools({
+    candidate: (triggerId) => engine.candidate(triggerId),
+    trigger: (triggerId) => repo.triggers.get(triggerId),
+    threadContext: (trigger) => registry.threadContext(trigger, sourceSettings),
+    commands: commandPort,
+    admission: () => evalAdmission,
+    roots: evalRoots,
+    log: (message) => logger.info(message)
+  })
   // Prompt 配置的读/写面（§L.4、§L.5）：版本库、部署事实与「保存后通知 Router」都在这里接线。
   // 部署事实给的是**路径**（CLI 的绝对路径、调用者自己的 token 文件），绝不写 token 值（§D.6）；
   // 保存产生新版本时，Router 保活器把 revision 换成一条短消息排队——不重启会话（§F.4）。
@@ -790,14 +812,17 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
   })
   const routes: readonly RouteDefinition[] = withDecisionHandlers(
     withPromptHandlers(
-      withAssessmentHandlers(
-        withDomainHandlers(ROUTE_TABLE, domain),
-        createAssessmentHandlers({
-          tools: routerTools,
-          afterWrite: () => {
-            refresh()
-          }
-        })
+      withEvalHandlers(
+        withAssessmentHandlers(
+          withDomainHandlers(ROUTE_TABLE, domain),
+          createAssessmentHandlers({
+            tools: routerTools,
+            afterWrite: () => {
+              refresh()
+            }
+          })
+        ),
+        createEvalHandlers({ tools: evalTools })
       ),
       prompts
     ),

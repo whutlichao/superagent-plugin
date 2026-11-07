@@ -3,7 +3,8 @@
 //
 // 三类命令：
 // - **已接线**：`status`、`health`、`pause`、`resume`、`setup check`、`source labels`、
-//   `admin backup`、`admin rotate-token`、`doctor`，以及运维读面（`read <resource>`）；
+//   `admin backup`、`admin rotate-token`、`doctor`，运维读面（`read <resource>`），Router 的
+//   评估面（`eval` / `eval-read` / `eval-decide` / `route`）与 Worker 的命令；
 // - **纯分派**：已接线的命令也**不重写业务逻辑**——它把参数变成一次 HTTP 调用，真正的工作
 //   在 worker 的 handler 里（§G「两层，同一份 handler」）；
 // - **未落地**：Router/Worker 的命令先占住最终名字与参数，返回固定 `unavailable`
@@ -20,7 +21,12 @@ import type { CliResponse } from './transport.ts'
 import { requestJson } from './transport.ts'
 import type { CliTarget } from './target.ts'
 import { encodePathSegment } from './target.ts'
-import { READ_MAX_LIMIT, READ_DEFAULT_LIMIT, READ_RESOURCES } from '../http/api-types.ts'
+import {
+  EVAL_READ_PARTS,
+  READ_MAX_LIMIT,
+  READ_DEFAULT_LIMIT,
+  READ_RESOURCES
+} from '../http/api-types.ts'
 import { EXIT, exitForCode, type Envelope, type ExitCode, type ParsedArgs } from './io.ts'
 
 /**
@@ -235,7 +241,7 @@ export const CLI_COMMANDS: readonly CommandDefinition[] = [
     flags: [],
     positionals: [{ name: 'trigger_id', required: true }],
     write: false,
-    available: false
+    available: true
   },
   {
     name: ['eval-read'],
@@ -243,13 +249,13 @@ export const CLI_COMMANDS: readonly CommandDefinition[] = [
     flags: [
       { name: 'message-id', kind: 'value', hint: 'message to read' },
       { name: 'image-id', kind: 'value', hint: 'image to download' },
-      { name: 'part', kind: 'value', hint: 'root | parent | thread', choices: ['root', 'parent', 'thread'] },
+      { name: 'part', kind: 'value', hint: 'root | parent | thread', choices: EVAL_READ_PARTS },
       { name: 'cursor', kind: 'value', hint: 'continue a paged part' },
       { name: 'path', kind: 'value', hint: 'a path inside the repository' }
     ],
     positionals: [{ name: 'trigger_id', required: true }],
     write: false,
-    available: false
+    available: true
   },
   {
     name: ['eval-decide'],
@@ -895,6 +901,26 @@ async function run(
     }
     case 'route':
       return call('route', { method: 'POST', body: { decisions: await routeDecisions(args, input) } })
+    // ---- 评估面（§G.2 的 eval / eval-read）：路径参数是 trigger id，读法进查询串。
+    case 'eval': {
+      const triggerId = args.positionals[0] ?? ''
+      if (triggerId.length === 0) {
+        throw new ApiError(ERROR_CODES.invalidParams, 'eval needs a trigger id', { argument: 'trigger_id' })
+      }
+      return call(`eval/${encodePathSegment(triggerId)}`, { method: 'GET' })
+    }
+    case 'eval-read': {
+      const triggerId = args.positionals[0] ?? ''
+      if (triggerId.length === 0) {
+        throw new ApiError(ERROR_CODES.invalidParams, 'eval-read needs a trigger id', {
+          argument: 'trigger_id'
+        })
+      }
+      return call(`eval-read/${encodePathSegment(triggerId)}`, {
+        method: 'GET',
+        query: evalReadQuery(args)
+      })
+    }
     case 'eval-decide': {
       const triggerId = args.positionals[0] ?? ''
       if (triggerId.length === 0) {
@@ -920,6 +946,35 @@ async function run(
         error: unavailableFor(command.name)
       }
   }
+}
+
+/**
+ * `eval-read` 的查询串：`--message-id` / `--image-id` / `--part` / `--path` **恰好一种**，
+ * `--cursor` 只属于 `--part thread`（§G.2）。形状在客户端先判（`invalid_params`，退出 2），
+ * 与 handler 校验共用同一组规则（`app/eval.ts` 的 `validateEvalRead`）。
+ */
+export function evalReadQuery(args: CommandArgs): Record<string, string> {
+  const fields = compact({
+    'message-id': valueArgs(args.flags, 'message-id'),
+    'image-id': valueArgs(args.flags, 'image-id'),
+    part: valueArgs(args.flags, 'part'),
+    cursor: valueArgs(args.flags, 'cursor'),
+    path: valueArgs(args.flags, 'path')
+  })
+  const forms = ['message-id', 'image-id', 'part', 'path']
+  if (forms.filter((form) => fields[form] !== undefined).length !== 1) {
+    throw new ApiError(
+      ERROR_CODES.invalidParams,
+      'eval-read takes exactly one of --message-id, --image-id, --part, --path',
+      { forms: forms.join(',') }
+    )
+  }
+  if (fields['cursor'] !== undefined && fields['part'] !== 'thread') {
+    throw new ApiError(ERROR_CODES.invalidParams, '--cursor belongs to --part thread', {
+      flag: 'cursor'
+    })
+  }
+  return fields
 }
 
 /** `read <resource>` 的路径（`thread/<key>` 与 `ticket/<id>` 各占一段参数）。 */

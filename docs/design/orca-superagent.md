@@ -814,8 +814,10 @@ Router/Worker 用的命令（等价上游 `orchestrator_*` 工具）：
 | `superagent route` | `--decisions <file\|-> `（JSON 数组，1–20）或重复 `--item '<json>'` | `{results:[{kind, decision?, reason, ticket?, triggerIds?, refused?}]}`，顺序与入参一致 | `refused_item`（单条，内嵌在 results）、`too_many_items`、`invalid_params` |
 | `superagent read <resource>` | `--offset N`、`--limit N`（默认 20，上限 50；文本页默认 4000 字符，上限 8000） | `{items, next_offset}` 或单对象 | `unknown_resource`、`refused`（角色不可读）、`missing` |
 | `superagent eval <trigger_id>` | — | 候选窗口：`{trigger, batch, threadWindow, relatedTickets, ticketsTotal, policyVersion, stubs}` | `not_a_candidate`、`missing`、`rate_limited` |
-| `superagent eval-read <trigger_id>` | 必含其一：`--message-id`、`--image-id`、`--part root\|parent\|thread`（可加 `--cursor`）、`--path <repo 内路径>` | `{messages?, message?, image?, next?, path?}` | `not_a_candidate`、`missing`、`too_large` |
+| `superagent eval-read <trigger_id>` | 必含其一：`--message-id`、`--image-id`、`--part root\|parent\|thread`（可加 `--cursor`）、`--path <repo 内路径>` | `{messages?, message?, image?, next?, path?}` | `not_a_candidate`、`missing`、`too_large`（`--path` 越界是 `refused`，§O） |
 | `superagent eval-decide <trigger_id>` | `--assessment <file\|->`（direction/rule_assessments/intent_evidence/acknowledgement/worktree_name/scope/reason） | `{decision, reason, ticket?}` | `invalid_assessment`、`incomplete_rules`、`policy_changed`、`too_late` |
+
+`eval` 的窗口按 §I.1 的 `threadContext` 读，**只对推断候选**可用（显式请求走 `route`；`not_a_candidate` 的 `values.reason` 区分 `explicit` 与 `not_assessing`），页数与超时取部署设置 `admissionContextMaxPages` / `admissionContextTimeoutMs`（§H.22）。窗口的七个字段是：`trigger`（正文最多 4000 字符，被截断时带 `truncated`/`chars`，并列出它自己的图片 id）、`batch`（同批其余 Trigger，每条最多 400 字符）、`threadWindow`（`{complete, loadedMessages, sourceFound, next?, messages[], error?}`；消息是 Thread 开头 5 条 + Trigger 前后各 5 条，最近两条邻居最多 1200 字符、其余 400，Trigger 自己只标 `trigger:true`）、`relatedTickets`/`ticketsTotal`（该 Thread 的 Ticket，开着的在前、新的在前，最多 8 条）、`policyVersion`（与 `eval-decide` 校验的是同一个）、`stubs`（窗口之外已加载的消息：`{id, from, at, chars, preview}`，预览 50 字符）。`eval-read --message-id` 按 id 读其中任意一条的全文；同一 `evalId` 的语境在进程内只加载一次（重启即丢，重新 `eval` 即可）。
 | `superagent ticket retry <ticket_id>` | — | `{retried:true, assignment}` | `not_retryable`、`missing` |
 | `superagent ticket stop <ticket_id>` | `--reason <text>`（可选） | `{stopped:true}` | `already_ended`、`missing` |
 | `superagent ticket note <ticket_id>` | `--text <text>`（≤ 100 词） | `{sent:true}` | `too_long`、`missing` |
@@ -874,6 +876,7 @@ Router/Worker 用的命令（等价上游 `orchestrator_*` 工具）：
 | `POST router/restart` | Router 重启（面板动作） | |
 | `POST workspaces/:id/open` | `host.call('workspace.open')` | 面板无此 Host 方法，必须走 worker |
 | `GET models` | 可用模型清单（来自 Orca 启动时的模型参数与设置） | 见 §H.17 |
+| `GET eval/:id`、`GET eval-read/:id` | `eval`、`eval-read` | `eval-read` 的四种读法是查询串：`message-id`、`image-id`、`part`（+`cursor`）、`path`；角色 ≥ router |
 | `POST doctor` | `doctor` | |
 
 鉴权与边界（逐条都要在 `http.test.ts` 里测）：
@@ -1006,6 +1009,8 @@ export interface SourceKind<C = unknown> {
 ```
 
 `SourceContext`（由 `app/source-context.ts` 构造）给 kind 的只有：`ready`、`configured()`、`problem`、`config<C>(kind)`、`receive(trigger)`、`atomic(fn)`、`state`（typed kv）、`threads.describe/patch`、`tickets.bindThread/threadClosed`、`triggers.read`、`notify`、`report(entry, health)`、`commands.withSignal`。
+
+图片的 id 是 `threadContext.image` 与 `eval-read --image-id` 之间的唯一契约：**`<message-id>/<image-key>`**。`eval` 窗口在每条消息上列出这样组合出来的 `images[]`（key 由 `threadContext.images(text)` 从正文认出），`eval-read --image-id` 原样把它交回 `threadContext.image`；kind 只接受自己正文里出现过的 key（与上游 `image` 的校验同），绝不下载任意远端 id。
 
 ### I.2 GitHub
 

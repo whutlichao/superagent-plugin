@@ -18,6 +18,9 @@ import { parseArgs } from '../src/worker/cli/io'
 import { main } from '../src/worker/cli/main'
 import { createDomainHandlers, withDomainHandlers } from '../src/worker/http/domain'
 import { createAssessmentHandlers, withAssessmentHandlers } from '../src/worker/http/assessment'
+import { createEvalHandlers, withEvalHandlers } from '../src/worker/http/eval'
+import { createEvalTools } from '../src/worker/app/eval'
+import { FakeCommands } from './support/fake-commands'
 import { createPromptHandlers, withPromptHandlers } from '../src/worker/http/prompts'
 import { createPromptVersions } from '../src/worker/app/prompts'
 import type { Store } from '../src/worker/app/store'
@@ -111,6 +114,42 @@ const WIRED: readonly (readonly [string, Case, Case])[] = [
       token: 'router'
     },
     { argv: ['route'], exit: 2, code: 'invalid_params' }
+  ],
+  // 评估面（§G.2 的 eval / eval-read）：router 可用、读同一份 handler；非候选是 missing。
+  [
+    'eval',
+    {
+      argv: ['eval', 'trigger-1'],
+      exit: 0,
+      resultKeys: [
+        'trigger',
+        'batch',
+        'threadWindow',
+        'relatedTickets',
+        'ticketsTotal',
+        'policyVersion',
+        'stubs'
+      ],
+      token: 'router'
+    },
+    { argv: ['eval', 'nope'], exit: 2, code: 'missing', token: 'router' }
+  ],
+  [
+    'eval-read',
+    {
+      argv: ['eval-read', 'trigger-1', '--message-id', 'trigger-1'],
+      exit: 0,
+      resultKeys: ['message'],
+      token: 'router'
+    },
+    // 四种读法必须恰好给一种：两种就是参数错误，且不发请求。
+    {
+      argv: ['eval-read', 'trigger-1', '--message-id', 'x', '--part', 'thread'],
+      exit: 2,
+      code: 'invalid_params',
+      token: 'router',
+      offline: true
+    }
   ],
   [
     'eval-decide',
@@ -227,8 +266,6 @@ const WIRED: readonly (readonly [string, Case, Case])[] = [
 
 /** 未落地命令：唯一的用例就是那条固定的 `unavailable`（离线，退出 3）。 */
 const PENDING: readonly string[][] = [
-  ['eval', 't-1'],
-  ['eval-read', 't-1'],
   ['ticket', 'list'],
   ['trigger', 'requeue', 't-1'],
   ['thread', 'unsubscribe', 'k'],
@@ -263,23 +300,12 @@ function ticketForCommands(): Ticket {
 }
 
 /**
- * Router 命令的替身宿主：`trigger-1` 有一个显式的候选，其余 trigger 没有 Eval（too_late）。
- * 领域写入被固定为一条 ignore Decision（route / eval-decide 的形状与错误码是这里的断言面，
- * 真正的领域行为在 `route.test.ts` 用真 Engine 覆盖）。
+ * Router 命令的替身宿主：`trigger-1` 有一个推断候选（`eval` / `eval-read` 只对推断候选可用），
+ * 其余 trigger 没有 Eval（too_late）。领域写入被固定为一条 ignore Decision（route /
+ * eval-decide 的形状与错误码是这里的断言面，真正的领域行为在 `route.test.ts` 用真 Engine 覆盖）。
  */
-function commandRouterTools() {
+function commandFixture(): { ticket: Ticket; trigger: Candidate['triggers'][number]; candidate: Candidate } {
   const ticket = ticketForCommands()
-  const decision: Decision = {
-    id: 'decision-1',
-    evalId: 'eval-1',
-    threadKey: 'github:acme/widgets#42',
-    triggerIds: ['trigger-1'],
-    policyVersion: 'v1',
-    at: AT,
-    kind: 'ignore',
-    reason: [{ code: 'noRuleMatched' }],
-    strength: 'explicit'
-  }
   const trigger = {
     id: 'trigger-1',
     source: 'github',
@@ -302,9 +328,25 @@ function commandRouterTools() {
       meta: {}
     },
     triggers: [trigger],
-    strength: 'explicit',
+    strength: 'inferred',
     policyVersion: 'v1',
     tickets: []
+  }
+  return { ticket, trigger, candidate }
+}
+
+function commandRouterTools() {
+  const { ticket, candidate } = commandFixture()
+  const decision: Decision = {
+    id: 'decision-1',
+    evalId: 'eval-1',
+    threadKey: 'github:acme/widgets#42',
+    triggerIds: ['trigger-1'],
+    policyVersion: 'v1',
+    at: AT,
+    kind: 'ignore',
+    reason: [{ code: 'noRuleMatched' }],
+    strength: 'inferred'
   }
   return createRouterTools({
     candidate: (triggerId) => (triggerId === 'trigger-1' ? candidate : undefined),
@@ -323,9 +365,30 @@ function commandRouterTools() {
  */
 function commandRoutes(store: Store): readonly RouteDefinition[] {
   const ticket = ticketForCommands()
+  const { trigger, candidate } = commandFixture()
+  const evalTools = createEvalTools({
+    candidate: (triggerId) => (triggerId === trigger.id ? candidate : undefined),
+    trigger: (triggerId) => (triggerId === trigger.id ? trigger : undefined),
+    // 语境：这条 Thread 只有 Trigger 自己那条消息（图片能力缺席）。
+    threadContext: () => ({
+      messageId: trigger.id,
+      read: async () => ({
+        messages: [{ id: trigger.id, from: trigger.actor.id, at: trigger.at, text: trigger.text }],
+        body: {}
+      }),
+      images: () => [],
+      image: async () => {
+        throw new Error('This Source has no images')
+      }
+    }),
+    commands: new FakeCommands(),
+    admission: () => ({ maxPages: 1, timeoutMs: 1_000 }),
+    roots: () => []
+  })
   return withPromptHandlers(
-    withAssessmentHandlers(
-      withDomainHandlers(
+    withEvalHandlers(
+      withAssessmentHandlers(
+        withDomainHandlers(
         ROUTE_TABLE,
         createDomainHandlers({
           report: () => ticket,
@@ -351,9 +414,11 @@ function commandRoutes(store: Store): readonly RouteDefinition[] {
                 ? { ...ticket, ended: { at: AT, by: 'human', outcome: 'stopped' } }
                 : undefined,
           tickets: () => [ticket]
-        })
+          })
+        ),
+        createAssessmentHandlers({ tools: commandRouterTools() })
       ),
-      createAssessmentHandlers({ tools: commandRouterTools() })
+      createEvalHandlers({ tools: evalTools })
     ),
     createPromptHandlers({
       versions: createPromptVersions({ store, now: () => AT }),
