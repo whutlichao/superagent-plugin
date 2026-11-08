@@ -37,7 +37,8 @@ export function emptySettingsPage(): SettingsPageView {
         blockedCommands: [],
         inlineLimit: 1000,
         worktreeRetention: 'keep',
-        confirmDelivery: true
+        confirmDelivery: true,
+        githubCommitEmail: ''
       },
       repos: [],
       variables: ['DSH_SUPERAGENT_DIR']

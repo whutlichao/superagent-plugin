@@ -1082,8 +1082,8 @@ export const COPY = {
 
   // ---- Settings 页（§M.3、§K.8）：五组框架、每组保存栏与历史 ----
   'settings.intro': {
-    zh: '每组一个保存栏：没有改动时不占空间。保存成功的改动对 Policy 立刻生效；其余块在插件重启后生效。',
-    en: 'One save bar per group; it takes no space while the draft is empty. Policy changes take effect at once; the other blocks take effect after the plugin restarts.'
+    zh: '每组一个保存栏：没有改动时不占空间。Policy 与提交邮箱保存即生效；其余块在插件重启后生效。',
+    en: 'One save bar per group; it takes no space while the draft is empty. Policy and the commit email take effect at once; the other blocks take effect after the plugin restarts.'
   },
   'settings.group.sources': { zh: '来源', en: 'Sources' },
   'settings.group.eval': { zh: '评估', en: 'Eval' },
@@ -1168,12 +1168,17 @@ export const COPY = {
 
   // Execution 组
   'settings.execution.intro': {
-    zh: 'worker 怎么起、在哪儿工作、哪些命令不许跑。这里的值在插件重启后生效。',
-    en: 'How workers start, where they work and which commands they may not run. These values take effect after the plugin restarts.'
+    zh: 'worker 怎么起、在哪儿工作、哪些命令不许跑。提交邮箱保存即生效；其余值在插件重启后生效。',
+    en: 'How workers start, where they work and which commands they may not run. The commit email applies as soon as it is saved; the other values take effect after the plugin restarts.'
   },
   'settings.execution.agent': { zh: 'Agent', en: 'Agent' },
   'settings.execution.model': { zh: '模型', en: 'Model' },
   'settings.execution.modelHint': { zh: '留空表示用 Agent 的默认模型。', en: "Leave it empty to use the agent's default model." },
+  'settings.execution.githubCommitEmail': { zh: '提交邮箱（noreply）', en: 'Commit email (noreply)' },
+  'settings.execution.githubCommitEmailHint': {
+    zh: 'agent 账号的 noreply 地址（形如 1234567+agent@users.noreply.github.com）；worker 的提交身份用它，空着部署检查会报 gitconfig_missing。只填 agent 自己的地址，不要填你的个人邮箱。',
+    en: "The agent account's noreply address (1234567+agent@users.noreply.github.com). Worker commits use it; while it is empty the deployment check reports gitconfig_missing. Use the agent's own address, never your personal one."
+  },
   'settings.execution.effort': { zh: 'Effort', en: 'Effort' },
   'settings.execution.effortHint': { zh: '留空表示用 Agent 的默认 effort。', en: "Leave it empty to use the agent's default effort." },
   'settings.execution.maxWorkers': { zh: '并发上限', en: 'Max workers' },

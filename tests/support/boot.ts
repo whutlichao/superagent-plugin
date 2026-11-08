@@ -75,6 +75,8 @@ export async function openBoot(options: {
   readonly boot?: (stateDir: string, runtime: FakeOrcaRuntime, commands: FakeCommands) => Promise<BootHandle>
   /** §O 的 handler 预算（测试注入小预算；缺省是各 handler 的常量）。 */
   readonly budgets?: BootOptions['budgets']
+  /** 注入的毫秒时钟：与夹具里写死的时间戳同一时刻的用例给它（活动计数按 24 h 窗口统计）。 */
+  readonly nowMs?: () => number
 } = {}): Promise<BootHarness> {
   const stateDir = options.stateDir ?? mkdtempSync(join(tmpdir(), 'superagent-boot-'))
   const worktrees = mkdtempSync(join(tmpdir(), 'superagent-worktrees-'))
@@ -106,6 +108,7 @@ export async function openBoot(options: {
       commands,
       stateDir,
       disableTimers: true,
+      ...(options.nowMs === undefined ? {} : { nowMs: options.nowMs }),
       // §O 的预算：测试用小预算，面板与 HTTP 走同一份（面板请求也不能占住 worker）。
       ...(options.budgets === undefined ? {} : { budgets: options.budgets })
     }))

@@ -784,7 +784,7 @@ Trigger 的 `meta`），不由 agent 发现；`${DSH_SUPERAGENT_*}` 的替换只
 原样留给 shell。`executor.blockedCommands` 的 shim 与 `GIT_CONFIG_GLOBAL` 由 launch 钩子注入
 （§H.11）；shim 只让被禁命令非零退出，**不是安全边界**——这句同时写在 shim 的 stderr、设计
 §H.11 与面板 Settings/Deployment 的文案里（#42/#47 的落点）。`GIT_CONFIG_GLOBAL` 指向的
-`<stateDir>/worker-gitconfig` 由启动与 `superagent setup check` 写入（#52），文件不存在时
+`<stateDir>/worker-gitconfig` 由启动、保存 `executor` 块与 `superagent setup check` 写入（#52），文件不存在时
 **不注入**：指向一个不存在的文件会让 git 停止加载用户级配置，比回落更糟。
 
 ---
@@ -1027,7 +1027,7 @@ stateDir：/Users/me/.local/state/orca-superagent
 | H.8 | **DSH skills 注册表**（`skill` 工具按名加载） | 内置 skills 写盘到 `<stateDir>/skills/<name>/SKILL.md`；prompt 给绝对路径并要求 agent 用 `read` 读取；面板可编辑 | 没有「按名自动加载」；靠 prompt 指令 + 文件路径，agent 可能不读 | 是 |
 | H.9 | **`dsh` CLI**（`dsh plugin add`、`dsh superagent --from-default-profile`、`dsh --profile`） | `superagent` CLI（本文 §G）+ `orca` CLI（worktree/agent/terminal）；安装走 Orca 插件安装与审批 | 无 profile 概念、无 `--from-default-profile`；安装步骤完全不同（见规格 issue 的 Solution） | 是 |
 | H.10 | **`ask_user_question` / `present` / plan mode 被从 worker 工具集移除** | 无法移除：worker 是普通 Orca agent，可能弹自己的提问。等价物是 `report --human-action` + 把 agent 的 `blocked` 状态转成 Attention（§E.7） | worker 可能在终端里等人而不是报 `blocked`；此时靠 `agent.status.changed=blocked` 兜住，面板能看到终端摘要 | 是 |
-| H.11 | **进程环境注入**：`worker-bin` 命令 shim（`gh`/`lark-cli` 指向 agent 账号、blocked commands 失败）、`worker-gitconfig`（凭据 helper、SSH→HTTPS、LFS） | a) `agent.launch.before` hook 给**本插件发起的** launch 追加 `env`（PATH 前置 `<stateDir>/bin`；`GIT_CONFIG_GLOBAL=<stateDir>/worker-gitconfig` **只在文件存在时**注入）；b) 该 hook 2 s 预算、失败 fail-open；c) blocked commands 由 shim 脚本 `exit 1` 实现；d) `<stateDir>/worker-gitconfig`（0600，启动与 `superagent setup check` 时写）只含三组键：`credential."https://github.com".helper = !gh auth git-credential`、`url."https://github.com/".insteadOf = git@github.com:`、`user.name`/`user.email`（部署的 agent 账号与其 noreply 邮箱，与 `DSH_SUPERAGENT_GITHUB_ACCOUNT`/`_COMMIT_EMAIL` 同源），**不写**任何 token、secret 或操作者个人身份；身份不全或写不进去时 setup 报 `gitconfig_missing`/`gitconfig_unwritable` 且**不注入**（回落操作者环境）；e) `doctor` 的 `gitconfig` 项只 stat（存在 + 0600），不读内容 | 若 hook 失败/超时，agent 用操作者的 `gh`（可能是个人账号）——**这是真实风险**，所以 setup 检查还会要求 agent 账号的 CLI 包装脚本路径，并在 prompt 里要求一律用该绝对路径；shim 不是安全边界（上游同样声明）。`GIT_CONFIG_GLOBAL` 一旦指向这份文件，用户级全局配置就不再加载：只有写进去的这三组键生效，`filter.lfs.*`（LFS）、`http.*`、用户的 `include.path` 等其余项只剩**系统级**配置——仍是**近似**，LFS 依赖系统配置 | 是 |
+| H.11 | **进程环境注入**：`worker-bin` 命令 shim（`gh`/`lark-cli` 指向 agent 账号、blocked commands 失败）、`worker-gitconfig`（凭据 helper、SSH→HTTPS、LFS） | a) `agent.launch.before` hook 给**本插件发起的** launch 追加 `env`（PATH 前置 `<stateDir>/bin`；`GIT_CONFIG_GLOBAL=<stateDir>/worker-gitconfig` **只在文件存在时**注入）；b) 该 hook 2 s 预算、失败 fail-open；c) blocked commands 由 shim 脚本 `exit 1` 实现；d) `<stateDir>/worker-gitconfig`（0600，启动、保存 `executor` 块与 `superagent setup check` 时写；保存提交邮箱因此不必等一次完整检查）只含三组键：`credential."https://github.com".helper = !gh auth git-credential`、`url."https://github.com/".insteadOf = git@github.com:`、`user.name`/`user.email`（部署的 agent 账号与其 noreply 邮箱，与 `DSH_SUPERAGENT_GITHUB_ACCOUNT`/`_COMMIT_EMAIL` 同源），**不写**任何 token、secret 或操作者个人身份；身份不全或写不进去时 setup 报 `gitconfig_missing`/`gitconfig_unwritable` 且**不注入**（回落操作者环境）；e) `doctor` 的 `gitconfig` 项只 stat（存在 + 0600），不读内容 | 若 hook 失败/超时，agent 用操作者的 `gh`（可能是个人账号）——**这是真实风险**，所以 setup 检查还会要求 agent 账号的 CLI 包装脚本路径，并在 prompt 里要求一律用该绝对路径；shim 不是安全边界（上游同样声明）。`GIT_CONFIG_GLOBAL` 一旦指向这份文件，用户级全局配置就不再加载：只有写进去的这三组键生效，`filter.lfs.*`（LFS）、`http.*`、用户的 `include.path` 等其余项只剩**系统级**配置——仍是**近似**，LFS 依赖系统配置 | 是 |
 | H.12 | **`cordis.patch.yml` 机器配置**（`stateDir`、`promptMaxChars`、`admissionContextMaxPages/TimeoutMs`） | `stateDir`/`superagent.home` 在 `contributes.settings`；其余进面板 Deployment 页（存库，改完即生效，`stateDir` 除外） | 无 YAML、无热重载机制；`stateDir` 变更需重启插件 | 否 |
 | H.13 | **DSH 进程重启**（升级后需重启 profile） | 插件 worker 重启（保存即重启，Orca 管理）；Orca 升级后由 Orca 自己重启 | 插件重启会丢内存态——所有内存态都必须在库/`storage` 里（设计上已要求） | 否 |
 | H.14 | **Inbox relay**（`Sessions.relay` 注入到 turn 的下一步） | `relay` effect 把消息 `sendText` 进 Router 终端（§F.2） | 不保证 Router 在「下一步」看到；快慢取决于 Router 是否在等输入。顺序仍保证（单 key FIFO） | 是 |
@@ -1350,7 +1350,7 @@ interface AdmissionCells {
 - 每个块一个 zod schema（`strict()`）：未知键拒绝、越界拒绝、类型错误拒绝；错误以 `{issues:[{path,message}]}` 返回（400）。
 - 跨块校验：`executor.baseRepo` 必须能在 `orca repo list` 里找到；`executor.agent` 非空；`policy.sources.*.allowed` 的 id 去重、大小写不敏感比较；`feishu.admission` 的 key 必须是已配置 chat、`other` 或 `direct`。
 - 保存校验在**写入前**完成（全有或全无）；账号类字段（`cli`、`repository`）变更会先跑 setup 检查，失败返回 400 且**不写库**。
-- `origin`：`panel | tool | sync | operator`。只有 `panel`/`operator` 能改 `stateDir`、`baseRepo`、`cli` 这类 setup 字段；`tool`（CLI，Router 用的 `settings save`）改这些 → `origin_forbidden`。
+- `origin`：`panel | tool | sync | operator`。只有 `panel`/`operator` 能改 `stateDir`、`baseRepo`、`cli`、`githubCommitEmail` 这类 setup 字段；`tool`（CLI，Router 用的 `settings save`）改这些 → `origin_forbidden`。
 
 ---
 
@@ -1502,7 +1502,7 @@ interface AdmissionCells {
 | --- | --- |
 | Sources | 每个 Source 一张卡：开关、`repository`/`cli`、`observeIssues/Pulls/Comments/Ci`；Feishu 的 chats 行编辑（chatId/name/listen）、`directMessages`、`otherChats`；「Sync now」（Feishu 允许名单纯）、Advanced（`pollSeconds`、`readLimit`） |
 | Eval | Policy version、rules 列表（增删改、启用开关）、`acceptMode`（RadioGroup: off/observe/auto）、`timeoutSeconds`、`model`；**On each Source** 子页：allowed 行编辑、bots、admission 表（每行的三个 cell，按 `rows()` 是否 observe 决定 cell 是否可用）、Feishu 的 `syncChat` |
-| Execution | `agent`、`model`、`effort`、`maxWorkers`、`baseRepo`（Select，来自 `GET models`/`orca repo list` 的 worker 镜像）、`baseBranch`、`branchPrefix`、`prepare`（Textarea + 「插入变量」菜单，点一下把 `${DSH_SUPERAGENT_…}` 插到光标处）、`blockedCommands`（提示语照抄 §H.11：shim 只挡手滑，**不是安全边界**）、`inlineLimit`、`worktreeRetention` |
+| Execution | `agent`、`model`、`effort`、`maxWorkers`、`baseRepo`（Select，来自 `GET models`/`orca repo list` 的 worker 镜像）、`baseBranch`、`branchPrefix`、`prepare`（Textarea + 「插入变量」菜单，点一下把 `${DSH_SUPERAGENT_…}` 插到光标处）、`blockedCommands`（提示语照抄 §H.11：shim 只挡手滑，**不是安全边界**）、`inlineLimit`、`worktreeRetention`、`githubCommitEmail`（agent 账号的 noreply 提交邮箱，§H.11；`executor` 块里唯一保存即生效的字段，空着部署检查报 `gitconfig_missing`） |
 | Prompts | 子 tab：**Edit**（三段团队文本 + 每个内置分片的 override，被改的标 `changed`，模板显示必保留占位符）、**Full prompt**（`CodeView` 全文 + 与「已保存」或「默认」的 `diff.ts` 行级对比）、**History**（版本列表 + 恢复到某版本）、**Skills**（内置只读 + 团队技能增删改） |
 | Deployment | setup 问题 + 「Check again」、`stateDir`（只读 + 复制路径）、机器限额（`promptMaxChars`、`admissionContextMaxPages/TimeoutMs`、`retention.days`）、`paused` 开关、health 明细、`router` 状态（terminal/since/restarts + Restart）、`doctor` 结果（四档计数）、「Rotate token」、Limitations 段（§H 里标「是」的条目摘要） |
 
@@ -1567,7 +1567,7 @@ interface AdmissionCells {
 
 ### N.2 设置项（`contributes.settings` vs 面板）
 
-只有需要用户**在 Orca Settings 里**改的少量项进 manifest（`settings:own`，最多 64 项），其余全在面板：`stateDir`、`agent`、`baseRepo`（这三项决定插件能否启动，值得在 Orca 设置里可见）、`routerAgent`。其余（模型、并发、prepare、blocked commands、CLI 路径、端口、保留策略）都在面板 Deployment/Execution 组里改，存库即生效；`source:<id>` 块的仓库、CLI 与四个 observe 开关同样保存即生效——组合根、Source 页、部署检查与运行时都现读保存过的块（`app/source-config.ts` 是保存块覆盖宿主设置的唯一读法，`boot.ts` 的 `githubConfigResolved()` 是 GitHub 配置的唯一解析处）。`pollSeconds` 例外：轮询定时器的间隔在启动时定一次，改它仍要重启插件，面板据此回 `restarting: true`。两个 agent 设置项的默认值都是 `pi`（#51 的产品决定）：清单的 `default` 是用户在 Orca Settings 看到的初值，`src/worker/app/agent-defaults.ts` 是设置缺失或为空时的代码回落值，两者必须同值；用户可随时在 Orca Settings 覆盖。
+只有需要用户**在 Orca Settings 里**改的少量项进 manifest（`settings:own`，最多 64 项），其余全在面板：`stateDir`、`agent`、`baseRepo`（这三项决定插件能否启动，值得在 Orca 设置里可见）、`routerAgent`。其余（模型、并发、prepare、blocked commands、CLI 路径、端口、保留策略）都在面板 Deployment/Execution 组里改，存库即生效；`source:<id>` 块的仓库、CLI 与四个 observe 开关同样保存即生效——组合根、Source 页、部署检查与运行时都现读保存过的块（`app/source-config.ts` 是保存块覆盖宿主设置的唯一读法，`boot.ts` 的 `githubConfigResolved()` 是 GitHub 配置的唯一解析处）。`pollSeconds` 例外：轮询定时器的间隔在启动时定一次，改它仍要重启插件，面板据此回 `restarting: true`。`executor.githubCommitEmail`（§H.11 的提交身份）保存即生效：部署检查、下一次 launch 的 `env.sh` 与部署事实都现读它，同一块里的其余字段仍在启动时定一次。两个 agent 设置项的默认值都是 `pi`（#51 的产品决定）：清单的 `default` 是用户在 Orca Settings 看到的初值，`src/worker/app/agent-defaults.ts` 是设置缺失或为空时的代码回落值，两者必须同值；用户可随时在 Orca Settings 覆盖。
 
 manifest 声明（对齐 `[skill] manifest.md`）：
 
@@ -1818,6 +1818,7 @@ ENOENT: no such file or directory, open
 | `cli-contract.test.ts` / `tools.test.ts` | 表驱动：每条命令一条成功 + 一条固定拒绝（断言 `error.code`）；入参/出参、请求幂等 | `tools.spec.ts` |
 | `cli-status.test.ts` / `cli-doctor.test.ts` / `cli-entry.test.ts` | `status` 的 0/1/2/3、`doctor` 的四档结论（含单条探针到点 → `timeout`、其余项照常）、可执行入口的端到端（真子进程） | `service-script.spec.ts` |
 | `settings.test.ts` / `settings-view.test.ts` / `settings-limits.test.ts` | 保存与 origin、写前校验、版本记账、账号探针的 §O 预算（挂住的探针 → `unavailable` 且不写库）；Settings 页的 worker 面；四个机器限额 | `settings.spec.ts` |
+| `github-commit-email-setting.test.ts` | 提交邮箱（`executor.githubCommitEmail`，§H.11）的真实入口与链路：设置读面、保存（含 `restarting: false` 与 origin 拒绝）、保存时重写 `<stateDir>/worker-gitconfig`、写失败后的「检查一次」、下一次 launch 的 `env.sh` 与重启后仍生效 | 无（Orca 专有缺陷回归） |
 | `prompts.test.ts` / `cards.test.ts` / `panel-prompts.test.tsx` / `diff.test.ts` | 分片清单、占位符、组装顺序、版本与 default-changed；每个分片必须声明的规则；prompt 配置分区与行 diff（上游 `prompt-config`） | `prompts.spec.ts`、`cards.spec.ts`、`prompt-config.spec.ts`（合并） |
 | `model-surface.test.ts` | 模型能读到的一切（帮助、prompt、skills、Input）与命令表/变量表/术语表一致，且有体量预算 | `model-surface.spec.ts` |
 | `deployment.test.ts` / `agent-defaults.test.ts` / `gitconfig.test.ts` / `main.test.ts` | setup 探针；两个 agent 默认值同源；`worker-gitconfig` 的内容与注入姿态；`activate` 的登记与越权；§O 的面板 host 方法预算（`checkSetup`/`doctor`/`refreshSourceLabels`/`syncSource`/`settingsSave` 与 HTTP 同一份）与 `admin backup` 的入队（`{queued:true}` + effect 落盘） | `deployment.spec.ts`、`index.spec.ts` |

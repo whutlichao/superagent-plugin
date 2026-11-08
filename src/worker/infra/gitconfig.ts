@@ -129,6 +129,22 @@ export function writeWorkerGitConfig(options: {
   }
 }
 
+/**
+ * 删掉 `<stateDir>/worker-gitconfig`（幂等）：身份变得不完整时用它。文件不存在就什么也不做。
+ *
+ * 为什么必须删：`launch-hook.ts` 只按「文件存在」注入 `GIT_CONFIG_GLOBAL`（§H.11 第 d 条）。
+ * 留下上一份身份，worker 会继续用旧邮箱提交，而部署检查同时报 `gitconfig_missing`——两处
+ * 说的是不同的事实。删掉之后注入停止、回落到操作者环境，与「身份不全就不注入」一致。
+ */
+export function clearWorkerGitConfig(stateDir: string): boolean {
+  const path = workerGitConfigPath(stateDir)
+  if (!existsSync(path)) return false
+  const info = statSync(path)
+  if (!info.isFile()) return false
+  unlinkSync(path)
+  return true
+}
+
 /** 现有文件的读数：只 stat，不读内容（doctor 的红线，§O「secret 不落日志」）。 */
 export type WorkerGitConfigInspection =
   | { readonly state: 'missing'; readonly path: string }

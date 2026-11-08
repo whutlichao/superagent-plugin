@@ -31,8 +31,11 @@ export type SettingsOrigin = 'panel' | 'tool' | 'sync' | 'operator'
 /**
  * setup 类字段（§K.8）：改它们要先跑 setup 检查，所以只有面板与 operator 能改。
  * `http/routes.ts` 的角色过滤与这里共用同一份清单。
+ *
+ * `githubCommitEmail` 也在其中：它是 worker 的提交身份（§H.11），写错会把提交记到别人名下，
+ * 所以 CLI（`tool`）与名单同步不能改它。
  */
-export const SETUP_FIELDS = ['stateDir', 'baseRepo', 'cli', 'repository'] as const
+export const SETUP_FIELDS = ['stateDir', 'baseRepo', 'cli', 'repository', 'githubCommitEmail'] as const
 
 /** 保存被拒的错误码（与 HTTP 的 `origin_forbidden` / 字段级 400 / 409 对应）。 */
 export type SettingsErrorCode = 'origin_forbidden' | 'invalid_settings' | 'conflict'

@@ -186,7 +186,8 @@ function settingsView(
         blockedCommands: ['rm'],
         inlineLimit: 1000,
         worktreeRetention: 'keep',
-        confirmDelivery: true
+        confirmDelivery: true,
+        githubCommitEmail: ''
       },
       repos: [{ value: 'path:/repos/widgets', label: 'widgets (/repos/widgets)' }],
       variables: ['DSH_SUPERAGENT_DIR', 'DSH_SUPERAGENT_NAME']
@@ -516,6 +517,32 @@ test('the admission cells are enabled only for rows that observe every message',
   await groupTab(observing, 'eval')
   assert.equal(observing.find(notAddressed)?.disabled, false, 'with observe on, the unaddressed cell is editable')
   await observing.unmount()
+})
+
+test('the commit email is a field in the Execution group and rides the normal save', async () => {
+  const panel = await openSettings({})
+  await groupTab(panel, 'execution')
+  // 标签与提示都来自文案表（与 worker 的字段名一致：`executor.githubCommitEmail`）。
+  const rendered = JSON.stringify(panel.tree())
+  assert.ok(
+    rendered.includes(JSON.stringify(COPY['settings.execution.githubCommitEmail'].en)),
+    'the field label is drawn'
+  )
+  assert.ok(
+    rendered.includes(JSON.stringify(COPY['settings.execution.githubCommitEmailHint'].en)),
+    'and the hint names what goes in it'
+  )
+  await panel.type({ type: 'Input', label: COPY['settings.execution.githubCommitEmail'].en }, '1+acme@users.noreply.github.com')
+  await panel.press({ text: COPY['action.save'].en })
+  const [saved] = saves(panel.host)
+  assert.equal(saved?.block, 'executor')
+  assert.equal(
+    (saved?.value as { githubCommitEmail: string }).githubCommitEmail,
+    '1+acme@users.noreply.github.com',
+    'the saved executor block carries the field'
+  )
+  assert.deepEqual(panel.refusals, [])
+  await panel.unmount()
 })
 
 test('the prepare editor inserts a whitelisted variable, value by value', async () => {

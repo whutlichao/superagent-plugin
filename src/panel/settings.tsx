@@ -477,7 +477,8 @@ function executionValueOf(groupValue: ExecutionGroupView): Record<string, unknow
     blockedCommands: [...value.blockedCommands],
     inlineLimit: value.inlineLimit,
     worktreeRetention: value.worktreeRetention,
-    confirmDelivery: value.confirmDelivery
+    confirmDelivery: value.confirmDelivery,
+    githubCommitEmail: value.githubCommitEmail
   }
 }
 
@@ -1232,6 +1233,7 @@ function ExecutionGroup(props: { readonly locale: string; readonly data: Setting
     inlineLimit: number
     worktreeRetention: 'keep' | 'on-end'
     confirmDelivery: boolean
+    githubCommitEmail: string
   }
   const group = props.data.execution
   const edit = (patch: Record<string, unknown>): void => editBlock('executor', { ...value, ...patch })
@@ -1259,6 +1261,7 @@ function ExecutionGroup(props: { readonly locale: string; readonly data: Setting
       <Hint text={translate(locale, 'settings.execution.intro')} />
       {textField('agent', 'settings.execution.agent')}
       {textField('model', 'settings.execution.model', 'settings.execution.modelHint')}
+      {textField('githubCommitEmail', 'settings.execution.githubCommitEmail', 'settings.execution.githubCommitEmailHint')}
       {textField('effort', 'settings.execution.effort', 'settings.execution.effortHint')}
       <Field label={translate(locale, 'settings.execution.maxWorkers')} {...(broken('maxWorkers') ? { error: translate(locale, 'settings.fieldInvalid') } : {})}>
         <Input

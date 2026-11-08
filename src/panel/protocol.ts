@@ -1266,6 +1266,8 @@ export interface ExecutionValues {
   readonly inlineLimit: number
   readonly worktreeRetention: 'keep' | 'on-end'
   readonly confirmDelivery: boolean
+  /** agent 账号的 noreply 提交邮箱（`executor.githubCommitEmail`）；空串是还没配。 */
+  readonly githubCommitEmail: string
 }
 
 /** Execution 组。 */
