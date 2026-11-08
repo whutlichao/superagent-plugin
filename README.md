@@ -266,6 +266,8 @@ docs/design/            技术设计（唯一的设计文档）
 docs/adding-a-source.md  新增一个 Source 的十一步指南（§I.1 的工程说明）
 docs/spikes/            实测记录（附录 C 的 spike 台账）
 docs/hourly-check.md    可选的小时级巡检（Orca Automation）
+docs/adr/               架构决策记录
+GLOSSARY.md             领域词汇（§M.5 术语表的仓库侧正本）
 src/worker/main.ts      activate(orca)：登记贡献点 + boot
 src/worker/runtime/     唯一接触 Orca 的目录（§B）
 src/worker/{core,policy,sources,executor,router,app,http,cli,infra}/  领域与实现
