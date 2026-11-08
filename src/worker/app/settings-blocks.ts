@@ -59,8 +59,10 @@ export const LIMITS_BLOCK_SCHEMA = object({
 }).strict()
 
 /**
- * `executor` 块（§E.6、§E.11、§N.2）：worker 的模型、并发、命名、投递确认与准备命令。
- * `baseRepo` 是 setup 字段（§K.8）：只有面板与 operator 能改，值本身是个选择器字符串。
+ * `executor` 块（§E.6、§E.11、§N.2）：worker 的模型、并发、命名、投递确认、准备命令与提交身份。
+ * `baseRepo` 与 `githubCommitEmail` 是 setup 字段（§K.8）：只有面板与 operator 能改，值本身是
+ * 一个选择器字符串 / 一个邮箱。邮箱允许空串（「还没配」，与 `repository` 同一口径），不允许
+ * 把别的账号身份写进来——它是 agent 账号的 noreply 地址，不是人的邮箱。
  */
 export const EXECUTOR_BLOCK_SCHEMA = object({
   agent: string().trim().min(1).max(200).optional(),
@@ -74,8 +76,32 @@ export const EXECUTOR_BLOCK_SCHEMA = object({
   confirmDelivery: boolean().optional(),
   worktreeRetention: enumOf(['keep', 'on-end']).optional(),
   blockedCommands: array(string().trim().min(1).max(100)).optional(),
-  prepare: string().max(4_000).optional()
+  prepare: string().max(4_000).optional(),
+  githubCommitEmail: string().trim().max(200).regex(/^$|^[^\s@]+@[^\s@]+$/).optional()
 }).strict()
+
+/**
+ * `executor` 块里**保存即生效**的字段（§N.2、§H.12）：提交邮箱由部署检查与部署事实现读，
+ * 保存之后下一次检查就用新值。其余字段仍在启动时读一次（模型、并发、准备命令……），
+ * 面板据 `executorRestartRequired()` 决定是否说「重启后生效」。
+ */
+export const EXECUTOR_LIVE_FIELDS: readonly string[] = ['githubCommitEmail']
+
+/**
+ * 这次 `executor` 块的保存是否还要重启才生效：比较两个块值里**除 `EXECUTOR_LIVE_FIELDS` 之外**
+ * 的键（缺键按 `null` 算）。只改提交邮箱时是 `false`，改其余任一字段时是 `true`。
+ */
+export function executorRestartRequired(before: unknown, after: unknown): boolean {
+  const record = (value: unknown): Record<string, unknown> =>
+    typeof value === 'object' && value !== null ? (value as Record<string, unknown>) : {}
+  const left = record(before)
+  const right = record(after)
+  for (const key of new Set([...Object.keys(left), ...Object.keys(right)])) {
+    if (EXECUTOR_LIVE_FIELDS.includes(key)) continue
+    if (JSON.stringify(left[key] ?? null) !== JSON.stringify(right[key] ?? null)) return true
+  }
+  return false
+}
 
 /** 一个块的校验器：`SafeParse<unknown>`（与 `SettingsSaveInput.validate` 同形）。 */
 export type BlockValidator = (value: unknown) => SafeParse<unknown>

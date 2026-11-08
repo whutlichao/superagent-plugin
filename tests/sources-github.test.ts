@@ -1014,7 +1014,9 @@ test('a missing repository or CLI leaves the Source in setup and starts no polli
 // §M.2 的「打开/关闭」、§I.2 的通知轮询：面板的开关写设置（origin=panel）后由组合根的
 // Source 运行时通知到轮询器——关掉就不再发一个 `gh` 调用、不再产生 Trigger，重新打开就恢复。
 test('the panel switch stops the poller in place and starts it again on enable', async () => {
-  const h = await openBoot()
+  // 固定时钟：活动计数按「最近 24 h」窗口统计，而夹具里的评论时间是写死的 2026-11-07。
+  // 不固定它，这条用例会在那个时刻过去 24 h 之后自己变红（与开关无关的时钟漂移）。
+  const h = await openBoot({ nowMs: () => Date.parse('2026-11-07T03:26:00.000Z') })
   try {
     const ghCalls = (): number => h.commands.calls.filter((call) => call.program === 'gh').length
     // 打开时：一轮读通知与评论，产生一条 Trigger。

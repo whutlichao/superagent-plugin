@@ -128,8 +128,10 @@ import { notePluginVersion } from './app/upgrade.ts'
 import { createSourceContext } from './app/source-context.ts'
 import {
   createSetupState,
+  gitConfigIdentityIssue,
   githubConfigIssues,
   issuesOf,
+  probeWorkerGitConfig,
   runSetupChecks,
   SETUP_PLACES,
   setupProblemOf
@@ -181,7 +183,12 @@ import { DEFAULT_MAX_WORKERS } from './http/state.ts'
 import { createDomainHandlers, withDomainHandlers } from './http/domain.ts'
 import { createSettingsHandlers, withSettingsHandlers } from './http/settings.ts'
 import { runWrite } from './http/idempotency.ts'
-import { MACHINE_LIMITS_BLOCK, parseSettingsBlock, validateSettingsBlock } from './app/settings-blocks.ts'
+import {
+  executorRestartRequired,
+  MACHINE_LIMITS_BLOCK,
+  parseSettingsBlock,
+  validateSettingsBlock
+} from './app/settings-blocks.ts'
 import { createAssessmentHandlers, withAssessmentHandlers } from './http/assessment.ts'
 import { createEvalHandlers, withEvalHandlers } from './http/eval.ts'
 import { createEvalTools } from './app/eval.ts'
@@ -701,6 +708,13 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
 
   // ---- 设置与 setup 探针（§N.1、§I.4）：一次只告诉人缺什么，不把「没配置」写成 error
   const executorSettings = resolveExecutorSettings(settings)
+  /**
+   * 现在的提交邮箱（`<stateDir>/worker-gitconfig` 的 `user.email`，§H.11）：Execution 组里
+   * `executor.githubCommitEmail` 是面板上唯一的入口，**每次现读**——保存之后下一轮部署检查、
+   * 下一次 launch 的环境段与 `DSH_SUPERAGENT_GITHUB_COMMIT_EMAIL` 都用新值（§N.2）。
+   * 空串是「还没配」：不猜、也不借用任何人的邮箱。
+   */
+  const executorCommitEmailNow = (): string => executorCommitEmailIn(settings, store)
   const rawSources = block(settings['sources'])
   /**
    * 存过的 `source:<id>` 块（§N.2：面板保存的设置存库即生效）。`enabled` 与 `config` 都以块
@@ -825,9 +839,10 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
     githubCli: githubConfigResolved().cli,
     githubEnabled: sourceEnabledNow(GITHUB_KIND, true),
     ...(feishuCli === undefined ? {} : { feishuCli }),
-    // worker 的提交身份（§H.11）：账号以探针读到的 `gh` 为准，邮箱来自设置（§E.11 同源）。
+    // worker 的提交身份（§H.11）：账号以探针读到的 `gh` 为准，邮箱来自 Execution 组
+    // （`executor.githubCommitEmail`，现读——保存之后下一次检查就用新值；§K.8）。
     gitConfig: {
-      email: text(settings['githubCommitEmail']) ?? '',
+      email: executorCommitEmailNow(),
       account: text(settings['githubLogin']) ?? ''
     },
     ports: {
@@ -856,6 +871,12 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
     log: (message) => logger.info(message)
   })
   const setup = createSetupState(await runSetupChecks(setupInput()))
+  /**
+   * worker git 配置**写不进去**的那条结论（§H.11）：`applySetup`（首次检查与每次重跑）与
+   * `syncWorkerGitConfig`（保存提交邮箱之后）各自刷新它。`gitconfig_missing` 不在这里——
+   * 它按现值重算（`identityIssueNow`），报告里的旧结论一律丢掉。
+   */
+  let gitConfigWriteIssue: SetupIssue | undefined = gitConfigWriteIssueOf(setup.report())
   /** 现在的 Source 设置视图：每个调用都现读保存过的块，保存之后同一进程立刻看到新值。 */
   const sourceSettingsNow = (): SourceSettingsView =>
     viewWithSources(settings, {
@@ -895,6 +916,7 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
    */
   function applySetup(report: SetupReport): void {
     setup.apply(report)
+    gitConfigWriteIssue = gitConfigWriteIssueOf(report)
     const githubIssues = issuesOf(report.issues, 'github')
     if (githubIssues.length > 0) {
       githubHealth?.set({ state: 'starting', detail: githubIssues[0]?.code ?? 'setup' })
@@ -972,13 +994,43 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
     return [...fromConfig, ...reported]
   }
   /**
-   * 全部 setup 结论的现值（`state`、Source 页与部署页共用）：github 的两条纯配置结论按现
-   * 配置现算，其余照报告；整体按 `SETUP_PLACES` 的次序排（面板照着这个顺序读）。
+   * 按现值重写文件（保存提交邮箱之后调用）：内容只由身份决定，重复写幂等；写的结果进
+   * `gitConfigWriteIssue`，下一次读页面就用它。`applySetup` 的完成检查同样会重写并刷新它。
+   */
+  const syncWorkerGitConfig = (): void => {
+    if (githubIssuesNow().length > 0) return
+    const account = githubLogin()
+    const email = executorCommitEmailNow()
+    if (gitConfigIdentityIssue(email, account) !== undefined) {
+      gitConfigWriteIssue = undefined
+      return
+    }
+    gitConfigWriteIssue = probeWorkerGitConfig({ stateDir: resolved, account, email })
+  }
+  /**
+   * 提交身份这一条的**现值**（纯读）：报告里那条只是上一次完整检查的快照，而保存提交邮箱
+   * 不会再跑一遍探针（§N.2）。身份缺项按现值回答；身份齐了则看最近一次写入的读数
+   * （`gitConfigWriteIssue`）——这里不碰文件系统，面板每次读都会走到它。
+   */
+  const identityIssueNow = (): readonly SetupIssue[] => {
+    // 根因优先（与探针同一条不变量）：GitHub 那一组还有问题时不再加一条同因的结论。
+    if (githubIssuesNow().length > 0) return []
+    const identity = gitConfigIdentityIssue(executorCommitEmailNow(), githubLogin())
+    if (identity !== undefined) return [identity]
+    return gitConfigWriteIssue === undefined ? [] : [gitConfigWriteIssue]
+  }
+  /**
+   * 全部 setup 结论的现值（`state`、Source 页与部署页共用）：github 的两条纯配置结论与提交
+   * 身份按现值重算，其余照报告；整体按 `SETUP_PLACES` 的次序排（面板照着这个顺序读）。
    */
   const setupIssuesNow = (): readonly SetupIssue[] =>
-    [...setup.issues().filter((issue) => issue.place !== 'github'), ...githubIssuesNow()].sort(
-      (left, right) => SETUP_PLACES.indexOf(left.place) - SETUP_PLACES.indexOf(right.place)
-    )
+    [
+      ...setup.issues().filter(
+        (issue) => issue.place !== 'github' && issue.code !== 'gitconfig_missing'
+      ),
+      ...githubIssuesNow(),
+      ...identityIssueNow()
+    ].sort((left, right) => SETUP_PLACES.indexOf(left.place) - SETUP_PLACES.indexOf(right.place))
   const githubBlocked = (): boolean => githubIssuesNow().length > 0
   const githubProblem = (): { readonly place: string; readonly code: string; readonly detail?: string } | undefined => {
     const found = githubIssuesNow()[0]
@@ -1060,6 +1112,17 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
      * `pollSeconds` 例外：轮询定时器的间隔在启动时定一次，改它仍要重启插件。
      */
     saved: (record) => {
+      // `executor` 块保存之后：提交邮箱按现值重写一次 `<stateDir>/worker-gitconfig`，部署检查
+      // 随即按新身份说话（§N.2、§H.11）。写失败只变成一条具名问题，不抛错、不回滚已提交的保存。
+      if (record.block === 'executor') {
+        try {
+          syncWorkerGitConfig()
+        } catch (error) {
+          logger.warn(`the worker git config could not be updated: ${stringOf(error)}`)
+        }
+        refresh()
+        return
+      }
       const parsed = parseSettingsBlock(record.block)
       if (parsed?.kind !== 'source') return
       const config =
@@ -1095,8 +1158,12 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
    * 部署派生的事实（§E.11）：每次现读，保存过的仓库/CLI 立刻反映到 Settings 的 facts、注入
    * worker 的环境段与 PR 归属判定里（§N.2）。
    */
-  const deploymentNow = (): Deployment =>
-    deployment(settings, { ...githubSetup, login: githubLogin() }, feishuSetup)
+  const deploymentNow = (): Deployment => ({
+    ...deployment(settings, { ...githubSetup, login: githubLogin() }, feishuSetup),
+    // 提交身份（§H.11）：邮箱是 Execution 组里那个可保存的字段，现读——保存之后下一次 launch
+    // 的 env.sh、部署事实与下一轮检查都用新值，与 `worker-gitconfig` 同源。
+    githubCommitEmail: executorCommitEmailNow()
+  })
   const cliPath = options.cliPath ?? defaultCliPath()
   // Prompt 配置与版本的唯一读写面（§L.4、§L.5）：两个 launch 与 `prompts get --text` 都从这里读；
   // 每次 launch 现读，所以保存过的团队段与 revision 在下一次 launch 就生效。体量上限来自设置
@@ -1346,6 +1413,8 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
     cliPath,
     tokenFile: (assignmentId) => assignmentTokenFile(store, resolved, assignmentId),
     apiBase: '',
+    // 部署事实每次 launch 现读（§E.11）：提交邮箱因此是保存即生效的那一项，其余仍在启动时定。
+    deployment: deploymentNow,
     // Worker 的 launch 也是在启动那一刻现读配置与 revision（§L.5）。
     prompts: promptVersions,
     wait: deliveryWait,
@@ -2413,6 +2482,28 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
 
   // ---- Settings 页（§M.3、§K.8）：读面是版本化块 + kind 的字段表/准入行；写面是上面那一个
   // `PUT settings/:block` handler（索引 #44 的写前检查），本票不另写入器。
+  /** Execution 组的现值（面板的编辑基线，也是「重启后生效」比较的左侧）。 */
+  const executorValuesNow = (): ExecutionValues => {
+    const executor = resolveExecutorSettings(liveSettings())
+    return {
+      agent: executor.agent,
+      model: executor.model ?? '',
+      effort: executor.effort ?? '',
+      maxWorkers: executor.maxWorkers,
+      baseRepo: selectorText(executor.baseRepo),
+      baseBranch: executor.baseBranch ?? '',
+      branchPrefix: executor.branchPrefix,
+      prepare: executor.prepare ?? '',
+      blockedCommands: [...executor.blockedCommands],
+      inlineLimit: executor.inlineLimit,
+      worktreeRetention: executor.worktreeRetention,
+      confirmDelivery: executor.confirmDelivery,
+      githubCommitEmail: executor.githubCommitEmail ?? ''
+    }
+  }
+  /** 保存前的 `executor` 块值：保存过就是那一版，没保存过就是面板看到的现值。 */
+  const executorBlockValueNow = (): unknown =>
+    savedSettingsVersion(store, 'executor')?.config ?? executorValuesNow()
   /**
    * 面板的编辑基线：宿主设置 + 保存过的 `limits` / `executor` 块。每次请求现读，"保存后重新
    * 载入"因此与库存一致；运行中的执行器与限额仍是启动时那份（§H.12，重启生效）。
@@ -2461,7 +2552,6 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
   /** Settings 页的一次读数（§M.3）。 */
   const settingsPage = async (): Promise<SettingsPageView> => {
     const live = liveSettings()
-    const executor = resolveExecutorSettings(live)
     const limitsNow = machineLimits(live)
     const syncable = policySyncable()
     const instances = registry.instances(sourceSettingsNow())
@@ -2485,20 +2575,7 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
       ]
     })
     const policy = effectivePolicy()
-    const executorValues: ExecutionValues = {
-      agent: executor.agent,
-      model: executor.model ?? '',
-      effort: executor.effort ?? '',
-      maxWorkers: executor.maxWorkers,
-      baseRepo: selectorText(executor.baseRepo),
-      baseBranch: executor.baseBranch ?? '',
-      branchPrefix: executor.branchPrefix,
-      prepare: executor.prepare ?? '',
-      blockedCommands: [...executor.blockedCommands],
-      inlineLimit: executor.inlineLimit,
-      worktreeRetention: executor.worktreeRetention,
-      confirmDelivery: executor.confirmDelivery
-    }
+    const executorValues = executorValuesNow()
     return settingsPageView({
       revision: settingsWriter.revision(),
       sources,
@@ -2563,6 +2640,8 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
     // 这里读的是**已解析**的值（带 kind 的缺省值）：从没保存过的实例本来就用 60，改仓库
     // 不该被误报成「要重启」。
     const beforePollSeconds = pollSecondsOf(input.block)
+    // 保存前的 `executor` 值：「重启后生效」的判定要比较两版的已存内容（缺省时是宿主设置）。
+    const beforeExecutorValue = input.block === 'executor' ? executorBlockValueNow() : undefined
     try {
       const result = (await handler({
         params: { block: input.block },
@@ -2578,17 +2657,20 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
         parsedBlock?.kind === 'source' &&
         result.changed &&
         beforePollSeconds !== pollSecondsOf(result.block)
+      // `executor` 块里的提交邮箱保存即生效（部署检查与下一次 launch 都现读）；同一块里其余
+      // 字段仍是启动时那份，所以只有它们变了才说「重启后生效」（§H.12）。
+      const executorNeedsRestart =
+        result.block === 'executor'
+          ? executorRestartRequired(beforeExecutorValue, input.value)
+          : result.block !== 'policy' && parsedBlock?.kind !== 'source'
       return {
         ok: true,
         block: result.block,
         revision: result.revision,
         changed: result.changed,
-        // §H.12：Policy（现读）与 `source:<id>` 的配置（组合根每处都现读保存过的块）保存即生效；
-        // `pollSeconds` 与其余块是启动时读的，所以告诉面板「重启后生效」，不假装热重载。
-        restarting:
-          result.restarting ||
-          (result.block !== 'policy' && parsedBlock?.kind !== 'source') ||
-          pollChanged,
+        // §H.12：Policy（现读）、`source:<id>` 的配置（组合根每处都现读保存过的块）与提交邮箱
+        // 保存即生效；`pollSeconds` 与其余字段是启动时读的，所以告诉面板「重启后生效」。
+        restarting: result.restarting || executorNeedsRestart || pollChanged,
         policyChanged: result.policy_changed,
         origin: result.origin
       }
@@ -3021,6 +3103,29 @@ async function baseRepoPathOf(
   }
 }
 
+/**
+ * 一次完整检查的报告里「worker git 配置写不进去」的那一条（§H.11）。`gitconfig_missing` 不在这里：
+ * 它按现值重算（`gitConfigIdentityIssue`），报告里的旧结论一律丢掉。
+ */
+function gitConfigWriteIssueOf(report: SetupReport): SetupIssue | undefined {
+  return report.issues.find((issue) => issue.code === 'gitconfig_unwritable')
+}
+
+/**
+ * 现在的提交邮箱（`<stateDir>/worker-gitconfig` 的 `user.email`，§H.11）：保存过的 `executor`
+ * 块里的 `githubCommitEmail` → 宿主设置的旧落点（`githubCommitEmail`，早期安装把值写在这一层）
+ * → 空串。两个来源都只**取值**，不猜、也不借用任何人的邮箱。空串是「还没配」，由部署检查的
+ * `gitconfig_missing` 说出来。
+ */
+function executorCommitEmailIn(
+  settings: Readonly<Record<string, unknown>>,
+  store: Store
+): string {
+  const saved = savedSettingsVersion(store, 'executor')?.config
+  const savedBlock = typeof saved === 'object' && saved !== null ? (saved as Record<string, unknown>) : {}
+  return text(savedBlock['githubCommitEmail']) ?? text(settings['githubCommitEmail']) ?? ''
+}
+
 /** 部署派生的事实（§E.11 的变量源）：仓库与账号来自设置与 setup 探针。 */
 function deployment(
   settings: Readonly<Record<string, unknown>>,
@@ -3032,6 +3137,8 @@ function deployment(
     repository: config.repository,
     githubCli: config.cli,
     githubLogin: github.login || text(settings['githubLogin']) || '',
+    // 只作为**回落值**：保存过的 `executor.githubCommitEmail` 由 `deploymentNow()` 覆盖
+    // （旧安装把它写在宿主设置顶层时仍读得到）。
     githubCommitEmail: text(settings['githubCommitEmail']) ?? '',
     feishuCli: feishu.cli,
     feishuBotId: feishu.botId,

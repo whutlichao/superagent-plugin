@@ -120,7 +120,7 @@ Orca 的 setup 钩子会在插件根（也就是仓库/worktree 根）创建 `.c
 7. **跑一次诊断**：`superagent doctor`（本机有没有 token/端口/锁/库/CLI/worker git 配置/两个登录），它只报「有没有」，不报「是什么」。
 8. **看一眼读数**：`superagent status --json`，退出码见下面的故障排查表。此后面板 Overview 与状态栏用同一份数据。
 
-worker 的提交身份（`<stateDir>/worker-gitconfig`）由启动与 `superagent setup check` 写入：只含 GitHub 凭据 helper、`git@github.com:` → `https://` 与提交身份三组键，身份不全时不写、不注入（H.11）。要它生效，面板 Execution 组里配好 agent 账号与其 noreply 提交邮箱。
+worker 的提交身份（`<stateDir>/worker-gitconfig`）由启动、保存 `executor` 块与 `superagent setup check` 写入：只含 GitHub 凭据 helper、`git@github.com:` → `https://` 与提交身份三组键，身份不全时不写、不注入（H.11）。要它生效，面板 Settings → Execution 组里填 agent 账号与其 noreply 提交邮箱（`githubCommitEmail`）：它是这一组里保存即生效的字段，其余字段仍是重启后生效。
 
 ## 状态目录
 

@@ -73,6 +73,11 @@ export interface ExecutorSettings {
   readonly prepare?: string
   /** `executor.blockedCommands`：不可运行的个人 CLI 名单（§E.11；shim 与变量都用它）。 */
   readonly blockedCommands: readonly string[]
+  /**
+   * `executor.githubCommitEmail`：worker 提交身份里的 noreply 邮箱（§H.11，与
+   * `DSH_SUPERAGENT_GITHUB_COMMIT_EMAIL` 同源）。空串/缺省是「还没配」——不猜任何人的邮箱。
+   */
+  readonly githubCommitEmail?: string
 }
 
 /** 队列只需要这两件事：入队与注册 handler（`Effects` 结构上满足它）。 */
@@ -114,8 +119,13 @@ export interface RegisterExecutorOptions {
    * revision 在下一次 launch 就生效。缺省读 revision 0 与内置默认文本（测试与早期启动路径）。
    */
   readonly prompts?: LaunchPromptSource
-  /** 部署派生的事实（§E.11 的变量源）；缺省全空串，等 setup（#44）填。 */
-  readonly deployment?: EnvironmentDeployment
+  /**
+   * 部署派生的事实（§E.11 的变量源）；缺省全空串，等 setup（#44）填。
+   *
+   * 可以给一个取值函数：组合根给的就是它，于是每次 launch 现读（保存过的仓库、账号与提交
+   * 邮箱在下一次 launch 就生效，§N.2）。
+   */
+  readonly deployment?: EnvironmentDeployment | (() => EnvironmentDeployment)
   /** loopback API 基址（`SUPERAGENT_API`）；缺省空串。 */
   readonly apiBase?: string
   /** Source kind 对执行环境的额外贡献（§I.1；#17/#21 之后由组合根传入）。 */
@@ -225,6 +235,9 @@ export function resolveExecutorSettings(raw: Readonly<Record<string, unknown>>):
   const baseRepo = parseRepoSelector(text(executor['baseRepo']) ?? text(raw['baseRepo']) ?? '')
   const baseBranch = text(executor['baseBranch'])
   const prepare = text(executor['prepare'])
+  // 提交邮箱（§H.11）：面板的 Execution 组写 `executor.githubCommitEmail`，早期安装可能把它
+  // 写在宿主设置的顶层。块里写了的优先，没写才回落宿主设置；两处都没有就是空串（不猜）。
+  const githubCommitEmail = text(executor['githubCommitEmail']) ?? text(raw['githubCommitEmail'])
   return {
     agent: text(executor['agent']) ?? resolveAgentSetting(raw, 'agent'),
     maxWorkers: positive(executor['maxWorkers']) ?? DEFAULT_MAX_WORKERS,
@@ -237,8 +250,18 @@ export function resolveExecutorSettings(raw: Readonly<Record<string, unknown>>):
     ...(effort === undefined ? {} : { effort }),
     ...(baseRepo === undefined ? {} : { baseRepo }),
     ...(baseBranch === undefined ? {} : { baseBranch }),
-    ...(prepare === undefined ? {} : { prepare })
+    ...(prepare === undefined ? {} : { prepare }),
+    ...(githubCommitEmail === undefined ? {} : { githubCommitEmail })
   }
+}
+
+/**
+ * 这次 launch 的部署事实：给的是取值函数就现读（组合根），给的是值就原样用，缺省全空串。
+ * 一次 launch 里只读一次，env.sh、作业文本与组装全文因此说的是同一份事实。
+ */
+function deploymentNow(options: RegisterExecutorOptions): EnvironmentDeployment {
+  if (typeof options.deployment === 'function') return options.deployment()
+  return options.deployment ?? EMPTY_DEPLOYMENT
 }
 
 /**
@@ -253,6 +276,7 @@ function workerLaunchPrompt(
     readonly cliPath: string
     readonly tokenFile: string
     readonly stateDir: string
+    readonly deployment: EnvironmentDeployment
   }
 ): LaunchPrompt {
   const maxChars = options.prompts?.maxChars?.()
@@ -267,8 +291,8 @@ function workerLaunchPrompt(
       cliPath: input.cliPath,
       tokenFile: input.tokenFile,
       stateDir: input.stateDir,
-      repository: options.deployment?.repository ?? '',
-      account: options.deployment?.githubLogin ?? ''
+      repository: input.deployment.repository,
+      account: input.deployment.githubLogin
     }
   })
 }
@@ -453,8 +477,9 @@ export function registerExecutorEffects(options: RegisterExecutorOptions): void 
     const trigger = records.triggers.get(ticket.origin.triggerId)
     const tokenFile = options.tokenFile(assignment.id)
     // 执行环境先落盘：env.sh、它的 git 排除与被禁命令的 shim 都在 launch 之前就位（§E.11、§H.11）。
+    const deployment = deploymentNow(options)
     const environment: EnvironmentTable = environmentOf({
-      deployment: options.deployment ?? EMPTY_DEPLOYMENT,
+      deployment,
       ticket: { id: ticket.id, name: workspace.short, directory: workspace.handle.path },
       plugin: {
         cliPath,
@@ -466,7 +491,7 @@ export function registerExecutorEffects(options: RegisterExecutorOptions): void 
       ...(options.sourceEnvironments === undefined ? {} : { sources: options.sourceEnvironments })
     })
     // 组装在环境写入之前做完（纯函数，只读当下的配置与部署）：写盘失败与 env.sh 同一处理。
-    const assembled = workerLaunchPrompt(options, { environment, cliPath, tokenFile, stateDir })
+    const assembled = workerLaunchPrompt(options, { environment, cliPath, tokenFile, stateDir, deployment })
     let promptPath: string
     try {
       const envPath = writeEnvFile({

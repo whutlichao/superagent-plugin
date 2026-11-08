@@ -186,7 +186,8 @@ function settingsView(
         blockedCommands: ['rm'],
         inlineLimit: 1000,
         worktreeRetention: 'keep',
-        confirmDelivery: true
+        confirmDelivery: true,
+        githubCommitEmail: ''
       },
       repos: [{ value: 'path:/repos/widgets', label: 'widgets (/repos/widgets)' }],
       variables: ['DSH_SUPERAGENT_DIR', 'DSH_SUPERAGENT_NAME']
