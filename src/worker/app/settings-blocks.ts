@@ -88,14 +88,16 @@ export const EXECUTOR_BLOCK_SCHEMA = object({
 
 /**
  * `executor` 块里**保存即生效**的字段（§N.2、§H.12）：提交邮箱由部署检查与部署事实现读，
- * 保存之后下一次检查就用新值。其余字段仍在启动时读一次（模型、并发、准备命令……），
- * 面板据 `executorRestartRequired()` 决定是否说「重启后生效」。
+ * 保存之后下一次检查就用新值。其余字段仍在启动时读一次（模型、并发、准备命令……）。
+ *
+ * 调用方比较的是**解析后**的执行器设置（面板协议里的 `ExecutionValues`，每个字段都有值）：
+ * 那一份里没有「键缺省」的歧义，所以按值比较即可，不必在这里排除字段。
  */
 export const EXECUTOR_LIVE_FIELDS: readonly string[] = ['githubCommitEmail']
 
 /**
- * 这次 `executor` 块的保存是否还要重启才生效：比较两个块值里**除 `EXECUTOR_LIVE_FIELDS` 之外**
- * 的键（缺键按 `null` 算）。只改提交邮箱时是 `false`，改其余任一字段时是 `true`。
+ * 这次 `executor` 块的保存是否还要重启才生效：按**解析后**的两版设置逐字段比较，跳过
+ * `EXECUTOR_LIVE_FIELDS`。只改提交邮箱时是 `false`，改其余任一字段时是 `true`。
  */
 export function executorRestartRequired(before: unknown, after: unknown): boolean {
   const record = (value: unknown): Record<string, unknown> =>

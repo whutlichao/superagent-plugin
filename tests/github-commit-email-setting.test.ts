@@ -214,7 +214,7 @@ test('a write that fails is named, and Check again reads the saved email once it
     const text = readFileSync(workerGitConfigPath(stateDir), 'utf8')
     assert.ok(text.includes(`email = "${EMAIL}"`), 'the re-run check uses the saved email')
   } finally {
-    await h.handle.shutdown()
+    await h.cleanup()
     await removeTree(stateDir)
   }
 })

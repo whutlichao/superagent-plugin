@@ -259,7 +259,7 @@ export function resolveExecutorSettings(raw: Readonly<Record<string, unknown>>):
  * 这次 launch 的部署事实：给的是取值函数就现读（组合根），给的是值就原样用，缺省全空串。
  * 一次 launch 里只读一次，env.sh、作业文本与组装全文因此说的是同一份事实。
  */
-function deploymentNow(options: RegisterExecutorOptions): EnvironmentDeployment {
+function launchDeployment(options: RegisterExecutorOptions): EnvironmentDeployment {
   if (typeof options.deployment === 'function') return options.deployment()
   return options.deployment ?? EMPTY_DEPLOYMENT
 }
@@ -477,7 +477,7 @@ export function registerExecutorEffects(options: RegisterExecutorOptions): void 
     const trigger = records.triggers.get(ticket.origin.triggerId)
     const tokenFile = options.tokenFile(assignment.id)
     // 执行环境先落盘：env.sh、它的 git 排除与被禁命令的 shim 都在 launch 之前就位（§E.11、§H.11）。
-    const deployment = deploymentNow(options)
+    const deployment = launchDeployment(options)
     const environment: EnvironmentTable = environmentOf({
       deployment,
       ticket: { id: ticket.id, name: workspace.short, directory: workspace.handle.path },

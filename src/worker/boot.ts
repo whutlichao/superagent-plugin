@@ -1021,6 +1021,9 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
    * 不会再跑一遍探针（§N.2）。身份缺项按现值回答；身份齐了则看最近一次写入的读数
    * （`gitConfigWriteIssue`）——这里不碰文件系统，面板每次读都会走到它。
    */
+  // 首次启动与每一次保存走同一个收敛步骤：身份齐全就（重）写文件，不全就删掉上一次留下的
+  // 旧身份——否则 launch-hook 仍按「文件存在」注入它（§H.11），与 gitconfig_missing 说两套话。
+  syncWorkerGitConfig()
   const identityIssueNow = (): readonly SetupIssue[] => {
     // 根因优先（与探针同一条不变量）：GitHub 那一组还有问题时不再加一条同因的结论。
     if (githubIssuesNow().length > 0) return []
@@ -2491,9 +2494,12 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
 
   // ---- Settings 页（§M.3、§K.8）：读面是版本化块 + kind 的字段表/准入行；写面是上面那一个
   // `PUT settings/:block` handler（索引 #44 的写前检查），本票不另写入器。
-  /** Execution 组的现值（面板的编辑基线，也是「重启后生效」比较的左侧）。 */
-  const executorValuesNow = (): ExecutionValues => {
-    const executor = resolveExecutorSettings(liveSettings())
+  /**
+   * 一个 `executor` 块值 → 面板协议里的 `ExecutionValues`（宿主设置打底、块覆盖同名字段）。
+   * 面板的编辑基线与「重启后生效」的比较都读这一份，字段表因此只有一处。
+   */
+  const executorValuesOf = (value: unknown): ExecutionValues => {
+    const executor = resolveExecutorSettings(withSavedSettings(settings, { executor: value }))
     return {
       agent: executor.agent,
       model: executor.model ?? '',
@@ -2510,27 +2516,9 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
       githubCommitEmail: executor.githubCommitEmail ?? ''
     }
   }
-  /**
-   * 一个 `executor` 块值**解析后**的执行器设置（宿主设置打底、块覆盖同名字段）。
-   * 「重启后生效」比较的是解析后的两版：旧版块可能只写了几个键（CLI 的局部保存），拿原始
-   * 键集比较会把「面板补全字段」误判成改了一大片。
-   */
-  const executorResolvedOf = (value: unknown): Record<string, unknown> =>
-    { const resolved = resolveExecutorSettings(withSavedSettings(settings, { executor: value }))
-      return {
-        agent: resolved.agent,
-        model: resolved.model ?? '',
-        effort: resolved.effort ?? '',
-        maxWorkers: resolved.maxWorkers,
-        baseRepo: selectorText(resolved.baseRepo),
-        baseBranch: resolved.baseBranch ?? '',
-        branchPrefix: resolved.branchPrefix,
-        prepare: resolved.prepare ?? '',
-        blockedCommands: [...resolved.blockedCommands],
-        inlineLimit: resolved.inlineLimit,
-        worktreeRetention: resolved.worktreeRetention,
-        confirmDelivery: resolved.confirmDelivery
-      } }
+  /** Execution 组的现值（面板的编辑基线）。 */
+  const executorValuesNow = (): ExecutionValues =>
+    executorValuesOf(savedSettingsVersion(store, 'executor')?.config)
   /**
    * 面板的编辑基线：宿主设置 + 保存过的 `limits` / `executor` 块。每次请求现读，"保存后重新
    * 载入"因此与库存一致；运行中的执行器与限额仍是启动时那份（§H.12，重启生效）。
@@ -2669,9 +2657,7 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
     const beforePollSeconds = pollSecondsOf(input.block)
     // 保存前的 `executor` 值（解析后）：「重启后生效」的判定比较两版真正生效的设置。
     const beforeExecutorValue =
-      input.block === 'executor'
-        ? executorResolvedOf(savedSettingsVersion(store, 'executor')?.config)
-        : undefined
+      input.block === 'executor' ? executorValuesNow() : undefined
     try {
       const result = (await handler({
         params: { block: input.block },
@@ -2691,7 +2677,7 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
       // 字段仍是启动时那份，所以只有它们变了才说「重启后生效」（§H.12）。
       const executorNeedsRestart =
         result.block === 'executor'
-          ? executorRestartRequired(beforeExecutorValue, executorResolvedOf(input.value))
+          ? executorRestartRequired(beforeExecutorValue, executorValuesOf(input.value))
           : result.block !== 'policy' && parsedBlock?.kind !== 'source'
       return {
         ok: true,
@@ -3142,18 +3128,21 @@ function gitConfigWriteIssueOf(report: SetupReport): SetupIssue | undefined {
 }
 
 /**
- * 现在的提交邮箱（`<stateDir>/worker-gitconfig` 的 `user.email`，§H.11）：保存过的 `executor`
- * 块里的 `githubCommitEmail` → 宿主设置的旧落点（`githubCommitEmail`，早期安装把值写在这一层）
- * → 空串。两个来源都只**取值**，不猜、也不借用任何人的邮箱。空串是「还没配」，由部署检查的
- * `gitconfig_missing` 说出来。
+ * 现在的提交邮箱（`<stateDir>/worker-gitconfig` 的 `user.email`，§H.11）。
+ *
+ * 走的是与面板、部署检查同一条读法（`withSavedSettings` + `resolveExecutorSettings`）：保存过的
+ * `executor` 块覆盖宿主设置，块里没写才回落宿主设置的旧落点（早期安装把值写在这一层）。空串
+ * 是「还没配」——不猜、也不借用任何人的邮箱，由部署检查的 `gitconfig_missing` 说出来。
  */
 function executorCommitEmailIn(
   settings: Readonly<Record<string, unknown>>,
   store: Store
 ): string {
-  const saved = savedSettingsVersion(store, 'executor')?.config
-  const savedBlock = typeof saved === 'object' && saved !== null ? (saved as Record<string, unknown>) : {}
-  return text(savedBlock['githubCommitEmail']) ?? text(settings['githubCommitEmail']) ?? ''
+  return (
+    resolveExecutorSettings(
+      withSavedSettings(settings, { executor: savedSettingsVersion(store, 'executor')?.config })
+    ).githubCommitEmail ?? ''
+  )
 }
 
 /** 部署派生的事实（§E.11 的变量源）：仓库与账号来自设置与 setup 探针。 */
