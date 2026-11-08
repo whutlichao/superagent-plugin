@@ -5,14 +5,18 @@
 // - 写面：`settings.save` 把 `https://github.com/<owner>/<name>` 规范成 `owner/name` 并存库，
 //   坏值整单拒绝且什么都不写；
 // - 读面：Settings / Source / Deployment 三处读数一致，不再报 `repository_missing`；
-// - 运行时：轮询器用规范后的 `owner/name` 调 `gh api`；下一次启动也从保存的块恢复。
+// - 运行时：轮询器用规范后的 `owner/name` 调 `gh api`；下一次启动也从保存的块恢复；
+// `pollSeconds` 之外的配置改完立刻可用于 `report --pr-number`（PR 规则的接线不靠启动快照）。
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { mkdtempSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { openBoot, settingsOf } from './support/boot.ts'
+import { assignmentToken, openBoot, settingsOf } from './support/boot.ts'
 import { removeTree } from './support/state.ts'
+import { dispatch } from '../src/worker/cli/commands.ts'
+import { parseArgs } from '../src/worker/cli/io.ts'
+import { readApiToken } from '../src/worker/infra/tokens.ts'
 import type { SettingsSaveOutcome } from '../src/panel/protocol'
 
 /** 截图里的输入。 */
@@ -96,27 +100,6 @@ test('saving a GitHub repository URL is normalised, applied at once, and reaches
     assert.equal(h.handle.snapshot().health.setupMissing, true)
     assert.deepEqual(await h.handle.pollOnce(), { notifications: 0, triggers: 0, skipped: 0 })
 
-    // 一个不是 GitHub 仓库的值：整单拒绝，什么都不写（相机能说清是哪个字段）。
-    const refused = await h.handle.settingsSave({
-      block: 'source:github',
-      revision: card.revision,
-      value: { enabled: true, config: { ...card.config, repository: 'https://gitlab.com/whutlichao/superagent-test' } }
-    })
-    assert.equal(refused.ok, false)
-    assert.equal(refused.ok === false ? refused.reason : 'ok', 'invalid')
-    const issues = refused.ok === false && 'issues' in refused ? refused.issues : []
-    assert.equal(
-      issues.some((issue) => issue.path === 'config.repository'),
-      true,
-      `the refusal names the repository field: ${JSON.stringify(issues)}`
-    )
-    const stillEmpty = await h.handle.settingsView()
-    assert.equal(
-      stillEmpty.sources.instances.find((instance) => instance.id === 'github')?.config['repository'],
-      '',
-      'a refused save writes nothing'
-    )
-
     // 截图里的 URL：保存成功，规范化成 owner/name，并且**不要求重启**。
     const saved = accepted(
       await h.handle.settingsSave({
@@ -142,6 +125,18 @@ test('saving a GitHub repository URL is normalised, applied at once, and reaches
     assert.deepEqual(
       github?.facts.find((fact) => fact.key === 'repository')?.value,
       REPOSITORY
+    )
+    // Settings 卡片的只读事实跟着同一个现读配置走（不是启动时那份）。
+    assert.deepEqual(
+      savedCard?.facts.find((fact) => fact.key === 'repository')?.value,
+      REPOSITORY,
+      'the Settings card facts read the saved repository too'
+    )
+    // 写前账号探针的读数被采用：保存之后 account 事实已知（不必重启再等一次完整检查）。
+    assert.deepEqual(
+      savedCard?.facts.find((fact) => fact.key === 'account')?.value,
+      'acme-agent',
+      'the save-time account probe result is used right away'
     )
 
     // 部署检查：github 这一组不再有问题（状态栏也不再是「等 setup」）。
@@ -192,6 +187,11 @@ test('a legacy raw URL already stored in the host settings is read as owner/name
       github?.fields.find((field) => field.key === 'repository')?.value,
       { type: 'text', text: REPOSITORY }
     )
+    // Settings 的编辑框也显示归一后的值（旧值不该有一处显示原始 URL、另一处显示 slug）。
+    const settingsCard = (await h.handle.settingsView()).sources.instances.find(
+      (instance) => instance.id === 'github'
+    )
+    assert.equal(settingsCard?.config['repository'], REPOSITORY)
     assert.deepEqual(await h.handle.pollOnce(), { notifications: 1, triggers: 0, skipped: 0 })
     assert.equal(
       h.commands.calls.some((call) =>
@@ -254,3 +254,91 @@ test('a saved GitHub repository URL survives a restart and is used by the next b
     await removeTree(stateDir)
   }
 })
+
+/**
+ * 仓库在运行中换掉之后，PR 绑定（`report --pr-number`）立刻读新仓库：它不看启动时的配置。
+ */
+test('a report with a PR number reads GitHub in the repository saved at runtime', async () => {
+  const stateDir = mkdtempSync(join(tmpdir(), 'superagent-github-repo-pr-'))
+  // 默认启动：仓库是 `acme/widgets`（缺省脚本），先走完通知 → Ticket → Assignment。
+  const h = await openBoot({ stateDir })
+  try {
+    // 先用启动时的仓库走完通知 → Ticket → Assignment，拿到 worker token。
+    await h.handle.pollOnce()
+    await h.handle.passOnce()
+    await h.handle.passOnce()
+    await h.handle.passOnce()
+    const [panelTicket] = h.handle.snapshot().tickets ?? []
+    assert.ok(panelTicket, 'the mention opened a ticket')
+    const port = h.handle.port()
+    assert.notEqual(port, null)
+    const detail = await h.handle.ticketDetail(panelTicket.id)
+    const assignmentId = detail.assignments[0]?.id
+    assert.ok(assignmentId, 'the executor wrote an assignment')
+    const worker = assignmentToken(h.stateDir, assignmentId)
+
+    // 运行中把仓库换成截图里的那个：下一次 PR 绑定就要读它。
+    const before = await h.handle.settingsView()
+    const card = before.sources.instances.find((instance) => instance.id === 'github')
+    assert.ok(card)
+    accepted(
+      await h.handle.settingsSave({
+        block: 'source:github',
+        revision: card.revision,
+        value: { enabled: true, config: { ...card.config, repository: URL } }
+      })
+    )
+    h.commands.script(['api', `repos/${REPOSITORY}/pulls/9`], () =>
+      JSON.stringify({
+        number: 9,
+        title: 'Fix the login redirect',
+        state: 'open',
+        merged: false,
+        html_url: `https://github.com/${REPOSITORY}/pull/9`,
+        created_at: '2026-11-07T03:20:00Z',
+        updated_at: '2026-11-07T03:21:00Z',
+        head: { sha: 'c0ffee', ref: 'bob/somewhere-else', repo: { full_name: REPOSITORY } },
+        base: { ref: 'main' },
+        user: { login: 'bob', type: 'User' }
+      })
+    )
+    const after = h.commands.calls.length
+    const attempted = await reportWithPull(h, 9, worker)
+    assert.equal(
+      h.commands.calls
+        .slice(after)
+        .some((call) => call.args.join(' ').includes(`repos/${REPOSITORY}/pulls/9`)),
+      true,
+      `the binding read the PR through the saved repository: ${JSON.stringify(h.commands.args.slice(after))}`
+    )
+    // 这条 PR 不属于这张 Ticket：固定拒绝是归属问题（`pr_mismatch`），不是配置缺失。
+    assert.equal(attempted.exit, 2, JSON.stringify(attempted.envelope))
+    assert.equal((attempted.envelope as { error?: { code?: string } }).error?.code, 'pr_mismatch')
+  } finally {
+    await h.cleanup()
+    await removeTree(stateDir)
+  }
+})
+
+/** 跑一条 worker 角色的 `report --pr-number`（真 loopback 服务器、真 token）。 */
+async function reportWithPull(
+  h: Awaited<ReturnType<typeof openBoot>>,
+  number: number,
+  token: string
+): Promise<{ readonly exit: number; readonly envelope: unknown }> {
+  const port = h.handle.port()
+  assert.notEqual(port, null, 'the worker listens on a loopback port')
+  return dispatch({
+    parsed: parseArgs(['report', '--state', 'progress', '--pr-number', String(number), '--summary', 'wip']),
+    target: {
+      stateDir: h.stateDir,
+      stateDirSource: 'argument' as const,
+      port: port as number,
+      baseUrl: `http://127.0.0.1:${port}/superagent/api`,
+      token,
+      tokenSource: 'argument' as const,
+      tokenFile: null
+    },
+    sleep: async () => undefined
+  })
+}

@@ -145,7 +145,8 @@ export function createGithubKind(cli: string | (() => string)): SourceKind<Githu
         key: 'repository',
         type: 'text',
         label: both('仓库', 'Repository'),
-        pattern: '^[^/\\s]+/[^/\\s]+$'
+        // 与 kind schema 同一个输入面：`owner/name` 或 github.com 的仓库地址（保存时归一）。
+        pattern: '^(?:[^/\\s]+/[^/\\s]+|(?:https?://)?(?:www\\.)?github\\.com/[^/\\s?#]+/[^/\\s?#]+/?)$'
       },
       { key: 'cli', type: 'text', label: both('GitHub CLI', 'GitHub CLI') },
       {

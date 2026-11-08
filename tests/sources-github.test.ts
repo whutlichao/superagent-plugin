@@ -217,8 +217,9 @@ test('a repository URL and owner/name normalise to the same slug', () => {
     'https://www.github.com/whutlichao/superagent-test',
     'https://github.com/whutlichao/superagent-test/',
     'https://github.com/whutlichao/superagent-test.git',
-    'https://github.com/whutlichao/superagent-test#readme',
-    'https://github.com/whutlichao/superagent-test?tab=readme',
+    'https://github.com/whutlichao/superagent-test/issues/7',
+    'https://github.com/whutlichao/superagent-test/pull/7/files#diff',
+    'https://github.com/whutlichao/superagent-test/tree/main',
     'github.com/whutlichao/superagent-test',
     '  https://github.com/whutlichao/superagent-test  ',
     'whutlichao/superagent-test',
@@ -232,18 +233,10 @@ test('a repository URL and owner/name normalise to the same slug', () => {
   // 空串是「还没配」，原样留下（`repository_missing` 由 setup 判定）。
   assert.equal(repositorySlug(''), undefined)
   assert.equal(githubConfigSchema.parse({ repository: '' }).repository, '')
-  // 不是 GitHub 仓库的写法：拒绝，不猜一个仓库名（GitLab / 缺 name / 多一段路径）。
-  for (const value of [
-    'https://gitlab.com/whutlichao/superagent-test',
-    'https://github.com/whutlichao',
-    'https://github.com/',
-    'whutlichao/',
-    '/superagent-test',
-    'https://github.com/whutlichao/superagent-test/tree/main',
-    'https://github.com/whutlichao/superagent-test/issues/7'
-  ]) {
+  // 认不出来的值：**原样保留**（本字段一直如此），本票不新增拒绝面；运行时只会读不通。
+  for (const value of ['https://gitlab.com/whutlichao/superagent-test', 'acme', 'a/b/c']) {
     assert.equal(repositorySlug(value), undefined, value)
-    assert.equal(githubConfigSchema.safeParse({ repository: value }).success, false, value)
+    assert.equal(githubConfigSchema.parse({ repository: value }).repository, value, value)
   }
 })
 

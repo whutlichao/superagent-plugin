@@ -937,7 +937,20 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
       githubHealth?.set({ state: 'starting', detail: 'Waiting for the next pass' })
     }
   }
-  const githubLogin = (): string => setup.report().githubLogin || fallbackLogin
+  /**
+   * 保存前账号探针读到的登录名（§K.8）：写前检查按**候选**仓库/CLI 跑过一次 `gh api user`，
+   * 保存成功后同一份配置就是现配置，于是那次读数直接可用——不必再跑一次探针，也不必重启。
+   * 键是当时的仓库与 CLI：配置一变就不匹配，回落到完整检查的读数。
+   */
+  let probedGithubLogin: { readonly repository: string; readonly cli: string; readonly login: string } | undefined
+  const githubLogin = (): string => {
+    const config = githubConfigResolved()
+    const probed = probedGithubLogin
+    if (probed !== undefined && probed.repository === config.repository && probed.cli === config.cli) {
+      return probed.login
+    }
+    return setup.report().githubLogin || fallbackLogin
+  }
   /**
    * 按**当前配置**现算的 GitHub 纯配置问题（`githubConfigIssues`）：保存过的仓库/CLI 因此
    * 立刻反映到部署检查与 Source 页上，不必等一次完整探针重跑（§N.2）。
@@ -1078,7 +1091,12 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
 
   // ---- Router（§F.1–§F.5）：专用 worktree、terminal 面的常驻会话、relay 与保活监督
   const roles = resolveRoles(settings)
-  const deploymentFacts = deployment(settings, { ...githubSetup, login: githubLogin() }, feishuSetup)
+  /**
+   * 部署派生的事实（§E.11）：每次现读，保存过的仓库/CLI 立刻反映到 Settings 的 facts、注入
+   * worker 的环境段与 PR 归属判定里（§N.2）。
+   */
+  const deploymentNow = (): Deployment =>
+    deployment(settings, { ...githubSetup, login: githubLogin() }, feishuSetup)
   const cliPath = options.cliPath ?? defaultCliPath()
   // Prompt 配置与版本的唯一读写面（§L.4、§L.5）：两个 launch 与 `prompts get --text` 都从这里读；
   // 每次 launch 现读，所以保存过的团队段与 revision 在下一次 launch 就生效。体量上限来自设置
@@ -1103,8 +1121,8 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
     cliPath,
     tokenFile,
     stateDir: resolved,
-    repository: deploymentFacts.repository,
-    account: deploymentFacts.githubLogin
+    repository: deploymentNow().repository,
+    account: deploymentNow().githubLogin
   })
   /** Router 的 Policy 段（§L.3 第 11 步）：跟**生效**的块走，与 Gate、复验同一个真相源。 */
   const promptPolicy = (): PromptPolicy => {
@@ -1234,8 +1252,10 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
     close: (thread, outcome, at) => {
       engine.threadClosed(thread, outcome, at)
     },
-    // agent 的账号与配置仓库判「这条 PR 是不是它的」（§I.2 PR 规则行）。
-    login: deploymentFacts.githubLogin,
+    // agent 的账号与配置仓库判「这条 PR 是不是它的」（§I.2 PR 规则行）；两者都现读。
+    get login(): string {
+      return deploymentNow().githubLogin
+    },
     get repository(): string {
       return githubRepository()
     },
@@ -1490,21 +1510,22 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
     // 读模型里的「已投递到该 Ticket」：归属判定与扇出/交回同一份记录（`followupOwners`）。
     followups: (ticket) => deliveredFollowups(ticket, repo),
     // `report --pr-number` 的绑定（§I.2「PR 规则」行）：读那条 PR、判归属并绑给这张 Ticket；
-    // 拒绝时整条命令落成固定码 `pr_mismatch`。没有 GitHub Source 时无从判归属，不接线。
-    ...(githubReady()
-      ? {
-          claimPull: (ticketId: string, pull: { readonly number: number }, probe) =>
-            claimReportedPull(
-              // §O：这次 PR 读在 handler 的预算里跑——信号绑到一个只属于这次调用的 API 上
-              // （`gh` 因此被 SIGTERM）；没有预算时用启动时那一份，行为与 #64 之前一致。
-              probe?.signal === undefined
-                ? pullHost
-                : { ...pullHost, api: createGithubApi(commandPort.withSignal(probe.signal), githubCli) },
-              ticketId,
-              pull.number
-            )
-        }
-      : {}),
+    // 拒绝时整条命令落成固定码 `pr_mismatch`。接线不看的启动时配置：没有仓库/CLI 时按
+    // 固定拒绝回答（保存过仓库之后**下一次**命令就能用，不必重启，§N.2）。
+    claimPull: (ticketId: string, pull: { readonly number: number }, probe) => {
+      if (!githubReady()) {
+        return 'the GitHub Source has no repository or CLI yet; set it on the Source page and retry'
+      }
+      return claimReportedPull(
+        // §O：这次 PR 读在 handler 的预算里跑——信号绑到一个只属于这次调用的 API 上
+        // （`gh` 因此被 SIGTERM）；没有预算时用启动时那一份，行为与 #64 之前一致。
+        probe?.signal === undefined
+          ? pullHost
+          : { ...pullHost, api: createGithubApi(commandPort.withSignal(probe.signal), githubCli) },
+        ticketId,
+        pull.number
+      )
+    },
     idempotent,
     afterWrite: () => {
       refresh()
@@ -1674,7 +1695,17 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
         // §O：handler 定的探针上限与取消线只加在这次写前检查上（启动路径没有预算）。
         ...(budget === undefined ? {} : { budget })
       })
-      return issuesOf(report.issues, 'github')
+      const issues = issuesOf(report.issues, 'github')
+      // 这次探针读到的账号留着：保存成功之后它就是现配置的账号（`githubLogin()` 按配置匹配取用）。
+      if (issues.length === 0 && report.githubLogin !== '') {
+        const config = githubConfigResolved()
+        probedGithubLogin = {
+          repository: candidate.repository ?? config.repository,
+          cli: candidate.cli ?? config.cli,
+          login: report.githubLogin
+        }
+      }
+      return issues
     },
     idempotent,
     policySync: {
@@ -2205,7 +2236,7 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
     setup: () => setupIssuesNow(),
     kind: (id) => registry.kind(id),
     facts: () =>
-      registry.facts(deployment(settings, { ...githubSetup, login: githubLogin() }, feishuSetup)),
+      registry.facts(deploymentNow()),
     config: (id) => registry.instance(id)?.config,
     syncable: () => policySyncDriver?.syncable() ?? [],
     reader: { sql: store.sql },
@@ -2391,13 +2422,25 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
       limits: savedSettingsVersion(store, MACHINE_LIMITS_BLOCK)?.config,
       executor: savedSettingsVersion(store, 'executor')?.config
     })
-  /** 一个 Source 的编辑值：kind 解析出的缺省值 + 保存过的块（保存过的优先）。 */
+  /**
+   * 一个 Source 的编辑值：kind 解析出的缺省值 + 保存过的块（保存过的优先）。
+   *
+   * 合并结果再过一次 kind 的 schema：旧版本存下的原始 URL 因此在编辑框里也显示成归一的
+   * `owner/name`（与 Source 页、运行时读同一个值）。校验不通过时原样显示，让人自己改。
+   */
   const liveSource = (instance: {
     readonly id: string
     readonly enabled: boolean
     readonly config: Record<string, unknown>
-  }): { readonly enabled: boolean; readonly config: Record<string, unknown> } =>
-    liveSourceOf(instance, savedSource(instance.id))
+  }): { readonly enabled: boolean; readonly config: Record<string, unknown> } => {
+    const value = liveSourceOf(instance, savedSource(instance.id))
+    const schema = registry.kind(instance.id)?.schema
+    if (schema === undefined) return value
+    const parsed = schema.safeParse(value.config)
+    return parsed.success
+      ? { enabled: value.enabled, config: parsed.data as Record<string, unknown> }
+      : value
+  }
   /** 选择器的人读写法（与 `parseRepoSelector` 互逆，面板编辑的就是这一段文本）。 */
   const selectorText = (selector: { path?: string; name?: string; id?: string } | undefined): string => {
     if (selector === undefined) return ''
@@ -2435,7 +2478,7 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
           enabled: value.enabled,
           config: value.config,
           fields: kind?.fields ?? [],
-          facts: kind?.facts?.(deploymentFacts) ?? [],
+          facts: kind?.facts?.(deploymentNow()) ?? [],
           syncable: syncable.includes(instance.id),
           revision: settingsWriter.blockRevision(`source:${instance.id}`)
         }
@@ -2500,6 +2543,13 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
       }
     })
   }
+  /** 一个 Source 现在生效的 `pollSeconds`（已解析、带缺省值）；非 Source 块是 `undefined`。 */
+  const pollSecondsOf = (blockName: string): number | undefined => {
+    const parsed = parseSettingsBlock(blockName)
+    if (parsed?.kind !== 'source') return undefined
+    const value = registry.instance(parsed.id)?.config['pollSeconds']
+    return typeof value === 'number' ? value : undefined
+  }
   /**
    * 一次面板保存（§K.8）：走 HTTP 的同一条 `PUT settings/:block`（含 #44 的账号类字段探针），
    * 来源恒为 `panel`（面板不能选来源），拒绝折成面板能画的结果（字段级 issues / 冲突 / 原因）。
@@ -2509,6 +2559,10 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
     if (handler === undefined) {
       return { ok: false, reason: 'failed', block: input.block, error: 'the settings writer is not wired' }
     }
+    // 保存前的 `pollSeconds`：它决定「这次保存是否还需要重启」（轮询间隔在启动时定一次）。
+    // 这里读的是**已解析**的值（带 kind 的缺省值）：从没保存过的实例本来就用 60，改仓库
+    // 不该被误报成「要重启」。
+    const beforePollSeconds = pollSecondsOf(input.block)
     try {
       const result = (await handler({
         params: { block: input.block },
@@ -2518,16 +2572,23 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
         at: now(),
         requestId: null
       })) as SettingsSaveView
+      const parsedBlock = parseSettingsBlock(result.block)
+      // `pollSeconds` 是 `source:<id>` 里唯一仍要重启的项：轮询定时器的间隔在启动时定一次。
+      const pollChanged =
+        parsedBlock?.kind === 'source' &&
+        result.changed &&
+        beforePollSeconds !== pollSecondsOf(result.block)
       return {
         ok: true,
         block: result.block,
         revision: result.revision,
         changed: result.changed,
-        // §H.12：Policy（现读）与 `source:<id>`（组合根每处都现读保存过的块）保存即生效；
-        // 其余块是启动时读的，所以告诉面板「重启后生效」，不假装热重载。
+        // §H.12：Policy（现读）与 `source:<id>` 的配置（组合根每处都现读保存过的块）保存即生效；
+        // `pollSeconds` 与其余块是启动时读的，所以告诉面板「重启后生效」，不假装热重载。
         restarting:
           result.restarting ||
-          (result.block !== 'policy' && parseSettingsBlock(result.block)?.kind !== 'source'),
+          (result.block !== 'policy' && parsedBlock?.kind !== 'source') ||
+          pollChanged,
         policyChanged: result.policy_changed,
         origin: result.origin
       }

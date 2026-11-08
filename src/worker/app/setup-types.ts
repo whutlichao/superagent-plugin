@@ -165,13 +165,19 @@ export interface SetupReport {
   readonly githubLogin: string
 }
 
-/** 当前的 setup 结论（boot 持有；`setup check` 重新算一份再 `apply`）。 */
+/**
+ * 当前的 setup 结论（boot 持有；`setup check` 重新算一份再 `apply`）。
+ *
+ * 这是**最近一次完整检查**的报告快照。组合根对外回答「现在还缺什么」时会把纯配置结论按现
+ * 配置重算一遍（`boot.ts` 的 `setupIssuesNow()`），所以 `problem()` 与 `missing()` 只描述
+ * 这份快照本身，不再直接喂给面板。
+ */
 export interface SetupState {
   report(): SetupReport
   issues(): readonly SetupIssue[]
-  /** `state.setup.problem`（最靠前的一条，`SETUP_PLACES` 顺序）。 */
+  /** 报告快照里最靠前的一条（`SETUP_PLACES` 顺序）。 */
   problem(): SetupProblem | null
-  /** 是否还有任何 setup 问题（状态栏与面板的「等 setup」读数）。 */
+  /** 报告快照里是否还有任何 setup 问题。 */
   missing(): boolean
   /** 某个部件是否被 setup 挡住（Source 停在 `starting`，不轮询、不启动）。 */
   blocked(place: SetupPlace): boolean
