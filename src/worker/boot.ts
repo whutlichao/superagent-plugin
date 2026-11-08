@@ -58,6 +58,7 @@ import {
   settingsPageView,
   withSavedSettings
 } from './app/settings-view.ts'
+import { liveSourceOf, savedSourceOf, viewWithSources } from './app/source-config.ts'
 import type { SettingsSourceInput } from './app/settings-view.ts'
 import { ApiError } from './http/errors.ts'
 import { refuseOnDeadline } from './http/budget.ts'
@@ -125,7 +126,14 @@ import { Effects, ROUTER_EFFECT_KEY } from './app/effects.ts'
 import { createPasses } from './app/passes.ts'
 import { notePluginVersion } from './app/upgrade.ts'
 import { createSourceContext } from './app/source-context.ts'
-import { createSetupState, issuesOf, runSetupChecks } from './app/setup.ts'
+import {
+  createSetupState,
+  githubConfigIssues,
+  issuesOf,
+  runSetupChecks,
+  SETUP_PLACES,
+  setupProblemOf
+} from './app/setup.ts'
 import type { SetupBudget, SetupCheckInput, SetupIssue, SetupProblem, SetupReport } from './app/setup.ts'
 import { withDeadline, type HandlerBudget, type ProbeBudget } from './infra/deadline.ts'
 import { backupNow, backupPath } from './app/backup.ts'
@@ -142,10 +150,12 @@ import {
   createGithubApi,
   createGithubKind,
   createGithubPoller,
+  githubConfigSchema,
   observePull,
   pullEndNotices,
   subscribedThreads,
-  GITHUB_KIND
+  GITHUB_KIND,
+  type GithubConfig
 } from './sources/github/index.ts'
 import type { GithubPollResult, GithubPoller, GithubPullHost } from './sources/github/index.ts'
 import {
@@ -447,42 +457,26 @@ function block(value: unknown): Record<string, unknown> {
   return typeof value === 'object' && value !== null ? (value as Record<string, unknown>) : {}
 }
 
-/** 把设置解析成注册表要的视图（`sources.<id>` 与 `policy.sources.<id>`）。 */
-function settingsView(
-  raw: Readonly<Record<string, unknown>>,
-  github: { enabled: boolean; config: Record<string, unknown> },
-  feishu: { enabled: boolean; config: Record<string, unknown> }
-): SourceSettingsView {
-  const policy = block(raw['policy'])
-  const sources = block(policy['sources'])
-  return {
-    sources: {
-      [GITHUB_KIND]: { enabled: github.enabled, config: github.config },
-      [FEISHU_KIND]: { enabled: feishu.enabled, config: feishu.config }
-    },
-    policy: {
-      sources: {
-        [GITHUB_KIND]: block(sources[GITHUB_KIND]),
-        [FEISHU_KIND]: block(sources[FEISHU_KIND])
-      }
-    }
-  }
-}
-
 /** 组合根持有的 Source 运行时（§M.2 的开关）：轮询与事件流的生命周期只在 boot（§C.1）。 */
 interface SourceRuntime {
   /** 设置里一个 Source 的 `enabled` 变了（已写入）：停或起它的轮询/事件流。 */
   notify(id: string, enabled: boolean): void
 }
 
-/** 一个 Source 实例的配置与 setup 问题（缺 repository/cli 时不轮询，§I.2）。 */
+/**
+ * 一个 Source 实例的配置与 setup 问题（缺 repository/cli 时不轮询，§I.2）。
+ *
+ * `enabled` 是**现值**（面板的开关会改它，§M.2「打开/关闭」）；`configSource` 是配置的现读
+ * 入口——保存过的 `source:<id>` 块优先于启动时读到的宿主设置，所以保存之后同一个进程里的
+ * 部署检查、注册表与运行时看到同一份配置（§N.2：面板保存的设置存库即生效）。
+ */
 interface GithubSetup {
-  /** 面板的开关会改它（§M.2「打开/关闭」）：其余字段仍是启动时读到的设置。 */
+  /** 面板的开关会改它：其余配置经 `configSource()` 现读。 */
   enabled: boolean
-  readonly config: Record<string, unknown>
+  /** 现在的配置（化简过、带 kind 的缺省值）：保存之后立刻是新值。 */
+  readonly configSource: () => GithubConfig
   /** setup 探针读到的 agent 账号（读不到时回落设置；§I.2 的 `@mention` 与自身消息都要它）。 */
   readonly login: string
-  readonly problem?: { readonly place: string; readonly code: string; readonly detail?: string }
 }
 
 /**
@@ -709,22 +703,10 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
   const executorSettings = resolveExecutorSettings(settings)
   const rawSources = block(settings['sources'])
   /**
-   * 存过的 `source:<id>` 块里有效的 `enabled`（§N.2：面板保存的设置存库即生效）。
-   * 只读这一项：`cli`/`repository` 这类 setup 字段仍取启动时读到的设置，改它们要重启。
+   * 存过的 `source:<id>` 块（§N.2：面板保存的设置存库即生效）。`enabled` 与 `config` 都以块
+   * 为准；合并读法只有 `app/source-config.ts` 一份（注册表、Source 页、运行时与部署检查共用）。
    */
-  const savedSourceEnabled = (id: string): boolean | undefined => {
-    const saved = savedSettingsVersion(store, `source:${id}`)?.config
-    if (typeof saved !== 'object' || saved === null) return undefined
-    const enabled = (saved as { enabled?: unknown }).enabled
-    return typeof enabled === 'boolean' ? enabled : undefined
-  }
-  /** 一个 Source 的存储形态：安装时的设置，加上面板保存过的 `enabled`（若有）。 */
-  const storedSource = (id: string): Record<string, unknown> => {
-    const base = block(rawSources[id])
-    const enabled = savedSourceEnabled(id)
-    return enabled === undefined ? base : { ...base, enabled }
-  }
-  const githubStored = storedSource(GITHUB_KIND)
+  const savedSource = (id: string): unknown => savedSettingsVersion(store, `source:${id}`)?.config
   const commandPort: CommandsHost =
     options.commands ?? new Commands({ configuredPrograms: () => [text(settings['githubCli'])] })
   // 机器限额（§H.12、§H.22）：保存过的块优先，没写的用缺省值；启动时读一次。
@@ -777,7 +759,61 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
       { reason: 'timeout' }
     )
   }
-  const githubInstance = githubInstanceOf({ raw: settings, stored: githubStored })
+  /**
+   * 现在的 GitHub 配置（原始形态）：宿主 `sources.github.config` → 保存过的 `source:github` 块
+   * → 清单级同名设置。规范化与缺省值由 `githubConfigResolved()` 的 schema 给。
+   */
+  const githubRawConfig = (): Record<string, unknown> => {
+    const merged: Record<string, unknown> = {
+      ...(storedSourceNow(GITHUB_KIND)['config'] as Record<string, unknown>)
+    }
+    // 清单级设置只在「这个键完全没写」时回落：显式空串是「没配」，不静默换回默认值。
+    if (text(merged['repository']) === undefined && text(settings['repository']) !== undefined) {
+      merged['repository'] = text(settings['repository'])
+    }
+    if (merged['cli'] === undefined) merged['cli'] = text(settings['githubCli']) ?? 'gh'
+    return merged
+  }
+  /**
+   * 现在的 GitHub 配置（过 kind 的 schema）：`repository` 因此是 GitHub API 要的 `owner/name`
+   * （URL 写法在这里规范化），其余字段带缺省值。**每次现读**，所以面板保存之后同一个进程里的
+   * 部署检查、Source 页、轮询器与 PR 规则看到同一份配置（§N.2：存库即生效）。
+   *
+   * 读不通时**显式**记一条日志（不静默吞掉）：回到缺省配置等同于「没配仓库」，面板随即显示
+   * `repository_missing`；设置页的 Save 已经先按同一份 schema 拒绝过坏值，所以这里只可能是
+   * 宿主设置或历史版本留下的值。
+   */
+  let warnedGithubConfig = ''
+  const githubConfigResolved = (): GithubConfig => {
+    const raw = githubRawConfig()
+    const parsed = githubConfigSchema.safeParse(raw)
+    if (parsed.success) return parsed.data
+    // 每次现读都可能走到这里（每轮轮询、每次面板读数）：同一个坏值只记一次，不刷日志。
+    const fingerprint = JSON.stringify(raw)
+    if (fingerprint !== warnedGithubConfig) {
+      warnedGithubConfig = fingerprint
+      logger.warn('the stored GitHub Source configuration is invalid; using the defaults until it is saved again', {
+        issues: parsed.issues.map((issue) => `${issue.path.join('.') || '(root)'}: ${issue.message}`)
+      })
+    }
+    return githubConfigSchema.parse({})
+  }
+  /**
+   * 一个 Source 的存储形态（`{enabled, config}`）：宿主设置打底，保存过的块覆盖**同名字段**，
+   * `config` 按键合并（不是整块替换）。`setupFeishu` 与 `sourceEnabledNow` 都读它。
+   */
+  const storedSourceNow = (id: string): Record<string, unknown> => {
+    const base = block(rawSources[id])
+    const saved = savedSourceOf(savedSource(id))
+    return {
+      ...base,
+      ...(saved.enabled === undefined ? {} : { enabled: saved.enabled }),
+      config: { ...block(base['config']), ...saved.config }
+    }
+  }
+  /** 一个 Source 现在的开关（保存过的块 → 宿主设置 → 缺省）。 */
+  const sourceEnabledNow = (id: string, fallback: boolean): boolean =>
+    flag(storedSourceNow(id)['enabled'], fallback)
   const feishuCli = feishuCliOf(rawSources)
   const setupInput = (): SetupCheckInput => ({
     stateDir: resolved,
@@ -785,9 +821,9 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
     ...(executorSettings.model === undefined ? {} : { model: executorSettings.model }),
     ...(executorSettings.baseRepo === undefined ? {} : { baseRepo: executorSettings.baseRepo }),
     ...(executorSettings.baseBranch === undefined ? {} : { baseRef: executorSettings.baseBranch }),
-    repository: githubInstance.repository,
-    githubCli: githubInstance.cli,
-    githubEnabled: githubInstance.enabled,
+    repository: githubConfigResolved().repository,
+    githubCli: githubConfigResolved().cli,
+    githubEnabled: sourceEnabledNow(GITHUB_KIND, true),
     ...(feishuCli === undefined ? {} : { feishuCli }),
     // worker 的提交身份（§H.11）：账号以探针读到的 `gh` 为准，邮箱来自设置（§E.11 同源）。
     gitConfig: {
@@ -803,12 +839,13 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
   })
   // 读不到的账号回落到设置里的值（§I.2：自身消息的判定要一个账号）。
   const fallbackLogin = text(settings['githubLogin']) ?? ''
+  /** GitHub 实例的现读配置（setup 结论、运行时与部署事实共用这一份）。 */
   const githubSetup: GithubSetup = {
-    enabled: githubInstance.enabled,
-    config: githubInstance.config,
+    enabled: sourceEnabledNow(GITHUB_KIND, true),
+    configSource: githubConfigResolved,
     login: fallbackLogin
   }
-  const feishuStored = storedSource(FEISHU_KIND)
+  const feishuStored = storedSourceNow(FEISHU_KIND)
   const feishuSetupCommands: CommandsHost =
     options.commands ??
     new Commands({ configuredPrograms: () => [text(settings['feishuCli'])] })
@@ -819,11 +856,20 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
     log: (message) => logger.info(message)
   })
   const setup = createSetupState(await runSetupChecks(setupInput()))
-  let sourceSettings: SourceSettingsView = settingsView(settings, githubSetup, feishuSetup)
+  /** 现在的 Source 设置视图：每个调用都现读保存过的块，保存之后同一进程立刻看到新值。 */
+  const sourceSettingsNow = (): SourceSettingsView =>
+    viewWithSources(settings, {
+      [GITHUB_KIND]: {
+        enabled: sourceEnabledNow(GITHUB_KIND, true),
+        config: { ...githubConfigResolved() }
+      },
+      [FEISHU_KIND]: { enabled: feishuSetup.enabled, config: feishuSetup.config }
+    })
 
   // ---- 注册表与 kind
-  const registry = new SourceRegistry({ health: board, settings: () => sourceSettings })
-  registry.register(createGithubKind(String(githubSetup.config['cli'] ?? 'gh')))
+  const registry = new SourceRegistry({ health: board, settings: () => sourceSettingsNow() })
+  // Channel 与语境读也现读 `cli`：保存过的 CLI 不必重新注册 kind（§N.2）。
+  registry.register(createGithubKind(() => githubConfigResolved().cli))
   // Feishu 的 kind 绑定配置的 CLI 与 stateDir：语境读/图片下载要它们（§I.3、§H.17）。
   registry.register(
     createFeishuKind(feishuSetup.cli === '' ? 'lark-cli' : feishuSetup.cli, {
@@ -837,7 +883,7 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
   /**
    * 这个 Source 实例现在是否真的在跑（§I.2/I.3 的启动条件、§M.2 的开关）：设置启用、配置有效。
    * 与注册表 `overview()` 的 `off`/`error` 同一口径——面板看到的那一档，就是轮询/事件流用的
-   * 那一档。开关只改设置（`sourceSettings`），`core/` 不存任何开关状态（§D.4）。
+   * 那一档。开关只改设置（`sourceSettingsNow()` 现读），`core/` 不存任何开关状态（§D.4）。
    */
   const sourceLive = (id: string): boolean => {
     const instance = registry.instance(id)
@@ -870,10 +916,72 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
     }
   }
   applySetup(setup.report())
-  const githubLogin = (): string => setup.report().githubLogin || fallbackLogin
-  const githubBlocked = (): boolean => setup.blocked('github')
-  const githubProblem = (): GithubSetup['problem'] => {
-    const found = issuesOf(setup.issues(), 'github')[0]
+  /**
+   * `github` 健康条目按**现配置**改写：保存过的仓库/CLI 立刻改写这一档（纯配置的两条结论
+   * 只看配置本身，不必重跑探针）；其余结论（账号读不到等）仍由报告说话。
+   */
+  const refreshGithubHealth = (): void => {
+    const issues = githubIssuesNow()
+    if (issues.length > 0) {
+      githubHealth?.set({ state: 'starting', detail: issues[0]?.code ?? 'setup' })
+      return
+    }
+    if (!githubSetup.enabled) {
+      githubHealth?.set({ state: 'paused', detail: 'disabled' })
+      return
+    }
+    // 刚被修好的纯配置问题不该留在条目上（保存过的仓库/CLI 已生效）：回到「等下一轮」，
+    // 下一轮轮询成功会写它自己的读数。其他读数（账号不可读、轮询失败）原样保留。
+    const current = githubHealth?.get()
+    if (current?.detail === 'repository_missing' || current?.detail === 'cli_missing') {
+      githubHealth?.set({ state: 'starting', detail: 'Waiting for the next pass' })
+    }
+  }
+  /**
+   * 保存前账号探针读到的登录名（§K.8）：写前检查按**候选**仓库/CLI 跑过一次 `gh api user`，
+   * 保存成功后同一份配置就是现配置，于是那次读数直接可用——不必再跑一次探针，也不必重启。
+   * 键是当时的仓库与 CLI：配置一变就不匹配，回落到完整检查的读数。
+   */
+  let probedGithubLogin: { readonly repository: string; readonly cli: string; readonly login: string } | undefined
+  const githubLogin = (): string => {
+    const config = githubConfigResolved()
+    const probed = probedGithubLogin
+    if (probed !== undefined && probed.repository === config.repository && probed.cli === config.cli) {
+      return probed.login
+    }
+    return setup.report().githubLogin || fallbackLogin
+  }
+  /**
+   * 按**当前配置**现算的 GitHub 纯配置问题（`githubConfigIssues`）：保存过的仓库/CLI 因此
+   * 立刻反映到部署检查与 Source 页上，不必等一次完整探针重跑（§N.2）。
+   */
+  const githubConfigProblemsNow = (): readonly SetupIssue[] => {
+    const config = githubConfigResolved()
+    return githubConfigIssues(config.repository, config.cli)
+  }
+  /**
+   * 一次 GitHub setup 结论的现值：完整检查报告里的 github 问题，但纯配置的那两条以**现配置**
+   * 为准（同名的旧结论被替换，不是被追加）。
+   */
+  const githubIssuesNow = (): readonly SetupIssue[] => {
+    const fromConfig = githubConfigProblemsNow()
+    // 纯配置的两条结论只由现配置回答：报告里的同名旧结论一律丢掉（不是被追加）。
+    const reported = issuesOf(setup.issues(), 'github').filter(
+      (issue) => issue.code !== 'repository_missing' && issue.code !== 'cli_missing'
+    )
+    return [...fromConfig, ...reported]
+  }
+  /**
+   * 全部 setup 结论的现值（`state`、Source 页与部署页共用）：github 的两条纯配置结论按现
+   * 配置现算，其余照报告；整体按 `SETUP_PLACES` 的次序排（面板照着这个顺序读）。
+   */
+  const setupIssuesNow = (): readonly SetupIssue[] =>
+    [...setup.issues().filter((issue) => issue.place !== 'github'), ...githubIssuesNow()].sort(
+      (left, right) => SETUP_PLACES.indexOf(left.place) - SETUP_PLACES.indexOf(right.place)
+    )
+  const githubBlocked = (): boolean => githubIssuesNow().length > 0
+  const githubProblem = (): { readonly place: string; readonly code: string; readonly detail?: string } | undefined => {
+    const found = githubIssuesNow()[0]
     if (found === undefined) return undefined
     return { place: found.place, code: found.code, detail: found.detail }
   }
@@ -906,7 +1014,7 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
   const policyKind = (source: string): PolicyKindView | undefined => {
     const part = registry.kind(source)?.policy
     if (part === undefined) return undefined
-    const config = registry.instance(source, sourceSettings)?.config ?? {}
+    const config = registry.instance(source, sourceSettingsNow())?.config ?? {}
     return {
       rows: () => part.rows?.(config) ?? [],
       extras: (section) => part.schema.safeParse(section)
@@ -946,9 +1054,10 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
       current: effectivePolicy
     }),
     /**
-     * 开关立即生效（§M.2）：任何 `source:<id>` 块的保存（Source 页的开关、Settings 页）
-     * 都把新的 `enabled` 交给 Source 运行时——不必重启插件。其余字段仍是「重启后生效」
-     * （§N.2）：`cli`/`repository` 只影响下一次启动。
+     * `source:<id>` 保存之后要做的事（§M.2、§N.2）：
+     * - 配置（仓库、CLI、四个 observe 开关）本来就现读（`githubConfigResolved()`），保存即生效；
+     * - 这里只把新的 `enabled` 交给 Source 运行时，并刷新 `github` 健康条目。
+     * `pollSeconds` 例外：轮询定时器的间隔在启动时定一次，改它仍要重启插件。
      */
     saved: (record) => {
       const parsed = parseSettingsBlock(record.block)
@@ -957,15 +1066,18 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
         typeof record.config === 'object' && record.config !== null
           ? (record.config as { enabled?: unknown })
           : {}
-      if (typeof config.enabled !== 'boolean') return
-      const previous = sourceFlag(parsed.id)
       try {
-        applySourceEnabled(parsed.id, config.enabled)
-        // 只改配置（开关没变）不降级健康：下一轮轮询/事件流会自己重新报告。
-        if (previous !== config.enabled) sourceRuntime.notify(parsed.id, config.enabled)
+        // 配置（仓库/CLI/开关）本来就现读；这里只把**开关**的即时效果交给 Source 运行时。
+        if (typeof config.enabled === 'boolean') {
+          const previous = sourceFlag(parsed.id)
+          applySourceEnabled(parsed.id, config.enabled)
+          // 只改配置（开关没变）不降级健康：下一轮轮询/事件流会自己重新报告。
+          if (previous !== config.enabled) sourceRuntime.notify(parsed.id, config.enabled)
+        }
+        refreshGithubHealth()
       } catch (error) {
         // 保存已经提交：通知失败不能把“已写入”变成“没写入”（面板会重试出冲突）。
-        logger.warn(`the ${parsed.id} Source switch could not be applied: ${stringOf(error)}`)
+        logger.warn(`the ${parsed.id} Source settings could not be applied: ${stringOf(error)}`)
       }
       refresh()
     }
@@ -979,7 +1091,12 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
 
   // ---- Router（§F.1–§F.5）：专用 worktree、terminal 面的常驻会话、relay 与保活监督
   const roles = resolveRoles(settings)
-  const deploymentFacts = deployment(settings, { ...githubSetup, login: githubLogin() }, feishuSetup)
+  /**
+   * 部署派生的事实（§E.11）：每次现读，保存过的仓库/CLI 立刻反映到 Settings 的 facts、注入
+   * worker 的环境段与 PR 归属判定里（§N.2）。
+   */
+  const deploymentNow = (): Deployment =>
+    deployment(settings, { ...githubSetup, login: githubLogin() }, feishuSetup)
   const cliPath = options.cliPath ?? defaultCliPath()
   // Prompt 配置与版本的唯一读写面（§L.4、§L.5）：两个 launch 与 `prompts get --text` 都从这里读；
   // 每次 launch 现读，所以保存过的团队段与 revision 在下一次 launch 就生效。体量上限来自设置
@@ -1004,8 +1121,8 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
     cliPath,
     tokenFile,
     stateDir: resolved,
-    repository: deploymentFacts.repository,
-    account: deploymentFacts.githubLogin
+    repository: deploymentNow().repository,
+    account: deploymentNow().githubLogin
   })
   /** Router 的 Policy 段（§L.3 第 11 步）：跟**生效**的块走，与 Gate、复验同一个真相源。 */
   const promptPolicy = (): PromptPolicy => {
@@ -1110,10 +1227,14 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
   // ---- GitHub 的 PR 规则（§I.2「PR 规则」行、§I.5）：读一条 PR、绑定与结束判定。宿主把
   // Engine 的两条命令与仓储的读面拼成 Source 端口（§C.2 规则 2：sources 不 import app），
   // 报告路径与轮询路径共用同一份，语义因此只有一处。
-  const githubRepository = String(githubSetup.config['repository'] ?? '')
-  const githubCli = String(githubSetup.config['cli'] ?? 'gh')
+  //
+  // 仓库与 CLI 都**现读**（与轮询器同一份配置）：面板保存的仓库从下一次读/下一轮起生效，
+  // 不必重启（§N.2）；`GitHub 的读端口是否接线`仍以启动时的完整配置为准。
+  const githubRepository = (): string => githubConfigResolved().repository
+  const githubCli = (): string => githubConfigResolved().cli
   /** GitHub 的读端口：setup 完成（仓库与 CLI 都在）才读，否则 PR 绑定与通知都不接线。 */
-  const githubReady = githubSetup.enabled && githubRepository !== '' && githubCli !== ''
+  const githubReady = (): boolean =>
+    githubSetup.enabled && githubRepository() !== '' && githubCli() !== ''
   const githubApi = createGithubApi(
     (options.commands ?? new Commands({ configuredPrograms: () => [text(settings['githubCli'])] })).withSignal(),
     githubCli
@@ -1131,9 +1252,13 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
     close: (thread, outcome, at) => {
       engine.threadClosed(thread, outcome, at)
     },
-    // agent 的账号与配置仓库判「这条 PR 是不是它的」（§I.2 PR 规则行）。
-    login: deploymentFacts.githubLogin,
-    repository: githubRepository,
+    // agent 的账号与配置仓库判「这条 PR 是不是它的」（§I.2 PR 规则行）；两者都现读。
+    get login(): string {
+      return deploymentNow().githubLogin
+    },
+    get repository(): string {
+      return githubRepository()
+    },
     now
   }
   const executor = new OrcaExecutor({ effects, runtime: options.runtime, log: (message) => logger.info(message) })
@@ -1164,11 +1289,11 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
       // 因 PR 结束的 Ticket 给 chat 发**一条**稳定通知（§I.2「结束通知」行）：键由 PR 号、
       // Channel 与结局派生，同一结束重复算也只排一条（§J.1 幂等）。GitHub 自己的时间线已经
       // 显示合并/关闭，所以通知只发往别的 Channel。
-      if (event.type === 'ticket.ended' && githubReady) {
+      if (event.type === 'ticket.ended' && githubReady()) {
         const ended = repo.tickets.get(event.data.ticketId)
         if (ended !== undefined) {
           const request = repo.triggers.get(ended.origin.triggerId)?.text ?? ''
-          for (const notice of pullEndNotices(ended, request, githubRepository)) outbox.send(notice)
+          for (const notice of pullEndNotices(ended, request, githubRepository())) outbox.send(notice)
         }
       }
     }
@@ -1257,7 +1382,7 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
     // §E.6 的槽读数：运行数/上限 + 单列的人类槽（执行器自己判定占用，面板不重算一遍）。
     load: () => loadReadout(repo.tickets.list(), executorSettings.maxWorkers),
     hasError: () => healthErrors() > 0,
-    setupMissing: () => setup.missing(),
+    setupMissing: () => setupIssuesNow().length > 0,
     paused: () => paused.paused(),
     sources: sourceSummary,
     // §J.3 的系统问题 = health error 条目 + 连续失败 3 次的回复（outbox）+ §K.7 判过四条件的
@@ -1329,7 +1454,7 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
    * 面板里的设置承诺即时生效）；人修好的外部条件（`gh auth login`、在 Orca 里加仓库）当场可见。
    */
   const checkSetup = async (budget?: SetupBudget): Promise<SetupCheckOutcome> => {
-    if (!setup.missing()) {
+    if (setupIssuesNow().length === 0) {
       return { checked: false, problem: null, issues: [], restarted: false }
     }
     const githubWasBlocked = githubBlocked()
@@ -1338,6 +1463,7 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
     // §O：handler 给的预算（探针上限 + 取消信号）只加在这次重跑上；启动路径没有预算。
     const report = await runSetupChecks(budget === undefined ? input : { ...input, budget })
     applySetup(report)
+    refreshGithubHealth()
     refresh()
     // 刚解锁的循环从现在开始干活：Source 轮询下一轮就发请求，Router 监督真的建会话。
     const routerArmed = !routerWasEnabled && routerEnabled()
@@ -1347,8 +1473,8 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
     const githubArmed = githubWasBlocked && !githubBlocked()
     return {
       checked: true,
-      problem: setup.problem(),
-      issues: report.issues,
+      problem: setupProblemOf(setupIssuesNow()),
+      issues: setupIssuesNow(),
       restarted: routerArmed || githubArmed
     }
   }
@@ -1384,21 +1510,22 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
     // 读模型里的「已投递到该 Ticket」：归属判定与扇出/交回同一份记录（`followupOwners`）。
     followups: (ticket) => deliveredFollowups(ticket, repo),
     // `report --pr-number` 的绑定（§I.2「PR 规则」行）：读那条 PR、判归属并绑给这张 Ticket；
-    // 拒绝时整条命令落成固定码 `pr_mismatch`。没有 GitHub Source 时无从判归属，不接线。
-    ...(githubReady
-      ? {
-          claimPull: (ticketId: string, pull: { readonly number: number }, probe) =>
-            claimReportedPull(
-              // §O：这次 PR 读在 handler 的预算里跑——信号绑到一个只属于这次调用的 API 上
-              // （`gh` 因此被 SIGTERM）；没有预算时用启动时那一份，行为与 #64 之前一致。
-              probe?.signal === undefined
-                ? pullHost
-                : { ...pullHost, api: createGithubApi(commandPort.withSignal(probe.signal), githubCli) },
-              ticketId,
-              pull.number
-            )
-        }
-      : {}),
+    // 拒绝时整条命令落成固定码 `pr_mismatch`。接线不看的启动时配置：没有仓库/CLI 时按
+    // 固定拒绝回答（保存过仓库之后**下一次**命令就能用，不必重启，§N.2）。
+    claimPull: (ticketId: string, pull: { readonly number: number }, probe) => {
+      if (!githubReady()) {
+        return 'the GitHub Source has no repository or CLI yet; set it on the Source page and retry'
+      }
+      return claimReportedPull(
+        // §O：这次 PR 读在 handler 的预算里跑——信号绑到一个只属于这次调用的 API 上
+        // （`gh` 因此被 SIGTERM）；没有预算时用启动时那一份，行为与 #64 之前一致。
+        probe?.signal === undefined
+          ? pullHost
+          : { ...pullHost, api: createGithubApi(commandPort.withSignal(probe.signal), githubCli) },
+        ticketId,
+        pull.number
+      )
+    },
     idempotent,
     afterWrite: () => {
       refresh()
@@ -1434,7 +1561,7 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
   const evalTools = createEvalTools({
     candidate: (triggerId) => engine.candidate(triggerId),
     trigger: (triggerId) => repo.triggers.get(triggerId),
-    threadContext: (trigger) => registry.threadContext(trigger, sourceSettings),
+    threadContext: (trigger) => registry.threadContext(trigger, sourceSettingsNow()),
     commands: commandPort,
     admission: () => evalAdmission,
     roots: evalRoots,
@@ -1446,7 +1573,7 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
   const readTools = createReadTools({
     commands: commandPort,
     sourceConfig: (kind) => {
-      const instance = registry.instance(kind, sourceSettings)
+      const instance = registry.instance(kind, sourceSettingsNow())
       return instance === undefined || !instance.enabled ? undefined : instance.config
     },
     trigger: (id) => repo.triggers.get(id),
@@ -1544,7 +1671,7 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
       'eval',
       'executor',
       MACHINE_LIMITS_BLOCK,
-      ...Object.keys(sourceSettings.sources).map((id) => `source:${id}`)
+      ...Object.keys(sourceSettingsNow().sources).map((id) => `source:${id}`)
     ],
     effective: (name) => {
       if (name === 'policy') return effectivePolicy()
@@ -1554,7 +1681,7 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
       if (name === MACHINE_LIMITS_BLOCK) return limitsBlockValue(limits)
       const parsed = parseSettingsBlock(name)
       return parsed?.kind === 'source'
-        ? (sourceSettings.sources[parsed.id] ?? { enabled: false, config: {} })
+        ? (sourceSettingsNow().sources[parsed.id] ?? { enabled: false, config: {} })
         : null
     },
     // 账号类字段的写前 setup 检查（§K.8）：按候选值跑 #44 的探针，只回 github 那一组问题
@@ -1568,7 +1695,17 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
         // §O：handler 定的探针上限与取消线只加在这次写前检查上（启动路径没有预算）。
         ...(budget === undefined ? {} : { budget })
       })
-      return issuesOf(report.issues, 'github')
+      const issues = issuesOf(report.issues, 'github')
+      // 这次探针读到的账号留着：保存成功之后它就是现配置的账号（`githubLogin()` 按配置匹配取用）。
+      if (issues.length === 0 && report.githubLogin !== '') {
+        const config = githubConfigResolved()
+        probedGithubLogin = {
+          repository: candidate.repository ?? config.repository,
+          cli: candidate.cli ?? config.cli,
+          login: report.githubLogin
+        }
+      }
+      return issues
     },
     idempotent,
     policySync: {
@@ -1634,7 +1771,7 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
         Object.fromEntries(
           Object.entries(board.all()).map(([name, entry]) => [name, { ...entry, at: now() }])
         ),
-      setup: () => ({ problem: setup.problem() }),
+      setup: () => ({ problem: setupProblemOf(setupIssuesNow()) }),
       paused: () => paused.paused(),
       loops: () =>
         loopEntries(
@@ -1702,20 +1839,11 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
   // 现在是否在跑」。setup 问题（账号读不到等）由 `pollOnce` 的门挡住，于是 `setup check`
   // 把它们修好之后，下一轮轮询就真的开始了——不必重启 Orca（§N.1）。面板的开关同理：
   // 关掉的 Source 在下一轮之前不再发一个 `gh` 调用、不再产生 Trigger（§M.2）。
-  const poller: GithubPoller | null =
-    githubInstance.repository !== '' && githubInstance.cli !== ''
-      ? createGithubPoller({
+  const githubPoller: GithubPoller = createGithubPoller({
           api: githubApi,
-          config: {
-            repository: githubRepository,
-            cli: githubCli,
-            pollSeconds: Number(githubSetup.config['pollSeconds'] ?? 60),
-            observeIssues: githubSetup.config['observeIssues'] === true,
-            observePulls: githubSetup.config['observePulls'] === true,
-            observeComments: githubSetup.config['observeComments'] === true,
-            observeCi: githubSetup.config['observeCi'] === true
-          },
-          login: deployment(settings, { ...githubSetup, login: githubLogin() }, feishuSetup).githubLogin,
+          // 每轮现读：面板保存的仓库/开关从下一轮起生效，不必重启（§N.2）。
+          config: githubConfigResolved,
+          login: () => githubLogin(),
           // 订阅 Thread 由组合根从 Thread/Ticket 行算出（轮询器自己不读库，§C.2）。
           subscribed: () => subscribedThreads(repo.threads.list(), repo.tickets.list()),
           now: nowMs,
@@ -1739,7 +1867,7 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
             instance: {
               id: GITHUB_KIND,
               enabled: githubSetup.enabled,
-              config: githubSetup.config,
+              config: { ...githubConfigResolved() },
               health: Object.fromEntries(registry.healthEntries(['github'])),
               ...(githubProblem() === undefined ? {} : { problem: githubProblem() })
             },
@@ -1749,7 +1877,6 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
           }),
           log: (message) => logger.info(message)
         })
-      : null
 
   // ---- Feishu 读侧（§I.3）：事件流长驻，回填/话题/群名每 60 s 一轮（测试手动推）
   const feishuInstance = registry.instance(FEISHU_KIND)
@@ -1903,12 +2030,11 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
 
   /**
    * 把 `source:<id>` 的新开关换成本进程的 Source 视图：注册表、Channel 与环境都读它。
-   * 其余配置原样保留（这个动作不改 setup 字段，§N.2：写它们仍要重启）。
+   * 其余配置本来就现读（`sourceSettingsNow()`），这里只留下启用的即时切换。
    */
   const applySourceEnabled = (id: string, enabled: boolean): void => {
     if (id === GITHUB_KIND) githubSetup.enabled = enabled
     else if (id === FEISHU_KIND) feishuSetup.enabled = enabled
-    sourceSettings = settingsView(settings, githubSetup, feishuSetup)
   }
 
   /** 这个 Source 在本进程里的开关值（设置写入之前的旧值，用来判「开关真的变了吗」）。 */
@@ -2015,10 +2141,11 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
   const pollOnce = async (): Promise<GithubPollResult> => {
     // setup 未完成：循环在跑，但一轮都不读（Source 停在 setup/starting，不是 error）。
     // 面板关掉的 Source 同理：这一轮不发一个 `gh` 调用、不产生 Trigger（§M.2）。
-    if (poller === null || githubBlocked() || !sourceLive(GITHUB_KIND)) {
+    if (githubBlocked() || !sourceLive(GITHUB_KIND)) {
       return { notifications: 0, triggers: 0, skipped: 0 }
     }
-    const result = await poller.poll()
+    // 没有仓库/CLI 时轮询器自己什么都不读（setup 态）；这里不再另造一个「没有轮询器」的分支。
+    const result = await githubPoller.poll()
     refresh()
     return result
   }
@@ -2070,13 +2197,11 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
     }, options.passIntervalMs ?? PASS_INTERVAL_MS)
     timers.push(passTimer)
     const pollMs =
-      options.pollIntervalMs ?? Math.max(10_000, Number(githubSetup.config['pollSeconds'] ?? 60) * 1000)
-    if (poller !== null) {
-      const pollTimer = setInterval(() => {
-        trackRound(pollOnce())
-      }, pollMs)
-      timers.push(pollTimer)
-    }
+      options.pollIntervalMs ?? Math.max(10_000, githubConfigResolved().pollSeconds * 1000)
+    const pollTimer = setInterval(() => {
+      trackRound(pollOnce())
+    }, pollMs)
+    timers.push(pollTimer)
     if (feishuConfig.cli !== '') {
       // 第一轮立刻跑一次（安装完就能补上安装前一刻之后的），之后每分钟一轮。
       // 入口自己看开关：关闭的 Source 这一轮直接返回，不发 CLI（§M.2）。
@@ -2108,10 +2233,10 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
     now: now(),
     overview: () => registry.overview(),
     health: () => board.all(),
-    setup: () => setup.issues(),
+    setup: () => setupIssuesNow(),
     kind: (id) => registry.kind(id),
     facts: () =>
-      registry.facts(deployment(settings, { ...githubSetup, login: githubLogin() }, feishuSetup)),
+      registry.facts(deploymentNow()),
     config: (id) => registry.instance(id)?.config,
     syncable: () => policySyncDriver?.syncable() ?? [],
     reader: { sql: store.sql },
@@ -2297,24 +2422,24 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
       limits: savedSettingsVersion(store, MACHINE_LIMITS_BLOCK)?.config,
       executor: savedSettingsVersion(store, 'executor')?.config
     })
-  /** 一个 Source 的编辑值：kind 解析出的缺省值 + 保存过的块（保存过的优先）。 */
+  /**
+   * 一个 Source 的编辑值：kind 解析出的缺省值 + 保存过的块（保存过的优先）。
+   *
+   * 合并结果再过一次 kind 的 schema：旧版本存下的原始 URL 因此在编辑框里也显示成归一的
+   * `owner/name`（与 Source 页、运行时读同一个值）。校验不通过时原样显示，让人自己改。
+   */
   const liveSource = (instance: {
     readonly id: string
     readonly enabled: boolean
     readonly config: Record<string, unknown>
   }): { readonly enabled: boolean; readonly config: Record<string, unknown> } => {
-    const saved = savedSettingsVersion(store, `source:${instance.id}`)?.config
-    const record =
-      typeof saved === 'object' && saved !== null ? (saved as Record<string, unknown>) : undefined
-    if (record === undefined) return { enabled: instance.enabled, config: instance.config }
-    const config =
-      typeof record['config'] === 'object' && record['config'] !== null
-        ? (record['config'] as Record<string, unknown>)
-        : {}
-    return {
-      enabled: typeof record['enabled'] === 'boolean' ? record['enabled'] : instance.enabled,
-      config: { ...instance.config, ...config }
-    }
+    const value = liveSourceOf(instance, savedSource(instance.id))
+    const schema = registry.kind(instance.id)?.schema
+    if (schema === undefined) return value
+    const parsed = schema.safeParse(value.config)
+    return parsed.success
+      ? { enabled: value.enabled, config: parsed.data as Record<string, unknown> }
+      : value
   }
   /** 选择器的人读写法（与 `parseRepoSelector` 互逆，面板编辑的就是这一段文本）。 */
   const selectorText = (selector: { path?: string; name?: string; id?: string } | undefined): string => {
@@ -2339,7 +2464,7 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
     const executor = resolveExecutorSettings(live)
     const limitsNow = machineLimits(live)
     const syncable = policySyncable()
-    const instances = registry.instances(sourceSettings)
+    const instances = registry.instances(sourceSettingsNow())
     const overview = new Map(registry.overview().map((row) => [row.id, row]))
     const sources: SettingsSourceInput[] = instances.flatMap((instance) => {
       const kind = registry.kind(instance.id)
@@ -2353,7 +2478,7 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
           enabled: value.enabled,
           config: value.config,
           fields: kind?.fields ?? [],
-          facts: kind?.facts?.(deploymentFacts) ?? [],
+          facts: kind?.facts?.(deploymentNow()) ?? [],
           syncable: syncable.includes(instance.id),
           revision: settingsWriter.blockRevision(`source:${instance.id}`)
         }
@@ -2418,6 +2543,13 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
       }
     })
   }
+  /** 一个 Source 现在生效的 `pollSeconds`（已解析、带缺省值）；非 Source 块是 `undefined`。 */
+  const pollSecondsOf = (blockName: string): number | undefined => {
+    const parsed = parseSettingsBlock(blockName)
+    if (parsed?.kind !== 'source') return undefined
+    const value = registry.instance(parsed.id)?.config['pollSeconds']
+    return typeof value === 'number' ? value : undefined
+  }
   /**
    * 一次面板保存（§K.8）：走 HTTP 的同一条 `PUT settings/:block`（含 #44 的账号类字段探针），
    * 来源恒为 `panel`（面板不能选来源），拒绝折成面板能画的结果（字段级 issues / 冲突 / 原因）。
@@ -2427,6 +2559,10 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
     if (handler === undefined) {
       return { ok: false, reason: 'failed', block: input.block, error: 'the settings writer is not wired' }
     }
+    // 保存前的 `pollSeconds`：它决定「这次保存是否还需要重启」（轮询间隔在启动时定一次）。
+    // 这里读的是**已解析**的值（带 kind 的缺省值）：从没保存过的实例本来就用 60，改仓库
+    // 不该被误报成「要重启」。
+    const beforePollSeconds = pollSecondsOf(input.block)
     try {
       const result = (await handler({
         params: { block: input.block },
@@ -2436,14 +2572,23 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
         at: now(),
         requestId: null
       })) as SettingsSaveView
+      const parsedBlock = parseSettingsBlock(result.block)
+      // `pollSeconds` 是 `source:<id>` 里唯一仍要重启的项：轮询定时器的间隔在启动时定一次。
+      const pollChanged =
+        parsedBlock?.kind === 'source' &&
+        result.changed &&
+        beforePollSeconds !== pollSecondsOf(result.block)
       return {
         ok: true,
         block: result.block,
         revision: result.revision,
         changed: result.changed,
-        // §H.12：只有 Policy 是保存即生效的（`effectivePolicy` 现读）；其余块是启动时读的，
-        // 所以告诉面板「重启后生效」，不假装热重载。
-        restarting: result.restarting || result.block !== 'policy',
+        // §H.12：Policy（现读）与 `source:<id>` 的配置（组合根每处都现读保存过的块）保存即生效；
+        // `pollSeconds` 与其余块是启动时读的，所以告诉面板「重启后生效」，不假装热重载。
+        restarting:
+          result.restarting ||
+          (result.block !== 'policy' && parsedBlock?.kind !== 'source') ||
+          pollChanged,
         policyChanged: result.policy_changed,
         origin: result.origin
       }
@@ -2647,7 +2792,7 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
     deployment: () =>
       deploymentView({
         stateDir: resolved,
-        setup: setup.issues(),
+        setup: setupIssuesNow(),
         limits,
         paused: paused.paused(),
         health: board.all(),
@@ -2829,36 +2974,6 @@ function assignmentTokenFile(store: Store, stateDir: string, assignmentId: strin
 }
 
 
-/** GitHub 实例的配置（§I.2 配置行）：只解析，不碰子进程。 */
-interface GithubInstance {
-  readonly enabled: boolean
-  readonly repository: string
-  readonly cli: string
-  readonly config: Record<string, unknown>
-}
-
-/**
- * 解析 GitHub 实例的配置（§I.2）。两处回落是刻意的：
- * - `repository`：Source 配置优先，其次是清单级的同名设置；
- * - `cli`：**只有完全没写**才回落到 `gh`；显式写成空串是「没配」，不能静默换回默认值。
- */
-function githubInstanceOf(input: {
-  readonly raw: Readonly<Record<string, unknown>>
-  readonly stored: Record<string, unknown>
-}): GithubInstance {
-  const config = block(input.stored['config'])
-  const enabled = flag(input.stored['enabled'], true)
-  const repository = text(config['repository']) ?? text(input.raw['repository']) ?? ''
-  const storedCli = config['cli']
-  const cli =
-    storedCli === undefined
-      ? text(input.raw['githubCli']) ?? 'gh'
-      : typeof storedCli === 'string' && storedCli.trim() === ''
-        ? ''
-        : text(storedCli) ?? ''
-  return { enabled, repository, cli, config: { ...config, repository, cli } }
-}
-
 /**
  * 配置了 Feishu 时的 CLI（§I.3）：没配这个 Source 就是 `undefined`（不查 lark-cli）；
  * 启用了但 CLI 空着是空串——那是一条 setup 问题（「配置了但缺 CLI」），不是「没配置」。
@@ -2912,9 +3027,10 @@ function deployment(
   github: GithubSetup,
   feishu: FeishuSetup
 ): Deployment {
+  const config = github.configSource()
   return {
-    repository: String(github.config['repository'] ?? ''),
-    githubCli: String(github.config['cli'] ?? 'gh'),
+    repository: config.repository,
+    githubCli: config.cli,
     githubLogin: github.login || text(settings['githubLogin']) || '',
     githubCommitEmail: text(settings['githubCommitEmail']) ?? '',
     feishuCli: feishu.cli,

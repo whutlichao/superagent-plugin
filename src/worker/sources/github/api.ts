@@ -503,13 +503,15 @@ export function rateLimited(error: unknown): boolean {
  * `gh api` 驱动的读取端口。所有参数都是 argv 数组（§I.4 白名单 + `shell:false`）：
  * 仓库名与数字经这里进入参数，正文永远不出现在读路径里。
  */
-export function createGithubApi(commands: CommandsHost, cli: string): GithubApi {
+export function createGithubApi(commands: CommandsHost, cli: string | (() => string)): GithubApi {
+  /** 现读 CLI：组合根传当前配置的那一份，保存过的 CLI 从下一次读取起生效（§N.2）。 */
+  const cliNow = (): string => (typeof cli === 'function' ? cli() : cli)
   /** 一条列表读取：解析每一项，畸形条目进 `skipped`。 */
   const readList = async <T>(
     args: readonly string[],
     parse: (value: unknown) => T | undefined
   ): Promise<GithubRead<T>> => {
-    const output = await commands.run(cli, args)
+    const output = await commands.run(cliNow(), args)
     let skipped = 0
     const items: T[] = []
     for (const value of parseArray(output)) {
@@ -525,7 +527,7 @@ export function createGithubApi(commands: CommandsHost, cli: string): GithubApi 
     args: readonly string[],
     parse: (value: unknown) => T | undefined
   ): Promise<GithubRead<T>> => {
-    const value = parseJson(await commands.run(cli, args))
+    const value = parseJson(await commands.run(cliNow(), args))
     if (!isRecord(value)) return { items: [], skipped: 1 }
     const parsed = parse(value)
     return parsed === undefined ? { items: [], skipped: 1 } : { items: [parsed], skipped: 0 }
@@ -593,7 +595,7 @@ export function createGithubApi(commands: CommandsHost, cli: string): GithubApi 
     async checks(repository: string, sha: string): Promise<GithubRead<GithubChecks>> {
       // check-runs 是对象响应：`--slurp` 把分页包成数组，再逐页展平（§I.2 CI 行）。
       const pages = parseJson(
-        await commands.run(cli, [
+        await commands.run(cliNow(), [
           'api',
           `repos/${repository}/commits/${sha}/check-runs`,
           '--paginate',
@@ -631,7 +633,7 @@ export function createGithubApi(commands: CommandsHost, cli: string): GithubApi 
     ): Promise<GithubRead<GithubBranchHead>> {
       // 工作流运行是对象响应（`workflow_runs: [...]`），与 check-runs 同一条读法（不 `--slurp`：只要最新一页）。
       const value = parseJson(
-        await commands.run(cli, [
+        await commands.run(cliNow(), [
           'api',
           `repos/${repository}/actions/runs`,
           '--method',

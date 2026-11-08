@@ -1107,7 +1107,7 @@ bots / sync）、环境变量、夹具与测试、资源名（`app/read.ts` 的 
 
 | 面 | 实现 | 失败处理 |
 | --- | --- | --- |
-| 配置 | `{repository, cli, observeIssues, observePulls, observeComments, observeCi}`（后四个缺省 false） | `repository` 或 `cli` 缺失 → Source `setup` 态，轮询不启动 |
+| 配置 | `{repository, cli, observeIssues, observePulls, observeComments, observeCi}`（后四个缺省 false）。`repository` 收 `owner/name`，也收 `https://github.com/owner/name`（含页面后缀与 `.git`）：能认出的 GitHub 仓库存库前归一成 `owner/name`，认不出的值原样保留（与既有行为一致，运行时读不通由 setup/探针说话） | `repository` 或 `cli` 缺失 → Source `setup` 态，轮询不启动 |
 | 通知轮询 | `gh api notifications --paginate`（默认 60 s，`pollSeconds` 可调 10–3600）→ 每条 subject 展开成 Issue/PR 读取；游标 `github-cursor:<id>` | 单条失败留 `thread.meta.pollError`，下次重读；连续 3 轮失败 → health `github` error；任何成功轮询清零 |
 | 订阅读取 | 有活 Ticket 订阅的 Thread 每轮读一次（`gh api repos/:o/:r/issues/:n`、`/comments`、`/pulls/:n`、`/pulls/:n/reviews`、`/pulls/:n/comments`） | 同上；404 也重试（上游：404 也可能是丢权限） |
 | receive-all | `observeIssues/observePulls/observeComments/observeCi` 开时，拉仓库新 Issue、新 PR、新评论、默认分支 CI（`gh api repos/:o/:r/actions/runs?branch=<default>`） | 单个畸形条目跳过并计数 |
@@ -1567,7 +1567,7 @@ interface AdmissionCells {
 
 ### N.2 设置项（`contributes.settings` vs 面板）
 
-只有需要用户**在 Orca Settings 里**改的少量项进 manifest（`settings:own`，最多 64 项），其余全在面板：`stateDir`、`agent`、`baseRepo`（这三项决定插件能否启动，值得在 Orca 设置里可见）、`routerAgent`。其余（模型、并发、prepare、blocked commands、CLI 路径、端口、保留策略）都在面板 Deployment/Execution 组里改，存库即生效。两个 agent 设置项的默认值都是 `pi`（#51 的产品决定）：清单的 `default` 是用户在 Orca Settings 看到的初值，`src/worker/app/agent-defaults.ts` 是设置缺失或为空时的代码回落值，两者必须同值；用户可随时在 Orca Settings 覆盖。
+只有需要用户**在 Orca Settings 里**改的少量项进 manifest（`settings:own`，最多 64 项），其余全在面板：`stateDir`、`agent`、`baseRepo`（这三项决定插件能否启动，值得在 Orca 设置里可见）、`routerAgent`。其余（模型、并发、prepare、blocked commands、CLI 路径、端口、保留策略）都在面板 Deployment/Execution 组里改，存库即生效；`source:<id>` 块的仓库、CLI 与四个 observe 开关同样保存即生效——组合根、Source 页、部署检查与运行时都现读保存过的块（`app/source-config.ts` 是保存块覆盖宿主设置的唯一读法，`boot.ts` 的 `githubConfigResolved()` 是 GitHub 配置的唯一解析处）。`pollSeconds` 例外：轮询定时器的间隔在启动时定一次，改它仍要重启插件，面板据此回 `restarting: true`。两个 agent 设置项的默认值都是 `pi`（#51 的产品决定）：清单的 `default` 是用户在 Orca Settings 看到的初值，`src/worker/app/agent-defaults.ts` 是设置缺失或为空时的代码回落值，两者必须同值；用户可随时在 Orca Settings 覆盖。
 
 manifest 声明（对齐 `[skill] manifest.md`）：
 

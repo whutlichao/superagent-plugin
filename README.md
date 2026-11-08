@@ -116,7 +116,7 @@ Orca 的 setup 钩子会在插件根（也就是仓库/worktree 根）创建 `.c
 3. **填四项设置**：`stateDir` 必须是绝对路径且可写；`agent` / `routerAgent` 填已安装的 Orca agent id；`baseRepo` 填第 1 步的写法。
 4. **启用插件**（第 2 步的 `dev load --approve`，或 Settings → Plugins）。状态栏出现 `Superagent`。
 5. **打开面板 → Deployment 页**，看 setup 问题列表：每条都写「缺配置（missing）」还是「读不通（broken）」，附一句修法与重跑入口。修一条、点一次「检查一次」（= `superagent setup check`）。setup 干净之前，受影响的来源停在 `starting`，不轮询、不报 `error`。
-6. **配来源**：Source 页填 GitHub 的 `repository`（`owner/name`）与 `cli`（`gh` 或 agent 包装脚本）。Feishu 可选：只接受 bot-only 的 `lark-cli` 配置。
+6. **配来源**：Source 页填 GitHub 的 `repository`（`owner/name`，或直接粘 `https://github.com/<owner>/<name>`——保存时归一成 `owner/name`）与 `cli`（`gh` 或 agent 包装脚本）。保存即生效，不必重启插件；Source 页、Settings 页与部署检查随后读同一份配置。Feishu 可选：只接受 bot-only 的 `lark-cli` 配置。
 7. **跑一次诊断**：`superagent doctor`（本机有没有 token/端口/锁/库/CLI/worker git 配置/两个登录），它只报「有没有」，不报「是什么」。
 8. **看一眼读数**：`superagent status --json`，退出码见下面的故障排查表。此后面板 Overview 与状态栏用同一份数据。
 

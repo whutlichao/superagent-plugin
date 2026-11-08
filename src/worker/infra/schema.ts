@@ -2,8 +2,9 @@
 // 等价能力在这里以源码实现——`strict()`、`safeParse`、可定位的错误路径。
 //
 // 覆盖本仓库真正用到的形状：object / string / number / boolean / array / enum / literal /
-// record / union，外加 `default` / `optional` / `partial` / `refine` 与 `trim` / `min` /
-// `max` / `int` / `regex` 这类约束。新增形状时先加测试（`tests/schema.test.ts`），再扩展这里。
+// record / union，外加 `default` / `optional` / `partial` / `refine` / `transform` 与
+// `trim` / `min` / `max` / `int` / `regex` 这类约束。新增形状时先加测试
+// （`tests/schema.test.ts`），再扩展这里。
 //
 // 两条纪律：
 // - 所有构造器都是不可变的：每次链式调用返回新实例，模块级 schema 常量因此可以安全共享；
@@ -132,6 +133,30 @@ export function refine<T>(
   message: string
 ): Schema<T> {
   return new RefinedSchema(schema, predicate, message)
+}
+
+class TransformSchema<T, U> extends Schema<U> {
+  readonly #inner: Schema<T>
+  readonly #map: (value: T) => U
+
+  constructor(inner: Schema<T>, map: (value: T) => U) {
+    super()
+    this.#inner = inner
+    this.#map = map
+  }
+
+  parseAt(value: unknown, path: readonly (string | number)[]): SafeParse<U> {
+    const result = this.#inner.parseAt(value, path)
+    return result.success ? { success: true, data: this.#map(result.data) } : result
+  }
+}
+
+/**
+ * 在已校验的值上做一次纯映射（`transform(string(), (v) => v.toLowerCase())`）：校验失败原样
+ * 透出，成功时把值换成规范形态。设置保存与运行时读的是同一个规范形态，不必各写一遍。
+ */
+export function transform<T, U>(schema: Schema<T>, map: (value: T) => U): Schema<U> {
+  return new TransformSchema(schema, map)
 }
 
 /** 一条字符串约束：返回 undefined 表示通过，否则是固定的英文短句。 */

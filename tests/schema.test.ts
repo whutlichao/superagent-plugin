@@ -2,7 +2,7 @@
 // 设置块提供与 zod 等价的最小能力——`strict()`、`safeParse`、可定位的错误路径。
 //
 // 只测本仓库真正用到的形状（object/string/number/boolean/array/enum/union/record +
-// default/optional/refine）；后续票要用新形状时在这里先加一条断言。
+// default/optional/refine/transform）；后续票要用新形状时在这里先加一条断言。
 import { describe, test } from 'node:test'
 import assert from 'node:assert/strict'
 import {
@@ -15,6 +15,7 @@ import {
   record,
   refine,
   string,
+  transform,
   union,
   SchemaError
 } from '../src/worker/infra/schema.ts'
@@ -143,6 +144,24 @@ describe('collections and combinators', () => {
     assert.deepEqual(outcome(schema.safeParse({ ratio: 2 })), {
       issues: [{ path: ['ratio'], message: 'expected a ratio' }]
     })
+  })
+})
+
+describe('transforms', () => {
+  test('transform maps only a valid value and passes the original issues through', () => {
+    const slug = transform(
+      refine(string().trim().max(20), (value) => value === '' || value.includes('/'), 'expected owner/name'),
+      (value) => value.toLowerCase()
+    )
+    assert.equal(slug.parse(' Acme/Widgets '), 'acme/widgets')
+    // 校验失败时映射不执行（值保持未规范化的原样）：issue 的路径与文案逐字透出。
+    assert.deepEqual(outcome(slug.safeParse('  nope  ')), {
+      issues: [{ path: [], message: 'expected owner/name' }]
+    })
+    assert.deepEqual(outcome(slug.safeParse(7)), { issues: [{ path: [], message: 'expected string' }] })
+    // 与 default 组合时默认值也走映射：设置缺席不会绕过规范化。
+    const withDefault = transform(string(), (value) => value.toUpperCase()).default('fallback')
+    assert.equal(withDefault.parse(undefined), 'FALLBACK')
   })
 })
 
