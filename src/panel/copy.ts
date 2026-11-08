@@ -1082,8 +1082,8 @@ export const COPY = {
 
   // ---- Settings 页（§M.3、§K.8）：五组框架、每组保存栏与历史 ----
   'settings.intro': {
-    zh: '每组一个保存栏：没有改动时不占空间。保存成功的改动对 Policy 立刻生效；其余块在插件重启后生效。',
-    en: 'One save bar per group; it takes no space while the draft is empty. Policy changes take effect at once; the other blocks take effect after the plugin restarts.'
+    zh: '每组一个保存栏：没有改动时不占空间。Policy 与提交邮箱保存即生效；其余块在插件重启后生效。',
+    en: 'One save bar per group; it takes no space while the draft is empty. Policy and the commit email take effect at once; the other blocks take effect after the plugin restarts.'
   },
   'settings.group.sources': { zh: '来源', en: 'Sources' },
   'settings.group.eval': { zh: '评估', en: 'Eval' },
@@ -1168,8 +1168,8 @@ export const COPY = {
 
   // Execution 组
   'settings.execution.intro': {
-    zh: 'worker 怎么起、在哪儿工作、哪些命令不许跑。这里的值在插件重启后生效。',
-    en: 'How workers start, where they work and which commands they may not run. These values take effect after the plugin restarts.'
+    zh: 'worker 怎么起、在哪儿工作、哪些命令不许跑。提交邮箱保存即生效；其余值在插件重启后生效。',
+    en: 'How workers start, where they work and which commands they may not run. The commit email applies as soon as it is saved; the other values take effect after the plugin restarts.'
   },
   'settings.execution.agent': { zh: 'Agent', en: 'Agent' },
   'settings.execution.model': { zh: '模型', en: 'Model' },

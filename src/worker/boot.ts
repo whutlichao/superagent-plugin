@@ -37,6 +37,7 @@ import type {
 import { Engine } from './core/index.ts'
 import type { Store } from './app/store.ts'
 import { openStore } from './app/store.ts'
+import { clearWorkerGitConfig } from './infra/gitconfig.ts'
 import { acquireLock } from './infra/lock.ts'
 import { createLogger, type Logger } from './infra/log.ts'
 import { HealthBoard, claimModelsEntry, FAILURES_BEFORE_ERROR } from './infra/health.ts'
@@ -128,7 +129,6 @@ import { notePluginVersion } from './app/upgrade.ts'
 import { createSourceContext } from './app/source-context.ts'
 import {
   createSetupState,
-  gitConfigIdentityIssue,
   githubConfigIssues,
   issuesOf,
   probeWorkerGitConfig,
@@ -137,6 +137,7 @@ import {
   setupProblemOf
 } from './app/setup.ts'
 import type { SetupBudget, SetupCheckInput, SetupIssue, SetupProblem, SetupReport } from './app/setup.ts'
+import { commitIdentityIssue } from './app/gitconfig-identity.ts'
 import { withDeadline, type HandlerBudget, type ProbeBudget } from './infra/deadline.ts'
 import { backupNow, backupPath } from './app/backup.ts'
 import { DOCTOR_BUDGET, SETUP_CHECK_BUDGET, SOURCE_LABELS_BUDGET } from './http/ops.ts'
@@ -998,10 +999,18 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
    * `gitConfigWriteIssue`，下一次读页面就用它。`applySetup` 的完成检查同样会重写并刷新它。
    */
   const syncWorkerGitConfig = (): void => {
+    // GitHub 根因还在：不清也不写（报告里 github 那一组会说出来）。
     if (githubIssuesNow().length > 0) return
     const account = githubLogin()
     const email = executorCommitEmailNow()
-    if (gitConfigIdentityIssue(email, account) !== undefined) {
+    if (commitIdentityIssue(email, account) !== undefined) {
+      // 身份变得不完整：删掉旧文件。launch-hook 只按「文件存在」注入（§H.11），留下它会让
+      // worker 用旧邮箱提交，而检查同时在报 gitconfig_missing。
+      try {
+        clearWorkerGitConfig(resolved)
+      } catch (error) {
+        logger.warn(`the worker git config could not be removed: ${stringOf(error)}`)
+      }
       gitConfigWriteIssue = undefined
       return
     }
@@ -1015,7 +1024,7 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
   const identityIssueNow = (): readonly SetupIssue[] => {
     // 根因优先（与探针同一条不变量）：GitHub 那一组还有问题时不再加一条同因的结论。
     if (githubIssuesNow().length > 0) return []
-    const identity = gitConfigIdentityIssue(executorCommitEmailNow(), githubLogin())
+    const identity = commitIdentityIssue(executorCommitEmailNow(), githubLogin())
     if (identity !== undefined) return [identity]
     return gitConfigWriteIssue === undefined ? [] : [gitConfigWriteIssue]
   }
@@ -2501,9 +2510,27 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
       githubCommitEmail: executor.githubCommitEmail ?? ''
     }
   }
-  /** 保存前的 `executor` 块值：保存过就是那一版，没保存过就是面板看到的现值。 */
-  const executorBlockValueNow = (): unknown =>
-    savedSettingsVersion(store, 'executor')?.config ?? executorValuesNow()
+  /**
+   * 一个 `executor` 块值**解析后**的执行器设置（宿主设置打底、块覆盖同名字段）。
+   * 「重启后生效」比较的是解析后的两版：旧版块可能只写了几个键（CLI 的局部保存），拿原始
+   * 键集比较会把「面板补全字段」误判成改了一大片。
+   */
+  const executorResolvedOf = (value: unknown): Record<string, unknown> =>
+    { const resolved = resolveExecutorSettings(withSavedSettings(settings, { executor: value }))
+      return {
+        agent: resolved.agent,
+        model: resolved.model ?? '',
+        effort: resolved.effort ?? '',
+        maxWorkers: resolved.maxWorkers,
+        baseRepo: selectorText(resolved.baseRepo),
+        baseBranch: resolved.baseBranch ?? '',
+        branchPrefix: resolved.branchPrefix,
+        prepare: resolved.prepare ?? '',
+        blockedCommands: [...resolved.blockedCommands],
+        inlineLimit: resolved.inlineLimit,
+        worktreeRetention: resolved.worktreeRetention,
+        confirmDelivery: resolved.confirmDelivery
+      } }
   /**
    * 面板的编辑基线：宿主设置 + 保存过的 `limits` / `executor` 块。每次请求现读，"保存后重新
    * 载入"因此与库存一致；运行中的执行器与限额仍是启动时那份（§H.12，重启生效）。
@@ -2640,8 +2667,11 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
     // 这里读的是**已解析**的值（带 kind 的缺省值）：从没保存过的实例本来就用 60，改仓库
     // 不该被误报成「要重启」。
     const beforePollSeconds = pollSecondsOf(input.block)
-    // 保存前的 `executor` 值：「重启后生效」的判定要比较两版的已存内容（缺省时是宿主设置）。
-    const beforeExecutorValue = input.block === 'executor' ? executorBlockValueNow() : undefined
+    // 保存前的 `executor` 值（解析后）：「重启后生效」的判定比较两版真正生效的设置。
+    const beforeExecutorValue =
+      input.block === 'executor'
+        ? executorResolvedOf(savedSettingsVersion(store, 'executor')?.config)
+        : undefined
     try {
       const result = (await handler({
         params: { block: input.block },
@@ -2661,7 +2691,7 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
       // 字段仍是启动时那份，所以只有它们变了才说「重启后生效」（§H.12）。
       const executorNeedsRestart =
         result.block === 'executor'
-          ? executorRestartRequired(beforeExecutorValue, input.value)
+          ? executorRestartRequired(beforeExecutorValue, executorResolvedOf(input.value))
           : result.block !== 'policy' && parsedBlock?.kind !== 'source'
       return {
         ok: true,
@@ -3105,7 +3135,7 @@ async function baseRepoPathOf(
 
 /**
  * 一次完整检查的报告里「worker git 配置写不进去」的那一条（§H.11）。`gitconfig_missing` 不在这里：
- * 它按现值重算（`gitConfigIdentityIssue`），报告里的旧结论一律丢掉。
+ * 它按现值重算（`commitIdentityIssue`），报告里的旧结论一律丢掉。
  */
 function gitConfigWriteIssueOf(report: SetupReport): SetupIssue | undefined {
   return report.issues.find((issue) => issue.code === 'gitconfig_unwritable')

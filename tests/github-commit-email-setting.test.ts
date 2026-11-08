@@ -10,7 +10,7 @@
 // - 重启与环境：再启动一次仍从保存的块恢复；worker 的 `env.sh` 拿到同一个邮箱。
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { existsSync, mkdtempSync, readFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { openBoot, settingsOf } from './support/boot.ts'
@@ -182,6 +182,39 @@ test('the commit email is a setup field: CLI saves cannot change it', async () =
     assert.deepEqual(h.handle.settingsHistory().history, [], 'and recorded no version')
   } finally {
     await h.cleanup()
+    await removeTree(stateDir)
+  }
+})
+
+test('a write that fails is named, and Check again reads the saved email once it can write', async () => {
+  const stateDir = mkdtempSync(join(tmpdir(), 'superagent-commit-email-check-'))
+  // 路径被同名目录占住：保存这一次写不出文件，但保存本身已经提交（设置是库里的）。
+  mkdirSync(workerGitConfigPath(stateDir), { recursive: true })
+  const h = await openBoot({ stateDir, settings: withoutCommitEmail(stateDir) })
+  try {
+    const view = await h.handle.settingsView()
+    const saved = accepted(
+      await h.handle.settingsSave({
+        block: 'executor',
+        revision: view.execution.revision,
+        value: { ...view.execution.value, githubCommitEmail: EMAIL }
+      })
+    )
+    assert.equal(saved.restarting, false)
+    // 写不进去是一条具名问题（broken），身份本身已不再是 missing。
+    const setup = h.handle.deployment().setup
+    assert.equal(setup.some((issue) => issue.code === 'gitconfig_missing'), false, JSON.stringify(setup))
+    assert.equal(setup.some((issue) => issue.code === 'gitconfig_unwritable'), true, JSON.stringify(setup))
+
+    // 人清掉挡路的目录，点一次「检查一次」：探针读到的是保存过的邮箱（不是宿主设置的旧快照）。
+    rmSync(workerGitConfigPath(stateDir), { recursive: true, force: true })
+    const checked = await h.handle.checkSetup()
+    assert.equal(checked.checked, true, 'there was a problem to re-check')
+    assert.equal(checked.issues.some((issue) => issue.code.startsWith('gitconfig')), false, JSON.stringify(checked.issues))
+    const text = readFileSync(workerGitConfigPath(stateDir), 'utf8')
+    assert.ok(text.includes(`email = "${EMAIL}"`), 'the re-run check uses the saved email')
+  } finally {
+    await h.handle.shutdown()
     await removeTree(stateDir)
   }
 })

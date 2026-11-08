@@ -8,8 +8,9 @@
 //
 // 依赖纪律（§C.2）：`app/` 可以 import `policy/`、`infra/schema.ts` 与 `core/` 的类型；
 // 本模块不读存储、不跑子进程、不认识 HTTP。
-import { array, boolean, enumOf, number, object, string } from '../infra/schema.ts'
+import { array, boolean, enumOf, number, object, refine, string } from '../infra/schema.ts'
 import type { SafeParse, SchemaIssue } from '../infra/schema.ts'
+import { commitEmailShape } from './gitconfig-identity.ts'
 import {
   ADMISSION_PAGE_LIMIT,
   ADMISSION_TIMEOUT_MAX_MS,
@@ -77,7 +78,12 @@ export const EXECUTOR_BLOCK_SCHEMA = object({
   worktreeRetention: enumOf(['keep', 'on-end']).optional(),
   blockedCommands: array(string().trim().min(1).max(100)).optional(),
   prepare: string().max(4_000).optional(),
-  githubCommitEmail: string().trim().max(200).regex(/^$|^[^\s@]+@[^\s@]+$/).optional()
+  // 形状与「保存之后现算」的那条 setup 结论共用一处判定：空串是「还没配」，其余必须像一个地址。
+  githubCommitEmail: refine(
+    string().trim().max(200),
+    (value) => commitEmailShape(value) !== 'invalid',
+    'expected an email address'
+  ).optional()
 }).strict()
 
 /**

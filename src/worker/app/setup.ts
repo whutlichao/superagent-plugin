@@ -27,6 +27,7 @@ import type {
 } from './setup-types.ts'
 import { SETUP_CHECK_AGAIN, issuesOf, setupProblemOf } from './setup-types.ts'
 import { githubConfigIssues } from './setup-github.ts'
+import { commitIdentityIssue } from './gitconfig-identity.ts'
 
 export type {
   RepoRow,
@@ -323,29 +324,6 @@ async function probeGithub(
 // ---------------------------------------------------------------- worker git config
 
 /**
- * 提交身份不全时的那一条结论（§H.11）：修法按**缺哪一项**说——邮箱是面板上的一格
- * （Settings → Execution → `executor.githubCommitEmail`），账号来自 `gh api user` 探针，
- * 两种缺失的下一步不同。身份齐了就是 `undefined`。
- *
- * 探针与组合根共用它：首次检查与「保存之后现算」说的是同一句话（§N.2）。
- */
-export function gitConfigIdentityIssue(email: string, account: string): SetupIssue | undefined {
-  if (email.trim() !== '' && account.trim() !== '') return undefined
-  const emailMissing = email.trim() === ''
-  return issue({
-    place: 'executor',
-    code: 'gitconfig_missing',
-    kind: 'missing',
-    detail: emailMissing
-      ? 'the worker git config has no commit identity yet: the agent noreply commit email is empty'
-      : 'the worker git config has no commit identity yet: the agent account is unknown',
-    fix: emailMissing
-      ? 'set the agent noreply commit email (Settings → Execution → githubCommitEmail), then run the check again'
-      : 'make the agent GitHub CLI readable (gh api user), then run the check again'
-  })
-}
-
-/**
  * 提交身份的那一条结论（§H.11）：身份不全 → `gitconfig_missing`；写不进去 → `gitconfig_unwritable`；
  * 写成功 → `undefined`。**只写这一个文件**，不跑任何探针——所以它也能在保存之后立刻重算一次
  * （§N.2：保存过的提交邮箱不必等一次完整检查才生效）。
@@ -359,11 +337,11 @@ export function probeWorkerGitConfig(
 ): SetupIssue | undefined {
   const account = input.account.trim()
   const email = input.email.trim()
-  const identity = gitConfigIdentityIssue(email, account)
+  const identity = commitIdentityIssue(email, account)
   if (identity !== undefined) return identity
   const outcome: WorkerGitConfigWrite = write({ stateDir: input.stateDir, account, email })
   if (outcome.state === 'written') return undefined
-  if (outcome.state === 'missing_identity') return gitConfigIdentityIssue(email, account)
+  if (outcome.state === 'missing_identity') return commitIdentityIssue(email, account)
   return issue({
     place: 'executor',
     code: 'gitconfig_unwritable',
