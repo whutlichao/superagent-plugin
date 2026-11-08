@@ -30,7 +30,7 @@ import {
   reviewTrigger
 } from '../src/worker/sources/github/translate'
 import { createGithubPoller, subscribedThreads, withinHorizon } from '../src/worker/sources/github/poll'
-import { githubSetupProblem } from '../src/worker/sources/github/config'
+import { githubConfigSchema, githubSetupProblem, repositorySlug } from '../src/worker/sources/github/config'
 import {
   claimPull,
   claimReportedPull,
@@ -206,6 +206,45 @@ test('a missing repository or CLI is a setup problem, not a polling failure', ()
   assert.equal(githubSetupProblem({ repository: 'acme/widgets', cli: '' }), 'cli_missing')
   assert.equal(githubSetupProblem({ repository: 'acme/widgets', cli: '  ' }), 'cli_missing')
   assert.equal(githubSetupProblem({ repository: 'acme/widgets', cli: 'gh' }), undefined)
+})
+
+// 截图里的缺陷：人把仓库页面地址整段粘进「仓库」文本框，于是保存的值不是 `owner/name`，
+// GitHub API 的每一次读都会拿着它拼路径。两种写法都必须归一到同一个 `owner/name`。
+test('a repository URL and owner/name normalise to the same slug', () => {
+  const cases = [
+    'https://github.com/whutlichao/superagent-test',
+    'http://github.com/whutlichao/superagent-test',
+    'https://www.github.com/whutlichao/superagent-test',
+    'https://github.com/whutlichao/superagent-test/',
+    'https://github.com/whutlichao/superagent-test.git',
+    'https://github.com/whutlichao/superagent-test#readme',
+    'https://github.com/whutlichao/superagent-test?tab=readme',
+    'github.com/whutlichao/superagent-test',
+    '  https://github.com/whutlichao/superagent-test  ',
+    'whutlichao/superagent-test',
+    'whutlichao/superagent-test.git'
+  ]
+  for (const value of cases) {
+    assert.equal(repositorySlug(value), 'whutlichao/superagent-test', value)
+    // schema 存下来的也是规范形态：保存、读取与运行时读同一个值。
+    assert.equal(githubConfigSchema.parse({ repository: value }).repository, 'whutlichao/superagent-test', value)
+  }
+  // 空串是「还没配」，原样留下（`repository_missing` 由 setup 判定）。
+  assert.equal(repositorySlug(''), undefined)
+  assert.equal(githubConfigSchema.parse({ repository: '' }).repository, '')
+  // 不是 GitHub 仓库的写法：拒绝，不猜一个仓库名（GitLab / 缺 name / 多一段路径）。
+  for (const value of [
+    'https://gitlab.com/whutlichao/superagent-test',
+    'https://github.com/whutlichao',
+    'https://github.com/',
+    'whutlichao/',
+    '/superagent-test',
+    'https://github.com/whutlichao/superagent-test/tree/main',
+    'https://github.com/whutlichao/superagent-test/issues/7'
+  ]) {
+    assert.equal(repositorySlug(value), undefined, value)
+    assert.equal(githubConfigSchema.safeParse({ repository: value }).success, false, value)
+  }
 })
 
 test('a notification expands into the Issue comments and one Trigger per comment', async () => {

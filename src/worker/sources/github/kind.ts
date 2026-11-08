@@ -121,10 +121,12 @@ const policySchema = object({
 
 /**
  * 造一个 GitHub kind。`cli` 是当前配置的 `gh`（或包装脚本）：Channel 发送需要它，而
- * `SourceChannel.send` 的签名里没有配置（§I.1），所以由组合根在注册时闭包进来
- * （设置变了就重新注册，与设计 §N.2 的「重启后生效」一致）。
+ * `SourceChannel.send` 的签名里没有配置（§I.1），所以由组合根在注册时闭包进来。给一个
+ * **取值函数**时，每次发送/语境读取都读当时的 `cli`——设置保存后不必重新注册 kind
+ * （`source:<id>` 的 `cli` 保存即生效，§N.2）。
  */
-export function createGithubKind(cli: string): SourceKind<GithubConfig> {
+export function createGithubKind(cli: string | (() => string)): SourceKind<GithubConfig> {
+  const cliNow = (): string => (typeof cli === 'function' ? cli() : cli)
   return {
     kind: GITHUB_KIND,
     title: both('GitHub', 'GitHub'),
@@ -137,7 +139,7 @@ export function createGithubKind(cli: string): SourceKind<GithubConfig> {
      * 评估窗口的语境（§I.2「线程上下文」行）：Issue/PR 描述 + 评论页、评审页、评审线程页，
      * 每页 20 条、带下一页游标；默认分支的 CI 以它自己的 Trigger 作语境。
      */
-    threadContext: githubThreadContext(cli),
+    threadContext: githubThreadContext(cliNow),
     fields: [
       {
         key: 'repository',
@@ -238,6 +240,7 @@ export function createGithubKind(cli: string): SourceKind<GithubConfig> {
       async send(host: CommandsHost, message: OutboundMessage): Promise<'sent' | 'gone'> {
         const target = addressOf(message.channel.address)
         if (target === undefined) return 'gone'
+        const cli = cliNow()
         const marker = idMarker(message.id)
         const body = `${message.text}\n\n${marker}`
         try {

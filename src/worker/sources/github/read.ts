@@ -679,14 +679,18 @@ async function contextPage(input: ContextRequest): Promise<ContextPart> {
  * kind 的 `threadContext`（§I.1）：绑定 CLI，评估窗口与资源读都从这里进。每一页最多 20 条，
  * 满页才给 `next`；`next` 就是下一页的资源名（`github/issues/12/comments/2`），原样交回本读即
  * 可续读。读不到的东西是明确状态（`forbidden` / `deleted` / `missing`），不是空页。
+ *
+ * `cli` 也可以是一个取值函数：组合根传当前配置的 CLI，设置保存后下一次读取就用新值
+ * （与 kind 的 Channel 同一条约定，见 `createGithubKind`）。
  */
-export function githubThreadContext(cli: string): ThreadContext<GithubConfig> {
+export function githubThreadContext(cli: string | (() => string)): ThreadContext<GithubConfig> {
+  const cliNow = (): string => (typeof cli === 'function' ? cli() : cli)
   return {
     messageId: githubMessageId,
     async read(host, trigger, part, cursor, config, signal) {
       const bound = host.withSignal(signal)
       return contextPage({
-        api: createGithubApi(bound, cli),
+        api: createGithubApi(bound, cliNow()),
         repository: repositoryOf(trigger, config),
         trigger,
         part,

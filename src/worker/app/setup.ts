@@ -26,6 +26,7 @@ import type {
   SetupState
 } from './setup-types.ts'
 import { SETUP_CHECK_AGAIN, issuesOf, setupProblemOf } from './setup-types.ts'
+import { githubConfigIssues } from './setup-github.ts'
 
 export type {
   RepoRow,
@@ -44,6 +45,7 @@ export type {
   SetupState
 } from './setup-types.ts'
 export { SETUP_CHECK_AGAIN, SETUP_PLACES, issuesOf, setupProblemOf } from './setup-types.ts'
+export { githubConfigIssues } from './setup-github.ts'
 
 /** 一条结论的字段（`checkAgain` 由构造处统一填）。 */
 interface IssueInput {
@@ -277,29 +279,7 @@ async function probeGithub(
   probe: Probe,
   run: (program: string, args: readonly string[], options?: SetupProbeOptions) => Promise<string>
 ): Promise<{ readonly issues: readonly SetupIssue[]; readonly login: string }> {
-  const issues: SetupIssue[] = []
-  if (input.repository.trim() === '') {
-    issues.push(
-      issue({
-        place: 'github',
-        code: 'repository_missing',
-        kind: 'missing',
-        detail: 'the GitHub Source has no repository',
-        fix: 'set the repository (owner/name) on the Source page'
-      })
-    )
-  }
-  if (input.githubCli.trim() === '') {
-    issues.push(
-      issue({
-        place: 'github',
-        code: 'cli_missing',
-        kind: 'missing',
-        detail: 'the GitHub Source has no CLI',
-        fix: 'set the GitHub CLI (gh or an agent wrapper script) on the Source page'
-      })
-    )
-  }
+  const issues = [...githubConfigIssues(input.repository, input.githubCli)]
   if (issues.length > 0) return { issues, login: '' }
   if (input.githubEnabled === false) return { issues, login: '' }
   try {

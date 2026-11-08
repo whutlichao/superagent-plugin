@@ -134,6 +134,30 @@ export function refine<T>(
   return new RefinedSchema(schema, predicate, message)
 }
 
+class TransformSchema<T, U> extends Schema<U> {
+  readonly #inner: Schema<T>
+  readonly #map: (value: T) => U
+
+  constructor(inner: Schema<T>, map: (value: T) => U) {
+    super()
+    this.#inner = inner
+    this.#map = map
+  }
+
+  parseAt(value: unknown, path: readonly (string | number)[]): SafeParse<U> {
+    const result = this.#inner.parseAt(value, path)
+    return result.success ? { success: true, data: this.#map(result.data) } : result
+  }
+}
+
+/**
+ * 在已校验的值上做一次纯映射（`transform(string(), (v) => v.toLowerCase())`）：校验失败原样
+ * 透出，成功时把值换成规范形态。设置保存与运行时读的是同一个规范形态，不必各写一遍。
+ */
+export function transform<T, U>(schema: Schema<T>, map: (value: T) => U): Schema<U> {
+  return new TransformSchema(schema, map)
+}
+
 /** 一条字符串约束：返回 undefined 表示通过，否则是固定的英文短句。 */
 type StringCheck = (value: string) => string | undefined
 
