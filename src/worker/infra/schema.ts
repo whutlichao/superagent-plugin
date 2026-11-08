@@ -2,8 +2,9 @@
 // 等价能力在这里以源码实现——`strict()`、`safeParse`、可定位的错误路径。
 //
 // 覆盖本仓库真正用到的形状：object / string / number / boolean / array / enum / literal /
-// record / union，外加 `default` / `optional` / `partial` / `refine` 与 `trim` / `min` /
-// `max` / `int` / `regex` 这类约束。新增形状时先加测试（`tests/schema.test.ts`），再扩展这里。
+// record / union，外加 `default` / `optional` / `partial` / `refine` / `transform` 与
+// `trim` / `min` / `max` / `int` / `regex` 这类约束。新增形状时先加测试
+// （`tests/schema.test.ts`），再扩展这里。
 //
 // 两条纪律：
 // - 所有构造器都是不可变的：每次链式调用返回新实例，模块级 schema 常量因此可以安全共享；

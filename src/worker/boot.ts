@@ -764,8 +764,8 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
    * → 清单级同名设置。规范化与缺省值由 `githubConfigResolved()` 的 schema 给。
    */
   const githubRawConfig = (): Record<string, unknown> => {
-    const merged = {
-      ...block(block(storedSourceNow(GITHUB_KIND))['config'])
+    const merged: Record<string, unknown> = {
+      ...(storedSourceNow(GITHUB_KIND)['config'] as Record<string, unknown>)
     }
     // 清单级设置只在「这个键完全没写」时回落：显式空串是「没配」，不静默换回默认值。
     if (text(merged['repository']) === undefined && text(settings['repository']) !== undefined) {
@@ -1041,9 +1041,10 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
       current: effectivePolicy
     }),
     /**
-     * 开关立即生效（§M.2）：任何 `source:<id>` 块的保存（Source 页的开关、Settings 页）
-     * 都把新的 `enabled` 交给 Source 运行时——不必重启插件。其余字段仍是「重启后生效」
-     * （§N.2）：`cli`/`repository` 只影响下一次启动。
+     * `source:<id>` 保存之后要做的事（§M.2、§N.2）：
+     * - 配置（仓库、CLI、四个 observe 开关）本来就现读（`githubConfigResolved()`），保存即生效；
+     * - 这里只把新的 `enabled` 交给 Source 运行时，并刷新 `github` 健康条目。
+     * `pollSeconds` 例外：轮询定时器的间隔在启动时定一次，改它仍要重启插件。
      */
     saved: (record) => {
       const parsed = parseSettingsBlock(record.block)
