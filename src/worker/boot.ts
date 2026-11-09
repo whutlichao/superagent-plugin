@@ -722,8 +722,35 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
    * 为准；合并读法只有 `app/source-config.ts` 一份（注册表、Source 页、运行时与部署检查共用）。
    */
   const savedSource = (id: string): unknown => savedSettingsVersion(store, `source:${id}`)?.config
-  const commandPort: CommandsHost =
-    options.commands ?? new Commands({ configuredPrograms: () => [text(settings['githubCli'])] })
+  /**
+   * Feishu 现在配置的 CLI（§I.3）：存过的 `source:feishu` 块 → 宿主设置，与 `setupFeishu`
+   * 同一份读法。`undefined` 是「这个 Source 没配置」（不查 lark-cli）。
+   */
+  const feishuCliNow = (): string | undefined => feishuCliOf(storedSourceNow(FEISHU_KIND), settings)
+  /**
+   * 路径白名单（§I.4）：只有两类值进名单——**当前已配置**的 Source `cli`（GitHub 由
+   * `githubConfigResolved()` 现读，Feishu 由 `feishuCliNow()` 给）与本次**候选** `cli`
+   * （保存前的账号检查，见 `checkAccount`）。裸名仍只认 `ALLOWED_PROGRAMS`，未配置的绝对路径
+   * 仍被拒：白名单的语义是「只允许你配置过的那个程序」，不是「任意路径」（票 #73）。
+   *
+   * 这里只是**提供一个闭包**：`configuredPort` 就在下面构造，而它要到首次
+   * `runSetupChecks(setupInput())` 才真的调这个闭包，那时 `githubConfigResolved` 与
+   * `storedSourceNow` 都已初始化。`feishuSetup` 因此故意不被捕获（它在那次首跑之后才赋值，
+   * 捕获它就是 TDZ）。
+   */
+  function allowedCliPaths(
+    candidates: readonly (string | undefined)[] = []
+  ): readonly (string | undefined)[] {
+    return [githubConfigResolved().cli, feishuCliNow(), ...candidates]
+  }
+  /**
+   * 一个带路径白名单的命令端口（§I.4）：`options.commands` 是测试注入的执行器，否则是
+   * `Commands` + `allowedCliPaths`。`candidates`（本次正在保存的候选 `cli`）只有保存前的
+   * 账号检查会传。
+   */
+  const configuredPort = (candidates: readonly (string | undefined)[] = []): CommandsHost =>
+    options.commands ?? new Commands({ configuredPrograms: () => allowedCliPaths(candidates) })
+  const commandPort: CommandsHost = configuredPort()
   // 机器限额（§H.12、§H.22）：保存过的块优先，没写的用缺省值；启动时读一次。
   const limits = machineLimits(effectiveSettings)
   /**
@@ -829,30 +856,32 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
   /** 一个 Source 现在的开关（保存过的块 → 宿主设置 → 缺省）。 */
   const sourceEnabledNow = (id: string, fallback: boolean): boolean =>
     flag(storedSourceNow(id)['enabled'], fallback)
-  const feishuCli = feishuCliOf(rawSources)
-  const setupInput = (): SetupCheckInput => ({
-    stateDir: resolved,
-    agent: executorSettings.agent,
-    ...(executorSettings.model === undefined ? {} : { model: executorSettings.model }),
-    ...(executorSettings.baseRepo === undefined ? {} : { baseRepo: executorSettings.baseRepo }),
-    ...(executorSettings.baseBranch === undefined ? {} : { baseRef: executorSettings.baseBranch }),
-    repository: githubConfigResolved().repository,
-    githubCli: githubConfigResolved().cli,
-    githubEnabled: sourceEnabledNow(GITHUB_KIND, true),
-    ...(feishuCli === undefined ? {} : { feishuCli }),
-    // worker 的提交身份（§H.11）：账号以探针读到的 `gh` 为准，邮箱来自 Execution 组
-    // （`executor.githubCommitEmail`，现读——保存之后下一次检查就用新值；§K.8）。
-    gitConfig: {
-      email: executorCommitEmailNow(),
-      account: text(settings['githubLogin']) ?? ''
-    },
-    ports: {
-      // 探针的上限与取消信号一路到 `execFile`（§O 的超时行）：到这里为止都不丢。
-      run: (program, args, probe) => commandPort.run(program, args, probe),
-      repos: () => options.runtime.listRepos(),
-      searchRefs: (selector, query) => options.runtime.searchRefs(selector, query)
+  const setupInput = (): SetupCheckInput => {
+    const feishuCli = feishuCliNow()
+    return {
+      stateDir: resolved,
+      agent: executorSettings.agent,
+      ...(executorSettings.model === undefined ? {} : { model: executorSettings.model }),
+      ...(executorSettings.baseRepo === undefined ? {} : { baseRepo: executorSettings.baseRepo }),
+      ...(executorSettings.baseBranch === undefined ? {} : { baseRef: executorSettings.baseBranch }),
+      repository: githubConfigResolved().repository,
+      githubCli: githubConfigResolved().cli,
+      githubEnabled: sourceEnabledNow(GITHUB_KIND, true),
+      ...(feishuCli === undefined ? {} : { feishuCli }),
+      // worker 的提交身份（§H.11）：账号以探针读到的 `gh` 为准，邮箱来自 Execution 组
+      // （`executor.githubCommitEmail`，现读——保存之后下一次检查就用新值；§K.8）。
+      gitConfig: {
+        email: executorCommitEmailNow(),
+        account: text(settings['githubLogin']) ?? ''
+      },
+      ports: {
+        // 探针的上限与取消信号一路到 `execFile`（§O 的超时行）：到这里为止都不丢。
+        run: (program, args, probe) => commandPort.run(program, args, probe),
+        repos: () => options.runtime.listRepos(),
+        searchRefs: (selector, query) => options.runtime.searchRefs(selector, query)
+      }
     }
-  })
+  }
   // 读不到的账号回落到设置里的值（§I.2：自身消息的判定要一个账号）。
   const fallbackLogin = text(settings['githubLogin']) ?? ''
   /** GitHub 实例的现读配置（setup 结论、运行时与部署事实共用这一份）。 */
@@ -862,13 +891,11 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
     login: fallbackLogin
   }
   const feishuStored = storedSourceNow(FEISHU_KIND)
-  const feishuSetupCommands: CommandsHost =
-    options.commands ??
-    new Commands({ configuredPrograms: () => [text(settings['feishuCli'])] })
   const feishuSetup = await setupFeishu({
     raw: settings,
     stored: feishuStored,
-    commands: feishuSetupCommands,
+    // 与 `doctor` / setup 探针 / GitHub API 同一个端口：`lark-cli` 与包装脚本看到同一份名单。
+    commands: commandPort,
     log: (message) => logger.info(message)
   })
   const setup = createSetupState(await runSetupChecks(setupInput()))
@@ -1314,10 +1341,7 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
   /** GitHub 的读端口：setup 完成（仓库与 CLI 都在）才读，否则 PR 绑定与通知都不接线。 */
   const githubReady = (): boolean =>
     githubSetup.enabled && githubRepository() !== '' && githubCli() !== ''
-  const githubApi = createGithubApi(
-    (options.commands ?? new Commands({ configuredPrograms: () => [text(settings['githubCli'])] })).withSignal(),
-    githubCli
-  )
+  const githubApi = createGithubApi(commandPort.withSignal(), githubCli)
   const pullHost: GithubPullHost = {
     api: githubApi,
     tickets: {
@@ -1439,7 +1463,7 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
       // Source 关闭（或未安装）时等待（§J.1 暂停行）；不再监听该地址时 drop（§J.1 原因 a）。
       enabled: (source) => registry.instance(source)?.enabled ?? false,
       allowed: (message) => registry.channelAllowed(message.channel),
-      send: (message) => registry.send(message, (options.commands ?? new Commands()).withSignal())
+      send: (message) => registry.send(message, commandPort.withSignal())
     },
     now,
     log: (message) => logger.info(message)
@@ -1768,11 +1792,20 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
     // 账号类字段的写前 setup 检查（§K.8）：按候选值跑 #44 的探针，只回 github 那一组问题
     // （repository / CLI 账号）；不写 gitconfig、不改任何设置。
     checkAccount: async (candidate, budget) => {
+      const input = setupInput()
+      // 写前检查按**候选** `cli` 跑（#73）：白名单不叠加候选值的话，第一次从 `gh` 切到绝对路径
+      // 的包装脚本会被自己的白名单拒掉（`account_unreadable`）。其余端口（`repos` / `searchRefs`）
+      // 沿用现成的那一份；`options.commands` 在的时候仍是它（测试注入的端口没有白名单）。
+      const probePort: CommandsHost = configuredPort([candidate.cli])
       const report = await runSetupChecks({
-        ...setupInput(),
+        ...input,
         ...(candidate.repository === undefined ? {} : { repository: candidate.repository }),
         ...(candidate.cli === undefined ? {} : { githubCli: candidate.cli }),
         gitConfig: undefined,
+        ports: {
+          ...input.ports,
+          run: (program, args, probe) => probePort.run(program, args, probe)
+        },
         // §O：handler 定的探针上限与取消线只加在这次写前检查上（启动路径没有预算）。
         ...(budget === undefined ? {} : { budget })
       })
@@ -1944,7 +1977,7 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
           host: createSourceContext({
             engine,
             store,
-            commands: (options.commands ?? new Commands()).withSignal(),
+            commands: commandPort.withSignal(),
             instance: {
               id: GITHUB_KIND,
               enabled: githubSetup.enabled,
@@ -1962,7 +1995,7 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
   // ---- Feishu 读侧（§I.3）：事件流长驻，回填/话题/群名每 60 s 一轮（测试手动推）
   const feishuInstance = registry.instance(FEISHU_KIND)
   const feishuDeployment = deployment(settings, githubSetup, feishuSetup)
-  const feishuCommands = (options.commands ?? new Commands()).withSignal()
+  const feishuCommands = commandPort.withSignal()
   const feishuKeys: FeishuKeys = {
     chats: feishuChatsKey,
     labels: sourceLabelsKey(FEISHU_KIND),
@@ -2082,7 +2115,7 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
     const probed = await setupFeishu({
       raw: settings,
       stored: { ...feishuStored, enabled: true },
-      commands: feishuSetupCommands,
+      commands: commandPort,
       log: (message) => logger.info(message)
     })
     if (probed.botId === '') {
@@ -2416,7 +2449,7 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
         engine,
         store,
         // 取消线交给 kind：它的每一次 `lark-cli` 读取都带着同一个 signal（§O）。
-        commands: (options.commands ?? new Commands()).withSignal(signal),
+        commands: commandPort.withSignal(signal),
         instance: { id, enabled: instance.enabled, config: instance.config, health: {} },
         configured: () => true,
         triggerOf: (triggerId) => repo.triggers.get(triggerId),
@@ -3073,13 +3106,16 @@ function assignmentTokenFile(store: Store, stateDir: string, assignmentId: strin
 
 
 /**
- * 配置了 Feishu 时的 CLI（§I.3）：没配这个 Source 就是 `undefined`（不查 lark-cli）；
- * 启用了但 CLI 空着是空串——那是一条 setup 问题（「配置了但缺 CLI」），不是「没配置」。
+ * 配置了 Feishu 时的 CLI（§I.3）：`stored` 是 `storedSourceNow(FEISHU_KIND)`（宿主设置 + 存过的
+ * `source:feishu` 块，与 `setupFeishu` 输入同一份）。没配这个 Source 就是 `undefined`（不查
+ * lark-cli）；启用了但 CLI 空着是空串——那是一条 setup 问题（「配置了但缺 CLI」），不是「没配置」。
  */
-function feishuCliOf(rawSources: Record<string, unknown>): string | undefined {
-  const stored = block(rawSources['feishu'])
+function feishuCliOf(
+  stored: Readonly<Record<string, unknown>>,
+  raw: Readonly<Record<string, unknown>>
+): string | undefined {
   if (flag(stored['enabled'], false) === false) return undefined
-  return text(block(stored['config'])['cli']) ?? ''
+  return text(block(stored['config'])['cli']) ?? text(raw['feishuCli']) ?? ''
 }
 
 /**

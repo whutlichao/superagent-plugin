@@ -74,6 +74,15 @@ describe('the program allowlist', () => {
     assert.equal(await commands.run('/bin/echo', ['hello']), 'hello\n')
   })
 
+  test('a candidate CLI joins the list for one check, and a third absolute path is still refused', async () => {
+    // 组合根（`boot.ts`，票 #73）的名单形状：当前配置的 Source `cli` + 本次正在保存的候选 `cli`。
+    // 候选常常不在配置值之下（`~/.local/bin/gh-bot` 对 `gh`），所以它必须单独入名单。
+    const commands = new Commands({ configuredPrograms: () => ['/bin/true', '/bin/echo'] })
+    assert.equal(await commands.run('/bin/echo', ['candidate']), 'candidate\n', 'the candidate runs')
+    // 第三个绝对路径（既不是配置值，也不是本次候选）：白名单没变成「任意绝对路径」。
+    await assert.rejects(commands.run('/bin/definitely-not-configured', ['x']), /not inside a configured CLI/)
+  })
+
   test('a bare configured name is still checked against the allowlist', async () => {
     const commands = new Commands({ configuredPrograms: () => ['gh-agent'] })
     await assert.rejects(commands.run('gh-agent', ['api', 'x']), /not one of the allowed programs/)
