@@ -5,9 +5,10 @@
 // - 写面：`settings.save` 的写前账号检查按**候选** `cli` 跑，因此第一次从裸名切到绝对路径
 //   就能存下（`configuredPrograms()` 用的是当前配置，不含候选值时会回 `account_unreadable`）；
 // - 拒面：另一个哪儿都没配置的绝对路径仍在写前检查里被拒（`not inside a configured CLI`），
-//   白名单没有被放松成「任意绝对路径」；
+//   白名单没有被放松成「任意绝对路径」；相对路径与裸名照旧被拒；
 // - 运行时：保存之后 Source 轮询真的用那个脚本（`github` health 走到 `ready`，账号是脚本给的
-//   那个），所以白名单不许只修在 setup 探针那一处。
+//   那个），所以白名单不许只修在 setup 探针那一处；
+// - 装配：插件入口不带自己的命令端口（否则生产路径绕过 boot 的白名单）。
 //
 // 这里**故意不注入 `FakeCommands`**：缺陷就在真命令端口的白名单上，换掉端口等于把 bug 藏起来。
 // `gh` 因此被换成本地包装脚本（写进临时目录），其余探针只跑本机的 `git --version`。
@@ -18,6 +19,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { bootPlugin } from '../src/worker/boot.ts'
 import { openBoot, settingsOf, type BootHarness } from './support/boot.ts'
+import { readRepoFile } from './support/repo.ts'
 
 /** 包装脚本给出的账号（真实部署里是 `superagent-bot-1106[bot]` 那样的机器人身份）。 */
 const BOT_LOGIN = 'superagent-bot-1106[bot]'
@@ -26,9 +28,7 @@ const BOT_LOGIN = 'superagent-bot-1106[bot]'
 interface Wrapper {
   /** 脚本的绝对路径（就是将来存进 `source:github` 的 `cli`）。 */
   readonly path: string
-  /** 调用日志（一行一次，脚本自己写）。 */
-  readonly log: string
-  /** 脚本被调用过的命令行（读不到日志时是空数组）。 */
+  /** 脚本被调用过的命令行（还没调用过就是空数组）。 */
   calls(): string[]
 }
 
@@ -55,7 +55,6 @@ function wrapperIn(directory: string, name: string, login: string = BOT_LOGIN): 
   )
   return {
     path,
-    log,
     calls: () => (existsSync(log) ? readFileSync(log, 'utf8').split('\n').filter((line) => line !== '') : [])
   }
 }
@@ -189,6 +188,28 @@ test('a Source CLI at an absolute path is saved, then used by the poller', async
     rmSync(directory, { recursive: true, force: true })
     rmSync(stateDir, { recursive: true, force: true })
   }
+})
+
+test('the plugin entry never injects its own command port', () => {
+  // 静态钉住（只防回退，不证明运行时行为）：`main.ts` 一旦重新 `new Commands()` 并把它传给
+  // `bootPlugin({commands})`，生产路径就会绕过 boot 的 `allowedCliPaths()`（注入端口没有白名单，
+  // 缺省 `() => []`），票 #73 的修复在整个插件里失效。运行时证据由 PR body 里的 `activate()`
+  // 端到端读数给（真实装配不注入端口）。
+  const entry = readRepoFile('src/worker/main.ts')
+  assert.equal(
+    entry.includes("from './sources/commands'"),
+    false,
+    'the plugin entry does not import the command port'
+  )
+  const start = entry.indexOf('bootPlugin({')
+  assert.ok(start >= 0, 'the plugin entry boots through bootPlugin({...})')
+  const end = entry.indexOf('\n  })', start)
+  const call = entry.slice(start, end < 0 ? start + 1200 : end)
+  assert.equal(
+    /(?:^|[\s,{])commands\s*[,:]/.test(call),
+    false,
+    'the plugin entry never passes `commands` to bootPlugin'
+  )
 })
 
 test('saving a Source CLI does not widen the allowlist: relative paths and bare names are still refused', async () => {

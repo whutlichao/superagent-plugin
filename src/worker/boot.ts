@@ -728,22 +728,29 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
    */
   const feishuCliNow = (): string | undefined => feishuCliOf(storedSourceNow(FEISHU_KIND), settings)
   /**
-   * 命令端口的路径白名单（§I.4）：只有两类值进名单——**当前已配置**的 Source `cli`（GitHub 由
+   * 路径白名单（§I.4）：只有两类值进名单——**当前已配置**的 Source `cli`（GitHub 由
    * `githubConfigResolved()` 现读，Feishu 由 `feishuCliNow()` 给）与本次**候选** `cli`
    * （保存前的账号检查，见 `checkAccount`）。裸名仍只认 `ALLOWED_PROGRAMS`，未配置的绝对路径
    * 仍被拒：白名单的语义是「只允许你配置过的那个程序」，不是「任意路径」（票 #73）。
    *
-   * 这里只是**提供一个闭包**：`commandPort` 就在下面构造，而它要到首次 `runSetupChecks(setupInput())`
-   * 才真的调这个闭包，那时 `githubConfigResolved` 与 `storedSourceNow` 都已初始化。`feishuSetup`
-   * 因此故意不被捕获（它在那次首跑之后才赋值，捕获它就是 TDZ）。
+   * 这里只是**提供一个闭包**：`configuredPort` 就在下面构造，而它要到首次
+   * `runSetupChecks(setupInput())` 才真的调这个闭包，那时 `githubConfigResolved` 与
+   * `storedSourceNow` 都已初始化。`feishuSetup` 因此故意不被捕获（它在那次首跑之后才赋值，
+   * 捕获它就是 TDZ）。
    */
-  function configuredPrograms(
+  function allowedCliPaths(
     candidates: readonly (string | undefined)[] = []
   ): readonly (string | undefined)[] {
     return [githubConfigResolved().cli, feishuCliNow(), ...candidates]
   }
-  const commandPort: CommandsHost =
-    options.commands ?? new Commands({ configuredPrograms: () => configuredPrograms() })
+  /**
+   * 一个带路径白名单的命令端口（§I.4）：`options.commands` 是测试注入的执行器，否则是
+   * `Commands` + `allowedCliPaths`。`candidates`（本次正在保存的候选 `cli`）只有保存前的
+   * 账号检查会传。
+   */
+  const configuredPort = (candidates: readonly (string | undefined)[] = []): CommandsHost =>
+    options.commands ?? new Commands({ configuredPrograms: () => allowedCliPaths(candidates) })
+  const commandPort: CommandsHost = configuredPort()
   // 机器限额（§H.12、§H.22）：保存过的块优先，没写的用缺省值；启动时读一次。
   const limits = machineLimits(effectiveSettings)
   /**
@@ -884,12 +891,11 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
     login: fallbackLogin
   }
   const feishuStored = storedSourceNow(FEISHU_KIND)
-  // 与 `doctor` / setup 探针 / GitHub API 同一个端口：`lark-cli` 与包装脚本看到同一份名单。
-  const feishuSetupCommands: CommandsHost = commandPort
   const feishuSetup = await setupFeishu({
     raw: settings,
     stored: feishuStored,
-    commands: feishuSetupCommands,
+    // 与 `doctor` / setup 探针 / GitHub API 同一个端口：`lark-cli` 与包装脚本看到同一份名单。
+    commands: commandPort,
     log: (message) => logger.info(message)
   })
   const setup = createSetupState(await runSetupChecks(setupInput()))
@@ -1790,9 +1796,7 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
       // 写前检查按**候选** `cli` 跑（#73）：白名单不叠加候选值的话，第一次从 `gh` 切到绝对路径
       // 的包装脚本会被自己的白名单拒掉（`account_unreadable`）。其余端口（`repos` / `searchRefs`）
       // 沿用现成的那一份；`options.commands` 在的时候仍是它（测试注入的端口没有白名单）。
-      const probePort: CommandsHost =
-        options.commands ??
-        new Commands({ configuredPrograms: () => configuredPrograms([candidate.cli]) })
+      const probePort: CommandsHost = configuredPort([candidate.cli])
       const report = await runSetupChecks({
         ...input,
         ...(candidate.repository === undefined ? {} : { repository: candidate.repository }),
@@ -2111,7 +2115,7 @@ export async function bootPlugin(options: BootOptions): Promise<BootHandle> {
     const probed = await setupFeishu({
       raw: settings,
       stored: { ...feishuStored, enabled: true },
-      commands: feishuSetupCommands,
+      commands: commandPort,
       log: (message) => logger.info(message)
     })
     if (probed.botId === '') {

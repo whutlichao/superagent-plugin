@@ -8,7 +8,6 @@ import { createWorkerHost } from './runtime/worker-host'
 import { createHostRuntime } from './runtime/host-runtime'
 import { bootPlugin, defaultCliPath, type BootHandle } from './boot'
 import { createStatusBarPublisher } from './app/status-bar'
-import { Commands } from './sources/commands'
 import { LAUNCH_HOOK_EVENT, launchHook, type LaunchHookEvent } from './executor/launch-hook'
 import { REPLY_WORD_LIMIT, wordCount } from './http/domain'
 import { PromptTextError, PromptVersionError } from './app/prompts.ts'
@@ -246,7 +245,6 @@ function triggerIdOf(input: unknown, name: string): string {
 export default function activate(orca: OrcaWorkerApi): void {
   const host = createWorkerHost(orca)
   const runtime = createHostRuntime(orca, { log: (message) => host.log(message) })
-  const commands = new Commands()
   const statusBar = createStatusBarPublisher({
     send: (update) => host.setStatusBar(update),
     now: () => Date.now(),
@@ -257,7 +255,6 @@ export default function activate(orca: OrcaWorkerApi): void {
   booting = bootPlugin({
     runtime,
     readSettings: () => orca.settings.get(),
-    commands,
     cliPath: defaultCliPath(),
     log: (message) => host.log(message),
     statusBar,
