@@ -3,7 +3,7 @@
 // 三条硬约束，测试在 `tests/commands.test.ts` 里逐条断言：
 // - **argv 数组 + `shell: false`**：消息正文永远只是某个 argv 元素，绝不拼进 shell；
 // - **白名单**：只允许 `gh` / `lark-cli` / `git` / `orca` / `sh`；程序名带路径时必须是绝对路径，
-//   且等于或位于 `settings.*.cli` 配置的可执行文件之下；
+//   且等于或位于**当前 Source 配置的 `cli`** 之下（保存前的账号检查再叠加本次候选值）；
 // - **错误脱敏**：只暴露「程序名 + 结束方式 + 标准错误前 2000 字符」，绝不回显 argv（argv 里
 //   有消息正文）；错误对象带 `CliError.code`（从 stderr 的 JSON `error.code` 或 `HTTP <nnn>`
 //   提取），Channel 用它判定「永久收不到」。
@@ -219,7 +219,10 @@ function mergeSignals(
 
 /** `Commands` 的构造选项；全部可选，测试与组合根按需覆盖。 */
 export interface CommandsOptions {
-  /** `settings.*.cli` 当前值（GitHub / Feishu 各自的 CLI）；空值忽略。 */
+  /**
+   * 放进路径白名单的值：**当前已配置**的 Source `cli`（GitHub / Feishu 各自的 `cli`），保存前的
+   * 账号检查再叠加**本次候选**值。空值与相对路径忽略（裸名仍只认 `ALLOWED_PROGRAMS`）。
+   */
   readonly configuredPrograms?: () => readonly (string | undefined)[]
   /** 子进程的额外环境（例如工作区隔离的 git 配置）；`undefined` 表示删除该变量。 */
   readonly environment?: Readonly<Record<string, string | undefined>>
@@ -353,7 +356,7 @@ export class Commands implements CommandsHost {
       }
       if (!underConfigured(program, this.#configuredPrograms())) {
         throw new Error(
-          `The program ${program} is not inside a configured CLI (settings.*.cli); a path is only allowed there`
+          `The program ${program} is not inside a configured CLI (the Source's cli setting); a path is only allowed there`
         )
       }
       return

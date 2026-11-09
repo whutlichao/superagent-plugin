@@ -1146,7 +1146,7 @@ bots / sync）、环境变量、夹具与测试、资源名（`app/read.ts` 的 
 
 | CLI | 用途 | 缺失/未登录表现 |
 | --- | --- | --- |
-| `gh` ≥ 2.48（可用包装脚本，如 `gh-agent`） | GitHub 全部读写 | setup 检查：`gh auth status` 失败 → `setup` 问题「The agent GitHub CLI cannot read its account」，面板给「Check again」 |
+| `gh` ≥ 2.48（可用指向 agent 账号的包装脚本，填它的**绝对路径**） | GitHub 全部读写 | setup 检查：`gh auth status` 失败 → `setup` 问题「The agent GitHub CLI cannot read its account」，面板给「Check again」 |
 | `lark-cli`（bot-only 配置） | Feishu 全部读写 | setup 检查：拒绝可充当用户身份的配置（上游同）→ `setup` 问题 |
 | `git` ≥ 2.32 | worktree 内的提交/推送（由 agent 自己使用） | 只影响 worker，不影响插件 |
 | `orca`（Orca 自带） | worktree/agent/terminal | 缺 → `cli_missing`，插件 health `runtime` 报错 |
@@ -1156,7 +1156,7 @@ bots / sync）、环境变量、夹具与测试、资源名（`app/read.ts` 的 
 - `run(program, args, opts)`：argv 数组、`shell:false`、60 s（可配）超时、`maxBuffer` 16 MiB、注入 `GH_PROMPT_DISABLED=1`、`LARKSUITE_CLI_NO_UPDATE_NOTIFIER=1`、`GIT_TERMINAL_PROMPT=0`。
 - 错误只暴露「程序名 + 结束方式 + stderr 前 2000 字符」，**绝不回显 argv**（argv 里有消息正文）。
 - `CliError { code?: number, exitCode?: number }`：`code` 取 stderr 里 JSON 的 `error.code`，或 `HTTP <nnn>`；Channel 用 `code` 判定 `gone`。
-- 白名单：只允许 `gh` / `lark-cli` / `git` / `orca` / `sh`（prepare）；程序名含路径时必须是绝对路径且位于 `settings.*.cli` 指定值。
+- 白名单：只允许 `gh` / `lark-cli` / `git` / `orca` / `sh`（prepare）；程序名含路径时必须是绝对路径，且等于或位于**当前 Source 配置的 `cli`** 之下（保存前的账号检查再叠加本次候选值；`ALLOWED_PROGRAMS` 不因包装脚本命名而放松）。
 
 ### I.5 PR 结束规则（Orca 版）
 
