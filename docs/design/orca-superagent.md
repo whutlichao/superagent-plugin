@@ -1483,7 +1483,7 @@ interface AdmissionCells {
 
 术语表 `Glossary` 不作为导航项：它是页头 `(?)` 按钮打开的**覆盖层**（与上游一致），内容为上游 §001 的双语术语表（`copy.ts` 的 `glossary`）。所以「7 个导航项 + 1 个覆盖层」。
 
-**导航的渲染形态（本次审查修正）**：七项由面板自有的可换行导航条渲染（`Toolbar` + `Button`，当前项实心、其余 ghost），不是宿主的 `Tabs`。原因见 §M.4 的实测记录：7 项 `Tabs` 的最小内容宽约 544px 且不换行，320–400px 的面板上必然出现整页横向滚动。**七项、顺序、每页的内容与 IA 都不变**，只是换行渲染。
+**导航的渲染形态（本次审查修正）**：七项由面板自有的可换行单选条渲染（`RadioGroup`，`labelHidden`，选项即七页），不是宿主的 `Tabs`。原因有两层：① 7 项 `Tabs` 的最小内容宽约 544px 且不换行，320–400px 的面板上必然出现整页横向滚动（§M.4 的实测记录）；② 宿主的 `Button` 没有 `aria-current` / `aria-pressed` / `selected`，用按钮做的导航会退化成「只靠背景色区分当前页」；`RadioGroup` 是真单选语义，「当前页 = 选中的那一项」，与 Settings 五组、Prompts 四子页同一种控件。**七项、顺序、每页的内容与 IA 都不变**，只是换行渲染。
 
 ### M.2 每页内容、主操作与三态
 
@@ -1526,7 +1526,7 @@ interface AdmissionCells {
 | 需求 | 组件 |
 | --- | --- |
 | 列表 | `Table`（`columns`/`rows`/`sort`/`loading`/`emptyText`/`hasMore`/`onLoadMore`；行点击用 `onRowAction`） |
-| 页面切换（7 项）、Settings 五组、Prompts 四子页 | **面板自有的可换行导航**：`Toolbar`/`RadioGroup` + `Button`。宿主 `Tabs` 不换行，7 项的最小内容宽约 544px，320–400px 的面板上会撑出整页横向滚动（见下面「已知限制（组件面）」的实测记录） |
+| 页面切换（7 项）、Settings 五组、Prompts 四子页 | **面板自有的可换行单选条**：`RadioGroup`（`labelHidden`，选项即名称）。宿主 `Tabs` 不换行，7 项的最小内容宽约 544px，320–400px 的面板上会撑出整页横向滚动；`Toolbar` + `Button` 虽可换行，但宿主的 `Button` 没有 `aria-current`/`aria-pressed`/`selected`，当前项只能靠背景色表达（见下面「已知限制（组件面）」的实测记录） |
 | 报告、追问、说明文本 | `Markdown`（只渲染核心子集：标题/段落/列表/代码块/链接） |
 | 全文 prompt、prepare 命令、diff | `CodeView`（`language`/`lineNumbers`/`wrap`） |
 | 警告/错误/确认/提示 | `Callout`（`tone`） |
@@ -1543,7 +1543,7 @@ interface AdmissionCells {
 已知限制（组件面）：无 Modal、无 Toast、无虚拟列表（长列表靠分页 50 条）；渲染上限 5000 节点 / 512 KiB，因此时间线与 Ticket 详情一律分页/折叠。
 
 **窄面板的横向滚动（实测记录，本次审查）**：320/360/370px 面板上整页出现横向滚动条、380px 起消失。取证定位到**三处**原因（都在组件面内，已修）：
-1. **导航 `Tabs` 不换行（主因）**：7 项 `Tabs` 在任何宽度下都按单行排布，最小内容宽约 544px。最小复现：一个只放 7 项 `Tabs` 的空面板，在 320/360/380/400/500px 下全部出现横向滚动条，560px 起消失。改成面板自有的可换行导航（`Toolbar` + `Button`，当前项实心、其余 ghost）后，320px 起无横向滚动。7 项、IA 顺序与「当前项可见」都不变。
+1. **导航 `Tabs` 不换行（主因）**：7 项 `Tabs` 在任何宽度下都按单行排布，最小内容宽约 544px。最小复现：一个只放 7 项 `Tabs` 的空面板，在 320/360/380/400/500px 下全部出现横向滚动条，560px 起消失。改成面板自有的可换行单选条（`RadioGroup`）后，320px 起无横向滚动，且当前页由「选中的那一项」表达（单选语义，不是背景色）。7 项与 IA 顺序都不变。
 2. **页头 `PageHeader` 与 Source 页页首的 `Row justify="between"` 不换行**：副标题 + 右侧动作（`Check again`）在 320–400px 下挤成一条，把内容撑到约 420px（把导航换掉后仍在 400px 上留下横向滚动条的最小复现）。给这两行加 `wrap` 后按宽度折行。
 3. **Settings 五组与 Prompts 四子页的 `Tabs`**：五组 `Tabs` 在 320–400px 下同样溢出（最小复现：只放五组 `Tabs` 的空面板，320/360/380/400px 全部出现横向滚动条）；Prompts 的四子页在 320px 下也溢出。两者换成可换行的 `RadioGroup`（`labelHidden`，选项即名称）。Prompts 的 default-updated 两个长按钮行加 `wrap`。
 

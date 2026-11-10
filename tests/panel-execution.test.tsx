@@ -207,7 +207,7 @@ test('the five filters ask the worker for their own window', async () => {
   assert.ok(mounted.find({ text: /Open one/ }))
 
   for (const filter of EXECUTION_FILTERS) {
-    await mounted.select({ type: 'RadioGroup' }, filter)
+    await mounted.select({ type: 'RadioGroup', label: COPY['execution.filters'].en }, filter)
     assert.deepEqual(
       requestInput(mounted.host, 'tickets'),
       { filter, offset: 0, limit: 50 },

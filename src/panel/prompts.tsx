@@ -32,6 +32,7 @@ import {
   type TableRow
 } from 'orca'
 import { translate, type CopyKey } from './copy'
+import { InlineError } from './widgets'
 import { lineDiff } from './diff'
 import {
   barShown,
@@ -698,9 +699,10 @@ function EditTab(props: { readonly locale: string; readonly current: PanelPrompt
       <IssueCallout locale={locale} issues={issues} />
       <SaveBar locale={locale} state={state} limit={current.maxChars} />
       {read(actionError) === '' ? null : (
-        <Text size="xs" tone="danger">
-          {read(actionError)}
-        </Text>
+        <InlineError
+          text={translate(locale, 'error.retry', { reason: read(actionError) })}
+          locale={locale}
+        />
       )}
       {read(restoredRevision) === null ? null : (
         <Text size="xs" tone="success">
@@ -814,9 +816,10 @@ function HistoryTab(props: { readonly locale: string; readonly current: PanelPro
         </Stack>
       )}
       {read(actionError) === '' ? null : (
-        <Text size="xs" tone="danger">
-          {read(actionError)}
-        </Text>
+        <InlineError
+          text={translate(locale, 'error.retry', { reason: read(actionError) })}
+          locale={locale}
+        />
       )}
     </Stack>
   )
@@ -896,9 +899,10 @@ function SkillsTab(props: { readonly locale: string; readonly current: PanelProm
       <IssueCallout locale={locale} issues={issueTexts(locale, read(draftIssues))} />
       <SaveBar locale={locale} state={state} limit={current.maxChars} />
       {read(actionError) === '' ? null : (
-        <Text size="xs" tone="danger">
-          {read(actionError)}
-        </Text>
+        <InlineError
+          text={translate(locale, 'error.retry', { reason: read(actionError) })}
+          locale={locale}
+        />
       )}
     </Stack>
   )

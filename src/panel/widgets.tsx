@@ -155,9 +155,10 @@ export function Hint(props: { readonly text: string }): OrcaElement {
 /**
  * 一次动作或一处读数的行内失败（§M.2 的行内错误）：图标 + 一句话 + 可选的重试。
  *
- * 全站只有这一种失败形态：整页读不到用 `ErrorState`（Callout），页内某处失败用这里。
- * 文案要求指出下一步（重试 / 去设置 / 查看终端）——面板不猜原因，也不把「下一步」留给
- * 人去想。
+ * 失败只有两种形态：整页读不到用 `ErrorState`（整块 Callout + 重试），页内某处失败用这里。
+ * 唯一的例外是保存栏自己的字段级错误（`draft.ts` 的 `SaveBar.error`：冲突、字段不合法）——
+ * 它要贴着那一段草稿，所以留在保存栏里。其余页内失败都走这里；文案要求指出下一步
+ * （重试 / 去设置 / 查看终端）——面板不猜原因，也不把「下一步」留给人去想。
  */
 export function InlineError(props: {
   readonly text: string

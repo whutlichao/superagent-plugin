@@ -66,7 +66,7 @@ import type {
   SourceSettingsCard
 } from './protocol'
 import { SETTINGS_GROUPS } from './protocol'
-import { ConfirmAction, ErrorState, Hint, LoadingState, MarkBadge, Section } from './widgets'
+import { ConfirmAction, ErrorState, Hint, InlineError, LoadingState, MarkBadge, Section } from './widgets'
 
 // ---------------------------------------------------------------------------
 // 状态（模块级 atom；面板重挂载时由 `resetSettings` 清掉）
@@ -1645,9 +1645,10 @@ export function Settings(props: { readonly locale: string }): OrcaElement {
         </Text>
       )}
       {failure === '' ? null : (
-        <Text tone="danger" size="xs">
-          {failure}
-        </Text>
+        <InlineError
+          text={translate(locale, 'error.retry', { reason: failure })}
+          locale={locale}
+        />
       )}
       <HistorySection locale={locale} />
     </Stack>

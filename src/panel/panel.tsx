@@ -2571,27 +2571,33 @@ export default function Panel(): OrcaElement {
   // 不认识的页面按 Overview 渲染；把存储改回干净值在 `setup` 里做（渲染中不能写 atom）。
   const remembered = read(page)
   const current: NavPage = isNavPage(remembered) ? remembered : 'overview'
-  // 导航是面板自有的可换行条（Toolbar + Button），不是宿主 `Tabs`：7 项 `Tabs` 的最小内容宽
-  // 约 544px 且不换行，320–400px 的面板上必然撑出整页横向滚动（§M.1 的记录）。七项、顺序与
-  // 「当前项可见」都不变：当前项是实心按钮，其余是 ghost。
+  // 导航是面板自有的可换行单选条（`RadioGroup`），不是宿主 `Tabs`：7 项 `Tabs` 的最小内容宽
+  // 约 544px 且不换行，320–400px 的面板上必然撑出整页横向滚动（§M.1 的记录）。
+  //
+  // 用 `RadioGroup` 而不是 `Toolbar` + `Button`：宿主的 `Button` 没有 `aria-current` /
+  // `aria-pressed` / `selected`，当前页就只剩「背景填充不同」这一个通道——读屏读不出来。
+  // `RadioGroup` 是真单选语义，当前页是「选中的那一项」，与 Settings 五组、Prompts 四子页
+  // 同一种控件。控件标签只作无障碍名（`labelHidden`），选项名就是导航文案。
   return (
     <Stack gap="md">
       <Header locale={locale} state={read(snapshot)} />
       {read(glossary) ? (
         <GlossaryOverlay locale={locale} onClose={() => set(glossary, false)} />
       ) : null}
-      <Toolbar label={words(locale, 'panel.title')}>
-        {NAV_PAGES.map((item) => (
-          <Button
-            key={item}
-            variant={item === current ? 'solid' : 'ghost'}
-            size="sm"
-            onPress={() => navigate(item)}
-          >
-            {translate(locale, `nav.${item}` as CopyKey)}
-          </Button>
-        ))}
-      </Toolbar>
+      <RadioGroup
+        label={words(locale, 'panel.title')}
+        labelHidden
+        orientation="horizontal"
+        value={current}
+        options={NAV_PAGES.map((item) => ({
+          value: item,
+          label: translate(locale, `nav.${item}` as CopyKey)
+        }))}
+        onChange={(next) => {
+          if (!isNavPage(next)) return
+          navigate(next)
+        }}
+      />
       {NAV_PAGES.map((item) => (
         <PageBody key={item} locale={locale} current={item} active={item === current} />
       ))}

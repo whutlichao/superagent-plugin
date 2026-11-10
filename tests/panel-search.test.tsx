@@ -23,7 +23,7 @@ import type {
   TicketDetailView
 } from '../src/panel/protocol'
 import { AT, isoAfter, openTempStore, tempStateDir } from './support/state'
-import { currentPage, navLabels, openPage } from './support/panel-nav'
+import { currentPage, navOptions, openPage } from './support/panel-nav'
 
 /** `mockHost` 的请求表类型（测试里只写用到的几个名字）。 */
 type Requests = NonNullable<NonNullable<Parameters<typeof mockHost>[0]>['requests']>
@@ -345,11 +345,8 @@ test('the glossary opens from the header in both languages and is not a navigati
       host: mockHost({ requests: { state: () => snapshot() } }),
       locale
     })
-    // 导航是七颗可换行的按钮（`Toolbar` + `Button`），不是宿主的 `Tabs`。
-    const navCount = (): number =>
-      mounted
-        .findAll({ role: 'button' })
-        .filter((button) => navLabels(locale).includes(button.text ?? '')).length
+    // 导航是面板自有的可换行单选条（`RadioGroup`），不是宿主的 `Tabs`。
+    const navCount = (): number => navOptions(mounted, locale).length
     assert.equal(navCount(), 7, `${locale}: seven navigation items`)
     assert.equal(
       mounted.find({ text: new RegExp(COPY['glossary.meaning.mandate'].zh) }),

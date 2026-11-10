@@ -3,7 +3,14 @@
 import { afterEach, assert, hostError, mockHost, mount, test } from 'orca/testing'
 import { mock } from 'node:test'
 import { COPY, translate } from '../src/panel/copy'
-import { currentPage, navLabels as navTexts, openPage } from './support/panel-nav'
+import {
+  currentPage,
+  navControl,
+  navLabels as navTexts,
+  navOptions,
+  openPage,
+  selectedNavPage
+} from './support/panel-nav'
 import type { PanelState } from '../src/panel/protocol'
 import * as panelModule from '../src/panel/panel'
 
@@ -57,16 +64,36 @@ test('shows the seven navigation items of the design, in order, in both language
       host: mockHost({ requests: { state: () => healthyState() } }),
       locale
     })
-    // 七项是面板自有的可换行导航按钮（`Toolbar` + `Button`），顺序即 §M.1 的顺序。
-    const nav = panel.findAll({ role: 'button' }).map((button) => button.text ?? '')
+    // 七项是面板自有的可换行单选条（`RadioGroup`），顺序即 §M.1 的顺序。
     assert.deepEqual(
-      nav.filter((text) => navLabels(locale).includes(text)),
+      navOptions(panel, locale).map((option) => option.label),
       navLabels(locale),
       locale
+    )
+    assert.deepEqual(
+      navOptions(panel, locale).map((option) => option.value),
+      ['overview', 'source', 'trigger', 'eval', 'execution', 'settings', 'search'],
+      `${locale}: the page order does not change`
     )
     await panel.unmount()
     panel = undefined
   }
+})
+
+test('the current page is the control’s selected option, not a colour', async () => {
+  // 行为门禁：当前页要能被读屏播报。导航是 `RadioGroup`，当前页 = 选中的那一项；
+  // 控件本身带无障碍名（页头标题），选项名是七页的文案。
+  panel = await mount(panelModule, {
+    host: mockHost({ requests: { state: () => healthyState() } }),
+    locale: 'en'
+  })
+  assert.equal(selectedNavPage(panel), 'overview', 'the selected option is the current page')
+  await openPage(panel, 'execution')
+  assert.equal(selectedNavPage(panel), 'execution', 'selecting a page moves the selection')
+  const control = panel.find(navControl('en'))
+  assert.ok(control, 'the navigation is one named control')
+  assert.equal(control.role, 'radiogroup', 'with radio-group semantics')
+  assert.equal(control.label, COPY['panel.title'].en, 'reachable by the panel title')
 })
 
 test('the glossary is a header overlay, not an eighth navigation item', async () => {
@@ -74,10 +101,7 @@ test('the glossary is a header overlay, not an eighth navigation item', async ()
     host: mockHost({ requests: { state: () => healthyState() } }),
     locale: 'zh-CN'
   })
-  const navCount = (): number =>
-    panel === undefined
-      ? 0
-      : panel.findAll({ role: 'button' }).filter((button) => navLabels('zh-CN').includes(button.text ?? '')).length
+  const navCount = (): number => (panel === undefined ? 0 : navOptions(panel, 'zh-CN').length)
   assert.equal(navCount(), 7)
   assert.equal(panel.find({ text: COPY['term.mandate'].zh }), null, 'the glossary starts closed')
 

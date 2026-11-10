@@ -448,7 +448,7 @@ test('the Trigger page asks for the Subscribed window first, then for each filte
   assert.ok(mounted.find({ text: /owner\/widgets#12/ }))
 
   for (const filter of THREAD_FILTERS) {
-    await mounted.select({ type: 'RadioGroup' }, filter)
+    await mounted.select({ type: 'RadioGroup', label: COPY['thread.filters'].en }, filter)
     assert.deepEqual(
       requestInput(mounted.host, 'threads'),
       { filter, offset: 0, limit: 50 },
