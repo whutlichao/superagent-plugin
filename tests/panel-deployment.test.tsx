@@ -21,7 +21,7 @@ import type {
   PanelState,
   SettingsPageView
 } from '../src/panel/protocol'
-import { COPY } from '../src/panel/copy'
+import { COPY, translate } from '../src/panel/copy'
 import { LIMITATIONS } from '../src/panel/limitations'
 import { readRepoFile } from './support/repo'
 import { currentPage, openPage, openSettingsGroup } from './support/panel-nav'
@@ -344,6 +344,28 @@ test('the health list groups every board entry by part, with its state and count
   assert.ok(mounted.find({ text: COPY['deployment.state.error'].en }), 'the error state is named')
   assert.ok(mounted.find({ text: COPY['deployment.state.paused'].en }), 'the paused state is named')
 
+  assert.deepEqual(mounted.errors, [])
+  assert.deepEqual(mounted.refusals, [])
+  await mounted.unmount()
+  panel = undefined
+})
+
+test('the Router last-error line points at the terminal id that is rendered above it', async () => {
+  // B（打回）：文案原来说终端 id 在「下面」，但 Fact 行画在 InlineError 之上。断言文案不再说
+  // below，且终端 id 确实出现在错误行之前（渲染顺序与文案一致）。
+  const mounted = await openDeployment(() =>
+    view({ router: routerOf({ lastError: 'restart failed: terminal_gone' }) })
+  )
+  const message = translate('en', 'error.router', { reason: 'restart failed: terminal_gone' })
+  assert.ok(mounted.find({ text: message }), 'the failure is stated')
+  assert.ok(!/\bbelow\b/i.test(message), 'the copy no longer says the id is below')
+  assert.ok(/\babove\b/i.test(message), 'it says the id is above')
+  const rendered = JSON.stringify(mounted.tree()).replace(/\\"/g, '"')
+  const terminalAt = rendered.indexOf('term_router')
+  const errorAt = rendered.indexOf(message)
+  assert.ok(terminalAt >= 0, 'the terminal id is on the page')
+  assert.ok(errorAt >= 0, 'the error is on the page')
+  assert.ok(terminalAt < errorAt, 'the terminal id is rendered before the error that points at it')
   assert.deepEqual(mounted.errors, [])
   assert.deepEqual(mounted.refusals, [])
   await mounted.unmount()

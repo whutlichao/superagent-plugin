@@ -180,9 +180,8 @@ const decisionDetailError = atom('')
 /** 详情页的动作在飞行中（dismiss 不可重复按）。 */
 const decisionActing = atom(false)
 
-/** 列表请求的代号：只有最后一次请求的答案落地。`set` 是批量生效的（同一个事件里连着
- * `set` + 读，读到的可能是上一批的值），所以「筛选在飞行中变了」用同步计数器判断，
- * 不用在 await 之后重读 atom。
+/** 列表请求的代号：只有最后一次请求的答案落地。「筛选在飞行中变了」用同步计数器判断，
+ * 不在 await 之后重读 atom。
  */
 let listRequest = 0
 
@@ -738,9 +737,11 @@ async function focusTerminal(terminalId: string): Promise<void> {
 // ---------------------------------------------------------------------------
 
 /**
- * 读一页 Execution 列表：`more` 是「加载更多」，否则从第一行重读。`filter` 是刚切过去的那一档
- * ——`set` 是批量生效的，同一个事件里 `set` 之后再 `read` 得到的还是旧值，所以换档的动作把
- * 新档显式传进来。
+ * 读一页 Execution 列表：`more` 是「加载更多」，否则从第一行重读。
+ *
+ * `filter` 让换档的调用点把「这次要哪一档」写在自己那一行（`loadExecutionList({ filter: next })`），
+ * 而不是依赖函数里去读 atom。宿主的 `set` 是即时赋值，读 atom 本来也能拿到新值；这里显式传参
+ * 只是让请求的档位在调用点可读，也避免以后换成批量提交的存储实现时出现难查的错档。
  */
 async function loadExecutionList(
   options: { readonly more?: boolean; readonly filter?: ExecutionFilter } = {}
@@ -1609,6 +1610,9 @@ function EvalListPage(props: { readonly locale: string }): OrcaElement {
         </Callout>
       )}
       {page !== null && items.length === 0 && failure === '' ? (
+        // 有意保持朴素空态：Eval 列表**没有筛选控件**（票面 MEDIUM-10 点名的「带筛选的列表」
+        // 在这里不适用），最宽的一档就是它唯一的一档，没有更宽的出口可给。Execution 与 Trigger
+        // 才有带筛选的空态（`FilteredEmpty`）。
         <EmptyStateBlock title={words(locale, 'eval.empty')} icon="check" />
       ) : null}
       {page === null && failure !== '' ? null : (
@@ -1851,8 +1855,8 @@ const threadNotice = atom<ThreadNotice | null>(null)
 const threadActionError = atom('')
 
 /**
- * 列表请求的代号：只有最后一次请求的答案落地（`set` 是批量生效的，所以在飞行中换档时
- * 用同步计数器判断，不在 await 之后重读 atom）。
+ * 列表请求的代号：只有最后一次请求的答案落地（飞行中换档时用同步计数器判断，不在 await
+ * 之后重读 atom 来决定这一份答案还属不属于当前档）。
  */
 let threadRequest = 0
 

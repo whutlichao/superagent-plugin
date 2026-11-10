@@ -32,9 +32,14 @@ export function word(locale: string, key: CopyKey, values?: CopyValues): string 
 }
 
 /**
- * 页头：标题 + 副标题 + 右侧动作。标题是文档的一级标题（宿主 `Heading level=1`）。
- * 行允许换行：320–370px 的面板上，副标题与右侧动作挤不进一行时换行，而不是把整页撑出
- * 横向滚动条。
+ * 页头：标题 + 副标题 + 右侧动作。行允许换行：320–370px 的面板上，副标题与右侧动作挤不进
+ * 一行时换行，而不是把整页撑出横向滚动条。
+ *
+ * 标题为什么仍是 `Text weight="semibold"` 而不是 `Heading level={1}`：宿主的 level 1 渲染成
+ * `h2 text-base`（16px），而 `Text` 的缺省 size 是 `text-sm`（14px）。票面 LOW-14 要求
+ * 「不得改变现有字号与视觉层次」，14px 优先——所以页头标题保留原写法；标题层级由区块标题
+ * （`Section` 的 `Heading level={2}`，宿主是 `text-sm` 一档）承担。这条取舍写进了设计 §M.4，
+ * 并有测试钉住页头标题的节点类型与字号档（`tests/widgets.test.tsx`）。
  */
 export function PageHeader(props: {
   readonly title: string
@@ -44,7 +49,7 @@ export function PageHeader(props: {
   return (
     <Row justify="between" align="start" gap="sm" wrap>
       <Stack gap="xs">
-        <Heading level={1}>{props.title}</Heading>
+        <Text weight="semibold">{props.title}</Text>
         {props.subtitle === undefined ? null : (
           <Text muted size="xs">
             {props.subtitle}

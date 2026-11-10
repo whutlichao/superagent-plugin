@@ -1539,6 +1539,7 @@ interface AdmissionCells {
 | 表单 | `Field`+`Input`/`Textarea`/`Switch`/`Select`/`RadioGroup`/`Slider`/`Checkbox` |
 | 布局 | `Stack`/`Row`/`Grid`/`Box`（无 `style`/`className`） |
 | 操作 | `Button`/`IconButton`/`Toolbar` |
+| 标题层级（LOW-14） | 区块标题用 `Heading level={2}`（宿主是 `text-sm`，14px，视觉不变）；**页头标题不换成 `Heading level={1}`**——宿主的 level 1 渲染成 `h2 text-base`（16px），会违反「不得改变现有字号」的票面要求，所以页头仍是 `<Text weight="semibold">`（`Text` 的缺省 size = `text-sm`）。取舍：14px 视觉优先，标题层级由区块标题承担，并在 `tests/widgets.test.tsx` 里钉住页头标题的节点类型与字号档 |
 
 已知限制（组件面）：无 Modal、无 Toast、无虚拟列表（长列表靠分页 50 条）；渲染上限 5000 节点 / 512 KiB，因此时间线与 Ticket 详情一律分页/折叠。
 
@@ -1549,7 +1550,7 @@ interface AdmissionCells {
 
 测量方法：`orca plugin shot --scenario` 在 320/360/370/380/400px × light/dark 下逐张截图，读每张图**最后 12 行**像素；某行出现长度 ≥ 40% 宽度、且与右缘底色明显不同的连续像素，并且那段从最左边起笔、右侧留出底色（即「一条水平条」而不是整片背景）时，判为出现横向滚动条。修复后实测 84 张（source/deployment/prompts × 5 个宽度 + 其余 9 个情景 × 3 个宽度，各 light/dark）全部 clean；修复前的 24 张（source/deployment/prompts × 4 个宽度 × 2 个主题）全部命中。每张截图先经「不是 Orca 应用侧栏」校验（`orca plugin shot --scenario` 偶尔回落到抓侧栏）。
 
-**截图取值校验（本次审查记录）**：判据是「图像顶部中央 120–220px × 8–36px 没有标题栏墨迹」——面板截图在那里是纯面板底色，侧栏截图会带窗口标题栏（居中「Orca」字样与返回箭头）。`orca plugin shot --scenario` 的回落在某些情景上不是偶发：`deployment-320-dark` 与 `prompts-320-dark` 在 320px 深色主题下反复重试仍稳定回落到侧栏，这是宿主 `--scenario` 的缺陷，不是面板实现的问题。因此交付的证据里这两张**记为未取得**（同名的侧栏截图带 `.sidebar.png` 后缀保留在现场记录里，不作面板证据）；320px 的宽度结论由 `source-320-light|dark` 与 `deployment-320-light`、`prompts-320-light` 四张真面板截图支撑（深色主题在 320px 只有 `source` 一张可作面板证据）。
+**截图取值校验（本次审查记录）**：判据是「图像顶部中央 120–220px × 8–36px 没有标题栏墨迹」——面板截图在那里是纯面板底色，侧栏截图会带窗口标题栏（居中「Orca」字样与返回箭头）。`orca plugin shot --scenario` 的回落在某些情景上不是偶发：`prompts-320-dark` 在 320px 深色主题下重试 24 + 12 次仍稳定回落到侧栏，这是宿主 `--scenario` 的缺陷，不是面板实现的问题。`deployment-320-dark` 则是**可取得但不稳定**：同一 head 上协调者第 1 次重试就拍到了真面板（证据目录里存档为 `deployment-320-dark.external-panel.png`，判据为真面板、无滚动条），本会话重试 12 次未拍到。因此交付的证据记为：本地真面板 10 张 + 外部取得 1 张（`deployment-320-dark`）+ 未取得 1 张（`prompts-320-dark`，同名的侧栏截图带 `.sidebar.png` 后缀保留，不作面板证据）。320px 的宽度结论由 `source-320-light|dark`、`deployment-320-light`、`prompts-320-light` 与外部取得的 `deployment-320-dark` 支撑（深色主题在 320px 有 `source-320-dark` 与 `deployment-320-dark` 两张面板证据）。
 
 **宿主输入框边界对比度（不计入 §A.3 的十一项）**：暗色下输入框边界 `#404355` 对卡片底 `#2b2d3a` 是 1.40:1、对页面底 `#21222c` 是 1.62:1，低于 WCAG 1.4.11 的 3:1。色值来自宿主的 `--orca-input` / `--orca-border`；components 面板没有样式通道（无 `style`/`className`、无调色板，`tests/styles.test.ts` 强制），修复方在宿主。面板 Deployment 页 Limitations 段在十一项之后用一行 `Hint` 说明，README 的「已知限制（摘要）」之后有同一段；这条不改变 `LIMITATIONS` 的长度（仍为 11）。
 

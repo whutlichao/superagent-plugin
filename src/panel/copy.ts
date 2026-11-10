@@ -620,8 +620,8 @@ export const COPY = {
     en: 'Reason: {reason}. Try again; if it still fails, check Sources and health on the Deployment page.'
   },
   'error.router': {
-    zh: '最后错误：{reason}。原因在 Router 的终端里（下面有终端 id）。',
-    en: 'Last error: {reason}. The cause is in the router terminal (its id is below).'
+    zh: '最后错误：{reason}。原因在 Router 的终端里（终端 id 在上面那一行）。',
+    en: 'Last error: {reason}. The cause is in the router terminal (its id is in the row above).'
   },
 
   // ---- 空态指路（§M.2：带筛选的列表点名当前档，并给一步出口） ----

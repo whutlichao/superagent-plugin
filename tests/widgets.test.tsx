@@ -139,6 +139,40 @@ test('a page header carries the title, subtitle and its right-hand actions', asy
   assert.ok(panel.find({ text: 'Check again' }))
 })
 
+/**
+ * 页头标题的字号档不能变（LOW-14：「不得改变现有字号与视觉层次」）。基线的页头标题是
+ * `<Text weight="semibold">`，宿主 `Text` 的缺省 size 就是 `text-sm`（14px）；把它换成
+ * `Heading level={1}` 会变成 16px。这条断言钉住「是 Text、semibold、没有显式 size」。
+ */
+test('the page header title keeps the base type node and its default (14px) size', async () => {
+  function Head() {
+    return <PageHeader title="Superagent" subtitle="Supervises a proactive coding agent." />
+  }
+  panel = await mount(Head, { host: mockHost(), locale: 'en' })
+
+  interface Node {
+    readonly type?: string
+    readonly props?: { readonly weight?: string; readonly size?: string }
+    readonly children?: readonly (Node | string)[]
+  }
+  const findTitle = (node: Node): Node | undefined => {
+    if (node.type !== undefined && node.children !== undefined) {
+      if ((node.children as readonly unknown[]).includes('Superagent')) return node
+    }
+    for (const child of node.children ?? []) {
+      if (typeof child === 'string') continue
+      const hit = findTitle(child)
+      if (hit !== undefined) return hit
+    }
+    return undefined
+  }
+  const title = findTitle(panel.tree() as Node)
+  assert.ok(title, 'the title is drawn')
+  assert.equal(title.type, 'Text', 'the title stays a Text node (Heading level=1 would be 16px)')
+  assert.equal(title.props?.weight, 'semibold')
+  assert.equal(title.props?.size, undefined, 'no explicit size: the host default (text-sm, 14px) applies')
+})
+
 test('a section names its count when it has one', async () => {
   function Groups() {
     return (
