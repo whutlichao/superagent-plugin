@@ -202,6 +202,21 @@ test('README states all eleven limitations, in the design order, in the panel’
   }
 })
 
+test('the README explains the host theme contrast, and it stays outside the eleven items', () => {
+  const readme = readRepoFile('README.md')
+  // 单独一段、写在已知限制之后，明说不计入十一项。
+  assert.ok(
+    readme.indexOf(COPY['deployment.hostTheme'].zh) > readme.indexOf(COPY[LIMITATIONS[10].impactKey].zh),
+    'the note sits after the eleven known limitations'
+  )
+  for (const phrase of ['1.40:1', '1.62:1', '--orca-input', '--orca-border', '3:1', 'WCAG 1.4.11']) {
+    assert.ok(readme.includes(phrase), `the README names ${phrase}`)
+  }
+  assert.ok(readme.includes('不计入上面十一项'), 'the README says it is not a twelfth item')
+  // 这一条不是第 12 项：单一来源的长度不变。
+  assert.equal(LIMITATIONS.length, 11)
+})
+
 test('README carries the design appendix A attribution sentence verbatim', () => {
   // 独立真相是设计文档：把它附录 A 的引用块折成一行，README 必须逐字包含（作为引用块）。
   const quoted = designSection('## 附录 A', '## 附录 B')

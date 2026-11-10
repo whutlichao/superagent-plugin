@@ -75,7 +75,7 @@ export function deliveredFollowups(
 export interface TicketView {
   readonly id: string
   readonly title: string
-  /** §E.8 的七档之一；已结束的没有标签。 */
+  /** §E.8 的八个面板标签之一；已结束的没有标签。 */
   readonly stage: StageLabel | 'ended'
   /**
    * 执行器观测到的 agent 状态（§E.7 的四态）。它已随 Ticket 持久化（`agentState`），所以
@@ -112,13 +112,8 @@ export function ticketView(
   const label = ticketStage(ticket)
   const stage: TicketView['stage'] =
     label.stage === 'person'
-      ? label.action === 'blocked' || label.action === 'failed'
-        ? 'blockedFailed'
-        : label.action === 'delivery'
-          ? 'delivery'
-          : label.action === 'review'
-            ? 'review'
-            : 'answer'
+      ? // person 的五个动作与 §E.8 的面板标签同名；blocked 与 failed 各占一档。
+        label.action
       : label.stage === 'working'
         ? label.action === 'queued'
           ? 'queued'

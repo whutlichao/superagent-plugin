@@ -23,6 +23,7 @@ import type {
   TicketDetailView
 } from '../src/panel/protocol'
 import { AT, isoAfter, openTempStore, tempStateDir } from './support/state'
+import { currentPage, navLabels, openPage } from './support/panel-nav'
 
 /** `mockHost` 的请求表类型（测试里只写用到的几个名字）。 */
 type Requests = NonNullable<NonNullable<Parameters<typeof mockHost>[0]>['requests']>
@@ -131,7 +132,7 @@ async function openSearchTab(requests: Requests): Promise<Awaited<ReturnType<typ
     host: mockHost({ requests: { state: () => snapshot(), ...requests } }),
     locale: 'en'
   })
-  await panel.select({ type: 'Tabs' }, 'search')
+  await openPage(panel, 'search')
   return panel
 }
 
@@ -257,7 +258,7 @@ test('a Trigger hit opens the Thread that owns it', async () => {
   })
   await search(mounted, 'build')
   await mounted.press({ text: /please fix the build/ })
-  assert.equal(mounted.valueOf({ type: 'Tabs' }), 'trigger', 'the Trigger page owns a Trigger')
+  assert.equal(currentPage(mounted), 'trigger', 'the Trigger page owns a Trigger')
   assert.deepEqual(lastInput(mounted.host, 'thread.detail'), { threadKey: 'github:12', limit: 50 })
   assert.deepEqual(mounted.refusals, [])
   await mounted.unmount()
@@ -271,7 +272,7 @@ test('a Thread hit opens its detail', async () => {
   })
   await search(mounted, 'build')
   await mounted.press({ text: /owner\/widgets#12/ })
-  assert.equal(mounted.valueOf({ type: 'Tabs' }), 'trigger')
+  assert.equal(currentPage(mounted), 'trigger')
   assert.deepEqual(lastInput(mounted.host, 'thread.detail'), { threadKey: 'github:12', limit: 50 })
   assert.deepEqual(mounted.refusals, [])
   await mounted.unmount()
@@ -285,7 +286,7 @@ test('a Ticket hit opens its detail on the Execution page', async () => {
   })
   await search(mounted, 'login redirect')
   await mounted.press({ text: /Fix the login redirect/ })
-  assert.equal(mounted.valueOf({ type: 'Tabs' }), 'execution', 'the Execution page owns a Ticket')
+  assert.equal(currentPage(mounted), 'execution', 'the Execution page owns a Ticket')
   assert.deepEqual(lastInput(mounted.host, 'ticket.detail'), { ticketId: 't1' })
   assert.deepEqual(mounted.refusals, [])
   await mounted.unmount()
@@ -296,12 +297,17 @@ test('a Ticket hit opens its detail on the Execution page', async () => {
 // 三态：没有命中、搜索失败与重试（§M.2 的 Search 行）
 // ---------------------------------------------------------------------------
 
-test('no matches is an empty state, not an error', async () => {
+test('no matches names the query, offers Clear search, and is not an error', async () => {
   const mounted = await openSearchTab({ search: () => pageOf({ query: 'nothing-matches-this' }) })
   await search(mounted, 'nothing-matches-this')
-  assert.ok(mounted.find({ text: COPY['search.noMatches'].en }), 'the empty state names it')
+  const named = translate('en', 'search.noMatchesQuery', { query: 'nothing-matches-this' })
+  assert.ok(mounted.find({ text: named }), 'the empty state names the query')
   assert.equal(mounted.find({ text: COPY['state.errorTitle'].en }), null, 'no error is claimed')
   assert.equal(mounted.find({ type: 'Button', text: COPY['state.retry'].en }), null, 'no retry either')
+  // 一步出口：清除搜索，回到「输入一条查询」的空态提示。
+  await mounted.press({ type: 'Button', text: COPY['search.clear'].en })
+  assert.equal(mounted.find({ text: named }), null, 'the empty state closes')
+  assert.ok(mounted.find({ text: COPY['search.idle'].en }), 'the page is back to its idle hint')
   assert.deepEqual(mounted.refusals, [])
   await mounted.unmount()
   panel = undefined
@@ -323,7 +329,7 @@ test('a failed search gives the reason and a retry', async () => {
   )
   await mounted.press({ type: 'Button', text: COPY['state.retry'].en })
   assert.ok(mounted.find({ text: /owner\/widgets#12/ }), 'retry reads the same query again')
-  assert.equal(mounted.find({ text: COPY['search.noMatches'].en }), null)
+  assert.equal(mounted.find({ text: /No matches for/ }), null)
   assert.deepEqual(mounted.refusals, [])
   await mounted.unmount()
   panel = undefined
@@ -339,7 +345,12 @@ test('the glossary opens from the header in both languages and is not a navigati
       host: mockHost({ requests: { state: () => snapshot() } }),
       locale
     })
-    assert.equal(mounted.findAll({ role: 'tab' }).length, 7, `${locale}: seven navigation items`)
+    // 导航是七颗可换行的按钮（`Toolbar` + `Button`），不是宿主的 `Tabs`。
+    const navCount = (): number =>
+      mounted
+        .findAll({ role: 'button' })
+        .filter((button) => navLabels(locale).includes(button.text ?? '')).length
+    assert.equal(navCount(), 7, `${locale}: seven navigation items`)
     assert.equal(
       mounted.find({ text: new RegExp(COPY['glossary.meaning.mandate'].zh) }),
       null,
@@ -352,7 +363,7 @@ test('the glossary opens from the header in both languages and is not a navigati
     const meaning = COPY['glossary.meaning.mandate'][locale === 'zh-CN' ? 'zh' : 'en']
     assert.ok(mounted.find({ text: new RegExp(term) }), `${locale}: the term is listed`)
     assert.ok(mounted.find({ text: new RegExp(meaning) }), `${locale}: and what it means`)
-    assert.equal(mounted.findAll({ role: 'tab' }).length, 7, `${locale}: still no eighth page`)
+    assert.equal(navCount(), 7, `${locale}: still no eighth page`)
     await mounted.press({ text: COPY['panel.glossaryClose'][locale === 'zh-CN' ? 'zh' : 'en'] })
     assert.equal(mounted.find({ text: new RegExp(meaning) }), null, `${locale}: close removes the overlay`)
     assert.deepEqual(mounted.refusals, [])

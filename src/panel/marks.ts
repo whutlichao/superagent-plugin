@@ -22,6 +22,14 @@ export type MarkIcon =
   | 'pause'
   | 'close'
 
+/**
+ * 状态标记的**颜色约定**（§M.4 的 `marks.ts`）：`accent` 只表示「进行中」——`stage.working`、
+ * `thread.evaluating`、`source.starting`、`report.progress`。其它意思各有自己的档：
+ * 「人工输入」与中性的归属信息用 `neutral`，提示词「已改动」用 `warning`，需要人介入的
+ * 失败用 `danger`。新增标记时先问「它是不是进行中」；不是就不要借 `accent`——一色多义会
+ * 让人把「还在跑」和「来自人」读成同一件事。
+ */
+
 /** 一个状态的视觉标记：文案键 + 语气 + 图标；`detail` 放不进文案键的结局原文。 */
 export interface Mark {
   readonly labelKey: CopyKey
@@ -78,9 +86,11 @@ export function ticketMark(ticket: {
       case 'review':
         return { labelKey: 'stage.review', tone: 'warning', icon: 'check' }
       case 'blocked':
-        return { labelKey: 'stage.blockedFailed', tone: 'warning', icon: 'warning' }
+        // 受阻可恢复：warning。它和 `failed` 是两个档，不能并成一个 danger 标签。
+        return { labelKey: 'stage.blocked', tone: 'warning', icon: 'warning' }
       case 'failed':
-        return { labelKey: 'stage.blockedFailed', tone: 'danger', icon: 'error' }
+        // 失败要人介入：danger。`blockedFailed` 曾把两档并成一个标签，这里已经拆开。
+        return { labelKey: 'stage.failed', tone: 'danger', icon: 'error' }
       case 'delivery':
         return { labelKey: 'stage.delivery', tone: 'warning', icon: 'download' }
       default:

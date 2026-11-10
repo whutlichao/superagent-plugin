@@ -46,7 +46,16 @@ import type {
   SourcePageView
 } from './protocol'
 import { dropReasonText, fieldValueText, localizedText, rowText } from './source-text'
-import { EmptyStateBlock, ErrorState, Hint, LoadingState, MarkBadge, Section, word } from './widgets'
+import {
+  EmptyStateBlock,
+  ErrorState,
+  Hint,
+  InlineError,
+  LoadingState,
+  MarkBadge,
+  Section,
+  word
+} from './widgets'
 
 /** 最近一份 Source 页读数；`null` 表示还没读到。 */
 const page = atom<SourcePageView | null>(null)
@@ -197,9 +206,10 @@ function ActionFeedback(props: { readonly locale: string; readonly state: Action
   if (state === undefined) return null
   if (state.error !== undefined) {
     return (
-      <Text tone="danger" size="xs">
-        {translate(props.locale, 'source.actionFailed', { reason: state.error })}
-      </Text>
+      <InlineError
+        text={translate(props.locale, 'error.retry', { reason: state.error })}
+        locale={props.locale}
+      />
     )
   }
   if (state.note === undefined) return null
@@ -578,7 +588,7 @@ export function SourcePage(props: {
   const note = read(checkNote)
   return (
     <Stack gap="md">
-      <Row justify="between" align="start" gap="sm">
+      <Row justify="between" align="start" gap="sm" wrap>
         <Hint text={translate(locale, 'source.intro')} />
         <Button
           variant="outline"
@@ -602,9 +612,11 @@ export function SourcePage(props: {
         />
       )}
       {read(checkError) === '' ? null : (
-        <Text tone="danger" size="xs">
-          {read(checkError)}
-        </Text>
+        <InlineError
+          text={translate(locale, 'error.retry', { reason: read(checkError) })}
+          locale={locale}
+          onRetry={() => void checkAgain()}
+        />
       )}
       {stage === 'error' ? (
         <Callout tone="danger" icon="error" title={translate(locale, 'state.errorTitle')}>

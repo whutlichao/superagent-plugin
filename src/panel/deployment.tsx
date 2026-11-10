@@ -35,6 +35,7 @@ import {
   ConfirmAction,
   ErrorState,
   Hint,
+  InlineError,
   LoadingState,
   MarkBadge,
   Section,
@@ -262,9 +263,11 @@ function SetupSection(props: { readonly locale: string; readonly view: Deploymen
         )}
         {note === 'nothing' ? <Hint text={translate(locale, 'deployment.nothingToCheck')} /> : null}
         {read(setupError) === '' ? null : (
-          <Text tone="danger" size="xs">
-            {read(setupError)}
-          </Text>
+          <InlineError
+            text={translate(locale, 'error.retry', { reason: read(setupError) })}
+            locale={locale}
+            onRetry={() => void checkAgain()}
+          />
         )}
       </Stack>
     </Section>
@@ -377,9 +380,10 @@ function RouterSection(props: { readonly locale: string; readonly view: Deployme
           </Fact>
         </Row>
         {router.lastError === null ? null : (
-          <Text tone="danger" size="xs">
-            {translate(locale, 'deployment.routerLastError')} · {router.lastError}
-          </Text>
+          <InlineError
+            text={translate(locale, 'error.router', { reason: router.lastError })}
+            locale={locale}
+          />
         )}
         {read(routerNote) === '' ? null : (
           <Text size="xs" tone="success">
@@ -390,6 +394,7 @@ function RouterSection(props: { readonly locale: string; readonly view: Deployme
           id="restart-router"
           label={translate(locale, 'deployment.routerRestart')}
           action={translate(locale, 'deployment.routerRestart')}
+          consequence={translate(locale, 'confirm.body.restartRouter')}
           locale={locale}
           icon="refresh"
           onConfirm={() => void restartRouter()}
@@ -510,9 +515,10 @@ function PausedSwitch(props: { readonly locale: string; readonly view: Deploymen
         </Row>
         <Hint text={translate(locale, 'deployment.pausedHint')} />
         {read(actionError) === '' ? null : (
-          <Text tone="danger" size="xs">
-            {read(actionError)}
-          </Text>
+          <InlineError
+            text={translate(locale, 'error.retry', { reason: read(actionError) })}
+            locale={locale}
+          />
         )}
       </Stack>
     </Section>
@@ -551,6 +557,8 @@ function TokenSection(props: { readonly locale: string }): OrcaElement {
           id="rotate-token"
           label={translate(locale, 'deployment.rotateToken')}
           action={translate(locale, 'deployment.rotateToken')}
+          confirmLabel={translate(locale, 'confirm.label.rotateToken')}
+          consequence={translate(locale, 'confirm.body.rotateToken')}
           locale={locale}
           icon="refresh"
           onConfirm={() => void rotateToken()}
@@ -578,6 +586,8 @@ function LimitationsSection(props: { readonly locale: string }): OrcaElement {
             </Text>
           </Stack>
         ))}
+        {/* 宿主主题的说明不是第 12 项：它记的是宿主输入框边界的对比度，修复方在宿主。 */}
+        <Hint text={translate(locale, 'deployment.hostTheme')} />
       </Stack>
     </Section>
   )

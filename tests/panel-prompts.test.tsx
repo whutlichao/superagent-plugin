@@ -32,6 +32,7 @@ import * as panelModule from '../src/panel/panel'
 import * as main from '../src/worker/main'
 import { emptySettingsPage } from './support/settings-page'
 import { AT, openTempStore } from './support/state'
+import { openPromptPage } from './support/panel-nav'
 
 /** 面板挂载后的请求表（测试只写用到的名字）。 */
 type Requests = NonNullable<NonNullable<Parameters<typeof mockHost>[0]>['requests']>
@@ -136,6 +137,15 @@ function viewOf(overrides: Partial<PanelPromptsView> = {}): PanelPromptsView {
 
 let panel: Awaited<ReturnType<typeof mount>> | undefined
 
+/** 最近一次挂载的 Prompts 面板（子页切换要按它上面的按钮）。 */
+let mountedPanel: Awaited<ReturnType<typeof mount>> | undefined
+
+/** 切到 Prompts 的一个子页（helper 见 `tests/support/panel-nav.ts`）。 */
+async function openPromptTab(tab: 'edit' | 'full' | 'history' | 'skills'): Promise<void> {
+  if (mountedPanel === undefined) throw new Error('no Prompts panel is mounted')
+  await openPromptPage(mountedPanel, tab)
+}
+
 afterEach(async () => {
   await panel?.unmount()
   panel = undefined
@@ -221,6 +231,7 @@ async function openPrompts(
     }),
     locale
   })
+  mountedPanel = panel
   return panel
 }
 
@@ -238,12 +249,14 @@ test('the group has the four sub-tabs, and the edit page marks the changed parts
     })
   )
   assert.equal(
-    mounted.valueOf({ type: 'Tabs', label: translate('en', 'prompt.tabs') }),
+    mounted.persisted.storage['panel.promptTab'] ?? 'edit',
     'edit',
     'the edit page opens first'
   )
+  const rendered = JSON.stringify(mounted.tree())
   for (const tab of PROMPT_TABS) {
-    assert.ok(mounted.find({ text: tabLabel('en', tab) }), `the ${tab} sub-tab is there`)
+    // 四个子页是 RadioGroup 的选项（宿主把选项画在控件内部，树里以 option 的形状存在）。
+    assert.ok(rendered.includes(JSON.stringify(tabLabel('en', tab))), `the ${tab} sub-page is there`)
   }
   // 三段团队文本与每个分片一个字段（§M.3：「每个内置分片的 override」）。
   assert.equal(
@@ -341,7 +354,7 @@ test('the full prompt shows the composed text and diffs it against the saved tex
   const mounted = await openPrompts(() =>
     viewOf({ config: { team: { communication: 'Talk in short sentences.' } } })
   )
-  await mounted.select({ type: 'Tabs', label: translate('en', 'prompt.tabs') }, 'full')
+  await openPromptTab('full')
 
   assert.ok(mounted.find({ text: /orchestrator saved text/ }), 'the assembled orchestrator text is shown')
   assert.ok(mounted.find({ text: COPY['prompt.sameAsSaved'].en }), 'nothing changed yet')
@@ -368,7 +381,7 @@ test('an edited draft is previewed by the worker, and the diff shows the added l
     'Open a PR before you stop.',
     { replace: true }
   )
-  await mounted.select({ type: 'Tabs', label: translate('en', 'prompt.tabs') }, 'full')
+  await openPromptTab('full')
 
   assert.deepEqual(requestInput(mounted.host, 'prompts.preview'), {
     config: { team: { delivery: 'Open a PR before you stop.' } }
@@ -395,7 +408,7 @@ test('the history page lists the versions and restoring one returns to the edit 
       ]
     })
   )
-  await mounted.select({ type: 'Tabs', label: translate('en', 'prompt.tabs') }, 'history')
+  await openPromptTab('history')
   assert.equal(mounted.rowsOf({ type: 'Table' }).length, 3, 'every version is a row')
   assert.ok(mounted.find({ text: COPY['prompt.history.intro'].en }), 'the page explains that history is read-only')
 
@@ -403,7 +416,7 @@ test('the history page lists the versions and restoring one returns to the edit 
   await mounted.press({ text: COPY['prompt.restore'].en })
   assert.deepEqual(requestInput(mounted.host, 'prompts.restore'), { revision: 2, baseRevision: 3 })
   assert.equal(
-    mounted.valueOf({ type: 'Tabs', label: translate('en', 'prompt.tabs') }),
+    mounted.persisted.storage['panel.promptTab'],
     'edit',
     'restoring returns to the edit page'
   )
@@ -469,7 +482,7 @@ test('the skills page keeps the built-in skills read-only and adds, edits and de
   const mounted = await openPrompts(() =>
     viewOf({ config: { skills: { 'team-style': 'Write short sentences.' } } })
   )
-  await mounted.select({ type: 'Tabs', label: translate('en', 'prompt.tabs') }, 'skills')
+  await openPromptTab('skills')
 
   // 内置技能只读，每个技能都带自己的稳定路径。
   assert.ok(mounted.find({ text: literal(COPY['prompt.skills.builtIn'].en) }), 'the read-only group is named')
@@ -519,7 +532,7 @@ test('a refused skill name or an over-limit config is answered with a readable r
   ]
   for (const refusal of refusals) {
     panel = await openPrompts(() => viewOf(), { issuesOf: () => [refusal.issue] })
-    await panel.select({ type: 'Tabs', label: translate('en', 'prompt.tabs') }, 'skills')
+    await openPromptTab('skills')
     await panel.type({ type: 'Input', label: translate('en', 'prompt.skills.name') }, 'team-style')
     await panel.press({ text: COPY['prompt.skills.add'].en })
     await panel.type({ type: 'Textarea', label: 'team-style' }, 'Write short sentences.', {

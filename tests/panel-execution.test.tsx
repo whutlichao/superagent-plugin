@@ -24,6 +24,7 @@ import { COPY, translate } from '../src/panel/copy'
 import * as panelModule from '../src/panel/panel'
 import check from '../src/panel/panel.check.ts'
 import { removeTree } from './support/state'
+import { currentPage, openPage } from './support/panel-nav'
 
 /** `mockHost` 的请求表类型（测试里只写用到的几个名字）。 */
 type Requests = NonNullable<NonNullable<Parameters<typeof mockHost>[0]>['requests']>
@@ -109,7 +110,7 @@ async function openExecutionTab(requests: Requests): Promise<Awaited<ReturnType<
     host: mockHost({ requests: { state: () => snapshot(), ...requests } }),
     locale: 'en'
   })
-  await panel.select({ type: 'Tabs' }, 'execution')
+  await openPage(panel, 'execution')
   return panel
 }
 
@@ -227,7 +228,8 @@ test('the stage column uses the core stage table labels, and a null agent state 
         row('t1', 'Undelivered', 'delivery'),
         row('t2', 'Awaiting answer', 'answer'),
         row('t3', 'Awaiting review', 'review'),
-        row('t4', 'Blocked or failed', 'blockedFailed'),
+        row('t4', 'Blocked', 'blocked'),
+        row('t9', 'Failed', 'failed'),
         row('t5', 'Queued', 'queued'),
         row('t6', 'Idle', 'idle'),
         // 没有观察到 agent 状态时，§E.8 的严格表落到第 8 行：Working。
@@ -241,7 +243,8 @@ test('the stage column uses the core stage table labels, and a null agent state 
     COPY['stage.delivery'].en,
     COPY['stage.answer'].en,
     COPY['stage.review'].en,
-    COPY['stage.blockedFailed'].en,
+    COPY['stage.blocked'].en,
+    COPY['stage.failed'].en,
     COPY['stage.queued'].en,
     COPY['stage.idle'].en,
     COPY['stage.working'].en,
@@ -252,9 +255,38 @@ test('the stage column uses the core stage table labels, and a null agent state 
   panel = undefined
 })
 
-test('no tickets says so instead of drawing a placeholder page', async () => {
-  const mounted = await openExecutionTab({ tickets: () => ({ items: [], nextOffset: null }) })
-  assert.ok(mounted.find({ text: COPY['execution.empty'].en }))
+test('a filtered empty list names the filter and offers a way out', async () => {
+  // 打开时停在「开放」档：这一档的空态就是全量空态，不给多余的出口。
+  const open = await openExecutionTab({ tickets: () => ({ items: [], nextOffset: null }) })
+  assert.ok(open.find({ text: COPY['execution.empty'].en }))
+  assert.equal(open.find({ text: COPY['execution.showAll'].en }), null, 'no way out of the widest filter')
+  await open.unmount()
+
+  // 停在「待办」档（导航记忆会这样留下它）：空态点名这一档，并有「查看全部」切回最宽的一档。
+  panel = await mount(panelModule, {
+    host: mockHost({
+      requests: {
+        state: () => snapshot(),
+        tickets: () => ({ items: [], nextOffset: null })
+      },
+      storage: { 'panel.page': 'execution', 'panel.executionFilter': 'pending' }
+    }),
+    locale: 'en'
+  })
+  const mounted = panel
+  await mounted.settled()
+  const filtered = translate('en', 'execution.emptyFiltered', {
+    filter: translate('en', 'execution.filter.pending')
+  })
+  assert.ok(mounted.find({ text: filtered }), 'the empty state names the active filter')
+  assert.ok(mounted.find({ text: COPY['execution.showAll'].en }), 'and offers a way out')
+
+  await mounted.press({ type: 'Button', text: COPY['execution.showAll'].en })
+  await mounted.settled()
+  assert.deepEqual(requestInput(mounted.host, 'tickets'), { filter: 'open', offset: 0, limit: 50 })
+  assert.equal(mounted.persisted.storage['panel.executionFilter'], 'open', 'the widest filter is remembered')
+  assert.equal(mounted.find({ text: COPY['execution.showAll'].en }), null, 'the way out is gone at the widest filter')
+  assert.ok(mounted.find({ text: COPY['execution.empty'].en }), 'the widest filter keeps the plain empty state')
   assert.equal(mounted.find({ text: /A later ticket fills this page/ }), null, 'the placeholder is gone')
   assert.deepEqual(mounted.refusals, [])
   await mounted.unmount()
@@ -470,11 +502,12 @@ test('Stop asks before acting, and cancelling sends nothing', async () => {
   })
   await mounted.activateRow({ type: 'Table' }, 't1')
   await mounted.press({ text: COPY['action.stop'].en })
-  const question = translate('en', 'confirm.body', {
-    action: COPY['action.stop'].en,
-    target: 'Fix the login redirect'
-  })
+  // 标题点名「停止工单」这个动作与对象（不再用泛用的「停止」）。
+  const question = COPY['confirm.title'].en
+    .replace('{action}', COPY['confirm.label.stop'].en)
+    .replace('{target}', 'Fix the login redirect')
   assert.ok(mounted.find({ text: new RegExp(question) }), 'the inline confirm names the ticket')
+  assert.ok(mounted.find({ text: COPY['confirm.body.stop'].en }), 'and states the consequence')
   assert.equal(requestNames(mounted.host).includes('ticket.stop'), false, 'nothing is sent yet')
 
   await mounted.press({ text: COPY['action.cancel'].en })
@@ -482,7 +515,7 @@ test('Stop asks before acting, and cancelling sends nothing', async () => {
   assert.equal(requestNames(mounted.host).includes('ticket.stop'), false, 'cancel has no side effect')
 
   await mounted.press({ text: COPY['action.stop'].en })
-  await mounted.press({ text: COPY['action.confirm'].en })
+  await mounted.press({ text: COPY['confirm.label.stop'].en })
   assert.deepEqual(requestInput(mounted.host, 'ticket.stop'), { ticketId: 't1' })
   assert.deepEqual(mounted.refusals, [])
   await mounted.unmount()
@@ -500,18 +533,23 @@ test('Remove worktree asks before acting, and confirming sends the request', asy
   })
   await mounted.activateRow({ type: 'Table' }, 't1')
   await mounted.press({ text: COPY['execution.removeWorktree'].en })
-  const question = translate('en', 'confirm.body', {
-    action: COPY['execution.removeWorktree'].en,
-    target: '/repos/widgets/superagent-fix-login'
-  })
+  const question = COPY['confirm.title'].en
+    .replace('{action}', COPY['execution.removeWorktree'].en)
+    .replace('{target}', '/repos/widgets/superagent-fix-login')
   assert.ok(mounted.find({ text: new RegExp(question) }), 'the confirmation names the directory')
+  // 后果必须写全：目录与未提交改动、已证明合并的分支、均不可恢复。
+  const consequence = COPY['confirm.body.removeWorktree'].en
+  for (const phrase of ['uncommitted changes', 'branch Orca can prove merged', 'Neither can be recovered']) {
+    assert.ok(consequence.includes(phrase), `the consequence copy names ${phrase}`)
+    assert.ok(mounted.find({ text: consequence }), 'the consequence is drawn in the confirmation')
+  }
   assert.equal(requestNames(mounted.host).includes('workspace.remove'), false)
 
   await mounted.press({ text: COPY['action.cancel'].en })
   assert.equal(requestNames(mounted.host).includes('workspace.remove'), false, 'cancel has no side effect')
 
   await mounted.press({ text: COPY['execution.removeWorktree'].en })
-  await mounted.press({ text: COPY['action.confirm'].en })
+  await mounted.press({ text: COPY['execution.removeWorktree'].en })
   assert.deepEqual(requestInput(mounted.host, 'workspace.remove'), { ticketId: 't1' })
   assert.deepEqual(mounted.refusals, [])
   await mounted.unmount()
@@ -580,7 +618,7 @@ test('Open terminal and Open worktree go through the worker, never the host', as
 test('the healthy check scenario shows the ticket row on Overview and the Execution list', async () => {
   panel = await mount(panelModule, { host: mockHost({ requests: check.healthy.requests }), locale: 'en' })
   assert.ok(panel.find({ text: /Fix the login redirect/ }), 'Overview shows it as another ticket')
-  await panel.select({ type: 'Tabs' }, 'execution')
+  await openPage(panel, 'execution')
   assert.equal(panel.rowsOf({ type: 'Table' }).length, 1, 'Execution lists the same ticket')
   assert.deepEqual(panel.refusals, [])
   await panel.unmount()
@@ -594,7 +632,7 @@ test('the needs-person check scenario shows the ticket row it wants a person for
   })
   assert.ok(panel.find({ text: /Fix the login redirect/ }), 'the attention row names it')
   assert.ok(panel.find({ text: /Awaiting answer/ }))
-  await panel.select({ type: 'Tabs' }, 'execution')
+  await openPage(panel, 'execution')
   assert.equal(panel.rowsOf({ type: 'Table' }).length, 2, 'both tickets are in the list')
   await panel.unmount()
   panel = undefined
@@ -721,9 +759,9 @@ test('Blocked and Failed read the persisted agent state, strictly by the §E.8 s
     panelTicketPage([{ ...ticket, ...(agentState === undefined ? {} : { agentState }) }]).items[0]?.stage
 
   // 集合 {blocked, done} 的成员：阻塞/失败行成立，面板的「待办」档列它。
-  assert.equal(stage(reported('blocked'), 'blocked'), 'blockedFailed')
-  assert.equal(stage(reported('failed'), 'blocked'), 'blockedFailed')
-  assert.equal(stage(reported('failed'), 'done'), 'blockedFailed', 'a closed turn is still a failure')
+  assert.equal(stage(reported('blocked'), 'blocked'), 'blocked')
+  assert.equal(stage(reported('failed'), 'blocked'), 'failed')
+  assert.equal(stage(reported('failed'), 'done'), 'failed', 'a closed turn is still a failure')
   // 集合外的取值与未观测：不命中第 5 行，严格落到第 8 行的 Working。
   for (const outside of ['working', 'waiting', undefined] as const) {
     assert.equal(stage(reported('blocked'), outside), 'working', `blocked report with ${outside}`)

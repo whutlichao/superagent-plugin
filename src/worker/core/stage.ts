@@ -15,14 +15,16 @@ export type TicketStage =
   | { stage: 'ended' }
 
 /**
- * 面板上的七个标签（§E.8「面板标签」列）。`person` 的 blocked 与 failed 共用一个标签
- * 「阻塞或失败」；已结束的 Ticket 不参与 stage 标签，面板用它自己的结局措辞。
+ * 面板上的八个标签（§E.8「面板标签」列）。`person` 的 blocked 与 failed 是两个标签：
+ * 受阻可恢复（warning），失败要人介入（danger）；并成一档会把可恢复的受阻标成危险色。
+ * 已结束的 Ticket 不参与 stage 标签，面板用它自己的结局措辞。
  */
 export const STAGE_LABELS = [
   'delivery',
   'answer',
   'review',
-  'blockedFailed',
+  'blocked',
+  'failed',
   'queued',
   'idle',
   'working'
@@ -80,7 +82,7 @@ export function ticketStage(ticket: Ticket, agentState?: AgentState | null): Tic
   return { stage: 'working' }
 }
 
-/** stage → 七个面板标签之一；已结束的 Ticket 没有 stage 标签。 */
+/** stage → 八个面板标签之一；已结束的 Ticket 没有 stage 标签。 */
 export function stageLabel(stage: TicketStage): StageLabel | undefined {
   switch (stage.stage) {
     case 'ended':
@@ -90,9 +92,8 @@ export function stageLabel(stage: TicketStage): StageLabel | undefined {
     case 'working':
       return stage.action === 'queued' ? 'queued' : 'working'
     case 'person':
-      return stage.action === 'blocked' || stage.action === 'failed'
-        ? 'blockedFailed'
-        : stage.action
+      // person 的五个动作与面板标签同名（blocked 与 failed 各占一档）。
+      return stage.action
   }
 }
 

@@ -148,14 +148,21 @@ const ROWS: readonly Row[] = [
     ticket: ticket({ assignments: [reported('blocked')] }),
     agentState: 'blocked',
     stage: { stage: 'person', action: 'blocked' },
-    label: 'blockedFailed'
+    label: 'blocked'
   },
   {
     name: 'a blocked Report the agent already ended',
     ticket: ticket({ assignments: [reported('blocked')] }),
     agentState: 'done',
     stage: { stage: 'person', action: 'blocked' },
-    label: 'blockedFailed'
+    label: 'blocked'
+  },
+  {
+    name: 'a failed Report whose agent stopped',
+    ticket: ticket({ assignments: [reported('failed')] }),
+    agentState: 'done',
+    stage: { stage: 'person', action: 'failed' },
+    label: 'failed'
   },
   {
     name: 'a blocked Report while the agent works on the answer',
@@ -280,13 +287,14 @@ describe('ticketStage', () => {
     })
   }
 
-  test('covers the seven panel labels of the stage table', () => {
-    // 票面要求逐行覆盖七个标签；少一个就说明表里漏了一行。
+  test('covers the eight panel labels of the stage table', () => {
+    // 票面要求逐行覆盖八个标签（blocked 与 failed 各占一档）；少一个就说明表里漏了一行。
     const labels = new Set(ROWS.map((row) => row.label).filter((label) => label !== undefined))
     assert.deepEqual([...labels].sort(), [
       'answer',
-      'blockedFailed',
+      'blocked',
       'delivery',
+      'failed',
       'idle',
       'queued',
       'review',

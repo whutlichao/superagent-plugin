@@ -26,10 +26,8 @@ import {
   type KeyValueItem,
   type OrcaElement,
   Stack,
-  Tab,
   Table,
   type TableRow,
-  Tabs,
   Text,
   Textarea,
   Toolbar,
@@ -88,6 +86,7 @@ import {
   EmptyStateBlock,
   ErrorState,
   Hint,
+  InlineError,
   LoadingState,
   MarkBadge,
   PageHeader,
@@ -512,6 +511,7 @@ function Overview(props: { locale: string; state: PanelState }): OrcaElement {
               id="pause"
               label={words(locale, 'action.resume')}
               action={words(locale, 'action.resume')}
+              consequence={words(locale, 'confirm.body.resume')}
               locale={locale}
               onConfirm={() => void setPaused(false)}
             />
@@ -525,6 +525,7 @@ function Overview(props: { locale: string; state: PanelState }): OrcaElement {
             id="pause"
             label={words(locale, 'action.pause')}
             action={words(locale, 'action.pause')}
+            consequence={words(locale, 'confirm.body.pause')}
             locale={locale}
             onConfirm={() => void setPaused(true)}
           />
@@ -540,11 +541,21 @@ function Overview(props: { locale: string; state: PanelState }): OrcaElement {
         </Button>
       </Toolbar>
 
-      {checked === null ? null : <Hint text={translate(locale, 'overview.checked', checked)} />}
+      {checked === null ? null : (
+        <Hint
+          text={translate(
+            locale,
+            checked.problems === 1 ? 'overview.checkedOne' : 'overview.checked',
+            checked
+          )}
+        />
+      )}
       {failure === '' ? null : (
-        <Text tone="danger" size="xs">
-          {failure}
-        </Text>
+        <InlineError
+          text={translate(locale, 'error.retry', { reason: failure })}
+          locale={locale}
+          onRetry={() => void checkNow()}
+        />
       )}
 
       <Section title={words(locale, 'overview.awaitingYou')} count={pending.length}>
@@ -552,10 +563,11 @@ function Overview(props: { locale: string; state: PanelState }): OrcaElement {
           <Stack gap="sm">
             <EmptyStateBlock title={words(locale, 'overview.nothingNeedsYou')} icon="check" />
             <Hint
-              text={translate(locale, 'overview.sources', {
-                enabled: sources.enabled,
-                problems: sources.problems
-              })}
+              text={translate(
+                locale,
+                sources.problems === 1 ? 'overview.sourcesOne' : 'overview.sources',
+                { enabled: sources.enabled, problems: sources.problems }
+              )}
             />
           </Stack>
         ) : (
@@ -721,13 +733,19 @@ async function focusTerminal(terminalId: string): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------
-// Execution 页的读数与动作（§M.2）：列表、详情、停止/重试/请求状态/note/工作区，全部经
-// worker 的同一批 handler；面板没有聚焦终端与打开工作区的宿主方法（§M.2 末段）。
+// Execution 页的读数与动作（§M.2）：列表、详情、停止/重试/请求状态/note/worktree，全部经
+// worker 的同一批 handler；面板没有聚焦终端与打开 worktree 的宿主方法（§M.2 末段）。
 // ---------------------------------------------------------------------------
 
-/** 读一页 Execution 列表：`more` 是「加载更多」，否则从第一行重读。 */
-async function loadExecutionList(options: { readonly more?: boolean } = {}): Promise<void> {
-  const filter = read(executionFilter)
+/**
+ * 读一页 Execution 列表：`more` 是「加载更多」，否则从第一行重读。`filter` 是刚切过去的那一档
+ * ——`set` 是批量生效的，同一个事件里 `set` 之后再 `read` 得到的还是旧值，所以换档的动作把
+ * 新档显式传进来。
+ */
+async function loadExecutionList(
+  options: { readonly more?: boolean; readonly filter?: ExecutionFilter } = {}
+): Promise<void> {
+  const filter = options.filter ?? read(executionFilter)
   const current = read(executionList)
   if (options.more === true && (current === null || current.nextOffset === null)) return
   const offset = options.more === true && current !== null ? (current.nextOffset ?? 0) : 0
@@ -1025,6 +1043,35 @@ async function removeTicketWorktree(ticketId: string): Promise<void> {
   }
 }
 
+/**
+ * 带筛选的列表空态（MEDIUM-10）：点名当前筛选，并给一步出口「查看全部」切到该页最宽的一档。
+ * 最宽的一档用那句朴素的「没有…」空态，不再给出口（没有更宽的档可去）。
+ */
+function FilteredEmpty(props: {
+  readonly locale: string
+  readonly filterLabel: string
+  readonly widest: boolean
+  readonly emptyTitle: string
+  readonly filteredTitle: string
+  readonly showAllLabel: string
+  readonly onShowAll: () => void
+}): OrcaElement {
+  if (props.widest) return <EmptyStateBlock title={props.emptyTitle} icon="layers" />
+  return (
+    <EmptyStateBlock
+      title={props.filteredTitle}
+      icon="layers"
+      action={
+        <Row gap="xs">
+          <Button variant="outline" size="sm" onPress={props.onShowAll}>
+            {props.showAllLabel}
+          </Button>
+        </Row>
+      }
+    />
+  )
+}
+
 /** 一个读数：标签 + 值。 */
 function Stat(props: { readonly label: string; readonly value: string; readonly tone?: MarkTone }): OrcaElement {
   return (
@@ -1110,7 +1157,8 @@ function TicketDetailPage(props: { readonly locale: string; readonly ticketId: s
   const asked = read(statusAsked)
   const draft = read(noteDraft)
   const back = (
-    <Button variant="ghost" size="sm" icon="next" onPress={backToExecution}>
+    // 组件面没有左箭头：返回按钮只留文字，右箭头留给「跳转离开」（打开工单/线程）。
+    <Button variant="ghost" size="sm" onPress={backToExecution}>
       {words(locale, 'execution.back')}
     </Button>
   )
@@ -1149,9 +1197,11 @@ function TicketDetailPage(props: { readonly locale: string; readonly ticketId: s
         }
       />
       {failure === '' ? null : (
-        <Text tone="danger" size="xs">
-          {failure}
-        </Text>
+        <InlineError
+          text={translate(locale, 'error.terminal', { reason: failure })}
+          locale={locale}
+          onRetry={() => void loadTicketDetail(props.ticketId)}
+        />
       )}
 
       <KeyValue label={words(locale, 'execution.mandate')} items={mandateItems(locale, shown.mandate)} />
@@ -1169,7 +1219,8 @@ function TicketDetailPage(props: { readonly locale: string; readonly ticketId: s
               >
                 <Row gap="xs" align="center" wrap>
                   {input.human === true ? (
-                    <MarkBadge label={words(locale, 'execution.human')} tone="accent" />
+                    // 约定：accent 只表示「进行中」；「人写的」是来源归属，走中性色。
+                    <MarkBadge label={words(locale, 'execution.human')} tone="neutral" />
                   ) : null}
                   <RelativeTime at={input.at} format="short" muted />
                 </Row>
@@ -1331,8 +1382,11 @@ function TicketDetailPage(props: { readonly locale: string; readonly ticketId: s
           <ConfirmAction
             id={`stop:${shown.id}`}
             label={words(locale, 'action.stop')}
-            action={words(locale, 'action.stop')}
+            action={words(locale, 'confirm.label.stop')}
             target={shown.title}
+            confirmLabel={words(locale, 'confirm.label.stop')}
+            consequence={words(locale, 'confirm.body.stop')}
+            tone="danger"
             locale={locale}
             icon="stop"
             onConfirm={() => void stopTicket(shown.id)}
@@ -1373,6 +1427,8 @@ function TicketDetailPage(props: { readonly locale: string; readonly ticketId: s
             label={words(locale, 'execution.removeWorktree')}
             action={words(locale, 'execution.removeWorktree')}
             target={shown.worktree.directory}
+            consequence={words(locale, 'confirm.body.removeWorktree')}
+            tone="danger"
             locale={locale}
             icon="delete"
             onConfirm={() => void removeTicketWorktree(shown.id)}
@@ -1462,7 +1518,21 @@ function ExecutionListPage(props: { readonly locale: string }): OrcaElement {
         </Callout>
       )}
       {page !== null && items.length === 0 && failure === '' ? (
-        <EmptyStateBlock title={words(locale, 'execution.empty')} icon="layers" />
+        <FilteredEmpty
+          locale={locale}
+          filterLabel={translate(locale, `execution.filter.${filter}` as CopyKey)}
+          widest={filter === 'open'}
+          emptyTitle={words(locale, 'execution.empty')}
+          filteredTitle={translate(locale, 'execution.emptyFiltered', {
+            filter: translate(locale, `execution.filter.${filter}` as CopyKey)
+          })}
+          showAllLabel={words(locale, 'execution.showAll')}
+          onShowAll={() => {
+            set(executionFilter, 'open')
+            set(executionList, null)
+            void loadExecutionList({ filter: 'open' })
+          }}
+        />
       ) : null}
       {page === null && failure !== '' ? null : (
         <Table
@@ -1619,7 +1689,7 @@ function DecisionDetailPage(props: {
   const busy = read(decisionActing)
   const actionFailure = read(actionError)
   const back = (
-    <Button variant="ghost" size="sm" icon="next" onPress={backToEval}>
+    <Button variant="ghost" size="sm" onPress={backToEval}>
       {words(locale, 'action.back')}
     </Button>
   )
@@ -1656,9 +1726,11 @@ function DecisionDetailPage(props: {
         }
       />
       {failure === '' ? null : (
-        <Text tone="danger" size="xs">
-          {failure}
-        </Text>
+        <InlineError
+          text={translate(locale, 'error.reopen', { reason: failure })}
+          locale={locale}
+          onRetry={() => void loadDecisionDetail(props.decisionId)}
+        />
       )}
       {shown.unresolved ? (
         <Callout tone="warning" title={words(locale, 'eval.needsPerson')} icon="info">
@@ -1717,6 +1789,8 @@ function DecisionDetailPage(props: {
             label={words(locale, 'eval.dismiss')}
             action={words(locale, 'eval.dismiss')}
             target={shown.thread.title}
+            consequence={words(locale, 'confirm.body.dismiss')}
+            tone="danger"
             locale={locale}
             icon="close"
             onConfirm={() => void dismissDecision(shown.id)}
@@ -1726,9 +1800,10 @@ function DecisionDetailPage(props: {
 
       {busy ? <Hint text={translate(locale, 'confirm.pending')} /> : null}
       {actionFailure === '' ? null : (
-        <Text tone="danger" size="xs">
-          {actionFailure}
-        </Text>
+        <InlineError
+          text={translate(locale, 'error.reopen', { reason: actionFailure })}
+          locale={locale}
+        />
       )}
     </Stack>
   )
@@ -1785,9 +1860,11 @@ const threadActionError = atom('')
  */
 let threadRequest = 0
 
-/** 读一页 Thread 列表：`more` 是「加载更多」，否则从第一行重读。 */
-async function loadThreadList(options: { readonly more?: boolean } = {}): Promise<void> {
-  const filter = read(threadFilter)
+/** 读一页 Thread 列表：`more` 是「加载更多」，否则从第一行重读（`filter` 的理由同 Execution）。 */
+async function loadThreadList(
+  options: { readonly more?: boolean; readonly filter?: ThreadFilter } = {}
+): Promise<void> {
+  const filter = options.filter ?? read(threadFilter)
   const current = read(threadList)
   if (options.more === true && (current === null || current.nextOffset === null)) return
   const offset = options.more === true && current !== null ? (current.nextOffset ?? 0) : 0
@@ -1989,7 +2066,21 @@ function TriggerListPage(props: { readonly locale: string }): OrcaElement {
         </Callout>
       )}
       {page !== null && items.length === 0 && failure === '' ? (
-        <EmptyStateBlock title={words(locale, 'thread.empty')} icon="layers" />
+        <FilteredEmpty
+          locale={locale}
+          filterLabel={translate(locale, filterLabelKey(filter))}
+          widest={filter === 'all'}
+          emptyTitle={words(locale, 'thread.empty')}
+          filteredTitle={translate(locale, 'thread.emptyFiltered', {
+            filter: translate(locale, filterLabelKey(filter))
+          })}
+          showAllLabel={words(locale, 'thread.showAll')}
+          onShowAll={() => {
+            set(threadFilter, 'all')
+            set(threadList, null)
+            void loadThreadList({ filter: 'all' })
+          }}
+        />
       ) : null}
       {page === null && failure !== '' ? null : (
         <Table
@@ -2038,7 +2129,8 @@ function TriggerCardRow(props: {
             </Text>
           )}
           {card.human ? (
-            <MarkBadge label={words(locale, 'execution.human')} tone="accent" />
+            // 与 Execution 详情同一条约定：accent 只表示「进行中」，人写的走中性色。
+            <MarkBadge label={words(locale, 'execution.human')} tone="neutral" />
           ) : null}
           <RelativeTime at={card.at} format="short" muted />
           {card.queued ? (
@@ -2121,7 +2213,7 @@ function ThreadDetailPage(props: { readonly locale: string; readonly threadKey: 
   const notice = read(threadNotice)
   const actionFailure = read(threadActionError)
   const back = (
-    <Button variant="ghost" size="sm" icon="next" onPress={backToThreads}>
+    <Button variant="ghost" size="sm" onPress={backToThreads}>
       {words(locale, 'thread.back')}
     </Button>
   )
@@ -2161,9 +2253,11 @@ function ThreadDetailPage(props: { readonly locale: string; readonly threadKey: 
         }
       />
       {failure === '' ? null : (
-        <Text tone="danger" size="xs">
-          {failure}
-        </Text>
+        <InlineError
+          text={translate(locale, 'error.sources', { reason: failure })}
+          locale={locale}
+          onRetry={() => void loadThreadDetail(props.threadKey)}
+        />
       )}
       <Row gap="md" wrap>
         <Text muted size="xs">
@@ -2205,9 +2299,11 @@ function ThreadDetailPage(props: { readonly locale: string; readonly threadKey: 
       )}
 
       {shown.pollError === undefined ? null : (
-        <Text tone="danger" size="xs">
-          {translate(locale, 'thread.pollFailed', { error: shown.pollError })}
-        </Text>
+        <InlineError
+          text={translate(locale, 'error.threadPoll', { reason: shown.pollError })}
+          locale={locale}
+          onRetry={() => void loadThreadDetail(props.threadKey)}
+        />
       )}
 
       <Section title={words(locale, 'thread.subscribedTickets')} count={shown.subscriptions.length}>
@@ -2225,7 +2321,8 @@ function ThreadDetailPage(props: { readonly locale: string; readonly threadKey: 
                 <Row gap="xs" align="center" wrap>
                   <MarkBadge
                     label={translate(locale, `thread.ticket.${ticket.state}` as CopyKey)}
-                    tone={ticket.state === 'open' ? 'accent' : 'neutral'}
+                    // 订阅状态是归属信息，不是「进行中」；两档都用中性色。
+                    tone="neutral"
                   />
                   {ticket.context ? (
                     <MarkBadge label={words(locale, 'thread.contextOnly')} tone="neutral" />
@@ -2318,6 +2415,8 @@ function ThreadDetailPage(props: { readonly locale: string; readonly threadKey: 
             label={words(locale, 'thread.unsubscribe')}
             action={words(locale, 'thread.unsubscribe')}
             target={shown.title}
+            consequence={words(locale, 'confirm.body.unsubscribe')}
+            tone="danger"
             locale={locale}
             icon="close"
             onConfirm={() => void unsubscribeThread(shown.key)}
@@ -2328,9 +2427,10 @@ function ThreadDetailPage(props: { readonly locale: string; readonly threadKey: 
 
       {notice === null ? null : <Hint text={words(locale, THREAD_NOTICE_KEYS[notice])} />}
       {actionFailure === '' ? null : (
-        <Text tone="danger" size="xs">
-          {actionFailure}
-        </Text>
+        <InlineError
+          text={translate(locale, 'error.retry', { reason: actionFailure })}
+          locale={locale}
+        />
       )}
     </Stack>
   )
@@ -2353,8 +2453,8 @@ function PageBody(props: {
   readonly active: boolean
 }): OrcaElement {
   const locale = props.locale
-  // 只有当前页画内容：`Tabs` 把每个 `Tab` 的子节点都放进同一棵树，隐藏页的表格会抢走
-  // 「第一个表格」这类位置，也会让别的页面的内容混进这一屏。
+  // 只有当前页画内容：七页同挂在一棵树上，隐藏页的表格会抢走「第一个表格」这类位置，
+  // 也会让别的页面的内容混进这一屏。
   if (!props.active) return <Stack gap="sm" />
   const state = read(snapshot)
   const stage = read(phase)
@@ -2477,36 +2577,45 @@ export default function Panel(): OrcaElement {
   // 不认识的页面按 Overview 渲染；把存储改回干净值在 `setup` 里做（渲染中不能写 atom）。
   const remembered = read(page)
   const current: NavPage = isNavPage(remembered) ? remembered : 'overview'
+  // 导航是面板自有的可换行条（Toolbar + Button），不是宿主 `Tabs`：7 项 `Tabs` 的最小内容宽
+  // 约 544px 且不换行，320–400px 的面板上必然撑出整页横向滚动（§M.1 的记录）。七项、顺序与
+  // 「当前项可见」都不变：当前项是实心按钮，其余是 ghost。
   return (
     <Stack gap="md">
       <Header locale={locale} state={read(snapshot)} />
       {read(glossary) ? (
         <GlossaryOverlay locale={locale} onClose={() => set(glossary, false)} />
       ) : null}
-      <Tabs
-        label={words(locale, 'panel.title')}
-        value={current}
-        onChange={(next) => {
-          if (!isNavPage(next)) return
-          set(page, next)
-          // Settings（含 Deployment 组）、Execution 列表与 Eval 列表打开时才读（隐藏与未打开的
-          // 页面不发请求，§M.6）。
-          if (next === 'settings') void openSettingsPage()
-          if (next === 'execution') enterExecution()
-          if (next === 'eval') enterEval()
-          if (next === 'source') void openSources()
-          if (next === 'trigger') enterTriggers()
-          if (next === 'search') openSearch()
-        }}
-      >
+      <Toolbar label={words(locale, 'panel.title')}>
         {NAV_PAGES.map((item) => (
-          <Tab key={item} value={item} label={translate(locale, `nav.${item}` as CopyKey)}>
-            <PageBody locale={locale} current={item} active={item === current} />
-          </Tab>
+          <Button
+            key={item}
+            variant={item === current ? 'solid' : 'ghost'}
+            size="sm"
+            onPress={() => navigate(item)}
+          >
+            {translate(locale, `nav.${item}` as CopyKey)}
+          </Button>
         ))}
-      </Tabs>
+      </Toolbar>
+      {NAV_PAGES.map((item) => (
+        <PageBody key={item} locale={locale} current={item} active={item === current} />
+      ))}
     </Stack>
   )
+}
+
+/** 切页（导航按钮的唯一动作）：写记忆，并在打开时才读该页的读数（§M.6）。 */
+function navigate(next: NavPage): void {
+  set(page, next)
+  // Settings（含 Deployment 组）、Execution 列表与 Eval 列表打开时才读（隐藏与未打开的
+  // 页面不发请求）。
+  if (next === 'settings') void openSettingsPage()
+  if (next === 'execution') enterExecution()
+  if (next === 'eval') enterEval()
+  if (next === 'source') void openSources()
+  if (next === 'trigger') enterTriggers()
+  if (next === 'search') openSearch()
 }
 
 /** 面板语言：Orca 的 UI 语言（BCP-47），在渲染里读，切换语言会重渲染（§M.5）。 */

@@ -76,6 +76,11 @@ export const COPY = {
     zh: '来源：{enabled} 个启用，{problems} 个有问题',
     en: 'Sources: {enabled} enabled, {problems} problems'
   },
+  /** `problems === 1` 的英文单数（中文不变；键分开是为了英文不出现「1 problems」）。 */
+  'overview.sourcesOne': {
+    zh: '来源：{enabled} 个启用，{problems} 个有问题',
+    en: 'Sources: {enabled} enabled, {problems} problem'
+  },
   'overview.actions': { zh: '本页操作', en: 'Overview actions' },
   'overview.answer': { zh: '回答', en: 'Answer' },
   'overview.review': { zh: '评审', en: 'Review' },
@@ -83,6 +88,11 @@ export const COPY = {
   'overview.checked': {
     zh: '已检查：{waiting} 个待人工，{problems} 个系统问题。',
     en: 'Checked: {waiting} waiting, {problems} problems.'
+  },
+  /** `problems === 1` 的英文单数（同上）。 */
+  'overview.checkedOne': {
+    zh: '已检查：{waiting} 个待人工，{problems} 个系统问题。',
+    en: 'Checked: {waiting} waiting, {problems} problem.'
   },
   'execution.empty': { zh: '没有工单。', en: 'No tickets.' },
 
@@ -129,7 +139,7 @@ export const COPY = {
   },
 
   'execution.requestStatus': { zh: '请求状态', en: 'Request status' },
-  'execution.openWorktree': { zh: '打开工作区', en: 'Open worktree' },
+  'execution.openWorktree': { zh: '打开 worktree', en: 'Open worktree' },
   'execution.removeWorktree': { zh: '移除 worktree', en: 'Remove worktree' },
   'execution.note': { zh: '发一条 fact note', en: 'Send a fact note' },
   'execution.notePlaceholder': { zh: '只作语境，不授权任何事', en: 'Context only; it grants no authority' },
@@ -181,6 +191,11 @@ export const COPY = {
   },
   'thread.evaluatingDeadline': { zh: '截止', en: 'Deadline' },
   'thread.pollFailed': { zh: '轮询失败：{error}', en: 'Polling failed: {error}' },
+  /** 行内失败要指出下一步（MEDIUM-9）：重读这条线程，仍失败就看部署页的健康明细。 */
+  'error.threadPoll': {
+    zh: '轮询失败：{reason}。重读这条线程；仍失败就看部署页的来源与健康明细。',
+    en: 'Polling failed: {reason}. Read this Thread again; if it still fails, check Sources and health on the Deployment page.'
+  },
   'thread.disposition.queued': { zh: '等待评估', en: 'Waiting for Eval' },
   'thread.delivered': { zh: '已交给工单的执行器', en: 'Its worker decides it' },
   'thread.fanout': { zh: '扇出给 {count} 个工单', en: 'Fanned out to {count} tickets' },
@@ -259,15 +274,10 @@ export const COPY = {
   'setup.openSettings': { zh: '去设置', en: 'Open Settings' },
 
   // ---- 状态栏项（§N.7）----
-  'status.idle': { zh: 'Superagent', en: 'Superagent' },
+  // 状态栏的四条固定文本（`Superagent` / `Superagent 3` / `Superagent paused` /
+  // `Superagent error`）由 worker 侧 `app/status-bar.ts` 直接拼，拿不到宿主语言，不在这里；
+  // 面板页头只用得到的这一条计数徽章。
   'status.count': { zh: '待人工 {count}', en: '{count} need you' },
-  'status.paused': { zh: 'Superagent 已暂停', en: 'Superagent paused' },
-  'status.error': { zh: 'Superagent 出错', en: 'Superagent error' },
-  'status.tooltip': {
-    zh: '{answer} 待回答 · {review} 待评审 · {problems} 问题',
-    en: '{answer} awaiting answer · {review} awaiting review · {problems} problem'
-  },
-
   // ---- 页头与通用操作 ----
   'action.refresh': { zh: '重新检查', en: 'Check again' },
   'action.back': { zh: '返回列表', en: 'Back to the list' },
@@ -275,7 +285,7 @@ export const COPY = {
   'action.details': { zh: '查看全部', en: 'See all' },
   'action.save': { zh: '保存', en: 'Save' },
   'action.discard': { zh: '放弃修改', en: 'Discard' },
-  'action.confirm': { zh: '确定', en: 'Confirm' },
+  // 泛用的「确定」已退役：确认按钮一律是动词 + 对象（`confirm.label.*`）。
   'action.cancel': { zh: '取消', en: 'Cancel' },
   'action.close': { zh: '关闭', en: 'Close' },
   'action.copy': { zh: '复制', en: 'Copy' },
@@ -306,7 +316,6 @@ export const COPY = {
     en: 'Type trigger text, a message id, a thread’s #12 or a link, or a ticket title.'
   },
   'search.searching': { zh: '正在搜索…', en: 'Searching…' },
-  'search.noMatches': { zh: '没有匹配。', en: 'No matches.' },
   'search.group.triggers': { zh: '触发', en: 'Triggers' },
   'search.group.threads': { zh: '线程', en: 'Threads' },
   'search.group.tickets': { zh: '工单', en: 'Tickets' },
@@ -397,7 +406,6 @@ export const COPY = {
   'deployment.routerTerminal': { zh: '终端', en: 'Terminal' },
   'deployment.routerSince': { zh: '起始时间', en: 'Since' },
   'deployment.routerRestarts': { zh: '十分钟内重启次数', en: 'Restarts in 10 min' },
-  'deployment.routerLastError': { zh: '最后错误', en: 'Last error' },
   'deployment.routerRestart': { zh: '重启 Router', en: 'Restart the router' },
   'deployment.routerRestarted': { zh: '已请求重启 Router。', en: 'Router restart requested.' },
   'deployment.empty': { zh: '—', en: '—' },
@@ -483,9 +491,10 @@ export const COPY = {
     en: 'Labels refreshed: {added} added, {total} total.'
   },
   'source.checked': { zh: '检查完成。', en: 'The check finished.' },
-  'source.actionFailed': { zh: '动作没有成功：{reason}', en: 'The action did not succeed: {reason}' },
   'source.enable': { zh: '运行来源：{name}', en: 'Run Source: {name}' },
   'source.openThread': { zh: '打开线程', en: 'Open the Thread' },
+  /** Source 行上的按钮：它真的只打开 Source 页（不重跑检查）。 */
+  'source.open': { zh: '查看来源', en: 'Open Source' },
   'source.drop.channelIgnored': {
     zh: '来源已不再监听这个对话',
     en: 'The Source no longer listens to this conversation'
@@ -518,7 +527,7 @@ export const COPY = {
     en: 'The system prompt is injected once, at launch'
   },
   'limitation.systemPrompt.impact': {
-    zh: '运行中的会话不会自动看到新的 Policy 段；变更只用消息告知 revision 与读法，全文对新会话才完整生效（H.2）。',
+    zh: '运行中的会话不会自动看到新的策略段；变更只用消息告知 revision 与读法，全文对新会话才完整生效（H.2）。',
     en: 'A running session never sees a new Policy section by itself; a change only sends a message naming the revision and how to re-read it, and the full text takes effect for new sessions (H.2).'
   },
   'limitation.background.title': {
@@ -570,6 +579,15 @@ export const COPY = {
     zh: 'worker 可能在自己的终端里等人，而不是用 report --human-action；插件把 blocked 状态当作 Attention 兜住，但问题文本只是终端摘要（H.10）。',
     en: 'A worker may ask in its own terminal instead of reporting --human-action; the plugin catches the blocked state as Attention, but the question text is only a terminal summary (H.10).'
   },
+  /**
+   * 宿主主题的输入框边界对比度（MEDIUM-8）：README 的同一段说明与面板 Deployment 页的
+   * Limitations `Hint` 读的就是这一条。**只有这一条**——两处措辞必须逐字相同，测试直接比对。
+   */
+  'deployment.hostTheme': {
+    zh: '宿主主题：暗色下输入框边界（--orca-input / --orca-border）对卡片底是 1.40:1、对页面底是 1.62:1，低于 WCAG 1.4.11 的 3:1。面板没有样式通道，修复方在宿主；色值与具体读数见 README 的同一段说明。',
+    en: 'Host theme: in dark mode the input border (--orca-input / --orca-border) measures 1.40:1 against the card and 1.62:1 against the page, below the 3:1 WCAG 1.4.11 asks for. The panel has no style channel, so the fix belongs to the host; the values and the exact ratios are in the same note in the README.'
+  },
+
   'limitation.environment.title': {
     zh: '进程隔离与执行环境注入只是近似',
     en: 'Process isolation and execution-environment injection are approximations'
@@ -579,10 +597,93 @@ export const COPY = {
     en: 'Blocked commands and the account shim rely on the agent.launch.before hook (2 s, fail-open) and are not a security boundary; the worker git config is a minimal copy (credential helper, SSH→HTTPS, commit identity), so http.*, LFS and other global entries fall back to system configuration only; the plugin adds no process isolation and recommends a dedicated OS account (H.11, H.20).'
   },
 
-  // ---- 确认对话（§M.2：行内二次确认，无模态框）----
-  'confirm.title': { zh: '确认{action}', en: 'Confirm {action}' },
-  'confirm.body': { zh: '确定要{action}吗？「{target}」', en: 'Really {action} “{target}”?' },
-  'confirm.bodyPlain': { zh: '确定要{action}吗？', en: 'Really {action}?' },
+  // ---- 动作失败的行内呈现（`widgets.tsx` 的 `InlineError`）：一句话 + 下一步 ----
+  // 每处失败都点名下一步（重试、看部署页 health、看终端），不只给原因；`{reason}` 是 worker
+  // 的原话，面板不改写它。
+  'error.retry': {
+    zh: '原因：{reason}。重试一次；仍然失败就看部署页 health 明细。',
+    en: 'Reason: {reason}. Try again; if it still fails, read the health detail on the Deployment page.'
+  },
+  'error.terminal': {
+    zh: '原因：{reason}。重试一次；仍然失败就去工单的终端看输出。',
+    en: 'Reason: {reason}. Try again; if it still fails, read the output in the ticket’s terminal.'
+  },
+  'error.reopen': {
+    zh: '原因：{reason}。重新打开这一条；仍然失败就看部署页 health 明细。',
+    en: 'Reason: {reason}. Open this record again; if it still fails, read the health detail on the Deployment page.'
+  },
+  'error.sources': {
+    zh: '原因：{reason}。重试一次；仍然失败就看部署页的来源与健康明细。',
+    en: 'Reason: {reason}. Try again; if it still fails, check Sources and health on the Deployment page.'
+  },
+  'error.router': {
+    zh: '最后错误：{reason}。原因在 Router 的终端里（下面有终端 id）。',
+    en: 'Last error: {reason}. The cause is in the router terminal (its id is below).'
+  },
+
+  // ---- 空态指路（§M.2：带筛选的列表点名当前档，并给一步出口） ----
+  'execution.emptyFiltered': {
+    zh: '「{filter}」档没有工单。',
+    en: 'No tickets in the “{filter}” filter.'
+  },
+  'execution.showAll': { zh: '查看全部', en: 'Show all' },
+  'thread.emptyFiltered': {
+    zh: '「{filter}」档没有线程。',
+    en: 'No threads in the “{filter}” filter.'
+  },
+  'thread.showAll': { zh: '查看全部', en: 'Show all' },
+  'search.noMatchesQuery': {
+    zh: '「{query}」没有匹配。',
+    en: 'No matches for “{query}”.'
+  },
+  'search.clear': { zh: '清除搜索', en: 'Clear search' },
+
+  // ---- 确认对话（§M.2：行内二次确认；标题点名动作与对象，正文写后果）----
+  'confirm.title': { zh: '{action}「{target}」？', en: '{action} “{target}”?' },
+  'confirm.titlePlain': { zh: '{action}？', en: '{action}?' },
+  // 确认按钮的文字：只在现有动作键不是「动词 + 对象」时才新开一条；其余直接用动作键
+  //（`thread.unsubscribe`「取消订阅」、`eval.dismiss`「不再提示」、`action.resume`「恢复处理」、
+  // `action.pause`「暂停处理」、`deployment.routerRestart`「重启 Router」、
+  // `execution.removeWorktree`「移除 worktree」）。
+  'confirm.label.stop': { zh: '停止工单', en: 'Stop ticket' },
+  'confirm.label.rotateToken': { zh: '轮换 token', en: 'Rotate the token' },
+  'confirm.label.restore': { zh: '恢复这一版', en: 'Restore this version' },
+  'confirm.body.stop': {
+    zh: '停止后这张工单的授权被撤回，正在跑的 worker 也停下；不能撤销。',
+    en: 'Stopping withdraws the ticket’s mandate and stops its running worker; it cannot be undone.'
+  },
+  'confirm.body.removeWorktree': {
+    zh: '目录与其中未提交的改动会被删除；Orca 能证明已合并的分支也会被删除。两者都不可恢复。',
+    en: 'The directory and any uncommitted changes in it are deleted, and a branch Orca can prove merged is deleted too. Neither can be recovered.'
+  },
+  'confirm.body.unsubscribe': {
+    zh: '这条线程上全部工单的订阅都会被丢掉，后续触发不再作为语境送达。',
+    en: 'Every ticket’s subscription on this Thread is dropped, so later Triggers stop arriving as context.'
+  },
+  'confirm.body.dismiss': {
+    zh: '这条问题不再计入待人工；记录保留，可以随时回看。',
+    en: 'The problem stops counting as needing a person; the record stays for review.'
+  },
+  'confirm.body.resume': {
+    zh: '来源继续记录触发，派发、评估与回复恢复运行。',
+    en: 'Sources keep recording Triggers, and dispatch, Evals and replies resume.'
+  },
+  'confirm.body.pause': {
+    zh: '来源继续记录触发，但派发、新评估与回复都会停下。',
+    en: 'Sources keep recording Triggers, but dispatch, new Evals and replies all stop.'
+  },
+  'confirm.body.restartRouter': {
+    zh: '旧会话会被关掉、换一个新会话，Router 的 token 也会轮换。',
+    en: 'The old session is closed, a new one starts, and the router token is rotated.'
+  },
+  'confirm.body.rotateToken': {
+    zh: '旧 token 立即失效；CLI 与面板下次都读同一个新文件。',
+    en: 'The old token stops working at once; the CLI and the panel read the same new file next time.'
+  },
+  'confirm.body.restore': {
+    zh: '把第 {revision} 版再保存一次；正在跑的会话不被重启。',
+    en: 'Save version {revision} again; running sessions are not restarted.'
+  },
   'confirm.pending': { zh: '正在执行…', en: 'Working…' },
 
   // ---- 设置草稿与保存栏（§M.3）----
@@ -909,11 +1010,12 @@ export const COPY = {
   'endBy.executor': { zh: '执行器', en: 'Executor' },
   'endBy.human': { zh: '人', en: 'A person' },
 
-  // --- 面板的七个 stage 标签（§E.8「面板标签」列） ---
+  // --- 面板的八个 stage 标签（§E.8「面板标签」列；blocked 与 failed 各占一档） ---
   'stage.delivery': { zh: '待投递', en: 'Input undelivered' },
   'stage.answer': { zh: '待回答', en: 'Awaiting answer' },
   'stage.review': { zh: '待评审', en: 'Awaiting review' },
-  'stage.blockedFailed': { zh: '阻塞或失败', en: 'Blocked · Failed' },
+  'stage.blocked': { zh: '受阻', en: 'Blocked' },
+  'stage.failed': { zh: '失败', en: 'Failed' },
   'stage.queued': { zh: '排队', en: 'Queued' },
   'stage.idle': { zh: '闲置', en: 'Waiting for a Trigger' },
   'stage.working': { zh: '工作中', en: 'Working' },
@@ -1082,7 +1184,7 @@ export const COPY = {
 
   // ---- Settings 页（§M.3、§K.8）：五组框架、每组保存栏与历史 ----
   'settings.intro': {
-    zh: '每组一个保存栏：没有改动时不占空间。Policy 与提交邮箱保存即生效；其余块在插件重启后生效。',
+    zh: '每组一个保存栏：没有改动时不占空间。策略与提交邮箱保存即生效；其余块在插件重启后生效。',
     en: 'One save bar per group; it takes no space while the draft is empty. Policy and the commit email take effect at once; the other blocks take effect after the plugin restarts.'
   },
   'settings.group.sources': { zh: '来源', en: 'Sources' },
@@ -1097,13 +1199,14 @@ export const COPY = {
   'settings.retry': { zh: '重试', en: 'Retry' },
   'settings.saveRestart': { zh: '已保存 · 重启插件后生效', en: 'Saved · takes effect after the plugin restarts' },
   'settings.rows.add': { zh: '添加一行', en: 'Add row' },
-  'settings.rows.remove': { zh: '删除这一行', en: 'Remove this row' },
+  /** 带行号的可访问名（同页多行时「删除这一行」会重复）。 */
+  'settings.rows.removeAt': { zh: '删除第 {index} 行', en: 'Remove row {index}' },
   'settings.rows.empty': { zh: '还没有行', en: 'No rows yet' },
   'settings.fact.empty': { zh: '（未知）', en: '(unknown)' },
 
   // Sources 组
   'settings.sources.intro': {
-    zh: '每个 Source 一张卡：开关、配置字段与只读的部署事实。改完保存；轮询在插件重启后按新配置跑。',
+    zh: '每个来源一张卡：开关、配置字段与只读的部署事实。改完保存；轮询在插件重启后按新配置跑。',
     en: 'One card per Source: the switch, its configuration fields and the read-only deployment facts. Save when done; polling follows the new configuration after the plugin restarts.'
   },
   'settings.sources.enabled': { zh: '启用这个来源', en: 'Enable this Source' },
@@ -1114,7 +1217,7 @@ export const COPY = {
     en: 'Synced: {count} allowed'
   },
   'settings.sources.syncHint': {
-    zh: '名单同步会以 origin=sync 写回 Policy 块，与面板保存同一条路径。',
+    zh: '名单同步会以 origin=sync 写回策略块，与面板保存同一条路径。',
     en: 'The list sync writes the Policy block back with origin=sync, the same path as a panel save.'
   },
   'settings.sources.configInvalid': {
@@ -1130,10 +1233,10 @@ export const COPY = {
 
   // Eval 组
   'settings.eval.intro': {
-    zh: 'Policy 决定谁能发起工作。版本是内容哈希：保存后立刻生效，历史里能看到受影响的工单。',
+    zh: '策略决定谁能发起工作。版本是内容哈希：保存后立刻生效，历史里能看到受影响的工单。',
     en: 'The Policy decides who may start work. Its version is a content hash: a save takes effect at once, and the history shows which tickets it affected.'
   },
-  'settings.eval.policyVersion': { zh: 'Policy 版本', en: 'Policy version' },
+  'settings.eval.policyVersion': { zh: '策略版本', en: 'Policy version' },
   'settings.eval.acceptMode': { zh: '接受模式', en: 'Accept mode' },
   'settings.eval.acceptMode.off': { zh: '关闭（只接受显式请求）', en: 'Off (explicit requests only)' },
   'settings.eval.acceptMode.observe': { zh: '观察（推断的只记录不接单）', en: 'Observe (inferred are recorded, not accepted)' },
@@ -1153,10 +1256,10 @@ export const COPY = {
   'settings.eval.ruleZh': { zh: '规则说明（中文）', en: 'Rule instruction (Chinese)' },
   'settings.eval.ruleEn': { zh: '规则说明（英文）', en: 'Rule instruction (English)' },
   'settings.eval.enabled': { zh: '启用这条规则', en: 'Enable this rule' },
-  'settings.eval.perSource': { zh: '每个 Source', en: 'On each Source' },
+  'settings.eval.perSource': { zh: '每个来源', en: 'On each Source' },
   'settings.eval.admission': { zh: '准入表', en: 'Admission' },
   'settings.eval.admissionHint': {
-    zh: '未点名的格子只在该 Source 观察全部消息时可用；不可用的格子按「不看」读。',
+    zh: '未点名的格子只在该来源观察全部消息时可用；不可用的格子按「不看」读。',
     en: 'The unaddressed cells work only while that Source observes every message; an unavailable cell reads as Ignore.'
   },
   'settings.admission.listedUnaddressed': { zh: '名单内 · 未点名', en: 'Listed · not addressed' },
@@ -1207,6 +1310,11 @@ export const COPY = {
     en: 'The shim stops slips; it is not a security boundary (H.11).'
   },
   'settings.execution.addCommand': { zh: '添加命令', en: 'Add command' },
+  /** 带行号与命令本身的可访问名（行里没有任何文字，只有输入框与删除按钮）。 */
+  'settings.execution.removeCommand': {
+    zh: '删除 blocked 命令 {index}：{command}',
+    en: 'Remove blocked command {index}: {command}'
+  },
   'settings.execution.inlineLimit': { zh: '内联上限（字符）', en: 'Inline limit (characters)' },
   'settings.execution.worktreeRetention': { zh: 'worktree 保留策略', en: 'Worktree retention' },
   'settings.execution.retentionKeep': { zh: '保留（不自动删除）', en: 'Keep (never deleted automatically)' },
@@ -1251,11 +1359,7 @@ export const COPY = {
     zh: '该行没有观察全部消息，这一格按「不看」读。',
     en: 'This row does not observe every message, so this cell reads as Ignore.'
   },
-  'settings.history.affectedTickets': { zh: '受影响工单：{tickets}', en: 'Affected tickets: {tickets}' },
-  'settings.history.confirmRestore': {
-    zh: '把第 {revision} 版再保存一次？',
-    en: 'Save version {revision} again?'
-  }
+  'settings.history.affectedTickets': { zh: '受影响工单：{tickets}', en: 'Affected tickets: {tickets}' }
 
 } as const satisfies Readonly<Record<string, CopyPair>>
 
@@ -1345,8 +1449,17 @@ export function translate(locale: string, key: CopyKey, values: CopyValues = {})
 // 领域码表的文案面（F5 的契约；`tests/terms.test.ts` 双向核对）
 // ---------------------------------------------------------------------------
 
-/** `stage` 组的码：§E.8「面板标签」一列，`blocked` 与 `failed` 共用一个标签。 */
-export const STAGE_TERMS = ['delivery', 'answer', 'review', 'blockedFailed', 'queued', 'idle', 'working'] as const
+/** `stage` 组的码：§E.8「面板标签」一列；`blocked` 与 `failed` 各占一档。 */
+export const STAGE_TERMS = [
+  'delivery',
+  'answer',
+  'review',
+  'blocked',
+  'failed',
+  'queued',
+  'idle',
+  'working'
+] as const
 export type StageTerm = (typeof STAGE_TERMS)[number]
 
 /**

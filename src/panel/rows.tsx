@@ -170,8 +170,9 @@ export function SourceRow(props: { readonly locale: string; readonly source: Sou
       <Row gap="xs" align="center" wrap>
         <MarkBadge label={label} tone={mark.tone} />
         {source.problem === undefined ? null : (
+          // 按钮只打开 Source 页（`onOpen`），不重跑检查：标签必须说它真的做什么。
           <Button variant="ghost" size="sm" onPress={source.onOpen}>
-            {translate(props.locale, 'action.refresh')}
+            {translate(props.locale, 'source.open')}
           </Button>
         )}
       </Row>

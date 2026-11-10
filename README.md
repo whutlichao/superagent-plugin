@@ -237,7 +237,7 @@ orca plugin types . --json && ls .orca/types
 Limitations 段与本节读同一份文案（同源同措辞）。
 
 1. **Session preset 的工具裁剪** —— Worker 与 Router 都是普通 Orca agent 会话，工具集不可裁剪：「Router 不读代码」只由提示词约束，Router 理论上仍能改代码；worker 可用的工具也与上游的 WORK_TOOLS 不完全相同（H.1、H.19）。
-2. **系统提示词在 launch 时一次性注入** —— 运行中的会话不会自动看到新的 Policy 段；变更只用消息告知 revision 与读法，全文对新会话才完整生效（H.2）。
+2. **系统提示词在 launch 时一次性注入** —— 运行中的会话不会自动看到新的策略段；变更只用消息告知 revision 与读法，全文对新会话才完整生效（H.2）。
 3. **看不到 agent 内部的后台工作与 30 分钟预算** —— 30 分钟规则退化为「发收尾指令并标记过期」，不杀进程：长任务可能继续占着 slot，也可能被误判为过期（H.3）。
 4. **模型预算重试由 Orca 负责** —— 插件只做三次 launch 重试；看不到预算重试状态，provider 抖动时工单可能直接失败；models 健康项恒为就绪并写明「由 Orca 负责」（H.4）。
 5. **没有 DSH Plugin Manager 页面** —— 少量项在 Orca 设置里改，其余在面板的 Settings → Deployment 组；两处不重复（H.5）。
@@ -249,6 +249,18 @@ Limitations 段与本节读同一份文案（同源同措辞）。
 11. **进程隔离与执行环境注入只是近似** —— blocked commands 与账号 shim 依赖 agent.launch.before 钩子（2 秒、失败即放行），不是安全边界；worker 的 git 配置是最小副本（凭据 helper、SSH→HTTPS、提交身份），http.*、LFS 等其余全局项只剩系统级配置；插件不做进程隔离，建议专用 OS 账号（H.11、H.20）。
 
 这一节是**近似**的清单，不是已实现功能的清单：没有 DSH 的机制就是没有，替换物如上所述。
+
+### 宿主主题：输入框边界对比度不足（不计入上面十一项）
+
+- **现象**：暗色主题下，面板里的输入框边界几乎融进底色，边界看不清；浅色主题没有这个问题。
+- **实测比值**：边界 `#404355` 对卡片底 `#2b2d3a` 是 **1.40:1**，对页面底 `#21222c` 是 **1.62:1**，低于 WCAG 1.4.11（非文本对比度）要求的 **3:1**。
+- **涉及的宿主 token**：`--orca-input`（输入框边界）与 `--orca-border`。这两个色值由 Orca 的主题决定。
+- **修复方在宿主**：面板是 components 面板，没有 DOM、没有 `style` / `className`，也不能自带调色板（`tests/styles.test.ts` 强制），因此插件无法改这两个色值，也不会绕过。修法在 Orca 的主题里把这两个 token 的暗色值提到 3:1 以上。
+- **面板里的同一句**：Deployment 页 Limitations 段在十一项之后有一行 `Hint`（`deployment.hostTheme`），说的是同一件事、同一条口径；上面这段的完整读数只在这里，面板那边的 Hint 点到为止并指回本节。
+
+宿主主题：暗色下输入框边界（--orca-input / --orca-border）对卡片底是 1.40:1、对页面底是 1.62:1，低于 WCAG 1.4.11 的 3:1。面板没有样式通道，修复方在宿主；色值与具体读数见 README 的同一段说明。
+
+这一条不计入上面十一项；面板 Deployment 页的 Limitations 段在十一项之后用一行 `Hint` 说同一句话（`copy.ts` 的 `deployment.hostTheme`，中英各一份）。
 
 计数口径只有一处：这十一项就是用户可见的完整列表，单一来源是 `src/panel/limitations.ts`（面板
 Deployment 页的 Limitations 段与本节读同一份文案，中英各一份，顺序也由它给）。设计文档 §A.3 列的

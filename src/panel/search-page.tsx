@@ -221,7 +221,28 @@ export function SearchPage(props: {
       )}
       {loading && view === null ? <LoadingState label={word(locale, 'search.searching')} /> : null}
       {view !== null && hits === 0 ? (
-        <EmptyStateBlock title={word(locale, 'search.noMatches')} icon="search" />
+        // 没有命中时点名查询词，并给一步出口（清除搜索回到空态提示）。
+        <EmptyStateBlock
+          title={translate(locale, 'search.noMatchesQuery', { query: view.query })}
+          icon="search"
+          action={
+            <Row gap="xs">
+              <Button
+                variant="outline"
+                size="sm"
+                onPress={() => {
+                  set(draft, '')
+                  set(submitted, '')
+                  set(page, null)
+                  set(phase, 'idle')
+                  set(reason, '')
+                }}
+              >
+                {word(locale, 'search.clear')}
+              </Button>
+            </Row>
+          }
+        />
       ) : null}
 
       {view !== null && hits > 0 ? (

@@ -34,7 +34,8 @@ function waiting(state: PanelState): number {
  */
 export function statusBarView(state: PanelState): StatusBarView {
   const { answer, review, problems } = state.attention
-  const tooltip = `${answer} awaiting answer · ${review} awaiting review · ${problems} problem${problems === 1 ? '' : 's'}`
+  // 英文单复数：1 用单数（「1 problem」），其余用复数。状态栏拿不到宿主语言，文案固定英文。
+  const tooltip = `${answer} awaiting answer · ${review} awaiting review · ${problems} ${problems === 1 ? 'problem' : 'problems'}`
   if (state.health.error) return { text: 'Superagent error', tone: 'danger', tooltip }
   if (state.health.paused) return { text: 'Superagent paused', tone: 'neutral', tooltip }
   const count = waiting(state)

@@ -122,12 +122,16 @@ export interface WorkerHealth {
 export interface PanelTicket {
   readonly id: string
   readonly title: string
-  /** §E.8 的七档之一；已结束是 `ended`。 */
+  /**
+   * §E.8 的面板标签之一；已结束是 `ended`。`blocked` 与 `failed` 是两个档：受阻可恢复
+   * （warning），失败要人介入（danger）——并成一档会把可恢复的受阻标成危险色。
+   */
   readonly stage:
     | 'delivery'
     | 'answer'
     | 'review'
-    | 'blockedFailed'
+    | 'blocked'
+    | 'failed'
     | 'queued'
     | 'idle'
     | 'working'
@@ -547,7 +551,7 @@ export interface PanelTerminal {
 export interface TicketDetailView {
   readonly id: string
   readonly title: string
-  /** §E.8 的七档之一（与列表同一判定，不带 `agentState` 时是表的严格结果）。 */
+  /** §E.8 的八个面板标签之一（与列表同一判定，不带 `agentState` 时是表的严格结果）。 */
   readonly stage: PanelTicket['stage']
   readonly outcome?: PanelTicket['outcome']
   /** 最后更新时间（epoch ms）。 */
@@ -1188,7 +1192,7 @@ export interface SettingsBlockSaved {
   readonly revision: number
   readonly at: string
   readonly origin: 'panel' | 'tool' | 'sync' | 'operator'
-  /** Policy 块的内容哈希；其余块为 `null`（§K.5）。 */
+  /** 策略块的内容哈希；其余块为 `null`（§K.5）。 */
   readonly policyVersion: string | null
 }
 
@@ -1238,7 +1242,7 @@ export interface SourcePolicyView {
   readonly syncable: boolean
 }
 
-/** Eval 组：Policy 版本、规则、accept mode、超时、模型，以及每个 Source 的部分。 */
+/** Eval 组：策略版本、规则、accept mode、超时、模型，以及每个来源的部分。 */
 export interface EvalGroupView {
   readonly block: 'policy'
   readonly revision: number
@@ -1476,7 +1480,7 @@ declare module 'orca' {
     'terminal.focus': { input: TerminalInput; output: FocusOutcome }
     /**
      * 打开该工单的 worktree（§M.2）：面板没有 `workspace.open` 这个宿主方法，
-     * 由 worker 按 Ticket 记录的目录找到工作区再调宿主。
+     * 由 worker 按 Ticket 记录的目录找到 worktree 再调宿主。
      */
     'workspace.open': { input: TicketInput; output: WorktreeOpened }
     /**

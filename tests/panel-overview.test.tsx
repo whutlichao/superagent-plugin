@@ -17,6 +17,7 @@ import { orderWaiting, problemPage } from '../src/panel/overview'
 import { readSystemProblems } from '../src/worker/app/views/problems'
 import { createRefreshableStateSource } from '../src/worker/app/state-source'
 import check from '../src/panel/panel.check.ts'
+import { currentPage, openPage } from './support/panel-nav'
 
 /** `mockHost` 的请求表类型（测试里只写几个名字）。 */
 type Requests = NonNullable<NonNullable<Parameters<typeof mockHost>[0]>['requests']>
@@ -124,40 +125,55 @@ interface TreeNode {
 }
 
 /** 一个页面（Tab）之下的节点，按绘制顺序。 */
-function nodesUnderTab(mounted: Awaited<ReturnType<typeof mount>>, page: string): TreeNode[] {
+function nodesOnPage(mounted: Awaited<ReturnType<typeof mount>>, page: string): TreeNode[] {
   const found: TreeNode[] = []
+  // 七页同挂在一棵树上，只有当前页画内容（其余页是一个空 Stack）。按页面自己的标题找到
+  // 那一块：Overview 的四块、Execution/Trigger/Eval 的表格与详情都在它下面。
+  const tree = mounted.tree() as TreeNode
+  // 本文件只覆盖 Overview：这一页的根 Stack 是唯一画出四块标题（`Heading`）的那一块。
+  const overviewTitles = [
+    translate('en', 'overview.awaitingYou'),
+    translate('en', 'overview.problems'),
+    translate('en', 'overview.flow'),
+    translate('en', 'overview.executor')
+  ]
+  const hit = (function seek(node: TreeNode): TreeNode | undefined {
+    if (node.type === 'Stack') {
+      const rendered = JSON.stringify(node.children ?? [])
+      if (overviewTitles.some((title) => rendered.includes(JSON.stringify(title)))) return node
+    }
+    for (const child of node.children ?? []) {
+      if (typeof child === 'string') continue
+      const found = seek(child)
+      if (found !== undefined) return found
+    }
+    return undefined
+  })(tree)
+  const scope = hit ?? tree
   const walk = (node: TreeNode): void => {
     found.push(node)
     for (const child of node.children ?? []) if (typeof child !== 'string') walk(child)
   }
-  const tab = (function seek(node: TreeNode): TreeNode | undefined {
-    if (node.type === 'Tab' && node.props?.['value'] === page) return node
-    for (const child of node.children ?? []) {
-      if (typeof child === 'string') continue
-      const hit = seek(child)
-      if (hit !== undefined) return hit
-    }
-    return undefined
-  })(mounted.tree() as TreeNode)
-  assert.ok(tab !== undefined, `the ${page} tab is drawn`)
-  for (const child of tab.children ?? []) if (typeof child !== 'string') walk(child)
+  walk(scope)
   return found
 }
 
 /** 一个页面上的行（`ListItem`）与其 props，按绘制顺序。 */
-function rowsUnderTab(
+function rowsOnPage(
   mounted: Awaited<ReturnType<typeof mount>>,
   page: string
 ): Readonly<Record<string, unknown>>[] {
-  return nodesUnderTab(mounted, page)
+  return nodesOnPage(mounted, page)
     .filter((node) => node.type === 'ListItem')
     .map((node) => node.props ?? {})
 }
 
-/** 页面上可见的文字，按绘制顺序（只用可见元素；一个 Text 的整句话算一条）。 */
+/**
+ * 页面上可见的文字，按绘制顺序（只用可见元素；一个 Text / Heading 的整句话算一条）。
+ * 区块标题是 `Heading level=2`（LOW-14 的标题层级），所以两种节点都算。
+ */
 function drawnTexts(mounted: Awaited<ReturnType<typeof mount>>): string[] {
-  return mounted
-    .findAll({ type: 'Text' })
+  return [...mounted.findAll({ type: 'Text' }), ...mounted.findAll({ type: 'Heading' })]
     .map((element) => element.text ?? '')
     .filter((text) => text !== '')
 }
@@ -217,7 +233,7 @@ test('waiting tickets are ordered by stage, newest first inside one stage', asyn
     })
   )
   assert.deepEqual(
-    rowsUnderTab(mounted, 'overview').map((row) => row['title']),
+    rowsOnPage(mounted, 'overview').map((row) => row['title']),
     ['Ticket d1', 'Ticket a2', 'Ticket a1', 'Ticket r1', 'Ticket b1', 'Ticket f1']
   )
   // 纯函数同一份规则：排序不依赖 worker 送来的顺序。
@@ -262,7 +278,7 @@ test('Answer and Review open the ticket, Retry and Open terminal ask the worker'
   assert.deepEqual(requestInput(host, 'ticket.retry'), { ticketId: 't2' })
 
   await mounted.press({ text: COPY['overview.answer'].en })
-  assert.equal(mounted.valueOf({ type: 'Tabs' }), 'execution', 'Answer opens the ticket on Execution')
+  assert.equal(currentPage(mounted), 'execution', 'Answer opens the ticket on Execution')
   assert.deepEqual(mounted.refusals, [])
   await mounted.unmount()
   panel = undefined
@@ -302,7 +318,7 @@ test('a waiting row opens that ticket detail on the Execution page', async () =>
   // 行内的第一个动作就是「点行」：Orca 不允许可点的 ListItem 里再放 Button，
   // 所以入口是行里的按钮（这里对评审档是 Review）。
   await mounted.press({ text: COPY['overview.review'].en })
-  assert.equal(mounted.valueOf({ type: 'Tabs' }), 'execution')
+  assert.equal(currentPage(mounted), 'execution')
   assert.deepEqual(asked, { ticketId: 't1' }, 'the detail asks the worker for that ticket')
   assert.ok(mounted.find({ text: /Ticket t1/ }), 'the detail names the ticket the person came for')
   assert.ok(mounted.find({ label: COPY['execution.mandate'].en }), 'and draws its blocks')
@@ -360,7 +376,7 @@ test('a problem row opens the page that owns it', async () => {
     snapshot({ problems: [problem('unavailable', 'u1', 'thread-7', 'no answer')] })
   )
   await mounted.press({ text: /thread-7/ })
-  assert.equal(mounted.valueOf({ type: 'Tabs' }), 'eval')
+  assert.equal(currentPage(mounted), 'eval')
   assert.deepEqual(mounted.refusals, [])
   await mounted.unmount()
   panel = undefined
@@ -379,7 +395,7 @@ test('Pause processing asks before it acts, and the request carries the change',
   })
   panel = await mount(panelModule, { host, locale: 'en' })
   await panel.press({ text: COPY['action.pause'].en })
-  const question = COPY['confirm.bodyPlain'].en.replace('{action}', COPY['action.pause'].en)
+  const question = COPY['confirm.titlePlain'].en.replace('{action}', COPY['action.pause'].en)
   assert.ok(panel.find({ text: new RegExp(question) }), 'the page asks first')
   assert.deepEqual(requestNames(host), [], 'nothing is sent before Confirm')
 
@@ -387,12 +403,67 @@ test('Pause processing asks before it acts, and the request carries the change',
   assert.deepEqual(requestNames(host), [], 'cancel sends nothing')
 
   await panel.press({ text: COPY['action.pause'].en })
-  await panel.press({ text: COPY['action.confirm'].en })
+  await panel.press({ text: COPY['action.pause'].en })
   assert.deepEqual(requestNames(host), ['pause'])
   assert.deepEqual(requestInput(host, 'pause'), { paused: true })
   assert.ok(panel.find({ text: new RegExp(COPY['processing.paused'].en) }), 'the page follows the snapshot')
   assert.deepEqual(panel.refusals, [])
   await panel.unmount()
+  panel = undefined
+})
+
+test('the English counts are singular at one and plural above one', async () => {
+  // LOW-15：英文不出现「1 problems」。面板侧两条计数文案各有一个单数键。
+  // 来源概况那一行只在「没有待人工」的空态里画。
+  const quiet = await openOverview(snapshot({ sources: { enabled: 1, problems: 1 } }))
+  assert.ok(
+    quiet.find({ text: translate('en', 'overview.sourcesOne', { enabled: 1, problems: 1 }) }),
+    'one problem reads as a singular source line'
+  )
+  assert.equal(
+    quiet.find({ text: translate('en', 'overview.sources', { enabled: 1, problems: 1 }) }),
+    null,
+    'the plural wording is not used for one'
+  )
+  assert.ok(
+    quiet.find({ text: translate('en', 'overview.sources', { enabled: 1, problems: 2 }) }) === null,
+    'the singular key is not the one drawn for two'
+  )
+  await quiet.unmount()
+
+  // 「检查一次」的结论：一个系统问题时用单数，两个时用复数。
+  const one = await openOverview(snapshot({}), {
+    check: () =>
+      snapshot({
+        revision: 2,
+        items: [item('t1', 'answer')],
+        problems: [problem('health', 'h1', 'assessment', 'failed 3 times')]
+      })
+  })
+  await one.press({ text: COPY['action.refresh'].en })
+  assert.ok(
+    one.find({ text: translate('en', 'overview.checkedOne', { waiting: 1, problems: 1 }) }),
+    'one problem reads as a singular check line'
+  )
+  await one.unmount()
+
+  const two = await openOverview(snapshot({}), {
+    check: () =>
+      snapshot({
+        revision: 2,
+        items: [item('t1', 'answer')],
+        problems: [
+          problem('health', 'h1', 'assessment', 'failed 3 times'),
+          problem('reply', 'r1', 'github:owner/widgets#12')
+        ]
+      })
+  })
+  await two.press({ text: COPY['action.refresh'].en })
+  assert.ok(
+    two.find({ text: translate('en', 'overview.checked', { waiting: 1, problems: 2 }) }),
+    'two problems read as the plural check line'
+  )
+  await two.unmount()
   panel = undefined
 })
 
@@ -411,8 +482,8 @@ test('Check again reads once and reports what it found', async () => {
   await mounted.press({ text: COPY['action.refresh'].en })
   assert.deepEqual(requestNames(mounted.host), ['check'])
   assert.ok(
-    mounted.find({ text: translate('en', 'overview.checked', { waiting: 1, problems: 1 }) }),
-    'the check says what it found'
+    mounted.find({ text: translate('en', 'overview.checkedOne', { waiting: 1, problems: 1 }) }),
+    'the check says what it found, with the singular English count'
   )
   assert.ok(mounted.find({ text: /Ticket t1/ }), 'and the page follows the new snapshot')
   assert.deepEqual(mounted.refusals, [])
