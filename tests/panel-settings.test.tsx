@@ -623,7 +623,7 @@ test('History lists what was saved and Restore saves that version again, after a
     'the confirmation states what a restore does'
   )
   assert.deepEqual(saves(panel.host), [], 'no write before the confirmation')
-  await panel.press({ text: COPY['confirm.label.restore'].en })
+  await panel.press({ text: COPY['settings.history.restore'].en })
   assert.deepEqual(restored, {
     block: 'source:github',
     revision: 2,

@@ -1547,7 +1547,7 @@ interface AdmissionCells {
 2. **页头 `PageHeader` 与 Source 页页首的 `Row justify="between"` 不换行**：副标题 + 右侧动作（`Check again`）在 320–400px 下挤成一条，把内容撑到约 420px（把导航换掉后仍在 400px 上留下横向滚动条的最小复现）。给这两行加 `wrap` 后按宽度折行。
 3. **Settings 五组与 Prompts 四子页的 `Tabs`**：五组 `Tabs` 在 320–400px 下同样溢出（最小复现：只放五组 `Tabs` 的空面板，320/360/380/400px 全部出现横向滚动条）；Prompts 的四子页在 320px 下也溢出。两者换成可换行的 `RadioGroup`（`labelHidden`，选项即名称）。Prompts 的 default-updated 两个长按钮行加 `wrap`。
 
-测量方法：`orca plugin shot --scenario` 在 320/360/370/380/400px × light/dark 下逐张截图，读每张图**最后 12 行**像素；某行出现长度 ≥ 40% 宽度、且与右缘底色明显不同的连续像素，并且那段从最左边起笔、右侧留出底色（即「一条水平条」而不是整片背景）时，判为出现横向滚动条。修复后 120 张（12 个情景 × 5 个宽度 × 2 个主题）全部 clean；修复前的 24 张（source/deployment/prompts × 4 个宽度 × 2 个主题）全部命中。脚本与逐张读数见 PR 的 Evidence。
+测量方法：`orca plugin shot --scenario` 在 320/360/370/380/400px × light/dark 下逐张截图，读每张图**最后 12 行**像素；某行出现长度 ≥ 40% 宽度、且与右缘底色明显不同的连续像素，并且那段从最左边起笔、右侧留出底色（即「一条水平条」而不是整片背景）时，判为出现横向滚动条。修复后实测 84 张（source/deployment/prompts × 5 个宽度 + 其余 9 个情景 × 3 个宽度，各 light/dark）全部 clean；修复前的 24 张（source/deployment/prompts × 4 个宽度 × 2 个主题）全部命中。每张截图先经「不是 Orca 应用侧栏」校验（`orca plugin shot --scenario` 偶尔回落到抓侧栏）。脚本与逐张读数见 PR 的 Evidence。
 
 **宿主输入框边界对比度（不计入 §A.3 的十一项）**：暗色下输入框边界 `#404355` 对卡片底 `#2b2d3a` 是 1.40:1、对页面底 `#21222c` 是 1.62:1，低于 WCAG 1.4.11 的 3:1。色值来自宿主的 `--orca-input` / `--orca-border`；components 面板没有样式通道（无 `style`/`className`、无调色板，`tests/styles.test.ts` 强制），修复方在宿主。面板 Deployment 页 Limitations 段在十一项之后用一行 `Hint` 说明，README 的「已知限制（摘要）」之后有同一段；这条不改变 `LIMITATIONS` 的长度（仍为 11）。
 

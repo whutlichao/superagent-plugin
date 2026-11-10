@@ -455,7 +455,7 @@ test('Rotate token asks first and then reports the file, never the token value',
   assert.ok(mounted.find({ text: COPY['confirm.body.rotateToken'].en }), 'rotation states the consequence')
   assert.deepEqual(requests(mounted.host, 'rotateToken'), [])
 
-  await mounted.press({ text: COPY['confirm.label.rotateToken'].en })
+  await mounted.press({ text: COPY['deployment.rotateToken'].en })
   assert.equal(requests(mounted.host, 'rotateToken').length, 1)
   // 结论只说文件路径；token 值不出现在任何读数或页面上（§O）。
   assert.ok(mounted.find({ text: /\/var\/lib\/superagent\/api-token/ }), 'the token file is named')

@@ -557,7 +557,6 @@ function TokenSection(props: { readonly locale: string }): OrcaElement {
           id="rotate-token"
           label={translate(locale, 'deployment.rotateToken')}
           action={translate(locale, 'deployment.rotateToken')}
-          confirmLabel={translate(locale, 'confirm.label.rotateToken')}
           consequence={translate(locale, 'confirm.body.rotateToken')}
           locale={locale}
           icon="refresh"

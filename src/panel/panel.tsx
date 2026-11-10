@@ -1048,8 +1048,6 @@ async function removeTicketWorktree(ticketId: string): Promise<void> {
  * 最宽的一档用那句朴素的「没有…」空态，不再给出口（没有更宽的档可去）。
  */
 function FilteredEmpty(props: {
-  readonly locale: string
-  readonly filterLabel: string
   readonly widest: boolean
   readonly emptyTitle: string
   readonly filteredTitle: string
@@ -1502,7 +1500,7 @@ function ExecutionListPage(props: { readonly locale: string }): OrcaElement {
           if (!isExecutionFilter(next) || next === filter) return
           set(executionFilter, next)
           set(executionList, null)
-          void loadExecutionList()
+          void loadExecutionList({ filter: next })
         }}
       />
       {failure === '' ? null : (
@@ -1519,8 +1517,6 @@ function ExecutionListPage(props: { readonly locale: string }): OrcaElement {
       )}
       {page !== null && items.length === 0 && failure === '' ? (
         <FilteredEmpty
-          locale={locale}
-          filterLabel={translate(locale, `execution.filter.${filter}` as CopyKey)}
           widest={filter === 'open'}
           emptyTitle={words(locale, 'execution.empty')}
           filteredTitle={translate(locale, 'execution.emptyFiltered', {
@@ -1801,7 +1797,7 @@ function DecisionDetailPage(props: {
       {busy ? <Hint text={translate(locale, 'confirm.pending')} /> : null}
       {actionFailure === '' ? null : (
         <InlineError
-          text={translate(locale, 'error.reopen', { reason: actionFailure })}
+          text={translate(locale, 'error.dismiss', { reason: actionFailure })}
           locale={locale}
         />
       )}
@@ -2067,8 +2063,6 @@ function TriggerListPage(props: { readonly locale: string }): OrcaElement {
       )}
       {page !== null && items.length === 0 && failure === '' ? (
         <FilteredEmpty
-          locale={locale}
-          filterLabel={translate(locale, filterLabelKey(filter))}
           widest={filter === 'all'}
           emptyTitle={words(locale, 'thread.empty')}
           filteredTitle={translate(locale, 'thread.emptyFiltered', {

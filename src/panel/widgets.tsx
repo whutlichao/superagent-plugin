@@ -220,6 +220,8 @@ export function ConfirmAction(props: {
   readonly icon?: IconName
   /** 确认按钮的语气；只有真正破坏性的四类动作传 `danger`。 */
   readonly tone?: 'neutral' | 'danger'
+  /** 动作在飞行中：触发按钮不可再按（确认态本身不受影响）。 */
+  readonly disabled?: boolean
 }) {
   const open = read(confirming) === props.id
   if (!open) {
@@ -229,6 +231,7 @@ export function ConfirmAction(props: {
           variant={props.variant ?? 'outline'}
           size="sm"
           {...(props.icon === undefined ? {} : { icon: props.icon })}
+          disabled={props.disabled === true}
           onPress={() => set(confirming, props.id)}
         >
           {props.label}

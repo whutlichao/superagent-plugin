@@ -190,7 +190,6 @@ export const COPY = {
     en: 'Evaluating {count} Triggers (strength: {strength})'
   },
   'thread.evaluatingDeadline': { zh: '截止', en: 'Deadline' },
-  'thread.pollFailed': { zh: '轮询失败：{error}', en: 'Polling failed: {error}' },
   /** 行内失败要指出下一步（MEDIUM-9）：重读这条线程，仍失败就看部署页的健康明细。 */
   'error.threadPoll': {
     zh: '轮询失败：{reason}。重读这条线程；仍失败就看部署页的来源与健康明细。',
@@ -608,6 +607,10 @@ export const COPY = {
     zh: '原因：{reason}。重试一次；仍然失败就去工单的终端看输出。',
     en: 'Reason: {reason}. Try again; if it still fails, read the output in the ticket’s terminal.'
   },
+  'error.dismiss': {
+    zh: '原因：{reason}。再按一次「不再提示」；仍然失败就看部署页 health 明细。',
+    en: 'Reason: {reason}. Press Dismiss again; if it still fails, read the health detail on the Deployment page.'
+  },
   'error.reopen': {
     zh: '原因：{reason}。重新打开这一条；仍然失败就看部署页 health 明细。',
     en: 'Reason: {reason}. Open this record again; if it still fails, read the health detail on the Deployment page.'
@@ -646,8 +649,6 @@ export const COPY = {
   // `action.pause`「暂停处理」、`deployment.routerRestart`「重启 Router」、
   // `execution.removeWorktree`「移除 worktree」）。
   'confirm.label.stop': { zh: '停止工单', en: 'Stop ticket' },
-  'confirm.label.rotateToken': { zh: '轮换 token', en: 'Rotate the token' },
-  'confirm.label.restore': { zh: '恢复这一版', en: 'Restore this version' },
   'confirm.body.stop': {
     zh: '停止后这张工单的授权被撤回，正在跑的 worker 也停下；不能撤销。',
     en: 'Stopping withdraws the ticket’s mandate and stops its running worker; it cannot be undone.'

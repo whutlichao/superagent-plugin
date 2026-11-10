@@ -1542,13 +1542,14 @@ function ConfirmRestore(props: { readonly locale: string; readonly row: Settings
     <ConfirmAction
       id={`restore:${props.row.revision}`}
       label={translate(props.locale, 'settings.history.restore')}
-      action={translate(props.locale, 'confirm.label.restore')}
+      action={translate(props.locale, 'settings.history.restore')}
       consequence={translate(props.locale, 'confirm.body.restore', {
         revision: props.row.revision
       })}
       locale={props.locale}
       variant="ghost"
       icon="refresh"
+      disabled={read(busy)}
       onConfirm={() => void restore(props.row)}
     />
   )

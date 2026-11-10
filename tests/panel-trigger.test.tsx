@@ -1062,8 +1062,9 @@ test('a Thread being evaluated and one whose polling failed say so on the detail
   )
   assert.ok(
     mounted.find({
-      text: literal(translate('en', 'thread.pollFailed', { error: 'graphql: 502 Bad Gateway' }))
-    })
+      text: literal(translate('en', 'error.threadPoll', { reason: 'graphql: 502 Bad Gateway' }))
+    }),
+    'the polling failure names the next step'
   )
   assert.deepEqual(mounted.refusals, [])
   await mounted.unmount()

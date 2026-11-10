@@ -124,13 +124,13 @@ interface TreeNode {
   readonly children?: readonly (TreeNode | string)[]
 }
 
-/** 一个页面（Tab）之下的节点，按绘制顺序。 */
-function nodesOnPage(mounted: Awaited<ReturnType<typeof mount>>, page: string): TreeNode[] {
+/**
+ * Overview 那一块的节点，按绘制顺序。七页同挂在一棵树上、只有当前页画内容，所以先按
+ * 「四块区块标题」找到 Overview 的根 Stack，再收它下面的节点。
+ */
+function overviewNodes(mounted: Awaited<ReturnType<typeof mount>>): TreeNode[] {
   const found: TreeNode[] = []
-  // 七页同挂在一棵树上，只有当前页画内容（其余页是一个空 Stack）。按页面自己的标题找到
-  // 那一块：Overview 的四块、Execution/Trigger/Eval 的表格与详情都在它下面。
   const tree = mounted.tree() as TreeNode
-  // 本文件只覆盖 Overview：这一页的根 Stack 是唯一画出四块标题（`Heading`）的那一块。
   const overviewTitles = [
     translate('en', 'overview.awaitingYou'),
     translate('en', 'overview.problems'),
@@ -158,12 +158,9 @@ function nodesOnPage(mounted: Awaited<ReturnType<typeof mount>>, page: string): 
   return found
 }
 
-/** 一个页面上的行（`ListItem`）与其 props，按绘制顺序。 */
-function rowsOnPage(
-  mounted: Awaited<ReturnType<typeof mount>>,
-  page: string
-): Readonly<Record<string, unknown>>[] {
-  return nodesOnPage(mounted, page)
+/** Overview 上的行（`ListItem`）与其 props，按绘制顺序。 */
+function overviewRows(mounted: Awaited<ReturnType<typeof mount>>): Readonly<Record<string, unknown>>[] {
+  return overviewNodes(mounted)
     .filter((node) => node.type === 'ListItem')
     .map((node) => node.props ?? {})
 }
@@ -233,7 +230,7 @@ test('waiting tickets are ordered by stage, newest first inside one stage', asyn
     })
   )
   assert.deepEqual(
-    rowsOnPage(mounted, 'overview').map((row) => row['title']),
+    overviewRows(mounted).map((row) => row['title']),
     ['Ticket d1', 'Ticket a2', 'Ticket a1', 'Ticket r1', 'Ticket b1', 'Ticket f1']
   )
   // 纯函数同一份规则：排序不依赖 worker 送来的顺序。
