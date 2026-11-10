@@ -359,9 +359,9 @@ test('the Settings page shows the five groups in the design order, and Prompts i
     'edit',
     'the four sub-pages live inside the group body'
   )
-  const promptTabs = JSON.stringify(panel.tree())
+  const promptPages = JSON.stringify(panel.tree())
   for (const key of ['prompt.tab.edit', 'prompt.tab.full', 'prompt.tab.history', 'prompt.tab.skills'] as const) {
-    assert.ok(promptTabs.includes(JSON.stringify(COPY[key].en)), `the ${key} sub-page is drawn by the real component`)
+    assert.ok(promptPages.includes(JSON.stringify(COPY[key].en)), `the ${key} sub-page is drawn by the real component`)
   }
   assert.deepEqual(panel.refusals, [])
   assert.deepEqual(panel.errors, [])

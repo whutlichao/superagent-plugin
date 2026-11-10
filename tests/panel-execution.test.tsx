@@ -139,7 +139,7 @@ interface TreeNode {
   readonly children?: readonly (TreeNode | string)[]
 }
 
-/** 某类型、某个 label 的节点（深度优先；Tabs 的每个页都在原始树里，按 label 区分）。 */
+/** 某类型、某个 label 的节点（深度优先；七页同挂在一棵树上，按 label 区分）。 */
 function nodeOfType(
   mounted: Awaited<ReturnType<typeof mount>>,
   type: string,

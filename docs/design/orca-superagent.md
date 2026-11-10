@@ -1469,7 +1469,7 @@ interface AdmissionCells {
 
 ### M.1 导航与 IA
 
-上游是 6 个 tab + 头部搜索 + `(?)` 术语表。Orca 面板**导航项 7 个**（与票据措辞对齐）：
+上游是 6 个 tab（本仓改称「导航项」，渲染为导航单选条）+ 头部搜索 + `(?)` 术语表。Orca 面板**导航项 7 个**（与票据措辞对齐）：
 
 | # | 导航项 | 对应上游 | 说明 |
 | --- | --- | --- | --- |
@@ -1483,7 +1483,7 @@ interface AdmissionCells {
 
 术语表 `Glossary` 不作为导航项：它是页头 `(?)` 按钮打开的**覆盖层**（与上游一致），内容为上游 §001 的双语术语表（`copy.ts` 的 `glossary`）。所以「7 个导航项 + 1 个覆盖层」。
 
-**导航的渲染形态（本次审查修正）**：七项由面板自有的可换行单选条渲染（`RadioGroup`，`labelHidden`，选项即七页），不是宿主的 `Tabs`。原因有两层：① 7 项 `Tabs` 的最小内容宽约 544px 且不换行，320–400px 的面板上必然出现整页横向滚动（§M.4 的实测记录）；② 宿主的 `Button` 没有 `aria-current` / `aria-pressed` / `selected`，用按钮做的导航会退化成「只靠背景色区分当前页」；`RadioGroup` 是真单选语义，「当前页 = 选中的那一项」，与 Settings 五组、Prompts 四子页同一种控件。**七项、顺序、每页的内容与 IA 都不变**，只是换行渲染。
+**导航的渲染形态（本次审查修正）**：七项由面板自有的**导航单选条**（navigation radio group：`RadioGroup`，`labelHidden`，选项即七页）渲染，不是宿主的 `Tabs`，也不是一组 `Button`。原因有两层：① 7 项 `Tabs` 的最小内容宽约 544px 且不换行，320–400px 的面板上必然出现整页横向滚动（§M.4 的实测记录）；② 宿主的 `Button` 没有 `aria-current` / `aria-pressed` / `selected`，用按钮做的导航会退化成「只靠背景色区分当前页」；`RadioGroup` 是真单选语义，「当前页 = 选中的那一项」，与 Settings 五组、Prompts 四子页同一种控件。**七项、顺序、每页的内容与 IA 都不变**，只是换行渲染。
 
 ### M.2 每页内容、主操作与三态
 
@@ -1516,7 +1516,7 @@ interface AdmissionCells {
 | Sources | 每个 Source 一张卡：开关、`repository`/`cli`、`observeIssues/Pulls/Comments/Ci`；Feishu 的 chats 行编辑（chatId/name/listen）、`directMessages`、`otherChats`；「Sync now」（Feishu 允许名单纯）、Advanced（`pollSeconds`、`readLimit`） |
 | Eval | Policy version、rules 列表（增删改、启用开关）、`acceptMode`（RadioGroup: off/observe/auto）、`timeoutSeconds`、`model`；**On each Source** 子页：allowed 行编辑、bots、admission 表（每行的三个 cell，按 `rows()` 是否 observe 决定 cell 是否可用）、Feishu 的 `syncChat` |
 | Execution | `agent`、`model`、`effort`、`maxWorkers`、`baseRepo`（Select，来自 `GET models`/`orca repo list` 的 worker 镜像）、`baseBranch`、`branchPrefix`、`prepare`（Textarea + 「插入变量」菜单，点一下把 `${DSH_SUPERAGENT_…}` 插到光标处）、`blockedCommands`（提示语照抄 §H.11：shim 只挡手滑，**不是安全边界**）、`inlineLimit`、`worktreeRetention`、`githubCommitEmail`（agent 账号的 noreply 提交邮箱，§H.11；`executor` 块里唯一保存即生效的字段，空着部署检查报 `gitconfig_missing`） |
-| Prompts | 子 tab：**Edit**（三段团队文本 + 每个内置分片的 override，被改的标 `changed`，模板显示必保留占位符）、**Full prompt**（`CodeView` 全文 + 与「已保存」或「默认」的 `diff.ts` 行级对比）、**History**（版本列表 + 恢复到某版本）、**Skills**（内置只读 + 团队技能增删改） |
+| Prompts | 子页（同一组可换行单选条）：**Edit**（三段团队文本 + 每个内置分片的 override，被改的标 `changed`，模板显示必保留占位符）、**Full prompt**（`CodeView` 全文 + 与「已保存」或「默认」的 `diff.ts` 行级对比）、**History**（版本列表 + 恢复到某版本）、**Skills**（内置只读 + 团队技能增删改） |
 | Deployment | setup 问题 + 「Check again」、`stateDir`（只读 + 复制路径）、机器限额（`promptMaxChars`、`admissionContextMaxPages/TimeoutMs`、`retention.days`）、`paused` 开关、health 明细、`router` 状态（terminal/since/restarts + Restart）、`doctor` 结果（四档计数）、「Rotate token」、Limitations 段（§H 里标「是」的条目摘要） |
 
 保存栏：草稿为空时**不占空间**；有改动时显示「N changes · Save / Discard」；保存中显示 `Spinner`；失败显示 `Callout tone="danger"` + `issues[]`（字段级 `invalid`）；冲突（409）显示「This block changed elsewhere. Reload latest?」。
@@ -1547,7 +1547,9 @@ interface AdmissionCells {
 2. **页头 `PageHeader` 与 Source 页页首的 `Row justify="between"` 不换行**：副标题 + 右侧动作（`Check again`）在 320–400px 下挤成一条，把内容撑到约 420px（把导航换掉后仍在 400px 上留下横向滚动条的最小复现）。给这两行加 `wrap` 后按宽度折行。
 3. **Settings 五组与 Prompts 四子页的 `Tabs`**：五组 `Tabs` 在 320–400px 下同样溢出（最小复现：只放五组 `Tabs` 的空面板，320/360/380/400px 全部出现横向滚动条）；Prompts 的四子页在 320px 下也溢出。两者换成可换行的 `RadioGroup`（`labelHidden`，选项即名称）。Prompts 的 default-updated 两个长按钮行加 `wrap`。
 
-测量方法：`orca plugin shot --scenario` 在 320/360/370/380/400px × light/dark 下逐张截图，读每张图**最后 12 行**像素；某行出现长度 ≥ 40% 宽度、且与右缘底色明显不同的连续像素，并且那段从最左边起笔、右侧留出底色（即「一条水平条」而不是整片背景）时，判为出现横向滚动条。修复后实测 84 张（source/deployment/prompts × 5 个宽度 + 其余 9 个情景 × 3 个宽度，各 light/dark）全部 clean；修复前的 24 张（source/deployment/prompts × 4 个宽度 × 2 个主题）全部命中。每张截图先经「不是 Orca 应用侧栏」校验（`orca plugin shot --scenario` 偶尔回落到抓侧栏）。脚本与逐张读数见 PR 的 Evidence。
+测量方法：`orca plugin shot --scenario` 在 320/360/370/380/400px × light/dark 下逐张截图，读每张图**最后 12 行**像素；某行出现长度 ≥ 40% 宽度、且与右缘底色明显不同的连续像素，并且那段从最左边起笔、右侧留出底色（即「一条水平条」而不是整片背景）时，判为出现横向滚动条。修复后实测 84 张（source/deployment/prompts × 5 个宽度 + 其余 9 个情景 × 3 个宽度，各 light/dark）全部 clean；修复前的 24 张（source/deployment/prompts × 4 个宽度 × 2 个主题）全部命中。每张截图先经「不是 Orca 应用侧栏」校验（`orca plugin shot --scenario` 偶尔回落到抓侧栏）。
+
+**截图取值校验（本次审查记录）**：判据是「图像顶部中央 120–220px × 8–36px 没有标题栏墨迹」——面板截图在那里是纯面板底色，侧栏截图会带窗口标题栏（居中「Orca」字样与返回箭头）。`orca plugin shot --scenario` 的回落在某些情景上不是偶发：`deployment-320-dark` 与 `prompts-320-dark` 在 320px 深色主题下反复重试仍稳定回落到侧栏，这是宿主 `--scenario` 的缺陷，不是面板实现的问题。因此交付的证据里这两张**记为未取得**（同名的侧栏截图带 `.sidebar.png` 后缀保留在现场记录里，不作面板证据）；320px 的宽度结论由 `source-320-light|dark` 与 `deployment-320-light`、`prompts-320-light` 四张真面板截图支撑（深色主题在 320px 只有 `source` 一张可作面板证据）。
 
 **宿主输入框边界对比度（不计入 §A.3 的十一项）**：暗色下输入框边界 `#404355` 对卡片底 `#2b2d3a` 是 1.40:1、对页面底 `#21222c` 是 1.62:1，低于 WCAG 1.4.11 的 3:1。色值来自宿主的 `--orca-input` / `--orca-border`；components 面板没有样式通道（无 `style`/`className`、无调色板，`tests/styles.test.ts` 强制），修复方在宿主。面板 Deployment 页 Limitations 段在十一项之后用一行 `Hint` 说明，README 的「已知限制（摘要）」之后有同一段；这条不改变 `LIMITATIONS` 的长度（仍为 11）。
 
@@ -1571,7 +1573,7 @@ interface AdmissionCells {
 - 每个页面一个 `*.test.tsx`：`mount(module, { host: mockHost({ results: { 'state': fixture, … } }), persisted })` → 断言列表行数、`summary()` 关键行、危险操作需要二次确认、`panel.refusals` 为空。
 - `src/panel/panel.check.ts` 的情景（`defineCheck`）共 **17 个**：`booting`、`empty`、`healthy`、`needs-person`、`problems`、`paused`、`setup-missing`、`source`、`deployment`、`prompts`、`long-lists`（>50 行分页）、`execution`、`trigger`、`search`、`zh`、`en`、`danger-confirm`。`orca plugin check` 逐情景渲染并给出 `summary` 与 `tree`，CI 逻辑（`scripts/check.sh`）断言没有 issue。
 - **语言不是 check 的维度（实测偏差）**：宿主 1.4.251 的 `CheckScenario` 只有 `mockHost` 选项 + `persisted`/`theme`/`events`，**没有 `locale`**，check 的挂载固定用 `'en'`。所以 `zh`/`en` 两个情景实际区分的是**主题**（`light`/`dark`），不是语言；中英双语由 `mount(module, { locale })` 的单测覆盖（`locales.test.ts` 断言 key 集合与非空、`panel-navigation.test.tsx` 按 `locale` 断文案）。17 个情景覆盖的是状态与主题，语言改由单测盖。
-- 视觉验收：`orca plugin shot <key> --panel superagent --theme light|dark --width 360` 与 `--scenario` 各情景，读 PNG 检查窄宽度与两套主题。
+- 视觉验收：`orca plugin shot <key> --panel superagent --theme light|dark --width 360` 与 `--scenario` 各情景，读 PNG 检查窄宽度与两套主题。七页的导航单选条在 `--panel` 与各情景里都会画出来；检查窄宽度时先核一眼 PNG 顶部是不是面板（`--scenario` 偶尔会回落到抓应用侧栏，判据见 §M.4 的「截图取值校验」）。
 
 ---
 
