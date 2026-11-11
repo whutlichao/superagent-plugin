@@ -72,6 +72,12 @@ test('the tooltip breaks the count down by what the person has to do', () => {
   )
 })
 
+test('the tooltip pluralises the counts in English: one problem, two problems', () => {
+  assert.equal(statusBarView(state({ problems: 1 })).tooltip, '0 awaiting answer · 0 awaiting review · 1 problem')
+  assert.equal(statusBarView(state({ problems: 2 })).tooltip, '0 awaiting answer · 0 awaiting review · 2 problems')
+  assert.equal(statusBarView(state({ answer: 1, review: 1, problems: 0 })).tooltip, '1 awaiting answer · 1 awaiting review · 0 problems')
+})
+
 test('the item keeps the manifest id', () => {
   assert.equal(STATUS_BAR_ID, 'superagent')
 })

@@ -24,9 +24,7 @@ import {
   set,
   Spinner,
   Stack,
-  Tab,
   Table,
-  Tabs,
   Text,
   Textarea,
   Toolbar,
@@ -34,6 +32,7 @@ import {
   type TableRow
 } from 'orca'
 import { translate, type CopyKey } from './copy'
+import { InlineError } from './widgets'
 import { lineDiff } from './diff'
 import {
   barShown,
@@ -432,7 +431,8 @@ function PartField(props: {
         <Text weight="medium" size="sm">
           {part.key}
         </Text>
-        {changed ? <MarkBadge label={translate(locale, 'prompt.changed')} tone="accent" /> : null}
+        {/* 已改动是提醒而不是「进行中」：按约定 accent 不用于它。 */}
+        {changed ? <MarkBadge label={translate(locale, 'prompt.changed')} tone="warning" /> : null}
       </Row>
       <Textarea
         label={part.key}
@@ -475,7 +475,8 @@ function TeamField(props: {
         <Text weight="medium" size="sm">
           {translate(locale, `prompt.section.${section}` as CopyKey)}
         </Text>
-        {changed ? <MarkBadge label={translate(locale, 'prompt.changed')} tone="accent" /> : null}
+        {/* 已改动是提醒而不是「进行中」：按约定 accent 不用于它。 */}
+        {changed ? <MarkBadge label={translate(locale, 'prompt.changed')} tone="warning" /> : null}
       </Row>
       <Textarea
         label={translate(locale, `prompt.section.${section}` as CopyKey)}
@@ -516,7 +517,7 @@ function DefaultUpdated(props: {
         />
       )}
       {removed ? null : (
-        <Row gap="xs">
+        <Row gap="xs" wrap>
           <Button variant="outline" size="sm" onPress={() => void keepMine(change)}>
             {translate(locale, 'prompt.keepMine', { part: change.part })}
           </Button>
@@ -698,9 +699,10 @@ function EditTab(props: { readonly locale: string; readonly current: PanelPrompt
       <IssueCallout locale={locale} issues={issues} />
       <SaveBar locale={locale} state={state} limit={current.maxChars} />
       {read(actionError) === '' ? null : (
-        <Text size="xs" tone="danger">
-          {read(actionError)}
-        </Text>
+        <InlineError
+          text={translate(locale, 'error.retry', { reason: read(actionError) })}
+          locale={locale}
+        />
       )}
       {read(restoredRevision) === null ? null : (
         <Text size="xs" tone="success">
@@ -814,9 +816,10 @@ function HistoryTab(props: { readonly locale: string; readonly current: PanelPro
         </Stack>
       )}
       {read(actionError) === '' ? null : (
-        <Text size="xs" tone="danger">
-          {read(actionError)}
-        </Text>
+        <InlineError
+          text={translate(locale, 'error.retry', { reason: read(actionError) })}
+          locale={locale}
+        />
       )}
     </Stack>
   )
@@ -896,9 +899,10 @@ function SkillsTab(props: { readonly locale: string; readonly current: PanelProm
       <IssueCallout locale={locale} issues={issueTexts(locale, read(draftIssues))} />
       <SaveBar locale={locale} state={state} limit={current.maxChars} />
       {read(actionError) === '' ? null : (
-        <Text size="xs" tone="danger">
-          {read(actionError)}
-        </Text>
+        <InlineError
+          text={translate(locale, 'error.retry', { reason: read(actionError) })}
+          locale={locale}
+        />
       )}
     </Stack>
   )
@@ -941,21 +945,23 @@ export function Prompts(props: { readonly locale: string }): OrcaElement {
     )
   }
   const shown = currentTab()
+  // 四个子页是面板自有的可换行单选条（RadioGroup）：宿主的 `Tabs` 不换行，窄面板上会把
+  // 整页撑出横向滚动条（§M.3、§M.1 的记录）。
   return (
-    <Tabs
-      label={translate(locale, 'prompt.tabs')}
-      value={shown}
-      onChange={(next) => void showTab(next)}
-    >
-      {PROMPT_TABS.map((value) => (
-        <Tab
-          key={value}
-          value={value}
-          label={translate(locale, `prompt.tab.${value}` as CopyKey)}
-        >
-          <TabBody locale={locale} current={shown} shown={value} view={current} />
-        </Tab>
-      ))}
-    </Tabs>
+    <Stack gap="md">
+      <RadioGroup
+        label={translate(locale, 'prompt.tabs')}
+        // 子页名已经在每颗选项上，控件的标签只作无障碍名，不再多画一行标题。
+        labelHidden
+        orientation="horizontal"
+        value={shown}
+        options={PROMPT_TABS.map((value) => ({
+          value,
+          label: translate(locale, `prompt.tab.${value}` as CopyKey)
+        }))}
+        onChange={(next) => void showTab(next)}
+      />
+      <TabBody locale={locale} current={shown} shown={shown} view={current} />
+    </Stack>
   )
 }

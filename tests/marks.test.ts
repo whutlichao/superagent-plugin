@@ -83,8 +83,8 @@ test('a Ticket waits for the person who must act, or reports how it ended', () =
     [
       ['stage.answer', 'warning', 'info'],
       ['stage.review', 'warning', 'check'],
-      ['stage.blockedFailed', 'warning', 'warning'],
-      ['stage.blockedFailed', 'danger', 'error'],
+      ['stage.blocked', 'warning', 'warning'],
+      ['stage.failed', 'danger', 'error'],
       ['stage.delivery', 'warning', 'download'],
       ['stage.queued', 'neutral', 'layers'],
       ['stage.working', 'accent', 'play'],
@@ -189,4 +189,42 @@ test('labels render in the active locale through the one copy table', () => {
   assert.equal(markLabel('zh-CN', ticketMark({ stage: 'person', action: 'answer' })), '待回答')
   assert.equal(markLabel('en', ticketMark({ stage: 'person', action: 'answer' })), 'Awaiting answer')
   assert.equal(translate('en', 'outcome.merged'), 'Pull request merged')
+})
+
+test('accent means "in progress" and nothing else', () => {
+  // §M.4 的颜色约定：accent 只给进行中的状态。这四条是全部用例。
+  const accent = [
+    ticketMark({ stage: 'working' }),
+    threadMark({ stage: 'evaluating', pending: 0 }),
+    sourceMark('starting'),
+    reportMark('progress')
+  ]
+  for (const mark of accent) assert.equal(mark.tone, 'accent', mark.labelKey)
+
+  // 其余状态没有一条借用 accent：人写的、已改动、订阅中都不是「进行中」。
+  const others = [
+    ticketMark({ stage: 'idle' }),
+    ticketMark({ stage: 'person', action: 'answer' }),
+    threadMark({ stage: 'subscribed', pending: 0 }),
+    threadMark({ stage: 'queued', pending: 1 }),
+    sourceMark('ready'),
+    sourceMark('paused'),
+    reportMark('waiting'),
+    reportMark('ready'),
+    decisionMark('accept'),
+    decisionMark('ignore')
+  ]
+  for (const mark of others) assert.notEqual(mark.tone, 'accent', mark.labelKey)
+})
+
+test('blocked is a warning and failed is a danger: two labels, not one', () => {
+  const blocked = ticketMark({ stage: 'person', action: 'blocked' })
+  const failed = ticketMark({ stage: 'person', action: 'failed' })
+  assert.deepEqual([blocked.labelKey, blocked.tone], ['stage.blocked', 'warning'])
+  assert.deepEqual([failed.labelKey, failed.tone], ['stage.failed', 'danger'])
+  assert.notEqual(blocked.labelKey, failed.labelKey, 'the two stages keep separate words')
+  assert.equal(translate('en', 'stage.blocked'), 'Blocked')
+  assert.equal(translate('en', 'stage.failed'), 'Failed')
+  assert.equal(translate('zh-CN', 'stage.blocked'), '受阻')
+  assert.equal(translate('zh-CN', 'stage.failed'), '失败')
 })

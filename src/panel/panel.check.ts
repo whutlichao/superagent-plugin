@@ -160,8 +160,8 @@ function nextRevision(state: PanelState, paused = state.health.paused): PanelSta
 
 /** 五档筛选在夹具上的判定（档位与 worker 的读模型同一口径，只是把 `PanelTicket` 切片）。 */
 const FILTER_STAGES: Readonly<Record<ExecutionFilter, readonly PanelTicket['stage'][]>> = {
-  open: ['delivery', 'answer', 'review', 'blockedFailed', 'queued', 'idle', 'working'],
-  pending: ['delivery', 'answer', 'review', 'blockedFailed'],
+  open: ['delivery', 'answer', 'review', 'blocked', 'failed', 'queued', 'idle', 'working'],
+  pending: ['delivery', 'answer', 'review', 'blocked', 'failed'],
   working: ['working', 'queued'],
   waiting: ['idle'],
   ended: ['ended']

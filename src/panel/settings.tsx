@@ -29,8 +29,6 @@ import {
   Spinner,
   Stack,
   Switch,
-  Tab,
-  Tabs,
   Text,
   Textarea,
   update,
@@ -68,7 +66,7 @@ import type {
   SourceSettingsCard
 } from './protocol'
 import { SETTINGS_GROUPS } from './protocol'
-import { ErrorState, Hint, LoadingState, MarkBadge, Section } from './widgets'
+import { ConfirmAction, ErrorState, Hint, InlineError, LoadingState, MarkBadge, Section } from './widgets'
 
 // ---------------------------------------------------------------------------
 // 状态（模块级 atom；面板重挂载时由 `resetSettings` 清掉）
@@ -617,7 +615,8 @@ function RowsEditor(props: {
           ))}
           <IconButton
             icon="close"
-            label={translate(locale, 'settings.rows.remove')}
+            // 可访问名带行号：同页多行时「删除这一行」会重复，读屏与测试都分不清删的是哪一行。
+            label={translate(locale, 'settings.rows.removeAt', { index: index + 1 })}
             variant="ghost"
             size="sm"
             onPress={() => props.onChange(props.rows.filter((_, at) => at !== index).map((entry) => rowRow(columnsSafe(props.columns), entry)))}
@@ -1085,7 +1084,7 @@ function PolicySource(props: {
   )
 }
 
-/** Eval 组：Policy 版本、模式、模型、超时、规则与每个 Source 的部分。 */
+/** Eval 组：策略版本、模式、模型、超时、规则与每个来源的部分。 */
 function EvalGroup(props: { readonly locale: string; readonly data: SettingsPageView }): OrcaElement {
   const locale = props.locale
   const invalid = invalidPathsOf('eval')
@@ -1199,7 +1198,11 @@ function CommandList(props: {
           />
           <IconButton
             icon="close"
-            label={translate(locale, 'settings.rows.remove')}
+            // 可访问名带行号与命令本身：「删除 blocked 命令 3」比「删除这一行」可判。
+            label={translate(locale, 'settings.execution.removeCommand', {
+              index: index + 1,
+              command
+            })}
             variant="ghost"
             size="sm"
             onPress={() => props.onChange(props.commands.filter((_, at) => at !== index))}
@@ -1506,7 +1509,7 @@ async function restore(row: SettingsHistoryRow): Promise<void> {
   }
 }
 
-/** 历史一行：版本、块、来源、时间、Policy 版本与受影响工单，以及恢复入口。 */
+/** 历史一行：版本、块、来源、时间、策略版本与受影响工单，以及恢复入口。 */
 function HistoryRow(props: { readonly locale: string; readonly row: SettingsHistoryRow }): OrcaElement {
   const locale = props.locale
   const row = props.row
@@ -1530,46 +1533,27 @@ function HistoryRow(props: { readonly locale: string; readonly row: SettingsHist
   )
 }
 
-/** 恢复是破坏性动作：先问，确认后走同一条保存路径。 */
+/**
+ * 恢复是破坏性动作：先问，确认后走同一条保存路径。确认态用与全站同一件 `ConfirmAction`
+ * （`Callout tone="warning"` + 后果 + 动词按钮 + 取消），不再自绘一行。
+ */
 function ConfirmRestore(props: { readonly locale: string; readonly row: SettingsHistoryRow }): OrcaElement {
-  const locale = props.locale
-  const key = `restore:${props.row.revision}`
-  const open = read(confirmingRestore) === key
-  if (!open) {
-    return (
-      <IconButton
-        icon="refresh"
-        label={translate(locale, 'settings.history.restore')}
-        variant="ghost"
-        size="sm"
-        disabled={read(busy)}
-        onPress={() => set(confirmingRestore, key)}
-      />
-    )
-  }
   return (
-    <Row gap="xs" align="center">
-      <Text size="xs">{translate(locale, 'settings.history.confirmRestore', { revision: props.row.revision })}</Text>
-      <Button
-        variant="solid"
-        tone="danger"
-        size="sm"
-        onPress={() => {
-          set(confirmingRestore, null)
-          void restore(props.row)
-        }}
-      >
-        {translate(locale, 'action.confirm')}
-      </Button>
-      <Button variant="ghost" size="sm" onPress={() => set(confirmingRestore, null)}>
-        {translate(locale, 'action.cancel')}
-      </Button>
-    </Row>
+    <ConfirmAction
+      id={`restore:${props.row.revision}`}
+      label={translate(props.locale, 'settings.history.restore')}
+      action={translate(props.locale, 'settings.history.restore')}
+      consequence={translate(props.locale, 'confirm.body.restore', {
+        revision: props.row.revision
+      })}
+      locale={props.locale}
+      variant="ghost"
+      icon="refresh"
+      disabled={read(busy)}
+      onConfirm={() => void restore(props.row)}
+    />
   )
 }
-
-/** 历史里正在确认的那一行（同一时刻只有一处）。 */
-const confirmingRestore = atom<string | null>(null)
 
 /** 历史区：最近若干次保存与恢复入口。 */
 function HistorySection(props: { readonly locale: string }): OrcaElement {
@@ -1637,35 +1621,34 @@ export function Settings(props: { readonly locale: string }): OrcaElement {
   return (
     <Stack gap="md">
       <Hint text={translate(locale, 'settings.intro')} />
-      <Tabs
+      <RadioGroup
         label={translate(locale, 'nav.settings')}
+        // 组名已经在每颗选项上，控件的标签只作无障碍名，不再多画一行标题。
+        labelHidden
+        orientation="horizontal"
         value={selected}
+        options={SETTINGS_GROUPS.map((groupId) => ({
+          value: groupId,
+          label: translate(locale, `settings.group.${groupId}` as CopyKey)
+        }))}
         onChange={(next) => {
           if (!SETTINGS_GROUPS.includes(next as SettingsGroupId)) return
           set(group, next as SettingsGroupId)
           // Prompts 组自带读数：切过去时读一次（其余组的读数由 `openSettings` 读过）。
           if (next === 'prompts') void openPrompts()
         }}
-      >
-        {SETTINGS_GROUPS.map((groupId) => (
-          <Tab
-            key={groupId}
-            value={groupId}
-            label={translate(locale, `settings.group.${groupId}` as CopyKey)}
-          >
-            <GroupBody locale={locale} groupId={groupId} data={data} />
-          </Tab>
-        ))}
-      </Tabs>
+      />
+      <GroupBody locale={locale} groupId={selected} data={data} />
       {noteText === '' ? null : (
         <Text size="sm" tone="success">
           {noteText}
         </Text>
       )}
       {failure === '' ? null : (
-        <Text tone="danger" size="xs">
-          {failure}
-        </Text>
+        <InlineError
+          text={translate(locale, 'error.retry', { reason: failure })}
+          locale={locale}
+        />
       )}
       <HistorySection locale={locale} />
     </Stack>

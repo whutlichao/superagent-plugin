@@ -6,7 +6,7 @@
 //   `settings.save`（块 + 基线修订号 + 面板来源由 worker 填，不由面板选）；
 // - worker：`tests/settings-limits.test.ts` 覆盖读面/写面的接线（origin、账号检查、重启标记）。
 import { assert, mockHost, mount, test } from 'orca/testing'
-import { COPY } from '../src/panel/copy'
+import { COPY, type CopyKey } from '../src/panel/copy'
 import type {
   AdmissionRowView,
   PolicyRuleView,
@@ -22,6 +22,7 @@ import { SETTINGS_GROUPS } from '../src/panel/protocol'
 import * as panelModule from '../src/panel/panel'
 import { SETTINGS_GROUP_BODIES, SETTINGS_GROUP_ORDER } from '../src/panel/settings'
 import { minimalPromptsView } from './support/prompts-view'
+import { currentPage, openPage, openSettingsGroup } from './support/panel-nav'
 
 /** 一份健康的 worker 快照（Settings 页读自己的请求，这一份只让面板壳起来）。 */
 function snapshot(): PanelState {
@@ -284,16 +285,15 @@ async function openSettings(options: {
     }),
     locale: options.locale ?? 'en'
   })
-  await panel.select({ type: 'Tabs' }, 'settings')
+  await openPage(panel, 'settings', options.locale ?? 'en')
   // 首屏的 Settings 读数与 Deployment 组的读数是异步的：等它们落地再断言。
   await panel.settled()
   return panel
 }
 
-/** 切到 Settings 的某一组（子 Tabs 的 label 是「设置」）。 */
+/** 切到 Settings 的某一组（与面板导航同一份文案；helper 见 `tests/support/panel-nav.ts`）。 */
 async function groupTab(panel: Awaited<ReturnType<typeof mount>>, value: string, locale = 'en'): Promise<void> {
-  await panel.select({ type: 'Tabs', label: COPY['nav.settings'][locale === 'en' ? 'en' : 'zh'] }, value)
-  await panel.settled()
+  await openSettingsGroup(panel, value, locale)
 }
 
 /** 一次 `settings.save` 请求的输入。 */
@@ -308,16 +308,43 @@ function saves(host: ReturnType<typeof mockHost>): SettingsSaveInput[] {
 /** 已经打开的那一组（面板里默认 Sources；这一页一次只渲染当前组）。 */
 test('the Settings page shows the five groups in the design order, and Prompts is the real editor', async () => {
   const panel = await openSettings({})
-  const labels = panel.findAll({ role: 'tab' }).map((tab) => tab.text)
-  // 当前页的子 Tabs 是五组（§M.3 的顺序）；它嵌在导航的 Settings 项里。
-  const groups = labels.slice(labels.indexOf(COPY['settings.group.sources'].en), labels.indexOf(COPY['settings.group.sources'].en) + 5)
-  assert.deepEqual(groups, [
-    COPY['settings.group.sources'].en,
-    COPY['settings.group.eval'].en,
-    COPY['settings.group.execution'].en,
-    COPY['settings.group.prompts'].en,
-    COPY['settings.group.deployment'].en
-  ])
+  // 当前页的子导航是五组的可换行单选条（§M.3 的顺序）：RadioGroup 的 options 就是那张顺序表。
+  // RadioGroup 的 options 就是那张顺序表：从树里取出这个控件的 options，按值比对。
+  interface Node {
+    readonly type?: string
+    readonly props?: {
+      readonly label?: string
+      readonly options?: readonly { readonly value: string; readonly label: string }[]
+    }
+    readonly children?: readonly (Node | string)[]
+  }
+  const findGroup = (node: Node): Node | undefined => {
+    if (node.type === 'RadioGroup' && node.props?.label === COPY['nav.settings'].en) return node
+    for (const child of node.children ?? []) {
+      if (typeof child === 'string') continue
+      const hit = findGroup(child)
+      if (hit !== undefined) return hit
+    }
+    return undefined
+  }
+  const control = findGroup(panel.tree() as Node)
+  assert.ok(control !== undefined, 'the five groups are one RadioGroup')
+  assert.deepEqual(
+    (control.props?.options ?? []).map((option) => option.value),
+    [...SETTINGS_GROUPS],
+    'the groups keep the design order'
+  )
+  assert.deepEqual(
+    (control.props?.options ?? []).map((option) => option.label),
+    [
+      COPY['settings.group.sources'].en,
+      COPY['settings.group.eval'].en,
+      COPY['settings.group.execution'].en,
+      COPY['settings.group.prompts'].en,
+      COPY['settings.group.deployment'].en
+    ],
+    'each group is named by the copy table'
+  )
   await groupTab(panel, 'prompts')
   // #43 的 Prompts 组是注册进来的真组件（`SETTINGS_GROUP_BODIES.prompts`），不是占位：
   // 团队文本、分片与四个子页都在这一格里，子页默认停在编辑。
@@ -328,12 +355,13 @@ test('the Settings page shows the five groups in the design order, and Prompts i
     'the per-part overrides are the real ones'
   )
   assert.equal(
-    panel.valueOf({ type: 'Tabs', label: COPY['prompt.tabs'].en }),
+    panel.valueOf({ type: 'RadioGroup', label: COPY['prompt.tabs'].en }),
     'edit',
-    'the four sub-tabs live inside the group body'
+    'the four sub-pages live inside the group body'
   )
+  const promptPages = JSON.stringify(panel.tree())
   for (const key of ['prompt.tab.edit', 'prompt.tab.full', 'prompt.tab.history', 'prompt.tab.skills'] as const) {
-    assert.ok(panel.find({ role: 'tab', text: COPY[key].en }), `the ${key} sub-tab is drawn by the real component`)
+    assert.ok(promptPages.includes(JSON.stringify(COPY[key].en)), `the ${key} sub-page is drawn by the real component`)
   }
   assert.deepEqual(panel.refusals, [])
   assert.deepEqual(panel.errors, [])
@@ -589,10 +617,13 @@ test('History lists what was saved and Restore saves that version again, after a
   )
 
   // 恢复先确认，确认之后走同一条保存路径（块 + 当前修订号 + 那一版的值）。
-  await panel.press({ label: COPY['settings.history.restore'].en })
-  assert.equal(panel.find({ text: COPY['settings.history.confirmRestore'].en.replace('{revision}', '4') }) !== null, true)
+  await panel.press({ text: COPY['settings.history.restore'].en })
+  assert.ok(
+    panel.find({ text: COPY['confirm.body.restore'].en.replace('{revision}', '4') }) !== null,
+    'the confirmation states what a restore does'
+  )
   assert.deepEqual(saves(panel.host), [], 'no write before the confirmation')
-  await panel.press({ text: COPY['action.confirm'].en })
+  await panel.press({ text: COPY['settings.history.restore'].en })
   assert.deepEqual(restored, {
     block: 'source:github',
     revision: 2,
@@ -612,7 +643,7 @@ test('the page speaks Chinese too, and every group renders without a refusal', a
     ['deployment', COPY['settings.group.deployment'].zh]
   ] as const) {
     await groupTab(panel, value, 'zh')
-    assert.ok(panel.find({ text: label }), `the ${value} group is named`)
+    assert.ok(JSON.stringify(panel.tree()).includes(JSON.stringify(label)), `the ${value} group is named`)
   }
   assert.ok(panel.find({ text: COPY['settings.limits.title'].zh }), 'the limits are editable in Chinese too')
   assert.deepEqual(panel.refusals, [])

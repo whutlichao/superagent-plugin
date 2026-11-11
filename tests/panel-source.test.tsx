@@ -30,6 +30,7 @@ import type {
   TicketDetailView
 } from '../src/panel/protocol'
 import { AT, isoAfter, openTempStore, tempStateDir } from './support/state'
+import { currentPage, openPage } from './support/panel-nav'
 
 /** `mockHost` 的请求表类型（测试里只写用到的几个名字）。 */
 type Requests = NonNullable<NonNullable<Parameters<typeof mockHost>[0]>['requests']>
@@ -137,7 +138,7 @@ async function openSourceTab(requests: Requests): Promise<Awaited<ReturnType<typ
     host: mockHost({ requests: { state: () => snapshot(), ...requests } }),
     locale: 'en'
   })
-  await panel.select({ type: 'Tabs' }, 'source')
+  await openPage(panel, 'source')
   // 页面打开后才发 `sources`：等它落地，交互针对的是加载完的那一棵树。
   await panel.settled()
   return panel
@@ -811,7 +812,7 @@ test('the filtered triggers list their reason code, and a row opens its thread',
   assert.ok(github.includes('source_disabled'), 'a Source-owned literal code shows as it is')
   assert.ok(github.includes('please deploy it'), 'and the message itself')
   await mounted.press({ type: 'Button', text: COPY['term.thread'].en })
-  assert.equal(mounted.valueOf({ type: 'Tabs' }), 'trigger', 'the row opens the Thread page')
+  assert.equal(currentPage(mounted), 'trigger', 'the row opens the Thread page')
   assert.deepEqual(mounted.refusals, [])
   await mounted.unmount()
   panel = undefined
@@ -858,7 +859,7 @@ test('the dropped messages list why, when, and the Ticket or Thread each belonge
 
   // 有工单就链接工单（更准），没有工单才链接 Thread。
   await mounted.press({ type: 'Button', text: 'Fix the regression' })
-  assert.equal(mounted.valueOf({ type: 'Tabs' }), 'execution')
+  assert.equal(currentPage(mounted), 'execution')
   assert.deepEqual(requestInput(mounted.host, 'ticket.detail'), { ticketId: 'ticket-1' })
   assert.deepEqual(mounted.refusals, [])
   await mounted.unmount()
@@ -888,7 +889,7 @@ test('a dropped message without a Ticket opens its Thread, and one with neither 
       ])
   })
   await mounted.press({ type: 'Button', text: 'Another topic' })
-  assert.equal(mounted.valueOf({ type: 'Tabs' }), 'trigger', 'the thread link opens the Thread page')
+  assert.equal(currentPage(mounted), 'trigger', 'the thread link opens the Thread page')
   const links = nodesOfType(mounted, 'Button').filter((button) => cardText(button).includes('Reply m1'))
   assert.deepEqual(links, [], 'a row with nothing to link offers no button')
   assert.deepEqual(mounted.refusals, [])
@@ -968,14 +969,14 @@ test('a failed label refresh stays on its own card and leaves the others alone',
   assert.deepEqual(requestInput(mounted.host, 'source.labels'), { sourceId: 'feishu' })
   assert.ok(
     cardTextOf(mounted, 'Feishu').includes(
-      translate('en', 'source.actionFailed', { reason: 'lark-cli: token expired' })
+      translate('en', 'error.retry', { reason: 'lark-cli: token expired' })
     ),
     'the failure is said on the card that failed'
   )
   const github = cardTextOf(mounted, 'GitHub')
   assert.ok(github.includes('acme/widgets'), 'the other card keeps its content')
   assert.equal(
-    github.includes(translate('en', 'source.actionFailed', { reason: 'lark-cli: token expired' })),
+    github.includes(translate('en', 'error.retry', { reason: 'lark-cli: token expired' })),
     false,
     'and carries no error of its own'
   )

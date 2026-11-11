@@ -704,12 +704,15 @@ pending ──launch 成功──▶ running ──report(ready|dropped) / stop 
 
 上游 Ticket stage 由 Report 与 Assignment 共同决定（`ticketStage`）。Orca 上 `ticketStage` 的输入多一个 `agentState`——它是 Ticket 上持久化的那次观测（§E.7）；没有观测过的旧数据不满足任何集合成员条件，按表继续往下落。
 
+**修正（本次审查）**：上游把 `blocked` 与 `failed` 并成一个面板标签「Blocked · Failed」，于是可恢复的「受阻」被标成危险色。面板标签现在拆成两档：`blocked` → `warning` +「受阻 / Blocked」，`failed` → `danger` +「失败 / Failed」；`core/stage.ts` 的 `STAGE_LABELS`、`panel/protocol.ts` 的 `PanelTicket['stage']`、`worker/app/views.ts` 的映射与 `panel/copy.ts` 的 `stage.*` 同一次改动，两边仍只有一份联合。
+
 | 上游 stage | 条件 | Orca 条件 | 面板标签 |
 | --- | --- | --- | --- |
 | person / delivery | Input 投递失败 | 同（`delivery.error` 未清） | Input undelivered |
 | person / answer | 有 Attention | 同 + `attention.via='terminal'` | Awaiting answer |
 | person / review | 最近 Report 是 `ready` | 同 | Awaiting review |
-| person / blocked, failed | 最近 Report 是 `blocked`/`failed` 且此后无人消息 | 同，**且 `agentState ∈ {blocked, done}`** | Blocked · Failed |
+| person / blocked | 最近 Report 是 `blocked` 且此后无人消息 | 同，**且 `agentState ∈ {blocked, done}`** | Blocked（受阻，warning） |
+| person / failed | 最近 Report 是 `failed` 且此后无人消息 | 同，**且 `agentState ∈ {blocked, done}`** | Failed（失败，danger） |
 | working / queued | 无 Assignment 或 pending | 同 | Queued |
 | idle | 最近 Report `waiting`，或 Assignment 已结束 | 同 + `agentState ∈ {waiting, done}` | Waiting for a Trigger |
 | working | 其余 | 同 | Working |
@@ -1466,7 +1469,7 @@ interface AdmissionCells {
 
 ### M.1 导航与 IA
 
-上游是 6 个 tab + 头部搜索 + `(?)` 术语表。Orca 面板**导航项 7 个**（与票据措辞对齐）：
+上游是 6 个 tab（本仓改称「导航项」，渲染为导航单选条）+ 头部搜索 + `(?)` 术语表。Orca 面板**导航项 7 个**（与票据措辞对齐）：
 
 | # | 导航项 | 对应上游 | 说明 |
 | --- | --- | --- | --- |
@@ -1479,6 +1482,8 @@ interface AdmissionCells {
 | 7 | Search | 头部搜索 | 成为独立导航项：查 Trigger 文本/id/Feishu message id/存储的链接，Thread 的 `#12`/URL，Ticket 的标题或匹配 Thread |
 
 术语表 `Glossary` 不作为导航项：它是页头 `(?)` 按钮打开的**覆盖层**（与上游一致），内容为上游 §001 的双语术语表（`copy.ts` 的 `glossary`）。所以「7 个导航项 + 1 个覆盖层」。
+
+**导航的渲染形态（本次审查修正）**：七项由面板自有的**导航单选条**（navigation radio group：`RadioGroup`，`labelHidden`，选项即七页）渲染，不是宿主的 `Tabs`，也不是一组 `Button`。原因有两层：① 7 项 `Tabs` 的最小内容宽约 544px 且不换行，320–400px 的面板上必然出现整页横向滚动（§M.4 的实测记录）；② 宿主的 `Button` 没有 `aria-current` / `aria-pressed` / `selected`，用按钮做的导航会退化成「只靠背景色区分当前页」；`RadioGroup` 是真单选语义，「当前页 = 选中的那一项」，与 Settings 五组、Prompts 四子页同一种控件。**七项、顺序、每页的内容与 IA 都不变**，只是换行渲染。
 
 ### M.2 每页内容、主操作与三态
 
@@ -1494,7 +1499,15 @@ interface AdmissionCells {
 
 **面板不能直接做的两件事**：聚焦终端与打开工作区都只能由 worker 代理——`plugin.request('terminal.focus', { terminalId })` → worker 跑 `orca terminal focus --terminal <h>`；`plugin.request('workspace.open', { workspaceId })` → worker 调 `host.call('workspace.open')`（面板无此 Host 方法）。
 
-**确认对话**（破坏性操作）：Stop ticket、Unsubscribe thread、Dismiss problem、Remove worktree、Rotate token、Apply prompt revision（重启 Router）、Pause processing。实现方式：`Button` 点击后把该行切到确认态（`Callout tone="warning"` + 「Confirm …」/「Cancel」两个 `Button`），用 panel atom 记 `confirming: <key|null>`。**没有 Modal 组件**，也不做浏览器 `confirm()`（面板无 DOM）。
+**确认对话**（需要二次确认的七类动作）：Stop ticket、Unsubscribe thread、Dismiss problem、Remove worktree、Rotate token、Restart router、Pause/Resume processing；历史恢复（Settings）用同一套按钮。
+
+实现方式：`Button` 点击后把该行切到确认态（`Callout tone="warning"` + 确认 / 取消两个 `Button`），用 panel atom 记 `confirming: <key|null>`。**没有 Modal 组件**，也不做浏览器 `confirm()`（面板无 DOM）。
+
+**确认文案约定（本次审查修正）**：确认对话必须携带信息——
+- 标题点名动作与对象（「停止工单『修复登录跳转』？」「移除 worktree？」「取消订阅这条线程？」「轮换主 token？」）；没有对象时是「动作？」。
+- 正文写一句可判断的后果（移除 worktree 必须写明「目录与未提交改动会被删除；Orca 能证明已合并的分支会被删除；均不可恢复」）。
+- 确认按钮是动词 + 对象（「停止工单」「移除 worktree」「取消订阅」「不再提示」「恢复处理」「暂停处理」「重启 Router」「轮换 token」「恢复这一版」），不再是泛用的「确定」；取消按钮保持「取消 / Cancel」。
+- **语气**：`accent` 一色一义——它只表示「进行中」。确认按钮默认中性实心；只有停止工单、移除 worktree、取消订阅、不再提示这四类破坏性动作用 `tone="danger"`，恢复处理、暂停处理、重启 Router、轮换 token 保持中性。
 
 ### M.3 Settings 分组与保存栏
 
@@ -1503,7 +1516,7 @@ interface AdmissionCells {
 | Sources | 每个 Source 一张卡：开关、`repository`/`cli`、`observeIssues/Pulls/Comments/Ci`；Feishu 的 chats 行编辑（chatId/name/listen）、`directMessages`、`otherChats`；「Sync now」（Feishu 允许名单纯）、Advanced（`pollSeconds`、`readLimit`） |
 | Eval | Policy version、rules 列表（增删改、启用开关）、`acceptMode`（RadioGroup: off/observe/auto）、`timeoutSeconds`、`model`；**On each Source** 子页：allowed 行编辑、bots、admission 表（每行的三个 cell，按 `rows()` 是否 observe 决定 cell 是否可用）、Feishu 的 `syncChat` |
 | Execution | `agent`、`model`、`effort`、`maxWorkers`、`baseRepo`（Select，来自 `GET models`/`orca repo list` 的 worker 镜像）、`baseBranch`、`branchPrefix`、`prepare`（Textarea + 「插入变量」菜单，点一下把 `${DSH_SUPERAGENT_…}` 插到光标处）、`blockedCommands`（提示语照抄 §H.11：shim 只挡手滑，**不是安全边界**）、`inlineLimit`、`worktreeRetention`、`githubCommitEmail`（agent 账号的 noreply 提交邮箱，§H.11；`executor` 块里唯一保存即生效的字段，空着部署检查报 `gitconfig_missing`） |
-| Prompts | 子 tab：**Edit**（三段团队文本 + 每个内置分片的 override，被改的标 `changed`，模板显示必保留占位符）、**Full prompt**（`CodeView` 全文 + 与「已保存」或「默认」的 `diff.ts` 行级对比）、**History**（版本列表 + 恢复到某版本）、**Skills**（内置只读 + 团队技能增删改） |
+| Prompts | 子页（同一组可换行单选条）：**Edit**（三段团队文本 + 每个内置分片的 override，被改的标 `changed`，模板显示必保留占位符）、**Full prompt**（`CodeView` 全文 + 与「已保存」或「默认」的 `diff.ts` 行级对比）、**History**（版本列表 + 恢复到某版本）、**Skills**（内置只读 + 团队技能增删改） |
 | Deployment | setup 问题 + 「Check again」、`stateDir`（只读 + 复制路径）、机器限额（`promptMaxChars`、`admissionContextMaxPages/TimeoutMs`、`retention.days`）、`paused` 开关、health 明细、`router` 状态（terminal/since/restarts + Restart）、`doctor` 结果（四档计数）、「Rotate token」、Limitations 段（§H 里标「是」的条目摘要） |
 
 保存栏：草稿为空时**不占空间**；有改动时显示「N changes · Save / Discard」；保存中显示 `Spinner`；失败显示 `Callout tone="danger"` + `issues[]`（字段级 `invalid`）；冲突（409）显示「This block changed elsewhere. Reload latest?」。
@@ -1513,7 +1526,7 @@ interface AdmissionCells {
 | 需求 | 组件 |
 | --- | --- |
 | 列表 | `Table`（`columns`/`rows`/`sort`/`loading`/`emptyText`/`hasMore`/`onLoadMore`；行点击用 `onRowAction`） |
-| 页面切换、Settings/Prompts 子 tab | `Tabs` + `Tab` |
+| 页面切换（7 项）、Settings 五组、Prompts 四子页 | **面板自有的可换行单选条**：`RadioGroup`（`labelHidden`，选项即名称）。宿主 `Tabs` 不换行，7 项的最小内容宽约 544px，320–400px 的面板上会撑出整页横向滚动；`Toolbar` + `Button` 虽可换行，但宿主的 `Button` 没有 `aria-current`/`aria-pressed`/`selected`，当前项只能靠背景色表达（见下面「已知限制（组件面）」的实测记录） |
 | 报告、追问、说明文本 | `Markdown`（只渲染核心子集：标题/段落/列表/代码块/链接） |
 | 全文 prompt、prepare 命令、diff | `CodeView`（`language`/`lineNumbers`/`wrap`） |
 | 警告/错误/确认/提示 | `Callout`（`tone`） |
@@ -1526,8 +1539,20 @@ interface AdmissionCells {
 | 表单 | `Field`+`Input`/`Textarea`/`Switch`/`Select`/`RadioGroup`/`Slider`/`Checkbox` |
 | 布局 | `Stack`/`Row`/`Grid`/`Box`（无 `style`/`className`） |
 | 操作 | `Button`/`IconButton`/`Toolbar` |
+| 标题层级（LOW-14） | 区块标题用 `Heading level={2}`（宿主是 `text-sm`，14px，视觉不变）；**页头标题不换成 `Heading level={1}`**——宿主的 level 1 渲染成 `h2 text-base`（16px），会违反「不得改变现有字号」的票面要求，所以页头仍是 `<Text weight="semibold">`（`Text` 的缺省 size = `text-sm`）。取舍：14px 视觉优先，标题层级由区块标题承担，并在 `tests/widgets.test.tsx` 里钉住页头标题的节点类型与字号档 |
 
 已知限制（组件面）：无 Modal、无 Toast、无虚拟列表（长列表靠分页 50 条）；渲染上限 5000 节点 / 512 KiB，因此时间线与 Ticket 详情一律分页/折叠。
+
+**窄面板的横向滚动（实测记录，本次审查）**：320/360/370px 面板上整页出现横向滚动条、380px 起消失。取证定位到**三处**原因（都在组件面内，已修）：
+1. **导航 `Tabs` 不换行（主因）**：7 项 `Tabs` 在任何宽度下都按单行排布，最小内容宽约 544px。最小复现：一个只放 7 项 `Tabs` 的空面板，在 320/360/380/400/500px 下全部出现横向滚动条，560px 起消失。改成面板自有的可换行单选条（`RadioGroup`）后，320px 起无横向滚动，且当前页由「选中的那一项」表达（单选语义，不是背景色）。7 项与 IA 顺序都不变。
+2. **页头 `PageHeader` 与 Source 页页首的 `Row justify="between"` 不换行**：副标题 + 右侧动作（`Check again`）在 320–400px 下挤成一条，把内容撑到约 420px（把导航换掉后仍在 400px 上留下横向滚动条的最小复现）。给这两行加 `wrap` 后按宽度折行。
+3. **Settings 五组与 Prompts 四子页的 `Tabs`**：五组 `Tabs` 在 320–400px 下同样溢出（最小复现：只放五组 `Tabs` 的空面板，320/360/380/400px 全部出现横向滚动条）；Prompts 的四子页在 320px 下也溢出。两者换成可换行的 `RadioGroup`（`labelHidden`，选项即名称）。Prompts 的 default-updated 两个长按钮行加 `wrap`。
+
+测量方法：`orca plugin shot --scenario` 在 320/360/370/380/400px × light/dark 下逐张截图，读每张图**最后 12 行**像素；某行出现长度 ≥ 40% 宽度、且与右缘底色明显不同的连续像素，并且那段从最左边起笔、右侧留出底色（即「一条水平条」而不是整片背景）时，判为出现横向滚动条。修复后实测 84 张（source/deployment/prompts × 5 个宽度 + 其余 9 个情景 × 3 个宽度，各 light/dark）全部 clean；修复前的 24 张（source/deployment/prompts × 4 个宽度 × 2 个主题）全部命中。每张截图先经「不是 Orca 应用侧栏」校验（`orca plugin shot --scenario` 偶尔回落到抓侧栏）。
+
+**截图取值校验（本次审查记录）**：判据是「图像顶部中央 120–220px × 8–36px 没有标题栏墨迹」——面板截图在那里是纯面板底色，侧栏截图会带窗口标题栏（居中「Orca」字样与返回箭头）。`orca plugin shot --scenario` 的回落在某些情景上不是偶发：`prompts-320-dark` 在 320px 深色主题下重试 24 + 12 次仍稳定回落到侧栏，这是宿主 `--scenario` 的缺陷，不是面板实现的问题。`deployment-320-dark` 则是**可取得但不稳定**：同一 head 上协调者第 1 次重试就拍到了真面板（证据目录里存档为 `deployment-320-dark.external-panel.png`，判据为真面板、无滚动条），本会话重试 12 次未拍到。因此交付的证据记为：本地真面板 10 张 + 外部取得 1 张（`deployment-320-dark`）+ 未取得 1 张（`prompts-320-dark`，同名的侧栏截图带 `.sidebar.png` 后缀保留，不作面板证据）。320px 的宽度结论由 `source-320-light|dark`、`deployment-320-light`、`prompts-320-light` 与外部取得的 `deployment-320-dark` 支撑（深色主题在 320px 有 `source-320-dark` 与 `deployment-320-dark` 两张面板证据）。
+
+**宿主输入框边界对比度（不计入 §A.3 的十一项）**：暗色下输入框边界 `#404355` 对卡片底 `#2b2d3a` 是 1.40:1、对页面底 `#21222c` 是 1.62:1，低于 WCAG 1.4.11 的 3:1。色值来自宿主的 `--orca-input` / `--orca-border`；components 面板没有样式通道（无 `style`/`className`、无调色板，`tests/styles.test.ts` 强制），修复方在宿主。面板 Deployment 页 Limitations 段在十一项之后用一行 `Hint` 说明，README 的「已知限制（摘要）」之后有同一段；这条不改变 `LIMITATIONS` 的长度（仍为 11）。
 
 ### M.5 中英双语
 
@@ -1549,7 +1574,7 @@ interface AdmissionCells {
 - 每个页面一个 `*.test.tsx`：`mount(module, { host: mockHost({ results: { 'state': fixture, … } }), persisted })` → 断言列表行数、`summary()` 关键行、危险操作需要二次确认、`panel.refusals` 为空。
 - `src/panel/panel.check.ts` 的情景（`defineCheck`）共 **17 个**：`booting`、`empty`、`healthy`、`needs-person`、`problems`、`paused`、`setup-missing`、`source`、`deployment`、`prompts`、`long-lists`（>50 行分页）、`execution`、`trigger`、`search`、`zh`、`en`、`danger-confirm`。`orca plugin check` 逐情景渲染并给出 `summary` 与 `tree`，CI 逻辑（`scripts/check.sh`）断言没有 issue。
 - **语言不是 check 的维度（实测偏差）**：宿主 1.4.251 的 `CheckScenario` 只有 `mockHost` 选项 + `persisted`/`theme`/`events`，**没有 `locale`**，check 的挂载固定用 `'en'`。所以 `zh`/`en` 两个情景实际区分的是**主题**（`light`/`dark`），不是语言；中英双语由 `mount(module, { locale })` 的单测覆盖（`locales.test.ts` 断言 key 集合与非空、`panel-navigation.test.tsx` 按 `locale` 断文案）。17 个情景覆盖的是状态与主题，语言改由单测盖。
-- 视觉验收：`orca plugin shot <key> --panel superagent --theme light|dark --width 360` 与 `--scenario` 各情景，读 PNG 检查窄宽度与两套主题。
+- 视觉验收：`orca plugin shot <key> --panel superagent --theme light|dark --width 360` 与 `--scenario` 各情景，读 PNG 检查窄宽度与两套主题。七页的导航单选条在 `--panel` 与各情景里都会画出来；检查窄宽度时先核一眼 PNG 顶部是不是面板（`--scenario` 偶尔会回落到抓应用侧栏，判据见 §M.4 的「截图取值校验」）。
 
 ---
 

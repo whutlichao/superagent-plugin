@@ -28,6 +28,7 @@ import { COPY, translate } from '../src/panel/copy'
 import * as panelModule from '../src/panel/panel'
 import * as main from '../src/worker/main'
 import { openTempStore, AT, isoAfter } from './support/state'
+import { currentPage, openPage } from './support/panel-nav'
 
 /** `mockHost` 的请求表类型（测试里只写用到的几个名字）。 */
 type Requests = NonNullable<NonNullable<Parameters<typeof mockHost>[0]>['requests']>
@@ -344,7 +345,7 @@ async function openTriggerTab(
     host: mockHost({ requests: { state: () => snapshot(), ...requests } }),
     locale: 'en'
   })
-  await panel.select({ type: 'Tabs' }, 'trigger')
+  await openPage(panel, 'trigger')
   return panel
 }
 
@@ -447,7 +448,7 @@ test('the Trigger page asks for the Subscribed window first, then for each filte
   assert.ok(mounted.find({ text: /owner\/widgets#12/ }))
 
   for (const filter of THREAD_FILTERS) {
-    await mounted.select({ type: 'RadioGroup' }, filter)
+    await mounted.select({ type: 'RadioGroup', label: COPY['thread.filters'].en }, filter)
     assert.deepEqual(
       requestInput(mounted.host, 'threads'),
       { filter, offset: 0, limit: 50 },
@@ -535,7 +536,14 @@ test('the Thread column shows the url when the Source gave no label', async () =
 
 test('no Threads says so instead of drawing a placeholder page', async () => {
   const mounted = await openTriggerTab({ threads: () => ({ items: [], nextOffset: null }) })
-  assert.ok(mounted.find({ text: COPY['thread.empty'].en }))
+  // 打开时停在「已订阅」档：空态点名这一档，并给一步出口（查看全部）。
+  const filtered = translate('en', 'thread.emptyFiltered', {
+    filter: translate('en', 'thread.filter.subscribed')
+  })
+  assert.ok(mounted.find({ text: filtered }), 'the empty state names the active filter')
+  assert.ok(mounted.find({ text: COPY['thread.showAll'].en }), 'and offers a way out')
+  await mounted.press({ type: 'Button', text: COPY['thread.showAll'].en })
+  assert.ok(mounted.find({ text: COPY['thread.empty'].en }), 'the widest filter keeps the plain empty state')
   assert.equal(
     mounted.find({ text: /A later ticket fills this page/ }),
     null,
@@ -1054,8 +1062,9 @@ test('a Thread being evaluated and one whose polling failed say so on the detail
   )
   assert.ok(
     mounted.find({
-      text: literal(translate('en', 'thread.pollFailed', { error: 'graphql: 502 Bad Gateway' }))
-    })
+      text: literal(translate('en', 'error.threadPoll', { reason: 'graphql: 502 Bad Gateway' }))
+    }),
+    'the polling failure names the next step'
   )
   assert.deepEqual(mounted.refusals, [])
   await mounted.unmount()
@@ -1145,10 +1154,9 @@ test('Unsubscribe asks before acting, and cancelling sends nothing', async () =>
   })
   await mounted.activateRow({ type: 'Table' }, 'github:owner/widgets#12')
   await mounted.press({ text: COPY['thread.unsubscribe'].en })
-  const question = translate('en', 'confirm.body', {
-    action: COPY['thread.unsubscribe'].en,
-    target: 'owner/widgets#12'
-  })
+  const question = COPY['confirm.title'].en
+    .replace('{action}', COPY['thread.unsubscribe'].en)
+    .replace('{target}', 'owner/widgets#12')
   assert.ok(mounted.find({ text: literal(question) }), 'the inline confirm names the Thread')
   assert.equal(requestNames(mounted.host).includes('thread.unsubscribe'), false, 'nothing is sent yet')
 
@@ -1161,7 +1169,7 @@ test('Unsubscribe asks before acting, and cancelling sends nothing', async () =>
   )
 
   await mounted.press({ text: COPY['thread.unsubscribe'].en })
-  await mounted.press({ text: COPY['action.confirm'].en })
+  await mounted.press({ text: COPY['thread.unsubscribe'].en })
   assert.deepEqual(requestInput(mounted.host, 'thread.unsubscribe'), {
     thread: 'github:owner/widgets#12'
   })

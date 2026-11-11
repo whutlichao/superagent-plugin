@@ -21,9 +21,10 @@ import type {
   PanelState,
   SettingsPageView
 } from '../src/panel/protocol'
-import { COPY } from '../src/panel/copy'
+import { COPY, translate } from '../src/panel/copy'
 import { LIMITATIONS } from '../src/panel/limitations'
 import { readRepoFile } from './support/repo'
+import { currentPage, openPage, openSettingsGroup } from './support/panel-nav'
 import * as panelModule from '../src/panel/panel'
 import check from '../src/panel/panel.check.ts'
 
@@ -198,8 +199,8 @@ async function openDeployment(
     locale: options.locale ?? 'en'
   })
   // 导航到 Settings，再打开其中的 Deployment 组（#42 的五组框架：一次只渲染当前组）。
-  await panel.select({ type: 'Tabs' }, 'settings')
-  await panel.select({ type: 'Tabs', label: COPY['nav.settings'].en }, 'deployment')
+  await openPage(panel, 'settings')
+  await pressGroup(panel, 'deployment')
   return panel
 }
 
@@ -210,6 +211,11 @@ function requests(host: ReturnType<typeof mockHost>, name: string): unknown[] {
     .map((params) => params as { name?: string; input?: unknown })
     .filter((params) => params.name === name)
     .map((params) => params.input)
+}
+
+/** 切到 Settings 的某一组（与面板导航同一份文案；helper 见 `tests/support/panel-nav.ts`）。 */
+async function pressGroup(panel: Awaited<ReturnType<typeof mount>>, value: string): Promise<void> {
+  await openSettingsGroup(panel, value)
 }
 
 test('the Deployment page shows the state directory, the machine limits and the paused switch', async () => {
@@ -344,6 +350,28 @@ test('the health list groups every board entry by part, with its state and count
   panel = undefined
 })
 
+test('the Router last-error line points at the terminal id that is rendered above it', async () => {
+  // B（打回）：文案原来说终端 id 在「下面」，但 Fact 行画在 InlineError 之上。断言文案不再说
+  // below，且终端 id 确实出现在错误行之前（渲染顺序与文案一致）。
+  const mounted = await openDeployment(() =>
+    view({ router: routerOf({ lastError: 'restart failed: terminal_gone' }) })
+  )
+  const message = translate('en', 'error.router', { reason: 'restart failed: terminal_gone' })
+  assert.ok(mounted.find({ text: message }), 'the failure is stated')
+  assert.ok(!/\bbelow\b/i.test(message), 'the copy no longer says the id is below')
+  assert.ok(/\babove\b/i.test(message), 'it says the id is above')
+  const rendered = JSON.stringify(mounted.tree()).replace(/\\"/g, '"')
+  const terminalAt = rendered.indexOf('term_router')
+  const errorAt = rendered.indexOf(message)
+  assert.ok(terminalAt >= 0, 'the terminal id is on the page')
+  assert.ok(errorAt >= 0, 'the error is on the page')
+  assert.ok(terminalAt < errorAt, 'the terminal id is rendered before the error that points at it')
+  assert.deepEqual(mounted.errors, [])
+  assert.deepEqual(mounted.refusals, [])
+  await mounted.unmount()
+  panel = undefined
+})
+
 test('the Router block shows the terminal, since when, the restart count, and Restart asks first', async () => {
   const mounted = await openDeployment(
     () =>
@@ -364,10 +392,13 @@ test('the Router block shows the terminal, since when, the restart count, and Re
   // 重启是破坏性动作：先问，确认后才发一次请求。
   assert.deepEqual(requests(mounted.host, 'restartRouter'), [])
   await mounted.press({ text: COPY['deployment.routerRestart'].en })
-  const question = COPY['confirm.bodyPlain'].en.replace('{action}', COPY['deployment.routerRestart'].en)
-  assert.ok(mounted.find({ text: new RegExp(question) }), 'the block asks before restarting')
+  assert.ok(
+    mounted.find({ text: new RegExp(COPY['confirm.titlePlain'].en.replace('{action}', 'Restart the router')) }),
+    'the title names the action'
+  )
+  assert.ok(mounted.find({ text: COPY['confirm.body.restartRouter'].en }), 'the body states the consequence')
   assert.deepEqual(requests(mounted.host, 'restartRouter'), [])
-  await mounted.press({ text: COPY['action.confirm'].en })
+  await mounted.press({ text: COPY['deployment.routerRestart'].en })
   assert.equal(requests(mounted.host, 'restartRouter').length, 1)
   assert.ok(mounted.find({ text: COPY['deployment.routerRestarted'].en }), 'it says what happened')
 
@@ -443,11 +474,10 @@ test('Rotate token asks first and then reports the file, never the token value',
   assert.deepEqual(requests(mounted.host, 'rotateToken'), [])
 
   await mounted.press({ text: COPY['deployment.rotateToken'].en })
-  const question = COPY['confirm.bodyPlain'].en.replace('{action}', COPY['deployment.rotateToken'].en)
-  assert.ok(mounted.find({ text: new RegExp(question) }), 'rotation asks before acting')
+  assert.ok(mounted.find({ text: COPY['confirm.body.rotateToken'].en }), 'rotation states the consequence')
   assert.deepEqual(requests(mounted.host, 'rotateToken'), [])
 
-  await mounted.press({ text: COPY['action.confirm'].en })
+  await mounted.press({ text: COPY['deployment.rotateToken'].en })
   assert.equal(requests(mounted.host, 'rotateToken').length, 1)
   // 结论只说文件路径；token 值不出现在任何读数或页面上（§O）。
   assert.ok(mounted.find({ text: /\/var\/lib\/superagent\/api-token/ }), 'the token file is named')
@@ -478,8 +508,17 @@ test('the Limitations section lists the eleven approximations, and the README sa
     assert.equal(item.refs.length > 0, true, `the limitation ${item.id} names its §H rows`)
   }
 
+  // 宿主主题的对比度说明在十一项之后（一行 Hint），它不是第 12 项。
+  const lastImpact = COPY[LIMITATIONS[LIMITATIONS.length - 1].impactKey].en
+  assert.ok(
+    rendered.indexOf(COPY['deployment.hostTheme'].en) > rendered.indexOf(lastImpact),
+    'the host-theme note comes after the eleven items'
+  )
   // 同一份来源、同一套措辞：README 的已知限制段逐条包含面板上的中英之一（中文）。
   const readme = readRepoFile('README.md')
+  // 宿主主题那一条与 README 逐字相同，不是「各说一遍」。
+  assert.ok(readme.includes(COPY['deployment.hostTheme'].zh), 'the README carries the same sentence')
+  assert.equal(LIMITATIONS.length, 11, 'the note is not a twelfth item')
   for (const item of LIMITATIONS) {
     assert.ok(readme.includes(COPY[item.titleKey].zh), `README carries ${item.id}`)
     assert.ok(readme.includes(COPY[item.impactKey].zh), `README carries the impact of ${item.id}`)
@@ -497,12 +536,8 @@ test('the plugin check scenario opens on the Deployment group with a real read',
     host: mockHost({ requests: scenario.requests, storage: scenario.storage }),
     locale: 'en'
   })
-  assert.equal(
-    mounted.valueOf({ type: 'Tabs', label: COPY['panel.title'].en }),
-    'settings',
-    'the scenario opens Settings'
-  )
-  await mounted.select({ type: 'Tabs', label: COPY['nav.settings'].en }, 'deployment')
+  assert.equal(currentPage(mounted), 'settings', 'the scenario opens Settings')
+  await pressGroup(mounted, 'deployment')
   assert.ok(mounted.find({ text: COPY['deployment.stateDir'].en }), 'the deployment read is on screen')
   assert.ok(mounted.find({ text: `${COPY['deployment.setup'].en} · 1` }), 'setup problems too')
   assert.deepEqual(mounted.refusals, [])

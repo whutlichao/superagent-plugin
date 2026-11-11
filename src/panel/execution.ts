@@ -9,7 +9,7 @@ import type { PanelTicket } from './protocol'
 
 /**
  * 一条 Execution 行的标记：stage 列、详情页的标记与 Overview 的「其他工单」共用。
- * `blockedFailed` 在两档里共用一个标签，语气按更重的 failed（§E.8 的「面板标签」列）。
+ * `blocked` 与 `failed` 各是一档（§E.8 的「面板标签」列）：受阻可恢复，失败要人介入。
  */
 export function executionMark(ticket: Pick<PanelTicket, 'stage' | 'outcome'>): Mark {
   switch (ticket.stage) {
@@ -20,8 +20,6 @@ export function executionMark(ticket: Pick<PanelTicket, 'stage' | 'outcome'>): M
       })
     case 'queued':
       return ticketMark({ stage: 'working', action: 'queued' })
-    case 'blockedFailed':
-      return ticketMark({ stage: 'person', action: 'failed' })
     case 'idle':
     case 'working':
       return ticketMark({ stage: ticket.stage })
@@ -41,8 +39,6 @@ export function executionRow(ticket: PanelTicket): TicketRowData {
       return { ...base, stage: ticket.stage }
     case 'queued':
       return { ...base, action: 'queued' }
-    case 'blockedFailed':
-      return { ...base, action: 'failed' }
     default:
       return { ...base, action: ticket.stage }
   }

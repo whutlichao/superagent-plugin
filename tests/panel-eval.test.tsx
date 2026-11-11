@@ -25,6 +25,7 @@ import type {
   TicketDetailView
 } from '../src/panel/protocol'
 import { AT as ISO_AT, isoAfter, openTempStore, removeTree, tempStateDir } from './support/state'
+import { currentPage, openPage } from './support/panel-nav'
 
 /** `mockHost` 的请求表类型（测试里只写用到的几个名字）。 */
 type Requests = NonNullable<NonNullable<Parameters<typeof mockHost>[0]>['requests']>
@@ -94,7 +95,7 @@ async function openEvalTab(requests: Requests): Promise<Awaited<ReturnType<typeo
     host: mockHost({ requests: { state: () => snapshot(), ...requests } }),
     locale: 'en'
   })
-  await panel.select({ type: 'Tabs' }, 'eval')
+  await openPage(panel, 'eval')
   return panel
 }
 
@@ -255,7 +256,7 @@ test('a row opens the decision detail, which links to its thread and its ticket'
 
   // 到 Thread 的链接：Trigger 页（焦点是两页的共享契约）。
   await mounted.press({ text: COPY['eval.openThread'].en })
-  assert.equal(mounted.valueOf({ type: 'Tabs' }), 'trigger')
+  assert.equal(currentPage(mounted), 'trigger')
   assert.deepEqual(mounted.refusals, [])
   await mounted.unmount()
   panel = undefined
@@ -277,7 +278,7 @@ test('the detail links to the ticket the decision accepted', async () => {
   })
   await mounted.activateRow({ type: 'Table' }, 'd1')
   await mounted.press({ text: COPY['eval.openTicket'].en })
-  assert.equal(mounted.valueOf({ type: 'Tabs' }), 'execution', 'the ticket link opens Execution')
+  assert.equal(currentPage(mounted), 'execution', 'the ticket link opens Execution')
   assert.deepEqual(requestInput(mounted.host, 'ticket.detail'), { ticketId: 'ticket-1' })
   assert.deepEqual(mounted.refusals, [])
   await mounted.unmount()
@@ -311,11 +312,11 @@ test('only an unavailable decision offers Dismiss, and it asks before acting', a
   await mounted.press({ text: COPY['action.back'].en })
   await mounted.activateRow({ type: 'Table' }, 'd1')
   await mounted.press({ text: COPY['eval.dismiss'].en })
-  const question = translate('en', 'confirm.body', {
-    action: COPY['eval.dismiss'].en,
-    target: 'owner/widgets#12'
-  })
+  const question = COPY['confirm.title'].en
+    .replace('{action}', COPY['eval.dismiss'].en)
+    .replace('{target}', 'owner/widgets#12')
   assert.ok(mounted.find({ text: new RegExp(question) }), 'the inline confirm names the thread')
+  assert.ok(mounted.find({ text: COPY['confirm.body.dismiss'].en }), 'and states the consequence')
   assert.equal(requestNames(mounted.host).includes('decision.dismiss'), false, 'nothing is sent yet')
 
   await mounted.press({ text: COPY['action.cancel'].en })
@@ -326,7 +327,7 @@ test('only an unavailable decision offers Dismiss, and it asks before acting', a
   )
 
   await mounted.press({ text: COPY['eval.dismiss'].en })
-  await mounted.press({ text: COPY['action.confirm'].en })
+  await mounted.press({ text: COPY['eval.dismiss'].en })
   assert.deepEqual(requestInput(mounted.host, 'decision.dismiss'), { decisionId: 'd1' })
 
   // 写后的详情重读：已 dismiss 的说明出现，入口消失（领域仍允许幂等重复，面板不重复问）。
@@ -743,7 +744,7 @@ test('an Overview problem row opens its decision on the Eval page', async () => 
     locale: 'en'
   })
   await panel.press({ text: /owner\/widgets#12/ })
-  assert.equal(panel.valueOf({ type: 'Tabs' }), 'eval', 'the row opens the page that owns it')
+  assert.equal(currentPage(panel), 'eval', 'the row opens the page that owns it')
   assert.deepEqual(
     requestInput(panel.host, 'decision.detail'),
     { decisionId: 'decision-1' },
